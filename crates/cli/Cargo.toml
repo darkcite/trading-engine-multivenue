@@ -45,6 +45,8 @@ strategy-hyparb      = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-icdp        = { workspace = true }
 strategy-set         = { workspace = true }
+# PVM impl-08 T19: the slot-8 boot seam (`pine_boot`: PineBootCfg, facts, warm slices).
+strategy-pine        = { workspace = true }
 # 8h backtest harness (cli::backtest): drives the real ruleset VM
 # offline and hashes the candidate artifact exactly like the worker.
 strategy-vm          = { workspace = true }

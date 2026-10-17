@@ -48,10 +48,16 @@ pub mod binary;
 pub mod clock;
 pub mod fill;
 pub mod funding;
+/// PVM B'1r (impl-Bp §4.4): which captured records `load_run` admits and stores.
+pub(crate) mod keep;
 /// XSD-F/Tier 3: `--member <name>` — the harness drives a coded member.
 pub mod member;
 /// VRP V2a: the option denomination law + the per-run option registry.
 pub mod opt;
+/// PVM B'3 (impl-Bp §3.6–§3.8, §4.5–§4.7): the streamed pine replay;
+/// `backtest --strategy pine` calls [`run_pine_main`] (T13).
+pub(crate) mod pine;
+pub use pine::run::{run_pine_main, PineArgv, PineExit};
 pub mod regime;
 pub mod stale;
 pub mod xmm_parity;
@@ -767,6 +773,20 @@ pub enum RecPayload {
     Trade(TradePrint),
 }
 
+/// PVM B'1r: the (post-remap) sym a record is stored under, for
+/// `KeepPolicy::store_syms`; `None` for a regime frame (venue-global).
+fn record_sym(p: &RecPayload) -> Option<u32> {
+    match p {
+        RecPayload::Tick(t) => Some(t.sym),
+        RecPayload::Event(e) => Some(e.sym),
+        RecPayload::Depth(d) => Some(d.sym),
+        RecPayload::Opt(o) => Some(o.sym),
+        RecPayload::Regime(_) => None,
+        RecPayload::Signal(s) => Some(s.sym),
+        RecPayload::Trade(t) => Some(t.sym),
+    }
+}
+
 /// The lanes a replay merges beyond the ones every replay carries.
 ///
 /// Each is loaded ONLY for the member that reads it: every other replay
@@ -942,6 +962,7 @@ fn load_run(
     binary_underlyings: &BTreeSet<u32>,
     sym_class: &BTreeMap<u32, InstrumentClass>,
     lanes: MergeLanes,
+    keep_policy: &keep::KeepPolicy<'_>,
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
     let mut venue_records = [0u64; VENUE_LABELS.len()];
@@ -1028,7 +1049,11 @@ fn load_run(
             let mut tick = *t;
             // Judged in FILE order on the RAW sym (the estimator is
             // per connection; the remap below is a naming concern).
-            judge.judge(vi, &mut tick, has_venue_time);
+            // PVM B'1r: 8g keeps the captured flag (`rejudge_stale` off);
+            // every legacy caller re-judges, as before.
+            if keep_policy.rejudge_stale {
+                judge.judge(vi, &mut tick, has_venue_time);
+            }
             tick.sym = match map_sym(t.sym, &mut summary_extra.4, &mut dropped_foreign) {
                 Some(s) => s,
                 None => continue,
@@ -1143,11 +1168,19 @@ fn load_run(
                 let is_hl_trade = lanes.hl_trades
                     && e.channel == ChannelId::Trade as u8
                     && e.venue == VenueId::Hyperliquid as u8;
+                // PVM B'1r (pin:Bp-keep-policy-additive): a Trade row the
+                // keep policy routes — filtered by `trade_syms` after the
+                // remap; never when the XH1 lane already takes it (the
+                // legacy flag wins). Empty `trade_syms` (LEGACY) ⇒ false.
+                let is_pine_trade = !is_hl_trade
+                    && !keep_policy.trade_syms.is_empty()
+                    && e.channel == ChannelId::Trade as u8;
                 let keep = e.channel == ChannelId::Funding as u8
                     || e.channel == ChannelId::AssetCtx as u8
                     || e.channel == ChannelId::InstrumentRoll as u8
                     || is_mark
-                    || is_hl_trade;
+                    || is_hl_trade
+                    || is_pine_trade;
                 if !keep {
                     continue;
                 }
@@ -1161,6 +1194,9 @@ fn load_run(
                 // Post-remap, because the set is keyed on the newest
                 // manifest's ordinals like everything else downstream.
                 if is_mark && !binary_underlyings.contains(&ev.sym) {
+                    continue;
+                }
+                if is_pine_trade && !keep_policy.admits_trade(ev.sym) {
                     continue;
                 }
                 if is_hl_trade {
@@ -1399,6 +1435,12 @@ fn load_run(
         });
     }
 
+    // PVM B'1r: the store filter — after the stale judge and the remap
+    // (every record above is already judged and renamed). `None`
+    // (LEGACY) keeps everything, so no legacy record moves.
+    if keep_policy.store_syms.is_some() {
+        recs.retain(|r| keep_policy.stores(record_sym(&r.payload)));
+    }
     order_run(&mut recs);
     Ok((
         recs,
@@ -1508,6 +1550,7 @@ fn load_and_merge(
             &binary_underlyings,
             sym_class,
             lanes,
+            &keep::KeepPolicy::LEGACY,
         )?;
         summary.opt_registry_refused = registry_refused;
         if recs.is_empty() {

@@ -15,9 +15,8 @@
 use core_types::{Fill, Order, SlotMask, MAX_STRATEGY_SLOTS};
 use strategy_core::{
     HarCounters, HarSeriesView, HcvCounters, HyparbCoinView, HyparbCounters, HyparbPoolView,
-    RegimeCounters,
-    RegimeRelView, SlotCounters, VmRowView, VrpCounters, VrpSnapshotView, XmmCounters,
-    XmmPerpView, HAR_VIEW_SERIES,
+    PineCounters, RegimeCounters, RegimeRelView, SlotCounters, VmRowView, VrpCounters,
+    VrpSnapshotView, XmmCounters, XmmPerpView, HAR_VIEW_SERIES,
 };
 
 /// JSON schema version of `/state` (`"v"`). Bump on any field removal
@@ -380,6 +379,16 @@ pub struct XmmSnapshot {
 pub struct HcvSnapshot {
     /// The member's counters and gauges.
     pub counters: HcvCounters,
+}
+
+/// PVM impl-08 T17: the slot-8 member (Pine, PAPER ONLY): its aggregate counters at one
+/// publish instant. The per-script rows (`PineScriptView`, 8 × 128 B) do not fit the 32 KB
+/// budget this file pins; they stay on `/metrics` and the boot tell until a budget ruling.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct PineSnapshot {
+    /// The member's counters (all zero when slot 8 is not configured).
+    pub counters: PineCounters,
 }
 
 /// P6: the VRP member (slot 1).
@@ -1145,6 +1154,8 @@ pub struct EngineSnapshot {
     pub xmm: XmmSnapshot,
     /// HC11: the slot-7 member.
     pub hcv: HcvSnapshot,
+    /// PVM impl-08 T17: the slot-8 member.
+    pub pine: PineSnapshot,
     /// The VRP member.
     pub vrp: VrpSnapshot,
     /// HYPARB H6: the slot-0 member.
@@ -1192,6 +1203,7 @@ impl EngineSnapshot {
             vm: VmSnapshot::empty(),
             xmm: XmmSnapshot::default(),
             hcv: HcvSnapshot::default(),
+            pine: PineSnapshot::default(),
             vrp: VrpSnapshot::default(),
             hyparb: HyparbSnapshot::default(),
             har: HarSnapshot::default(),
@@ -1255,10 +1267,11 @@ mod tests {
         // same alignment: still 31,872 B. S16-5's schema 3 widens the
         // per-slot arrays 8 → 16: `slots` +192 B (three 64 B lines);
         // `exec.halted`'s +8 B fit the 64 B alignment. 32,064 B, 704 B
-        // left.
+        // left. PVM impl-08 T17's `pine` section (`PineCounters`, 336 B) makes it 32,384 B
+        // (it fit the previous alignment slack): 384 B left.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
-        assert_eq!(n, 32_064, "the S16-5 figure: a change states its own");
+        assert_eq!(n, 32_384, "the T17 figure: a change states its own");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);
         assert_eq!(core::mem::size_of::<HarSnapshot>(), 2_216);
     }

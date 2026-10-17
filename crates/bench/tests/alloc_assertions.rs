@@ -3042,6 +3042,143 @@ fn ai_ingress_admit_frame_is_zero_alloc() {
     let _ = std::fs::remove_dir_all(&cap_dir);
 }
 
+/// PVM B'1 (impl-Bp §7.10): the ingress Trade route push — a Binance
+/// spot sentinel slot whose sym is on the pine route, spawned with
+/// `EVENT_LANE_TRADE`: 1 000 aggTrade prints parsed, captured, routed
+/// onto the event lane (and popped) must allocate nothing after boot.
+/// The push is the same `TradeLane::offer` law at all five ingress
+/// sites.
+#[test]
+fn ingress_trade_route_push_is_zero_alloc() {
+    use ingress_binance::run_loop as bwl;
+
+    // ---- boot (NOT measured) ----
+    static ROUTE: [SymbolId; 1] = [7];
+    let mut transport = TestTransport::with_capacity(128 * 1024);
+    let mut driver = bwl::Driver::new_spot_sentinel(0xBA07u64, 7);
+    driver.set_trade_route(&ROUTE);
+    bwl::note_transport_ready(&mut driver, core_net::Status::Ready);
+    let (mut otx, _orx) =
+        Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
+    let status = core_metrics::IngressStatus::new();
+    let (mut prod, _cons) = Ring::<Tick, { bwl::DEFAULT_TICK_RING_CAP }>::new().split();
+    let (mut etx, mut erx) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let mask = core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_TRADE;
+    let mut capture = core_types::NullCapture;
+    let mut scratch = [0u8; 4096];
+    let mut resp = [0u8; 256];
+    for step in 0..2 {
+        if step == 1 {
+            let _ = transport.drain_outgoing(&mut scratch);
+            let n = bn_upgrade_reply(0xBA07u64, &mut resp);
+            transport.inject_incoming(&resp[..n]);
+        }
+        bwl::drive_one(
+            &mut transport,
+            &mut driver,
+            b"h",
+            b"/ws/btcusdt@bookTicker",
+            &mut prod,
+            &mut etx,
+            mask,
+            &mut otx,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
+    }
+    assert_eq!(driver.state(), bwl::State::Steady);
+    let _ = transport.drain_outgoing(&mut scratch);
+    let payload: &[u8] = br#"{"e":"aggTrade","E":1755216000001,"s":"BTCUSDT","a":26129,"p":"25.35","q":"0.5","f":1,"l":2,"T":1755216000000,"m":true,"M":true}"#;
+    // The live print is 128 B: one unmasked Text frame in the 16-bit length form.
+    assert!(payload.len() > 125 && payload.len() <= 252);
+    let mut frame = [0u8; 256];
+    frame[0] = 0x81;
+    frame[1] = 126;
+    frame[2..4].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    frame[4..4 + payload.len()].copy_from_slice(payload);
+    let frame_len = 4 + payload.len();
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for _ in 0..1_000u32 {
+        transport.inject_incoming(&frame[..frame_len]);
+        bwl::drive_one(
+            &mut transport,
+            &mut driver,
+            b"h",
+            b"/ws/btcusdt@bookTicker",
+            &mut prod,
+            &mut etx,
+            mask,
+            &mut otx,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
+        let e = *erx.try_pop_ref().expect("routed print");
+        acc = acc.wrapping_add(e.v1);
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "trade route push allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0);
+    assert_eq!(status.trade_shed_total(), 0);
+}
+
+/// PVM B'1 (impl-Bp §7.10): the `strategy-set` Trade forward — a Trade
+/// event handed to the set reaches the pine slot only (here the boot-
+/// time inert shell, which counts it) and returns before the regime
+/// tap and the fan-out; 1 000 of them allocate nothing.
+#[test]
+fn strategy_set_trade_forward_is_zero_alloc() {
+    use core_types::{ChannelEvent, ChannelId, Order};
+    use strategy_core::{Ctx, Strategy, StrategyCounters, SubmitErr};
+    use strategy_set::{StrategySet, AI_MASK, BIT_PINE};
+
+    struct NoCtx;
+    impl Ctx for NoCtx {
+        fn submit(&mut self, _o: Order) -> Result<(), SubmitErr> {
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            1_000_000_000_000
+        }
+    }
+    // ---- boot (NOT measured) ----
+    let mut set = StrategySet::new(AI_MASK | BIT_PINE);
+    let mut ctx = NoCtx;
+    let ev = ChannelEvent::new(
+        1,
+        VenueId::Hyperliquid,
+        ChannelId::Trade,
+        7,
+        1,
+        1,
+        64_437_500_000,
+        250_000,
+    );
+    let before = set.pine_counters().callbacks_ignored;
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+    for _ in 0..1_000u32 {
+        set.on_venue_event(&ev, &mut ctx);
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "trade forward allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0);
+    assert_eq!(set.pine_counters().callbacks_ignored - before, 1_000);
+}
+
 /// Phase 8f item 7: StrategySet fan-out steady state — mask-gated
 /// member dispatch (ticks through the slot-0 member — the hyparb stub
 /// since HYPARB H0, latency-arb before it — AI heartbeat fan-out, an
@@ -21244,4 +21381,618 @@ fn pine_screen_interleaved_bar_loop_is_zero_alloc() {
     );
     assert_eq!(deallocs, 0, "gate PVM-5: {deallocs} frees");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+// impl-08 §7.10 — the seven `strategy-pine` arms (gates PVM-6 … PVM-12, I1): after `on_start`
+// returns (the warm-up merge-walk included) the slot-8 member allocates nothing. Modelled on
+// `crates/strategy-pine/tests/alloc.rs`: a PAPER boot on hyperliquid btc/eth under the anchor
+// (0, 0) (event ns = UTC ns), the scripts of `crates/strategy-pine/tests/scripts`, a fixed-ring
+// scripted ctx. Drop-in text: every path is fully qualified; helpers carry a `pvm8_` prefix. The
+// bench crate gains the dev edge `strategy-pine`. Setup (boot, warm-up, the first touch of every
+// path) runs before each `AllocGuard`; the guarded loop is asserted (0, 0, 0).
+
+/// The tests' boot instant, 2026-01-01T00:00:00Z (a 4-h boundary).
+const PVM8_T0: i64 = 1_767_225_600_000;
+const PVM8_COINS: [&str; 2] = ["btc", "eth"];
+/// The scripted ctx's verb ring (fixed: it never allocates after construction).
+const PVM8_REC_CAP: usize = 4096;
+
+fn pvm8_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../strategy-pine/tests/scripts")
+}
+
+fn pvm8_sym(coin: usize) -> u32 {
+    4096 + u32::try_from(coin).expect("coin")
+}
+
+fn pvm8_facts(coin: usize) -> strategy_pine::PineSymbolFacts {
+    let c = PVM8_COINS[coin];
+    strategy_pine::PineSymbolFacts {
+        key: format!("hyperliquid:{c}"),
+        sym: pvm8_sym(coin),
+        venue: VenueId::Hyperliquid,
+        mintick_1e6: 10_000,
+        pointvalue_1e6: 1_000_000,
+        qty_step_1e6: 1_000,
+        min_notional_1e6: 10_000_000,
+        syminfo_strs: [
+            c.to_uppercase(),
+            c.to_uppercase(),
+            "USD".to_string(),
+            "crypto".to_string(),
+        ],
+        venue_read: true,
+    }
+}
+
+fn pvm8_script(file: &str, coin: usize) -> core_config::pine::PineScriptCfg {
+    let src = std::fs::read(pvm8_dir().join(file))
+        .unwrap_or_else(|e| panic!("gates PVM-6..12: {file}: {e}"));
+    core_config::pine::PineScriptCfg {
+        line: 1,
+        sha256: core_crypto::sha256(&src),
+        file: file.to_string(),
+        dialect: 6,
+        enabled: true,
+        mode: core_config::pine::PineMode::BarClose,
+        symbol: format!("hyperliquid:{}", PVM8_COINS[coin]),
+        timeframe_s: 60,
+        venue: "hyperliquid".to_string(),
+        max_bars_back: 5000,
+        coalesce_ms: 250,
+        coalesce_bps: 0,
+        insn_budget: 1_000_000,
+        qty_notional_1e6: 12_000_000,
+        limit_primitive: core_config::pine::PineLimitPrimitive::Ioc,
+        cross_ticks: 2,
+        cap_instance_1e6: 12_000_000,
+        cap_day_1e6: 48_000_000,
+        max_open: 2,
+        collection_cap: 4096,
+        str_persist_bytes: 4096,
+        str_cell_bytes: 128,
+        str_scratch_bytes: 8192,
+        intent_cap: 32,
+        inputs: Vec::new(),
+        symbols: Vec::new(),
+        provenance: None,
+    }
+}
+
+/// A realtime script (`coalesce_ms`, `coalesce_bps` as given).
+fn pvm8_rt(
+    file: &str,
+    coin: usize,
+    coalesce_ms: u32,
+    bps: u32,
+) -> core_config::pine::PineScriptCfg {
+    let mut s = pvm8_script(file, coin);
+    s.mode = core_config::pine::PineMode::Realtime;
+    s.coalesce_ms = coalesce_ms;
+    s.coalesce_bps = bps;
+    s
+}
+
+fn pvm8_boot(scripts: Vec<core_config::pine::PineScriptCfg>) -> strategy_pine::PineBootCfg {
+    let mut slot = core_config::pine::PineSlotCfg::DEFAULT;
+    slot.event_insn_budget = Some(100_000_000);
+    strategy_pine::PineBootCfg {
+        manifest: core_config::pine::PineManifest { scripts },
+        manifest_sha256: [0; 32],
+        artifact_dir: pvm8_dir(),
+        slot,
+        slot_caps: strategy_pine::SlotCaps8::default(),
+        slot_venue: None,
+        route: strategy_pine::SlotRoute::Paper,
+        host: strategy_pine::HostKind::Engine,
+        symbols: (0..PVM8_COINS.len()).map(pvm8_facts).collect(),
+        boot_state: Vec::new(),
+        anchor: core_time::WallAnchor::new(0, 0),
+        boot_utc_ms: PVM8_T0,
+        oid_epoch: 1,
+        activation_ns: [0; 8],
+        fee: strategy_pine::FeeModel::default(),
+        exec_sha256: [0; 32],
+        tape: false,
+        replay: false,
+        boot_record: None,
+        warmup: None,
+    }
+}
+
+/// `n` confirmed bars of `tf_s` whose last closes at `PVM8_T0`.
+fn pvm8_warm_bars(tf_s: u32, n: usize) -> Vec<pine_ir::Bar> {
+    let len = i64::from(tf_s) * 1000;
+    let n_i = i64::try_from(n).expect("n");
+    (0..n_i)
+        .map(|k| {
+            let open = PVM8_T0 - (n_i - k) * len;
+            let px = 100_000_000 + (k % 17) * 250_000;
+            pine_ir::Bar {
+                open_1e6: px,
+                high_1e6: px + 500_000,
+                low_1e6: px - 500_000,
+                close_1e6: px + 100_000,
+                volume_1e6: 1_000_000,
+                open_ms: open,
+                close_ms: open + len,
+                index: u32::try_from(k).expect("k"),
+                flags: pine_ir::barflag::CONFIRMED,
+            }
+        })
+        .collect()
+}
+
+fn pvm8_slice(coin: usize, tf_s: u32, n: usize) -> strategy_pine::WarmSlice {
+    strategy_pine::WarmSlice {
+        symbol_hash: pine_ir::symbol_hash(format!("hyperliquid:{}", PVM8_COINS[coin]).as_bytes()),
+        tf_s,
+        digest: [0; 32],
+        bars: pvm8_warm_bars(tf_s, n),
+    }
+}
+
+/// Configure, supply the 1-m warm slices of both coins (and `extra`), start.
+fn pvm8_start(
+    cfg: strategy_pine::PineBootCfg,
+    extra: Vec<strategy_pine::WarmSlice>,
+) -> strategy_pine::PineStrategy {
+    let mut p = strategy_pine::PineStrategy::new();
+    if let Err(e) = p.configure(cfg) {
+        panic!("gates PVM-6..12: configure: {e}");
+    }
+    let mut warm = vec![pvm8_slice(0, 60, 300), pvm8_slice(1, 60, 300)];
+    warm.extend(extra);
+    p.supply_warm(warm).expect("warm");
+    let mut ctx = Pvm8Ctx::new();
+    strategy_core::Strategy::on_start(&mut p, &mut ctx).expect("on_start");
+    p
+}
+
+/// A Trade print at UTC ms `t`.
+fn pvm8_print(coin: usize, t: i64, px_1e6: i64, qty_1e6: i64) -> core_types::ChannelEvent {
+    let ts = u64::try_from(t).expect("t") * 1_000_000;
+    core_types::ChannelEvent::new(
+        ts,
+        VenueId::Hyperliquid,
+        core_types::ChannelId::Trade,
+        pvm8_sym(coin),
+        0,
+        u64::try_from(t).expect("t"),
+        px_1e6,
+        qty_1e6,
+    )
+}
+
+/// A quote tick at UTC ms `t` (bid 99, ask 101 + `skew` ×1e-6).
+fn pvm8_quote(coin: usize, t: i64, skew: i64) -> Tick {
+    let ts = u64::try_from(t).expect("t") * 1_000_000;
+    let mut q = Tick::new(
+        ts,
+        VenueId::Hyperliquid,
+        pvm8_sym(coin),
+        1,
+        Price::from_raw(99_000_000 + skew),
+        Qty::from_raw(1_000_000),
+        Price::from_raw(101_000_000 + skew),
+        Qty::from_raw(1_000_000),
+    );
+    q.venue_time_ms = u64::try_from(t).expect("t");
+    q
+}
+
+/// The scripted `Ctx` double: every verb into a fixed ring, `Ok` to all; the pop clock is
+/// `clock` (`None`: no clock on the decision path, P5 — only `--pine-tape` reads it).
+struct Pvm8Ctx {
+    orders: Box<[core_types::Order]>,
+    verbs: Box<[u8]>,
+    n: usize,
+    clock: Option<u64>,
+}
+
+impl Pvm8Ctx {
+    fn new() -> Self {
+        let z = core_types::Order::new(
+            0,
+            VenueId::Hyperliquid,
+            0,
+            core_types::Side::Bid,
+            0,
+            Price::from_raw(0),
+            Qty::from_raw(0),
+            0,
+        );
+        Self {
+            orders: vec![z; PVM8_REC_CAP].into_boxed_slice(),
+            verbs: vec![0u8; PVM8_REC_CAP].into_boxed_slice(),
+            n: 0,
+            clock: None,
+        }
+    }
+    fn push(&mut self, verb: u8, o: core_types::Order) {
+        let k = self.n % PVM8_REC_CAP;
+        self.orders[k] = o;
+        self.verbs[k] = verb;
+        self.n += 1;
+    }
+}
+
+impl strategy_core::Ctx for Pvm8Ctx {
+    fn submit(&mut self, order: core_types::Order) -> Result<(), strategy_core::SubmitErr> {
+        self.push(0, order);
+        Ok(())
+    }
+    fn cancel(&mut self, req: core_types::CancelReq) -> Result<(), strategy_core::SubmitErr> {
+        let mut o = self.orders[0];
+        o.client_oid = req.client_oid;
+        o.sym = req.sym;
+        self.push(2, o);
+        Ok(())
+    }
+    fn modify(
+        &mut self,
+        _prev: u64,
+        order: core_types::Order,
+    ) -> Result<(), strategy_core::SubmitErr> {
+        self.push(1, order);
+        Ok(())
+    }
+    fn now_ns(&self) -> core_time::NsTs {
+        self.clock.expect("no clock on the decision path (P5)")
+    }
+}
+
+/// A full paper fill of `o`, 1 ms after it.
+fn pvm8_fill(o: &core_types::Order) -> core_types::Fill {
+    let mut f = core_types::Fill::new(
+        o.ts_ns + 1_000_000,
+        o.sym,
+        o.side,
+        o.px,
+        o.qty,
+        o.client_oid,
+    );
+    f.strategy_id = 8;
+    f.origin = core_types::FILL_ORIGIN_PAPER;
+    f
+}
+
+/// One step of tape at `t` on both coins: a print each, then a quote each.
+fn pvm8_step(p: &mut strategy_pine::PineStrategy, c: &mut Pvm8Ctx, i: i64, t: i64) {
+    use strategy_core::Strategy;
+    p.on_venue_event(
+        &pvm8_print(0, t, 100_000_000 + (i % 40) * 10_000, 1_000_000),
+        c,
+    );
+    p.on_venue_event(
+        &pvm8_print(1, t + 3, 50_000_000 + (i % 30) * 10_000, 2_000_000),
+        c,
+    );
+    p.on_tick(&pvm8_quote(0, t + 7, (i % 5) * 10_000), c);
+    p.on_tick(&pvm8_quote(1, t + 9, (i % 7) * 10_000), c);
+}
+
+/// Fill every third new IoC submit since `done` (a paper judgment), after the pump.
+fn pvm8_fill_some(p: &mut strategy_pine::PineStrategy, c: &mut Pvm8Ctx, done: &mut usize) {
+    use strategy_core::Strategy;
+    while *done < c.n {
+        let k = *done % PVM8_REC_CAP;
+        let o = c.orders[k];
+        if c.verbs[k] == 0 && o.kind == core_fill::ORDER_KIND_IOC && *done % 3 == 0 {
+            let f = pvm8_fill(&o);
+            p.note_fill_fee(o.client_oid, 1_000_000);
+            p.on_fill(&f, c);
+        }
+        *done += 1;
+    }
+}
+
+#[test]
+fn pine_on_tick_quote_reconcile_is_zero_alloc() {
+    // Gate PVM-6 (impl-08 §7.10): quote ticks of pine symbols — E, the quote, gone-evidence,
+    // the rows confirmed by time, and reconcile + dispatch of a resting maker (requote = Modify).
+    use strategy_core::{Strategy, StrategyCounters};
+    let mut m = pvm8_rt("rt_maker.pine", 0, 0, 0);
+    m.limit_primitive = core_config::pine::PineLimitPrimitive::Maker;
+    m.cap_instance_1e6 = 48_000_000;
+    let mut p = pvm8_start(
+        pvm8_boot(vec![m, pvm8_script("sma_always.pine", 1)]),
+        Vec::new(),
+    );
+    let mut c = Pvm8Ctx::new();
+    p.on_venue_event(&pvm8_print(0, PVM8_T0 + 10, 100_000_000, 1_000_000), &mut c);
+    p.on_tick(&pvm8_quote(0, PVM8_T0 + 20, 0), &mut c);
+    let g = AllocGuard::new();
+    let mut i = 0i64;
+    while i < 5_000 {
+        let t = PVM8_T0 + 30 + i * 10;
+        p.on_tick(&pvm8_quote(0, t, (i % 9) * 10_000), &mut c);
+        p.on_tick(&pvm8_quote(1, t + 1, (i % 4) * 10_000), &mut c);
+        i += 1;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        (allocs, bytes, deallocs),
+        (0, 0, 0),
+        "gate PVM-6: on_tick allocated"
+    );
+    let k = p.pine_counters();
+    assert!(k.submits >= 1, "gate PVM-6: the maker was quoted: {k:?}");
+}
+
+#[test]
+fn pine_on_venue_event_print_confirm_eval_dispatch_is_zero_alloc() {
+    // Gate PVM-7 (impl-08 §7.10): prints building bars and confirming them — the sub-program
+    // step (HTF close + lookahead containing bar), `step_bar`, commit, reconcile, submit — and,
+    // on a replay member, the R7 bar marks drained after every record.
+    use strategy_core::{Strategy, StrategyCounters};
+    let scripts = vec![
+        pvm8_script("htf_close.pine", 0),
+        pvm8_script("htf_la.pine", 0),
+        pvm8_script("sma_always.pine", 1),
+    ];
+    let htf = || vec![pvm8_slice(0, 14_400, 10)];
+    let mut p = pvm8_start(pvm8_boot(scripts.clone()), htf());
+    let mut rb = pvm8_boot(scripts);
+    rb.host = strategy_pine::HostKind::Replay;
+    let mut r = pvm8_start(rb, htf());
+    let mut marks = [(pine_ir::Bar::default(), 0i128); 4];
+    let mut c = Pvm8Ctx::new();
+    let mut rc = Pvm8Ctx::new();
+    pvm8_step(&mut p, &mut c, 0, PVM8_T0 + 10);
+    let before = p.pine_counters();
+    let g = AllocGuard::new();
+    let mut i = 1i64;
+    // 1 500 steps of 15 s: 6 h 15 m of tape, across the 04:00 HTF close.
+    while i < 1_500 {
+        let t = PVM8_T0 + i * 15_000;
+        p.on_venue_event(
+            &pvm8_print(0, t, 100_000_000 + (i % 40) * 10_000, 1_000_000),
+            &mut c,
+        );
+        p.on_venue_event(
+            &pvm8_print(1, t + 3, 50_000_000 + (i % 30) * 10_000, 2_000_000),
+            &mut c,
+        );
+        // The quotes the broker prices its IoC band from (no bar confirms on them here).
+        p.on_tick(&pvm8_quote(0, t + 7, 0), &mut c);
+        p.on_tick(&pvm8_quote(1, t + 9, 0), &mut c);
+        r.on_venue_event(
+            &pvm8_print(0, t, 100_000_000 + (i % 40) * 10_000, 1_000_000),
+            &mut rc,
+        );
+        let _ = r.take_bar_marks(0, &mut marks);
+        let _ = r.take_bar_marks(1, &mut marks);
+        let _ = r.take_bar_marks(2, &mut marks);
+        i += 1;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        (allocs, bytes, deallocs),
+        (0, 0, 0),
+        "gate PVM-7: on_venue_event allocated"
+    );
+    let k = p.pine_counters();
+    assert!(
+        k.bars_confirmed >= before.bars_confirmed + 370,
+        "gate PVM-7: {k:?}"
+    );
+    assert!(
+        k.bar_evals > before.bar_evals && k.submits > before.submits,
+        "gate PVM-7: {k:?}"
+    );
+}
+
+#[test]
+fn pine_realtime_tick_eval_is_zero_alloc() {
+    // Gate PVM-8 (impl-08 §7.10): realtime scripts — coalesced admission (time and book
+    // change), `step_tick` with the journal undo, the per-event budget, round-robin.
+    use strategy_core::StrategyCounters;
+    let scripts = vec![
+        pvm8_rt("rt_entry.pine", 0, 20_000, 5),
+        pvm8_rt("rt_cof.pine", 1, 20_000, 5),
+        pvm8_rt("rt_entry.pine", 1, 0, 0),
+    ];
+    let mut p = pvm8_start(pvm8_boot(scripts), Vec::new());
+    let mut c = Pvm8Ctx::new();
+    pvm8_step(&mut p, &mut c, 0, PVM8_T0 + 10);
+    let before = p.pine_counters();
+    let g = AllocGuard::new();
+    let mut i = 1i64;
+    while i < 2_000 {
+        pvm8_step(&mut p, &mut c, i, PVM8_T0 + i * 7_000);
+        i += 1;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        (allocs, bytes, deallocs),
+        (0, 0, 0),
+        "gate PVM-8: tick evaluation allocated"
+    );
+    let k = p.pine_counters();
+    assert!(k.tick_evals > before.tick_evals, "gate PVM-8: {k:?}");
+    assert!(
+        k.ticks_coalesced > before.ticks_coalesced,
+        "gate PVM-8: {k:?}"
+    );
+}
+
+#[test]
+fn pine_on_fill_settle_cof_is_zero_alloc() {
+    // Gate PVM-9 (impl-08 §7.10): fills booked through `NativeBroker::on_fill` with the host's
+    // fee (R8 `note_fill_fee`), the settle points, `calc_on_order_fills` evaluations, the
+    // re-entries they cause.
+    use strategy_core::StrategyCounters;
+    let scripts = vec![
+        pvm8_rt("rt_entry.pine", 0, 0, 0),
+        pvm8_rt("rt_cof.pine", 1, 0, 0),
+        pvm8_rt("rt_close.pine", 0, 0, 0),
+    ];
+    let mut p = pvm8_start(pvm8_boot(scripts), Vec::new());
+    let mut c = Pvm8Ctx::new();
+    let mut done = 0usize;
+    pvm8_step(&mut p, &mut c, 0, PVM8_T0 + 10);
+    pvm8_fill_some(&mut p, &mut c, &mut done);
+    let before = p.pine_counters();
+    let g = AllocGuard::new();
+    let mut i = 1i64;
+    while i < 1_500 {
+        pvm8_step(&mut p, &mut c, i, PVM8_T0 + i * 5_000);
+        pvm8_fill_some(&mut p, &mut c, &mut done);
+        let _ = p.broker_counters(0);
+        let _ = p.closed_count(2);
+        let _ = p.fault(0);
+        i += 1;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        (allocs, bytes, deallocs),
+        (0, 0, 0),
+        "gate PVM-9: on_fill allocated"
+    );
+    let k = p.pine_counters();
+    assert!(
+        k.fills > before.fills && k.cof_evals > before.cof_evals,
+        "gate PVM-9: {k:?}"
+    );
+    assert!(k.settle_points > before.settle_points, "gate PVM-9: {k:?}");
+    assert!(p.closed_count(2) > 0, "gate PVM-9: rt_close closed trades");
+}
+
+#[test]
+fn pine_fault_disable_flatten_is_zero_alloc() {
+    // Gate PVM-10 (impl-08 §7.10, T15): a VM fault holding a position — the D13 disable, the
+    // incident push, the flatten and its retries into `flatten_stuck` and the slow phase — and
+    // the incident view.
+    use strategy_core::{Strategy, StrategyCounters};
+    let mut p = pvm8_start(
+        pvm8_boot(vec![pvm8_rt("rt_fault.pine", 0, 0, 0)]),
+        Vec::new(),
+    );
+    let mut c = Pvm8Ctx::new();
+    let mut inc = [strategy_core::PineIncident::default(); 8];
+    let g = AllocGuard::new();
+    p.on_venue_event(&pvm8_print(0, PVM8_T0 + 10, 100_000_000, 1_000_000), &mut c);
+    p.on_tick(&pvm8_quote(0, PVM8_T0 + 20, 0), &mut c);
+    let o = c.orders[0];
+    p.on_fill(&pvm8_fill(&o), &mut c);
+    let mut t = PVM8_T0 + 30;
+    while t < PVM8_T0 + 180_000 {
+        p.on_venue_event(&pvm8_print(0, t, 100_000_000, 1_000_000), &mut c);
+        p.on_tick(&pvm8_quote(0, t + 5, 0), &mut c);
+        let _ = p.pine_incidents_view(&mut inc, 0);
+        let _ = p.fault(0);
+        t += 2_000;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        (allocs, bytes, deallocs),
+        (0, 0, 0),
+        "gate PVM-10: fault/flatten allocated"
+    );
+    let k = p.pine_counters();
+    assert_eq!(k.scripts_faulted, 1, "gate PVM-10");
+    assert!(
+        k.flatten_attempts > u64::from(strategy_pine::FLATTEN_RETRIES),
+        "gate PVM-10"
+    );
+    assert_eq!(k.flatten_stuck, 1, "gate PVM-10");
+}
+
+#[test]
+fn pine_tape_record_and_view_is_zero_alloc() {
+    // Gate PVM-11 (impl-08 §7.10): `--pine-tape` — the pop stamp, the sequencing and decision
+    // records, and both views.
+    use strategy_core::StrategyCounters;
+    let mut b = pvm8_boot(vec![
+        pvm8_rt("rt_entry.pine", 0, 0, 0),
+        pvm8_script("sma_always.pine", 1),
+    ]);
+    b.tape = true;
+    let mut p = pvm8_start(b, Vec::new());
+    let mut c = Pvm8Ctx::new();
+    c.clock = Some(1);
+    let mut seq = [strategy_core::PineSeqRec::default(); 64];
+    let mut dec = [strategy_core::PineTapeRec::default(); 64];
+    let mut done = 0usize;
+    pvm8_step(&mut p, &mut c, 0, PVM8_T0 + 10);
+    let g = AllocGuard::new();
+    let mut i = 1i64;
+    while i < 1_000 {
+        c.clock = Some(1 + u64::try_from(i).expect("i"));
+        pvm8_step(&mut p, &mut c, i, PVM8_T0 + i * 15_000);
+        pvm8_fill_some(&mut p, &mut c, &mut done);
+        let k = p.pine_counters();
+        let _ = p.pine_seq_view(&mut seq, k.seq_records.saturating_sub(64));
+        let _ = p.pine_tape_view(&mut dec, k.tape_records.saturating_sub(64));
+        i += 1;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        (allocs, bytes, deallocs),
+        (0, 0, 0),
+        "gate PVM-11: the tape allocated"
+    );
+    let k = p.pine_counters();
+    assert!(
+        k.seq_records > 0 && k.tape_records > 0,
+        "gate PVM-11: {k:?}"
+    );
+}
+
+#[test]
+fn pine_ignored_callbacks_are_zero_alloc() {
+    // Gate PVM-12 (impl-08 §7.10): the counted-and-dropped callbacks — signal, depth, AI,
+    // timer — and the ruleset / option / regime ones.
+    use strategy_core::{Strategy, StrategyCounters};
+    let mut p = pvm8_start(
+        pvm8_boot(vec![pvm8_script("sma_always.pine", 0)]),
+        Vec::new(),
+    );
+    let mut c = Pvm8Ctx::new();
+    let mut payload = [0u8; 40];
+    payload[..4].copy_from_slice(b"pine");
+    let sig = core_types::Signal::new(
+        0,
+        42,
+        core_types::LatencyClass::Warm,
+        core_types::SignalSource::Rpc as u8,
+        payload,
+    );
+    let depth = core_types::DepthTopK::EMPTY;
+    let ai = core_types::AiCmd::new(
+        1,
+        1,
+        core_types::SYMBOL_ID_NONE,
+        0,
+        0,
+        0,
+        core_types::AiCmdKind::RulesetCommit,
+        VenueId::Ai,
+        core_types::STRATEGY_SLOT_VM,
+        core_types::AI_SIDE_NONE,
+        0,
+        0,
+    );
+    let before = p.pine_counters().callbacks_ignored;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < 10_000 {
+        p.on_signal(&sig, &mut c);
+        p.on_depth(&depth, &mut c);
+        p.on_ai(&ai, &mut c);
+        p.on_timer(i, &mut c);
+        i += 1;
+    }
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        (allocs, bytes, deallocs),
+        (0, 0, 0),
+        "gate PVM-12: ignored callbacks allocated"
+    );
+    assert_eq!(
+        p.pine_counters().callbacks_ignored,
+        before + 40_000,
+        "gate PVM-12"
+    );
 }

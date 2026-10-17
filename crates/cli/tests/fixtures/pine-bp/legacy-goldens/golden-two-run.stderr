@@ -1,0 +1,19 @@
+backtest H2 (strict-cross maker model): ruleset sha256 ae86efaa666379616602070311de2ac8ecda5e6f9e1f51dc9e471517a5f5c3b8
+capture: 2 run(s), 5 merged tick(s), universe 2 sym(s), 1 UTC day(s) spanned
+channels: events=0 depths=0 opts=0 opt_synth_ticks=0 remapped_syms=0 dropped_foreign=0
+  run[0] epoch_ns=1000000000 pm=2 bn=1 okx=0 rpc=0 deribit=0 hl=0 bybit=0 mexc=0 hyperevm=0 hypercall=0
+    stale: pm=0/2 (0bps) bn=0/1 (0bps)
+  run[1] epoch_ns=5000000000 pm=1 bn=1 okx=0 rpc=0 deribit=0 hl=0 bybit=0 mexc=0 hyperevm=0 hypercall=0
+    stale: pm=0/1 (0bps) bn=0/1 (0bps)
+window: virt [100000000000000000, 100000004000000200], split 70/30 boundary 100000002800000140 (2 OOS tick(s))
+vm: evals=5 fires=2 orders_emitted=2 orders_dropped=0 book_track_failed=0
+regime: off — every row evaluates as ANY (tails stripped)
+regime: labelled_rows=0 blocked=0 hard_exits=0 minutes=0 declared=0 set_regime_frames=0 (expired-at-anchor 0) seed_rows=0 mode=off
+funding: seed_prints=0 dropped=0 deduped=0 warmup=table
+model: latency_ns pm=200000000 bn=130000000 okx=130000000 deribit=220000000 hl=340000000; fee_bps pm=0:0 bn=0:0 okx=0:0 deribit=0:0 hl=0:0 bybit=0:0 mexc=0:0 hyperevm=0:0 hypercall=0:0; open-order caps 8/sym 64 total; stale_after_ms pm=1000 bn=1000 okx=400 deribit=600 hl=700 bybit=500 mexc=400 (stale ticks skipped: 0)
+orders: accepted is=1 oos=1, rejected_caps=0+0 (sym+total), unroutable=0, canceled_end=2, peak_open=2 (per-sym 2)
+fills: total=0 oos=0 mark=0 ioc=0 ioc_canceled=0 ttl_expired=0
+oos: net_pnl=0.0 (realized=0.0 fees=0.0 markout=0.0), max_drawdown=0.0, trades=0, trading_days=0
+fee ladder (oos net, flat bps/side): 0=0.0 1=0.0 2=0.0 tier=0.0 — a number positive only at 0 is positive at zero fee only
+bounds (full window): max_order_notional=50.0 max_symbol_notional=0.0 max_total_notional=0.0
+reproducibility: zero RNG anywhere (determinism by construction); strict-cross maker (trade-through only — no touch fills, no queue credit); IoC takers judged once at the first fresh tick after Δ (pay the touch, remainder cancels, taker fee); fills/marks on two-sided fresh ticks only; ttl_ns cancels at expiry; unfilled remainders canceled at end (zero P&L); open positions marked out at last mid into net_pnl

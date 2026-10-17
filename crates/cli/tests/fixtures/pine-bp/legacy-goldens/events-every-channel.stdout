@@ -1,0 +1,1 @@
+{"schema_version":1,"ruleset_hash":"ae86efaa666379616602070311de2ac8ecda5e6f9e1f51dc9e471517a5f5c3b8","split":"70/30","oos":{"net_pnl_usd":0.0,"trades":0,"trading_days":0,"max_drawdown_usd":0.0,"round_trips":0,"legs":0},"bounds":{"max_order_notional_usd":50.0,"max_symbol_notional_usd":0.0,"max_total_notional_usd":0.0},"position_rows":0}

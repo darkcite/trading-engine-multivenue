@@ -246,6 +246,9 @@ pub struct ExecBoot {
     /// **BX6** — `[exec.binance]`, when the artifact has one (a live slot
     /// naming binance cannot boot without it).
     pub binance: Option<core_config::exec::ExecBinance>,
+    /// PVM impl-08 §3.6 — `[exec.slot.8.pine]`, when the artifact has one:
+    /// `pine_boot::build` reads it from here, never from the file again.
+    pub pine8: Option<core_config::pine::PineSlotCfg>,
 }
 
 impl ExecBoot {
@@ -824,6 +827,7 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
         live_mask: artifact_mask,
         slots,
         binance: file.binance,
+        pine8: file.pine8,
     };
     Ok(Some(boot))
 }
@@ -2007,6 +2011,7 @@ mod tests {
             live_mask,
             slots,
             binance: None,
+            pine8: None,
         }
     }
 
@@ -2536,6 +2541,7 @@ mod tests {
             live_mask: 0b0000_1000,
             slots: vec![slot],
             binance: None,
+            pine8: None,
         };
         let lines = render_boot_tell(&boot);
         assert_eq!(lines.len(), 3, "header + caps + halts");
@@ -2703,6 +2709,7 @@ mod tests {
             live_mask: (1 << 11) | (1 << 15),
             slots: vec![s3],
             binance: None,
+            pine8: None,
         };
         assert!(boot.any_live());
         assert!(boot.slot_live(11) && boot.slot_live(15));

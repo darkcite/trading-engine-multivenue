@@ -173,6 +173,8 @@ fn binance_coinm_live_smoke() {
         None,
         // The lane as a boot without a Binance arm runs it (no marks).
         core_types::EVENT_LANE_FUNDING,
+        // PVM B'1: no pine Trade route.
+        &[],
     )
     .expect("spawn_binance_multi");
 

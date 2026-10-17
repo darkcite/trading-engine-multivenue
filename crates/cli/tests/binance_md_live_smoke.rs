@@ -167,6 +167,7 @@ fn binance_md_live_smoke() {
         eapi: Some(table),
         mark_price: false,
         spot_sentinel: false,
+        usdm_trades: false,
     });
     // ---- spot: one bookTicker slot carrying the aggTrade sentinel ----
     let spot_sym = make_symbol_id(VenueId::Binance, 620);
@@ -177,6 +178,7 @@ fn binance_md_live_smoke() {
         eapi: None,
         mark_price: false,
         spot_sentinel: true,
+        usdm_trades: false,
     });
     let (run_dir, epoch_ns) = cli::new_capture_run_dir(&root).expect("run dir");
     let (tick_prod, mut tick_cons) = Ring::<Tick, TICK_RING_SIZE>::new().split();
@@ -202,6 +204,8 @@ fn binance_md_live_smoke() {
         None,
         // The lane as a boot without a Binance arm runs it (no marks).
         core_types::EVENT_LANE_FUNDING,
+        // PVM B'1: no pine Trade route.
+        &[],
     )
     .expect("spawn_binance_multi");
 

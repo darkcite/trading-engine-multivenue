@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: a realtime entry re-emitted on every evaluation while flat — the 8c / 8d probe
+// (impl-08 T11–T14: coalescing, W21's one order, dispatch, fills).
+strategy("rt entry (strategy-pine T11)", overlay = true)
+plot(close)
+if strategy.position_size == 0
+    strategy.entry("L", strategy.long)

@@ -1,0 +1,24 @@
+[[script]]
+sha256            = "fa6a7dca2dfc9c00b535b0f1f390822412f43d729919e3068b92d255a836c726"
+file              = "rt_entry.pine"
+dialect           = 6
+enabled           = 1
+mode              = "realtime"
+symbol            = "hyperliquid:btc"
+timeframe_s       = 60
+venue             = "hyperliquid"
+max_bars_back     = 5000
+coalesce_ms       = 250
+coalesce_bps      = 0
+insn_budget       = 1000000
+qty_notional_1e6  = 12000000
+limit_primitive   = "ioc"
+cross_ticks       = 2
+cap_instance_1e6  = 12000000
+cap_day_1e6       = 48000000
+max_open          = 4
+collection_cap    = 4096
+str_persist_bytes = 4096
+str_cell_bytes    = 128
+str_scratch_bytes = 8192
+intent_cap        = 32

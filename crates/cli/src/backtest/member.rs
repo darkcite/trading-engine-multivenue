@@ -2248,6 +2248,7 @@ mod tests {
             fee_1e12: 0,
             oos: false,
             client_oid: 0,
+            fee_row: crate::backtest::fill::FeeRowId::default(),
         }
     }
 

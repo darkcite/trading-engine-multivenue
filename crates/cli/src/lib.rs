@@ -83,10 +83,16 @@ pub mod pine;
 /// PVM impl-08: the slot-8 (Pine member) boot seam — today the F19 refusal of a requested,
 /// unconfigurable slot 8.
 pub mod pine_boot;
+/// PVM impl-08 T17: slot 8's `engine_pine_*` family (5 s mirror) and the incident drain / log line.
+pub mod pine_metrics;
+/// PVM impl-08 T18: the `--pine-tape` writer (`seq.bin`, `decisions.bin`, `set.tsv`).
+pub mod pine_tape;
 pub mod pinning;
 pub mod regime_boot;
 pub mod sigint;
 pub mod state_file;
+/// PVM B'1 (impl-Bp §3.5): the pine slot's per-lane Trade route, resolved at boot.
+pub mod trade_route;
 pub mod universe_boot;
 /// VRP V5: the VRP member's boot artifacts (`vrp.toml` + `vrp-seed.tsv`).
 pub mod vrp_boot;
@@ -105,20 +111,21 @@ pub mod xmm_preflight;
 pub mod hcv_boot;
 
 pub use paper::{
-    bn_coinm_specs, bn_options_path, bn_usdm_specs, boot_discovery, boot_info, build_ai_universe,
-    build_deribit_symbol_table, build_hl_coin_table, build_hl_families, build_okx_symbol_table,
-    engine_loop_ev_full, engine_loop_ev_paper, engine_loop_rule_tree_full, engine_loop_set_full,
-    extend_deribit_table_with_combos, extend_deribit_table_with_options,
-    extend_okx_table_with_options, hyperevm_pool_table, join_reverse, log_hl_families,
-    new_capture_run_dir, open_events_capture, open_fills_capture, open_orders_capture,
-    parse_ai_hmac_key, parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai,
-    spawn_binance, spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall,
-    spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_polymarket, spawn_rpc,
-    split_host_port, state_writer, AiIngressCounterIds, AiIngressStatus, BinanceConnSpec,
-    BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters,
-    EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds, HypercallSpec, IngressCounterIds,
-    IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
-    RawTapConfig, Rings, RunDirGuard, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
+    bn_book_driver, bn_coinm_specs, bn_options_path, bn_usdm_route_slot, bn_usdm_specs,
+    boot_discovery, boot_info, build_ai_universe, build_deribit_symbol_table, build_hl_coin_table,
+    build_hl_families, build_okx_symbol_table, engine_loop_ev_full, engine_loop_ev_paper,
+    engine_loop_rule_tree_full, engine_loop_set_full, extend_deribit_table_with_combos,
+    extend_deribit_table_with_options, extend_okx_table_with_options, funding_lane_mask,
+    hl_lane_mask, hyperevm_pool_table, join_reverse, log_hl_families, new_capture_run_dir,
+    open_events_capture, open_fills_capture, open_orders_capture, parse_ai_hmac_key,
+    parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai, spawn_binance,
+    spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall, spawn_hyperevm,
+    spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_polymarket, spawn_rpc, split_host_port,
+    state_writer, AiIngressCounterIds, AiIngressStatus, BinanceConnSpec, BybitConnSpec,
+    CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters, EngineLoopResult,
+    EngineLoopStats, ExecObs, HcMetricIds, HypercallSpec, IngressCounterIds, IngressStatusSet,
+    LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability, RawTapConfig,
+    Rings, RunDirGuard, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};
 pub use sigint::{install_sigint_handler, shutdown_requested, SHUTDOWN};
