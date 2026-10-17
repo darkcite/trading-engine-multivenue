@@ -250,7 +250,7 @@ function renderStrategies() {
   });
   set('strat-sub', `${E.boot.strategy_kind} · latest report ${W && W.pnl && W.pnl.latest ? esc(W.pnl.latest.day) : '—'}`);
   const idleNote = idle ? `<div class="muted">+${idle} reserved slot${idle === 1 ? '' : 's'} idle (/state v${esc(String(E.v))})</div>` : '';
-  set('strat', table(['slot','member','cfg','on','gate','orders','drop','fires','fills','net @0/1/tier'], rows, [5,6,7,8]) + idleNote + xmmBlock());
+  set('strat', table(['slot','member','cfg','on','gate','orders','drop','fires','fills','net @0/1/tier'], rows, [5,6,7,8]) + idleNote + xmmBlock() + pm15Block());
 }
 
 // ---- xmm (slot 6, XMM XH3; /state schema 2 — tolerant of an older engine) ----
@@ -275,6 +275,37 @@ function xmmBlock() {
     `${QSTATE[r.ask_state] || r.ask_state} ${px(r.ask_px_1e6)}`,
     `${ageMs(r.lead_age_ms)} / ${ageMs(r.fol_age_ms)}${r.stale_flags ? ' <span class="warn">stale</span>' : ''}`]);
   return kv + table(['perp', 'position', 'touch bid / ask', 'our bid', 'our ask', 'leader / follower age'], rows, [1]);
+}
+
+// ---- pm15 (slot 9, PM15) — from /metrics: the member's and the rolling
+// ingress's counters (engine_pm15_*, engine_ingress_pm15_*) ----
+let PM = null;
+function parseProm(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    if (!line || line[0] === '#') continue;
+    const sp = line.lastIndexOf(' ');
+    if (sp < 0) continue;
+    const name = line.slice(0, sp);
+    if (name.startsWith('engine_pm15_') || name.startsWith('engine_ingress_pm15_')) out[name] = Number(line.slice(sp + 1));
+  }
+  return out;
+}
+function pm15Block() {
+  if (!PM || PM.engine_pm15_rolls_total === undefined) return '<div class="muted" style="margin-top:6px">pm15: <span class="dim">n/a (no engine_pm15_* on /metrics)</span></div>';
+  const g = k => PM['engine_pm15_' + k];
+  const i = k => PM['engine_ingress_pm15_' + k];
+  const c = v => n(v, 0);
+  const d = v => n(v / 1e6, 2);
+  const must0 = v => v ? `<span class="bad">${c(v)}</span>` : '0';
+  return `<div class="kv" style="margin-top:6px"><div>pm15 (slot 9)</div><div>markets live ${c(g('markets_live'))} · rolls ${c(g('rolls_total'))}, settled ${c(g('rolls_settled_total'))} · ${g('halted') ? '<span class="bad">HALTED</span>' : '<span class="ok">running</span>'}</div>` +
+    `<div>strikes computed / missing</div><div>${c(g('strikes_computed_total'))} / ${c(g('strikes_missing_total'))}</div>` +
+    `<div>priced · skipped: persist / book / book old / law / price / cap</div><div>${c(g('reprices_total'))} · ${c(g('skip_persist_total'))} / ${c(g('skip_book_total'))} / ${c(g('skip_book_old_total'))} / ${c(g('skip_law_total'))} / ${c(g('skip_price_total'))} / ${c(g('skip_cap_total'))}</div>` +
+    `<div>takes submitted / filled / unfilled · fills (late)</div><div>${c(g('takes_submitted_total'))} / ${c(g('takes_filled_total'))} / ${c(g('takes_unfilled_total'))} · ${c(g('fills_total'))} (${c(g('late_fills_total'))})</div>` +
+    `<div>settled won / lost / unknown</div><div>${c(g('settled_won_total'))} / ${c(g('settled_lost_total'))} / ${c(g('settled_unknown_total'))}</div>` +
+    `<div>P&amp;L · fees · bought · open cost</div><div>${usd(g('pnl_usd_1e6') / 1e6)} · ${d(g('fees_usd_1e6'))} · ${d(g('bought_usd_1e6'))} · ${d(g('open_cost_usd_1e6'))}</div>` +
+    `<div>ingress: slots bound · ticks · marks · reconnects market / rtds</div><div>${c(i('slots_bound'))} · ${c(i('ticks_total'))} · ${c(i('marks_total'))} · ${c(i('market_reconnects_total'))} / ${c(i('rtds_reconnects_total'))}</div>` +
+    `<div>must stay 0: parse errors / unknown fills / refused submits / unknown rolls</div><div>${must0(i('parse_errors_total'))} / ${must0(g('unknown_fills_total'))} / ${must0(g('submit_refused_total'))} / ${must0(g('rolls_unknown_total'))}</div></div>`;
 }
 
 // ---- P&L ----
@@ -697,13 +728,19 @@ async function pollEngine() {
   catch (e) { engineErr = `engine: ${e.message}`; }
   renderAll();
 }
+async function pollMetrics() {
+  try { const r = await fetch('/api/engine/metrics', {cache: 'no-store'}); if (!r.ok) throw new Error(`metrics ${r.status}`); PM = parseProm(await r.text()); }
+  catch (e) { PM = null; }
+  renderStrategies();
+}
 async function pollWorker() {
   try { const r = await fetch('/api/worker', {cache: 'no-store'}); if (!r.ok) throw new Error(`worker ${r.status}`); W = await r.json(); workerErr = null; }
   catch (e) { workerErr = `worker: ${e.message}`; }
   renderAll();
 }
-pollEngine(); pollWorker();
+pollEngine(); pollWorker(); pollMetrics();
 setInterval(pollEngine, 2000);
+setInterval(pollMetrics, 5000);
 setInterval(pollWorker, 10000);
 </script>
 </body>
