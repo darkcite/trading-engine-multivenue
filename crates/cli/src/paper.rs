@@ -776,6 +776,9 @@ pub struct IngressStatusSet {
     /// PM15: the rolling families' own counters (ingress + discovery
     /// threads), beside the generic slot like `hl_roll`.
     pub pm15c: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
+    /// PM15-8c: slot 9's arm and pm-gw (with its redeemer) — zero unless
+    /// slot 9 boots live.
+    pub pm15x: Arc<exec_polymarket::stats::PmExecStats>,
 }
 
 impl IngressStatusSet {
@@ -798,6 +801,7 @@ impl IngressStatusSet {
             binance_options: Arc::new(IngressStatus::new()),
             pm15: Arc::new(IngressStatus::new()),
             pm15c: Arc::new(ingress_polymarket::pm15_loop::Pm15Counters::new()),
+            pm15x: Arc::new(exec_polymarket::stats::PmExecStats::new()),
         }
     }
 }
@@ -4645,6 +4649,9 @@ impl Observability {
             // PM15: the rolling families' own family (gauges mirrored
             // from `Pm15Counters`).
             let pm15 = register_pm15_metrics(&mut reg)?;
+            // PM15-8c: slot 9's arm and pm-gw (gauges mirrored from
+            // `PmExecStats`).
+            let pm15x = register_pm15x_metrics(&mut reg)?;
 
             // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
             // (mirrored centrally from the shared status slot), the
@@ -4785,6 +4792,7 @@ impl Observability {
                 hypercall_options_selected,
                 hypercall,
                 pm15,
+                pm15x,
                 ingress_ai,
                 capture_ai,
                 fills_capture,
@@ -5236,6 +5244,8 @@ pub struct EngineCounters {
     pub hypercall: HcMetricIds,
     /// PM15: the rolling families' family ([`register_pm15_metrics`]).
     pub pm15: Pm15MetricIds,
+    /// PM15-8c: slot 9's arm and pm-gw ([`register_pm15x_metrics`]).
+    pub pm15x: Pm15xMetricIds,
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
@@ -9569,6 +9579,59 @@ pub fn pm15_metric_values(c: &ingress_polymarket::pm15_loop::Pm15Counters) -> [u
     v
 }
 
+/// PM15-8c: slot 9's arm (`engine_pm15_arm_*`) and pm-gw
+/// (`engine_pm15_gw_*`) — one gauge per word of
+/// `exec_polymarket::stats::PmExecStats`, a tally `…_total`, a level
+/// bare. Plain stores, as [`Pm15MetricIds`].
+#[derive(Copy, Clone, Debug)]
+pub struct Pm15xMetricIds {
+    /// The arm's words, then pm-gw's.
+    pub gauges: [GaugeId; PM15X_METRICS],
+}
+
+/// Size of the slot-9 arm family.
+pub const PM15X_METRICS: usize =
+    exec_polymarket::stats::ARM_WORDS + exec_polymarket::stats::GW_WORDS;
+
+/// Register the slot-9 arm family (boot-only; the names are rendered once).
+fn register_pm15x_metrics(reg: &mut MetricsRegistry) -> Result<Pm15xMetricIds, &'static str> {
+    use exec_polymarket::stats::{ARM_LEVELS, ARM_NAMES, ARM_WORDS, GW_LEVELS, GW_NAMES, GW_WORDS};
+    let mut gauges = [GaugeId::default(); PM15X_METRICS];
+    let mut i = 0usize;
+    while i < PM15X_METRICS {
+        let (who, name, level) = if i < ARM_WORDS {
+            ("arm", ARM_NAMES[i], i >= ARM_WORDS - ARM_LEVELS)
+        } else {
+            let k = i - ARM_WORDS;
+            ("gw", GW_NAMES[k], k >= GW_WORDS - GW_LEVELS)
+        };
+        let full = if level {
+            format!("engine_pm15_{who}_{name}")
+        } else {
+            format!("engine_pm15_{who}_{name}_total")
+        };
+        gauges[i] = reg
+            .register_gauge(&full)
+            .map_err(|_| "register pm15 arm gauge")?;
+        i += 1;
+    }
+    Ok(Pm15xMetricIds { gauges })
+}
+
+/// The slot-9 arm family's current values, in [`register_pm15x_metrics`]
+/// order.
+#[must_use]
+pub fn pm15x_metric_values(s: &exec_polymarket::stats::PmExecStats) -> [i64; PM15X_METRICS] {
+    let arm = exec_polymarket::stats::ARM_WORDS;
+    let mut v = [0i64; PM15X_METRICS];
+    let mut i = 0usize;
+    while i < PM15X_METRICS {
+        v[i] = if i < arm { s.arm(i) } else { s.gw(i - arm) };
+        i += 1;
+    }
+    v
+}
+
 /// The Hypercall family's current values, in [`HC_METRIC_NAMES`] order.
 /// Relaxed loads — statistics, never a synchronization point.
 #[must_use]
@@ -10241,6 +10304,13 @@ where
                     let mut k = 0usize;
                     while k < PM15_METRICS {
                         reg.gauge(ids.pm15.gauges[k]).set(pm[k] as i64);
+                        k += 1;
+                    }
+                    // PM15-8c: slot 9's arm and pm-gw — plain stores.
+                    let px = pm15x_metric_values(&ing.pm15x);
+                    let mut k = 0usize;
+                    while k < PM15X_METRICS {
+                        reg.gauge(ids.pm15x.gauges[k]).set(px[k]);
                         k += 1;
                     }
                     // HC5: the venue family — plain stores (see

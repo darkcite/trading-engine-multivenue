@@ -574,3 +574,22 @@ fn a_lost_leg_leaves_at_settlement_and_an_unknown_one_is_redeemed() {
     );
     assert_eq!(b.arm.halt_signal().pnl_delta_usd_1e6, -102_000_000);
 }
+
+/// PM15-8c: the tallies reach `/metrics`' block at the first pass and
+/// then once a second — never on every pass of the engine loop.
+#[test]
+fn the_tallies_reach_the_metrics_block_once_a_second() {
+    use crate::stats::{PmExecStats, ARM_NAMES, PUBLISH_EVERY_NS};
+    let mut b = bench();
+    let s = std::sync::Arc::new(PmExecStats::new());
+    b.arm.set_stats(std::sync::Arc::clone(&s));
+    assert_eq!(ARM_NAMES[0], "submitted");
+    b.arm.submit(&order(0, 0, 930_000, 100_000_000, 1)).unwrap();
+    b.arm.pump(1);
+    assert_eq!(s.arm(0), 1);
+    b.arm.submit(&order(0, 0, 930_000, 100_000_000, 2)).unwrap();
+    b.arm.pump(2);
+    assert_eq!(s.arm(0), 1, "not again inside the second");
+    b.arm.pump(1 + PUBLISH_EVERY_NS);
+    assert_eq!(s.arm(0), 2);
+}

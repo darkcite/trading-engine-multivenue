@@ -6639,6 +6639,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 pm15_boot.as_ref(),
                                 TlsTransport::default_client_config(),
                                 rx,
+                                statuses.pm15x.clone(),
                             ),
                             None => Err(String::from(
                                 "slot 9 is live, but the PM15 ingress did not start (no \

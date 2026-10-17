@@ -16956,7 +16956,7 @@ and 39 (the P0 pre-registration, sha256 `d06d0038…488e`, registered
 `5849b4e` PM15-4, `1c8b014` PM15-5, `babf584` PM15-6a, `03a3191` PM15-8a,
 `a9987fa` PM15-5b, `a391129` PM15-5c, `cc6900b` PM15-6b, `ef8b22c` PM15-5d,
 `860ab76` PM15-6c, `1d41a11` PM15-6d, `a0d7ca7` PM15-6e, `4597be6` PM15-8b
-(the dashboard's slot-9 panel), PM15-7 (this entry's last section).
+(the dashboard's slot-9 panel), `19e2d77` PM15-7, PM15-8c (the last section).
 **Deployed PAPER 2026-10-17 09:22Z (`03a3191`); `a9987fa` (PM15-5b) since 09:49Z; `ef8b22c` (PM15-5d) since 11:41Z.**
 
 | id | ruling (operator, 2026-10-17) |
@@ -17256,11 +17256,21 @@ Alloc gate 130: the arm's submit and drain and the gateway's submit at
   TWAP every 10 s — before PolyBolt becomes slot 9's mark, which is its
   own cut and its own entry here.
 
+### PM15-8c — the live arm on `/metrics`
+
+`exec_polymarket::stats::PmExecStats`: one block of relaxed atomics per
+writer, each on its own cache lines — the arm (engine thread: its 25
+tallies, then halted, reconciled, the account's worth, the anchor, the
+drift) and pm-gw (its 17 tallies, the redeemer's 10, then halted) —
+published at most once a second, mirrored as `engine_pm15_arm_*` and
+`engine_pm15_gw_*` (a tally `…_total`, a level bare). A paper boot never
+builds the arm: the family reads 0. The dashboard's slot-9 panel shows the
+arm's rows once it is live (submitted, acks, refused, in doubt, fills,
+reads, the worth against the anchor, the drift, the redemptions).
+
 ### Open
 
-- The arm's, pm-gw's and the redeemer's counters on `/metrics` (zero
-  until live); a `/state` pm15 section (the dashboard's panel reads
-  `/metrics`).
+- A `/state` pm15 section (the dashboard's panel reads `/metrics`).
 - PolyBolt as the mark, after `polybolt-probe` has run on the account.
 - When the account exists: `pm15-exec.sh key-check`, then `miss-probe`,
   then P0's result or a ruling, then `pm15-flip.sh live`.

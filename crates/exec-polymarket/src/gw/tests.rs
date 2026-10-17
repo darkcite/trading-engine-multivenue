@@ -500,3 +500,29 @@ fn a_redemption_ask_queues_its_condition_and_runs_only_off_the_quiet_tail() {
     b.gw.step(t, open);
     assert_eq!(b.gw.redeem_counters().request_failures, 1);
 }
+
+/// PM15-8c: pm-gw publishes its tallies (and its redeemer's) once a
+/// second; the names are unique and the levels last.
+#[test]
+fn pm_gw_publishes_its_tallies_once_a_second() {
+    use crate::stats::{PmExecStats, ARM_NAMES, GW_NAMES, GW_WORDS, PUBLISH_EVERY_NS};
+    let mut b = bench();
+    let s = std::sync::Arc::new(PmExecStats::new());
+    b.gw.set_stats(std::sync::Arc::clone(&s));
+    b.gw.step(2 * PUBLISH_EVERY_NS, WALL);
+    assert_eq!(
+        (s.gw(0), s.gw(GW_WORDS - 1)),
+        (1, 0),
+        "one window taken, not halted"
+    );
+    assert_eq!(GW_NAMES[GW_WORDS - 1], "halted");
+    let mut all: Vec<&str> = ARM_NAMES.iter().chain(GW_NAMES.iter()).copied().collect();
+    let n = all.len();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(
+        all.len() + 4,
+        n,
+        "acks, refused, in_doubt and halted are each writer's own"
+    );
+}

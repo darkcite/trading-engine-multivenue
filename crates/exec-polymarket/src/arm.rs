@@ -76,6 +76,7 @@ use crate::cmd::{
     PM_CMD_RING, PM_EVT_RING, PM_USER_RING,
 };
 use crate::gw::WATCH_STOP;
+use crate::stats::{word, PmExecStats, ARM_WORDS, PUBLISH_EVERY_NS};
 use crate::user::PUB_USER_RX_NS;
 use crate::userws::{TS_CONFIRMED, TS_FAILED};
 
@@ -318,6 +319,10 @@ pub struct PmArm {
     anchor_1e6: Option<i64>,
     equity_1e6: i64,
     reject_streak: u32,
+    /// `/metrics`' block (PM15-8c; `None` in the rigs) and its next
+    /// publish.
+    stats: Option<std::sync::Arc<PmExecStats>>,
+    next_pub_ns: u64,
 }
 
 impl PmArm {
@@ -348,7 +353,57 @@ impl PmArm {
             anchor_1e6: None,
             equity_1e6: 0,
             reject_streak: 0,
+            stats: None,
+            next_pub_ns: 0,
         }
+    }
+
+    /// Publish the tallies into `stats` once a [`PUBLISH_EVERY_NS`] —
+    /// boot-only.
+    pub fn set_stats(&mut self, stats: std::sync::Arc<PmExecStats>) {
+        self.stats = Some(stats);
+    }
+
+    /// The tallies and the levels into `/metrics`' block.
+    fn publish(&mut self, now: u64) {
+        self.next_pub_ns = now.saturating_add(PUBLISH_EVERY_NS);
+        let Some(s) = &self.stats else {
+            return;
+        };
+        let c = &self.counters;
+        let v: [i64; ARM_WORDS] = [
+            word(c.submitted),
+            word(c.refused_shape),
+            word(c.refused_family),
+            word(c.refused_halted),
+            word(c.refused_full),
+            word(c.acks),
+            word(c.refused),
+            word(c.no_match),
+            word(c.in_doubt),
+            word(c.recons),
+            word(c.gaps),
+            word(c.fills),
+            word(c.repeats),
+            word(c.confirmed),
+            word(c.reversed),
+            word(c.unknown),
+            word(c.done),
+            word(c.out_full),
+            word(c.evicted_young),
+            word(c.reads_agreed),
+            word(c.reads_disagreed),
+            word(c.legs_redeemed),
+            word(c.legs_lost),
+            word(c.redeem_asks),
+            word(c.ledger_full),
+            i64::from(self.halted),
+            i64::from(self.reconciled),
+            self.equity_1e6,
+            self.anchor_1e6.unwrap_or(0),
+            self.drift_1e6,
+        ];
+        s.set_arm(&v);
     }
 
     /// Restore the session anchor a previous boot set (pUSD + legs at
@@ -454,6 +509,9 @@ impl PmArm {
 
     /// One pass over the rings and the clock (module docs).
     fn pump(&mut self, now: u64) -> bool {
+        if now >= self.next_pub_ns {
+            self.publish(now);
+        }
         // What was retired last poll may go now: its fills went first.
         self.retired.release();
         let mut did = self.drain_gw(now);

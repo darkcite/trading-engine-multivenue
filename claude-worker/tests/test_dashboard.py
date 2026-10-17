@@ -863,3 +863,5 @@ def test_the_pm15_panel_reads_the_engine_metrics() -> None:
     assert "/api/engine/metrics" in claude_worker.dashboard._ENGINE_ROUTES
     for name in ("rolls_total", "skip_book_total", "takes_submitted_total", "pnl_usd_1e6", "halted"):
         assert f"g('{name}')" in html, name
+    # PM15-8c: the live arm's rows (engine_pm15_arm_* / engine_pm15_gw_*).
+    assert "engine_pm15_arm_" in html and "a('worth_usd_1e6')" in html and "w('redeemed_total')" in html

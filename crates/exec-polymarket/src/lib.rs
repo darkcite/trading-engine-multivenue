@@ -35,6 +35,7 @@
 //! | [`arm`] | engine | `OrderDispatch`: admission (D-9), the in-flight table, fills once, retirements after them; the ledger, the account's worth and the halt signal (6c) |
 //! | [`run`] | pm-gw, pm-user | the threads' loops (6c) |
 //! | [`venue`] | boot | the venue gate: version 2, the account open, pUSD readable, the allowance (D-8, 6c) |
+//! | [`stats`] | engine, pm-gw | the two writers' tallies for `/metrics`, relaxed atomics on their own lines (8c) |
 //! | [`redeem`] | pm-gw | redemption through the relayer: a Deposit Wallet batch per ripe markets, polled to the chain (D-10, 6d) |
 //!
 //! ## The laws
@@ -71,6 +72,7 @@ pub mod response;
 pub mod run;
 pub mod selftest;
 pub mod sign;
+pub mod stats;
 pub mod tokens;
 pub mod user;
 pub mod userws;

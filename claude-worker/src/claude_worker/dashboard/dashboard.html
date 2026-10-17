@@ -298,6 +298,12 @@ function pm15Block() {
   const c = v => n(v, 0);
   const d = v => n(v / 1e6, 2);
   const must0 = v => v ? `<span class="bad">${c(v)}</span>` : '0';
+  const a = k => PM['engine_pm15_arm_' + k];
+  const w = k => PM['engine_pm15_gw_' + k];
+  const live = a('anchor_usd_1e6') || a('submitted_total') || a('reconciled');
+  const arm = !live ? '<div>arm</div><div class="dim">paper — the live arm is not built</div>' :
+    `<div>arm: submitted / acks / refused / in doubt · fills · reads ok / not</div><div>${c(a('submitted_total'))} / ${c(a('acks_total'))} / ${c(a('refused_total'))} / ${c(a('in_doubt_total'))} · ${c(a('fills_total'))} · ${c(a('reads_agreed_total'))} / ${c(a('reads_disagreed_total'))}${a('halted') || w('halted') ? ' · <span class="bad">HALTED</span>' : ''}</div>` +
+    `<div>account worth · anchor · drift · redeemed (dropped)</div><div>${d(a('worth_usd_1e6'))} · ${d(a('anchor_usd_1e6'))} · ${d(a('drift_usd_1e6'))} · ${c(w('redeemed_total'))} (${must0(w('redeem_dropped_total'))})</div>`;
   return `<div class="kv" style="margin-top:6px"><div>pm15 (slot 9)</div><div>markets live ${c(g('markets_live'))} · rolls ${c(g('rolls_total'))}, settled ${c(g('rolls_settled_total'))} · ${g('halted') ? '<span class="bad">HALTED</span>' : '<span class="ok">running</span>'}</div>` +
     `<div>strikes computed / missing</div><div>${c(g('strikes_computed_total'))} / ${c(g('strikes_missing_total'))}</div>` +
     `<div>priced · skipped: persist / book / book old / law / price / cap</div><div>${c(g('reprices_total'))} · ${c(g('skip_persist_total'))} / ${c(g('skip_book_total'))} / ${c(g('skip_book_old_total'))} / ${c(g('skip_law_total'))} / ${c(g('skip_price_total'))} / ${c(g('skip_cap_total'))}</div>` +
@@ -305,7 +311,7 @@ function pm15Block() {
     `<div>settled won / lost / unknown</div><div>${c(g('settled_won_total'))} / ${c(g('settled_lost_total'))} / ${c(g('settled_unknown_total'))}</div>` +
     `<div>P&amp;L · fees · bought · open cost</div><div>${usd(g('pnl_usd_1e6') / 1e6)} · ${d(g('fees_usd_1e6'))} · ${d(g('bought_usd_1e6'))} · ${d(g('open_cost_usd_1e6'))}</div>` +
     `<div>ingress: slots bound · ticks · marks · reconnects market / rtds</div><div>${c(i('slots_bound'))} · ${c(i('ticks_total'))} · ${c(i('marks_total'))} · ${c(i('market_reconnects_total'))} / ${c(i('rtds_reconnects_total'))}</div>` +
-    `<div>must stay 0: parse errors / unknown fills / refused submits / unknown rolls</div><div>${must0(i('parse_errors_total'))} / ${must0(g('unknown_fills_total'))} / ${must0(g('submit_refused_total'))} / ${must0(g('rolls_unknown_total'))}</div></div>`;
+    `<div>must stay 0: parse errors / unknown fills / refused submits / unknown rolls</div><div>${must0(i('parse_errors_total'))} / ${must0(g('unknown_fills_total'))} / ${must0(g('submit_refused_total'))} / ${must0(g('rolls_unknown_total'))}</div>${arm}</div>`;
 }
 
 // ---- P&L ----

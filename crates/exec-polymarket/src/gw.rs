@@ -69,6 +69,7 @@ use crate::redeem::{RedeemCounters, Redeemer};
 use crate::render::{render_order_tail, render_ts, PREFIX_MAX, TAIL_MAX};
 use crate::response::{read_order_answer, Refusal, Verdict};
 use crate::sign::{sign_order, SIG_MAX};
+use crate::stats::{word, PmExecStats, GW_WORDS, PUBLISH_EVERY_NS};
 use crate::tokens::PmTokens;
 use crate::userws::{fnv1a, scan_trades_page, UserEvt, KIND_TRADE, ROLE_MAKER};
 
@@ -172,6 +173,10 @@ pub struct PmGateway<W: PmClob> {
     account_step: usize,
     /// The redeemer and its relayer client (`None`: by hand).
     redeem: Option<(Redeemer, W)>,
+    /// `/metrics`' block (PM15-8c; `None` in the rigs) and its next
+    /// publish.
+    stats: Option<std::sync::Arc<PmExecStats>>,
+    next_pub_ns: u64,
 }
 
 impl<W: PmClob> PmGateway<W> {
@@ -212,7 +217,56 @@ impl<W: PmClob> PmGateway<W> {
             account_next_ns: 0,
             account_step: usize::MAX,
             redeem: None,
+            stats: None,
+            next_pub_ns: 0,
         }
+    }
+
+    /// Publish the tallies into `stats` once a [`PUBLISH_EVERY_NS`] —
+    /// boot-only.
+    pub fn set_stats(&mut self, stats: std::sync::Arc<PmExecStats>) {
+        self.stats = Some(stats);
+    }
+
+    /// The tallies (the redeemer's with them) into `/metrics`' block.
+    fn publish(&mut self, now_ns: u64) {
+        self.next_pub_ns = now_ns.saturating_add(PUBLISH_EVERY_NS);
+        let r = self.redeem_counters();
+        let Some(s) = &self.stats else {
+            return;
+        };
+        let c = &self.counters;
+        let v: [i64; GW_WORDS] = [
+            word(c.specs),
+            word(c.specs_refused),
+            word(c.posts),
+            word(c.resends),
+            word(c.acks),
+            word(c.refused),
+            word(c.refused_local),
+            word(c.in_doubt),
+            word(c.recon_requests),
+            word(c.recon_failures),
+            word(c.recon_fills),
+            word(c.recon_done),
+            word(c.account_requests),
+            word(c.account_failures),
+            word(c.account_reads),
+            word(c.redeem_off),
+            word(c.redeem_no_row),
+            word(r.queued),
+            word(r.dupes),
+            word(r.queue_full),
+            word(r.batches),
+            word(r.batches_done),
+            word(r.redeemed),
+            word(r.batches_failed),
+            word(r.dropped),
+            word(r.request_failures),
+            word(r.polls),
+            i64::from(self.halted),
+        ];
+        s.set_gw(&v);
     }
 
     /// Redeem through `r` on the relayer client `rly` (PM15-6d) —
@@ -261,6 +315,9 @@ impl<W: PmClob> PmGateway<W> {
     /// discovery found, at most one command, at most one recon request.
     /// `true` when it did something.
     pub fn step(&mut self, now_ns: u64, wall_ns: u64) -> bool {
+        if now_ns >= self.next_pub_ns {
+            self.publish(now_ns);
+        }
         let mut did = false;
         while let Some(spec) = self.specs.try_pop_ref() {
             match self.tokens.offer(&spec, &self.acct) {

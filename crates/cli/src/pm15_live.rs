@@ -473,6 +473,7 @@ pub fn boot_pm15_arm(
     member: Option<&Pm15Boot>,
     tls: Arc<ClientConfig>,
     specs: Consumer<PmWindowSpec, PM15_SPEC_RING>,
+    stats: Arc<exec_polymarket::stats::PmExecStats>,
 ) -> Result<Pm15Live, String> {
     let s = eb
         .slots
@@ -558,6 +559,7 @@ pub fn boot_pm15_arm(
     if let Some((r, rly, _)) = redeem {
         gw.set_redeemer(r, rly);
     }
+    gw.set_stats(Arc::clone(&stats));
     let mut arm = PmArm::new(
         PmArmCfg {
             slot: PM15_SLOT as u8,
@@ -567,6 +569,7 @@ pub fn boot_pm15_arm(
         user_rx,
     );
     arm.restore_anchor(anchor);
+    arm.set_stats(stats);
     let flag = Arc::new(AtomicBool::new(false));
     let gw_flag = Arc::clone(&flag);
     let user_flag = Arc::clone(&flag);
