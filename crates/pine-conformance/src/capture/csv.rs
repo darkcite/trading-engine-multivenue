@@ -7,7 +7,7 @@
 //! `pin:06-csv-quoting` — RFC 4180 quoting (a field in `"`, `""` an escaped quote); the delimiter
 //! and line end come from `format.tsv`; a trailing empty line is ignored.
 
-use super::format::{ExportFormat, TimeFormat};
+use super::format::{ExportFormat, TimeFormat, CCY};
 use crate::dec::{parse_dec, Dec};
 use crate::fixture::{Cell, ExitCols, Summary, TradeRow};
 
@@ -25,7 +25,8 @@ pub struct ChartExport {
     pub digits: u8,
 }
 
-/// Splits the export into records of fields.
+/// Splits the export into records of fields. A leading UTF-8 BOM is dropped (recon 2026-10-17: the
+/// List of Trades "Download .csv" carries one).
 pub fn records(bytes: &[u8], fmt: &ExportFormat) -> Result<Vec<Vec<String>>, String> {
     let text = core::str::from_utf8(bytes).map_err(|_| "export is not UTF-8".to_string())?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
@@ -209,38 +210,76 @@ fn opt_dec(s: &str, what: &str) -> Result<Option<Dec>, String> {
     }
 }
 
-/// The List of Trades: two records per trade (entry, then exit), any order of trade numbers in the
-/// file; trades are returned by number.
+/// The List of Trades: two records per trade (an entry and an exit), any order of trade numbers in
+/// the file; trades are returned by number.
 ///
 /// `pin:06-trades-two-rows` — the entry record carries `time`, `price`, `signal`; the exit record
-/// carries the exit columns, `qty`, `pnl`, `cum_pnl`, `runup`, `drawdown`. An exit record whose
-/// signal is `open_signal` marks a trade still open (no exit columns, no P&L). `bars` is not a List
-/// of Trades column (left `None`).
+/// carries the exit columns, `qty`, `pnl`, `cum_pnl`, the excursions (→ `runup`, `drawdown`) and
+/// the duration (→ `bars`, less `duration_offset`, `pin:06-duration-offset-bars`). An exit record
+/// whose signal is `open_signal` marks a trade still open (no exit columns, no P&L, no `bars`).
+///
+/// `pin:06-trades-row-order` — recon 2026-10-17 read the header only, not which record of a trade
+/// comes first: entries are read before exits, whatever their order in the file.
+///
+/// Every `col_*` title of `format.tsv` must be a header column (a missing one is named); the
+/// columns no `.fix` field holds are checked, never read.
 pub fn parse_trades_csv(bytes: &[u8], fmt: &ExportFormat) -> Result<Vec<TradeRow>, String> {
     let c = &fmt.trades;
     if c.trade.is_empty() {
         return Err("format.tsv carries no List of Trades columns".into());
     }
+    if fmt.has_ccy() {
+        return Err(format!(
+            "a `col_*` title still spells `{CCY}`: resolve it from syminfo.tsv (pin:06-format-ccy)"
+        ));
+    }
     let recs = records(bytes, fmt)?;
     let (head, body) = recs.split_first().ok_or("empty export")?;
-    let col = |t: &str| {
-        head.iter()
-            .position(|h| h == t)
-            .ok_or_else(|| format!("no `{t}` column (pin:06-export-columns-verify-in-recon)"))
-    };
+    let titles = fmt.trade_titles();
+    let mut missing: Vec<String> = Vec::new();
+    for (i, t) in titles.iter().enumerate() {
+        if !head.iter().any(|h| h == t) {
+            missing.push(format!("`{t}` ({})", ExportFormat::trade_key(i)));
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "no {} column (pin:06-export-columns-verify-in-recon)",
+            missing.join(", ")
+        ));
+    }
+    let col = |t: &str| head.iter().position(|h| h == t).unwrap_or(usize::MAX);
     let ix = [
-        col(&c.trade)?,
-        col(&c.kind)?,
-        col(&c.signal)?,
-        col(&c.time)?,
-        col(&c.price)?,
-        col(&c.qty)?,
-        col(&c.pnl)?,
-        col(&c.cum_pnl)?,
-        col(&c.runup)?,
-        col(&c.drawdown)?,
+        col(&c.trade),
+        col(&c.kind),
+        col(&c.signal),
+        col(&c.time),
+        col(&c.price),
+        col(&c.qty),
+        col(&c.pnl),
+        col(&c.cum_pnl),
+        col(&c.fav_exc),
+        col(&c.adv_exc),
+        col(&c.bars),
     ];
     let mut out: Vec<TradeRow> = Vec::new();
+    for pass_exits in [false, true] {
+        parse_trade_pass(body, fmt, &ix, pass_exits, &mut out)?;
+    }
+    out.sort_by_key(|t| t.n);
+    Ok(out)
+}
+
+/// One pass of [`parse_trades_csv`] over the body: entries (`exits = false`) or exits.
+fn parse_trade_pass(
+    body: &[Vec<String>],
+    fmt: &ExportFormat,
+    ix: &[usize; 11],
+    exits: bool,
+    out: &mut Vec<TradeRow>,
+) -> Result<(), String> {
+    let c = &fmt.trades;
+    let mut exited: Vec<u32> = Vec::new();
     for (ri, r) in body.iter().enumerate() {
         let line = ri + 2;
         let f = |k: usize| r.get(ix[k]).map(String::as_str).unwrap_or("");
@@ -252,8 +291,11 @@ pub fn parse_trades_csv(bytes: &[u8], fmt: &ExportFormat) -> Result<Vec<TradeRow
             .iter()
             .position(|t| t == f(1))
             .ok_or_else(|| format!("row {line}: unknown type `{}`", f(1)))?;
+        if (ty >= 2) != exits {
+            continue;
+        }
         let long = ty % 2 == 0;
-        let t = parse_time(f(3), fmt)? + fmt.duration_offset;
+        let t = parse_time(f(3), fmt)?;
         if ty < 2 {
             if out.iter().any(|x| x.n == n) {
                 return Err(format!("row {line}: trade {n} entered twice"));
@@ -278,16 +320,20 @@ pub fn parse_trades_csv(bytes: &[u8], fmt: &ExportFormat) -> Result<Vec<TradeRow
             });
             continue;
         }
+        if exited.contains(&n) {
+            return Err(format!("row {line}: trade {n} exited twice"));
+        }
+        exited.push(n);
         let tr = out
             .iter_mut()
             .find(|x| x.n == n)
-            .ok_or_else(|| format!("row {line}: exit before entry of trade {n}"))?;
+            .ok_or_else(|| format!("row {line}: exit of trade {n}, which has no entry"))?;
         if tr.long != long {
             return Err(format!("row {line}: trade {n} changes side"));
         }
         tr.qty = dec(f(5), "qty")?;
-        tr.runup = opt_dec(f(8), "runup")?;
-        tr.drawdown = opt_dec(f(9), "drawdown")?;
+        tr.runup = opt_dec(f(8), "favorable excursion")?;
+        tr.drawdown = opt_dec(f(9), "adverse excursion")?;
         if f(2) != c.open_signal {
             tr.exit = Some(ExitCols {
                 ms: t,
@@ -296,10 +342,21 @@ pub fn parse_trades_csv(bytes: &[u8], fmt: &ExportFormat) -> Result<Vec<TradeRow
             });
             tr.pnl = opt_dec(f(6), "pnl")?;
             tr.cum_pnl = opt_dec(f(7), "cum_pnl")?;
+            tr.bars = match f(10) {
+                "" => None,
+                b => {
+                    let printed: i64 = b
+                        .parse()
+                        .map_err(|_| format!("row {line}: duration `{b}` is not a bar count"))?;
+                    let bars = u32::try_from(printed - fmt.duration_offset).map_err(|_| {
+                        format!("row {line}: duration {printed} less duration_offset < 0")
+                    })?;
+                    Some(bars)
+                }
+            };
         }
     }
-    out.sort_by_key(|t| t.n);
-    Ok(out)
+    Ok(())
 }
 
 /// The Performance Summary: records `title, value[, …]`; the first value column (TradingView's

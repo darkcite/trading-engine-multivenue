@@ -253,6 +253,114 @@ fn no_generated_program_is_refused_for_deferred_builtin() {
     );
 }
 
+/// §4.8.2 / §7.8: every deliberately ill-typed program (`ill_typed_permille`, one bad site) is
+/// refused at parse or compile with at least one `Diag` — never compiled, never a panic — in both
+/// dialects over 2 000 seeds each.
+#[test]
+fn ill_typed_programs_produce_a_diag_not_a_panic() {
+    for d in [Dialect::V5, Dialect::V6] {
+        let c = cfg(d);
+        let mut h = Harness::new(root(), "ill").expect("harness");
+        let mut n = 0u32;
+        for s in 0..2_000u64 {
+            let g = generate(s, &c);
+            if !g.expect_refusal {
+                continue;
+            }
+            n += 1;
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.compile(&g)));
+            let Ok(r) = r else {
+                panic!("v{} seed {s}: compile panicked\n{}", d as u8, g.source);
+            };
+            match r {
+                Err(RunError::Compile(ds) | RunError::Parse(ds)) => {
+                    assert!(
+                        !ds.is_empty(),
+                        "v{} seed {s}: refused with no Diag",
+                        d as u8
+                    );
+                }
+                other => panic!(
+                    "v{} seed {s}: an ill-typed program gave {:?}\n{}",
+                    d as u8,
+                    other.map(|_| ()),
+                    g.source
+                ),
+            }
+        }
+        assert!(n >= 20, "v{}: {n} ill-typed programs of 2 000", d as u8);
+    }
+}
+
+fn loop_trips(list: &[Stmt], prod: u64, max: u16, s: u64, worst: &mut u64) {
+    for st in list {
+        match st {
+            Stmt::For { lo, hi, body, .. } => {
+                let trips = (i64::from(*hi) - i64::from(*lo)).unsigned_abs() + 1;
+                assert!(trips <= u64::from(max), "seed {s}: {trips} trips > {max}");
+                let p = prod.saturating_mul(trips);
+                *worst = (*worst).max(p);
+                loop_trips(body, p, max, s, worst);
+            }
+            Stmt::If { then, els, .. } => {
+                loop_trips(then, prod, max, s, worst);
+                loop_trips(els, prod, max, s, worst);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// §4.8.2 / §7.8: the grammar's only loop is `for i = lo to hi` with literal bounds whose trip
+/// count is within `max_loop_trips` (no `while`, no counter is a writable slot), so a bar's
+/// iterations are bounded by the product along the nesting — checked over 10 000 seeds in both
+/// dialects; and 300 programs run their 64 bars to the end in the VM with no `InsnBudget` fault
+/// (termination observed, not only argued).
+#[test]
+fn generated_loops_always_terminate() {
+    for d in [Dialect::V5, Dialect::V6] {
+        let c = cfg(d);
+        let (mut worst, mut loops) = (0u64, 0u32);
+        for s in 0..10_000u64 {
+            let g = generate(s, &c);
+            let mut w = 0u64;
+            loop_trips(&g.ast.stmts, 1, c.max_loop_trips, s, &mut w);
+            loops += u32::from(w > 0);
+            worst = worst.max(w);
+        }
+        println!(
+            "v{}: {loops} programs loop, worst nest product {worst}",
+            d as u8
+        );
+        assert!(loops > 1_000, "v{}: {loops} looping programs", d as u8);
+    }
+    let c = cfg(Dialect::V6);
+    let mut h = Harness::new(root(), "loops").expect("harness");
+    let mut ran = 0u32;
+    for s in 0..300u64 {
+        let g = generate(s, &c);
+        if g.expect_refusal {
+            continue;
+        }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.run(&g.ast, pine_ir::ExecMode::BarClose, 64)
+        }));
+        let Ok(r) = r else {
+            panic!("seed {s}: the run panicked\n{}", g.source);
+        };
+        if let Err(RunError::Fault { kind, .. }) = &r {
+            assert_ne!(
+                *kind,
+                pine_ir::FaultKind::InsnBudget,
+                "seed {s}\n{}",
+                g.source
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 250, "{ran} programs ran");
+}
+
 /// Seeds (grammar 1, v6, `Indicator`) whose compile panics inside the engine — FINDINGS for the
 /// owner (the compiler must return a `Diag`, never panic); each is a `regressions.tsv` row.
 /// `pin:06-fuzz-panic-table` — detected with `catch_unwind` in this test only; nothing passes.
@@ -263,20 +371,14 @@ const MODE_FINDINGS: &[(&str, u16, u64)] = &[];
 
 /// Engine panics (debug assertions) a sweep has met — FINDINGS by message class, each with its
 /// owner. `pin:06-fuzz-panic-class` — a seed that panics is recorded (the predicate is rebuilt and
-/// the sweep goes on) and its message must be a row here; an unknown panic is red.
-const KNOWN_PANICS: &[(&str, &str)] = &[
-    (
-        "set_f64_arg on an i64 entry",
-        "pine-std (PVM-4): ta.highestbars / ta.lowestbars write their int output via \
-         set_f64_arg (pine-vm frame.rs:360); shrunk to `int v = ta.highestbars(0, 1)` — also \
-         B088/B091 in hygiene I9; ~1/3 of seeds",
-    ),
-    (
-        "!a.is_nan() && !b.is_nan()",
-        "pine-std (PVM-4): ta.cmo → change_pairs → winp_push asserts non-na inputs \
-         (pine-std state.rs:604) on an `na` source (synna); seed 692",
-    ),
-];
+/// the sweep goes on) and its message must be a row here; an unknown panic is red. A row whose
+/// class `mode_vs_mode_agrees_on_1000_seeds` no longer meets is red too (a fixed finding leaves).
+///
+/// Fixed 2026-10-17 (r21), rows retired: "set_f64_arg on an i64 entry" (pine-std `bi_extreme`:
+/// `ta.highestbars`/`ta.lowestbars` now write their `int` result via `set_i64_arg`; seed 4,
+/// B088/B091) and "!a.is_nan() && !b.is_nan()" (pine-std `change_pairs`: an `inf − inf` change
+/// pair is skipped, `pin:04-change-pair-nan`; seed 692 `ta.cmo(math.exp(syni), 12)`).
+const KNOWN_PANICS: &[(&str, &str)] = &[];
 
 /// `(programs run, divergent seeds, panicking seeds with their message)`.
 fn sweep<P: Predicate, F: Fn() -> P>(
@@ -350,6 +452,15 @@ fn mode_vs_mode_agrees_on_1000_seeds() {
     println!("mode-vs-mode: {ran} programs, {} divergent", div.len());
     assert!(ran > 900);
     check_panics("mode-vs-mode", &panics);
+    // A class this sweep no longer meets is a fixed finding: its row leaves KNOWN_PANICS.
+    if cfg!(debug_assertions) {
+        for (k, _) in KNOWN_PANICS {
+            assert!(
+                panics.iter().any(|(_, m)| m.contains(k)),
+                "KNOWN_PANICS `{k}` no longer met: a fixed finding leaves the table"
+            );
+        }
+    }
     assert_eq!(div, known("mode-vs-mode"), "mode-vs-mode findings moved");
 }
 
@@ -369,8 +480,9 @@ fn interleaved_instances_agree_on_1000_seeds() {
 
 /// §4.8.5: every `regressions.tsv` row of this grammar still reproduces under mode (a) — a row
 /// with a fixture id still diverges; an id `-` row (an engine-panic finding,
-/// `pin:06-regressions-panic-rows`) still panics with a [`KNOWN_PANICS`] message. A row that stops
-/// reproducing is as much a finding as one that starts.
+/// `pin:06-regressions-panic-rows`) still panics with a [`KNOWN_PANICS`] message while its class
+/// is open, and once the class is fixed (it left the table) the row stays and must run clean —
+/// no panic, no divergence. A row that stops reproducing is as much a finding as one that starts.
 #[test]
 fn regressions_still_reproduce() {
     let text =
@@ -410,7 +522,11 @@ fn regressions_still_reproduce() {
             // The panic findings are pine-vm `debug_assert!` trips; a release build compiles them
             // out, so there the row only has to run (pin:06-regressions-panic-debug-only).
             ("-", Ok(_)) if !cfg!(debug_assertions) => {}
-            ("-", Ok(_)) => panic!("{l}: the engine-panic finding no longer reproduces"),
+            // A fixed panic finding runs clean: its class left KNOWN_PANICS (which
+            // `mode_vs_mode_agrees_on_1000_seeds` keeps honest — a listed class it no longer
+            // meets is red), and the row stays as a regression that must neither panic nor diverge.
+            ("-", Ok(None)) => {}
+            ("-", Ok(Some(sig))) => panic!("{l}: the fixed panic finding now diverges: {sig:?}"),
             (_, Ok(Some(_))) => {}
             (_, other) => panic!("{l}: no longer diverges ({:?})", other.ok()),
         }

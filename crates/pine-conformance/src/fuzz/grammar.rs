@@ -25,7 +25,12 @@ use super::{GrammarConfig, Profile};
 ///
 /// `pin:06-fuzz-deny` — the spec names the classes, not the list; this is the literal reading of
 /// those classes plus the declaration/capture statements (`plot*`, `input.*`, `strategy*`), which
-/// the profiles emit as statements, never as expressions.
+/// the profiles emit as statements, never as expressions. The bare `input(…)` stays denied
+/// (r21, 2026-10-17): with it admitted, 2 000 seeds compile with zero panics since the
+/// `pin:02-input-series-defval` fix, but 153 well-typed programs are refused — 150 `3008` (the
+/// `series` row `INPUT_F_SRC` fed a non-constant) and 3 `3050` (`vN := input(…)` names a second
+/// input `vN`) — so the generator cannot yet emit only valid `input()` calls, and admitting it
+/// re-draws every grammar-1 program (the `regressions.tsv` seeds) — a `GRAMMAR_VERSION` decision.
 pub const FUZZ_DENY_NS: [&str; 18] = [
     "input",
     "strategy",

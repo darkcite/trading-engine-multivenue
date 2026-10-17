@@ -14,11 +14,25 @@
 //! keys too (`col_*`, `type_*`, `open_signal`, `sum_*`, `time_column`), measured by probe-03 on the
 //! Premium "strategy report" (the former Strategy Tester; recon 2026-10-17). Every one of them may be
 //! renamed by the Premium UI and is verified in recon before the first capture session.
+//!
+//! `pin:06-trades-columns-recon` — recon 2026-10-17 read the List of Trades header of the Premium
+//! "Download .csv" (17 columns, UTF-8 with BOM, comma). Each column is a `col_*` key; the keys added
+//! for it (`col_size_value`, `col_return_pct`, `col_commission`, `col_fav_exc`, `col_fav_exc_pct`,
+//! `col_adv_exc`, `col_adv_exc_pct`, `col_cum_pnl_pct`, `col_bars`) are named here, not by §4.7.3.
+//! The excursion columns replace the guessed `col_runup` / `col_drawdown` (retired keys, refused
+//! with their successor named). The `type_*` values and the date format were not read: VERIFY.
+//!
+//! `pin:06-format-ccy` — the money titles carry the symbol currency as a suffix (`Price USDT`):
+//! a `col_*` title spells it `{ccy}`, and [`load_format`] substitutes `syminfo.tsv`'s `currency`
+//! (every fixture runs on the one conformance chart, §4.1.4). Only `col_*` titles are substituted.
 
 use std::path::Path;
 
 use crate::fixture::FixError;
 use crate::trades::PnlBasis;
+
+/// The currency placeholder of a `col_*` title (`pin:06-format-ccy`).
+pub const CCY: &str = "{ccy}";
 
 /// `capture/format.tsv`, relative to the workspace root.
 pub const FORMAT_TSV: &str = "tests/conformance/capture/format.tsv";
@@ -53,10 +67,16 @@ pub struct TradeColumns {
     pub pnl: String,
     /// `col_cum_pnl`.
     pub cum_pnl: String,
-    /// `col_runup`.
-    pub runup: String,
-    /// `col_drawdown`.
-    pub drawdown: String,
+    /// `col_fav_exc` — the favorable excursion in money (→ `TradeRow::runup`).
+    pub fav_exc: String,
+    /// `col_adv_exc` — the adverse excursion in money (→ `TradeRow::drawdown`).
+    pub adv_exc: String,
+    /// `col_bars` — the duration in bars (→ `TradeRow::bars`, less `duration_offset`).
+    pub bars: String,
+    /// Columns the export carries that no `.fix` field holds (§4.4.1's trade row): checked present,
+    /// never read — `col_size_value`, `col_return_pct`, `col_commission`, `col_fav_exc_pct`,
+    /// `col_adv_exc_pct`, `col_cum_pnl_pct`.
+    pub unread: [String; 6],
     /// `type_entry_long`, `type_entry_short`, `type_exit_long`, `type_exit_short`.
     pub types: [String; 4],
     /// `open_signal` — the exit row's signal text of a trade still open at export.
@@ -102,7 +122,12 @@ pub struct ExportFormat {
     pub pnl_basis: PnlBasis,
     /// `size_digits` — decimals of a printed size.
     pub size_digits: u8,
-    /// `duration_offset` — ms added to a printed trade time to reach the bar open (0 = none).
+    /// `duration_offset` — the duration convention of §4.7.2: `0` when the printed duration is
+    /// `exit_bar − entry_bar`, `1` when it is `+ 1`.
+    ///
+    /// `pin:06-duration-offset-bars` — read literally from §4.7.2 / R12 (the convention, 0 or 1),
+    /// now that the export prints `Duration (bars)` (recon 2026-10-17): `bars = printed −
+    /// duration_offset`. It never shifts a trade time (§4.4.4: TradingView prints the bar time).
     pub duration_offset: i64,
     /// `p_negzero` — the export prints the sign of zero (§4.4.2).
     pub prints_negzero: bool,
@@ -130,17 +155,52 @@ const KEYS: [&str; 15] = [
     "time_column",
 ];
 
-const TRADE_KEYS: [&str; 15] = [
+/// The `col_*` keys whose title [`ExportFormat::resolve_ccy`] substitutes — the List of Trades
+/// columns, in the recon header's order (`pin:06-trades-columns-recon`).
+const COL_KEYS: [&str; 17] = [
     "col_trade",
     "col_type",
-    "col_signal",
     "col_time",
+    "col_signal",
     "col_price",
     "col_qty",
+    "col_size_value",
     "col_pnl",
+    "col_return_pct",
+    "col_commission",
+    "col_fav_exc",
+    "col_fav_exc_pct",
+    "col_adv_exc",
+    "col_adv_exc_pct",
     "col_cum_pnl",
-    "col_runup",
-    "col_drawdown",
+    "col_cum_pnl_pct",
+    "col_bars",
+];
+
+/// Keys a `format.tsv` may no longer carry, with their successor (recon 2026-10-17).
+const RETIRED: [(&str, &str); 2] = [
+    ("col_runup", "col_fav_exc"),
+    ("col_drawdown", "col_adv_exc"),
+];
+
+const TRADE_KEYS: [&str; 22] = [
+    "col_trade",
+    "col_type",
+    "col_time",
+    "col_signal",
+    "col_price",
+    "col_qty",
+    "col_size_value",
+    "col_pnl",
+    "col_return_pct",
+    "col_commission",
+    "col_fav_exc",
+    "col_fav_exc_pct",
+    "col_adv_exc",
+    "col_adv_exc_pct",
+    "col_cum_pnl",
+    "col_cum_pnl_pct",
+    "col_bars",
     "type_entry_long",
     "type_entry_short",
     "type_exit_long",
@@ -167,14 +227,95 @@ fn err(path: &str, line: u32, what: String) -> FixError {
     }
 }
 
-/// Reads `<root>/tests/conformance/capture/format.tsv`.
+impl ExportFormat {
+    /// Whether a `col_*` title still spells [`CCY`].
+    pub fn has_ccy(&self) -> bool {
+        self.trade_titles().iter().any(|t| t.contains(CCY))
+    }
+
+    /// Substitutes `ccy` for [`CCY`] in every `col_*` title (`pin:06-format-ccy`).
+    pub fn resolve_ccy(&mut self, ccy: &str) -> Result<(), String> {
+        if ccy.is_empty() || ccy.contains(CCY) || ccy.chars().any(char::is_control) {
+            return Err(format!("`{ccy}` is not a currency (pin:06-format-ccy)"));
+        }
+        let c = &mut self.trades;
+        let [u0, u1, u2, u3, u4, u5] = &mut c.unread;
+        let titles: [&mut String; 17] = [
+            &mut c.trade,
+            &mut c.kind,
+            &mut c.time,
+            &mut c.signal,
+            &mut c.price,
+            &mut c.qty,
+            &mut c.pnl,
+            &mut c.cum_pnl,
+            &mut c.fav_exc,
+            &mut c.adv_exc,
+            &mut c.bars,
+            u0,
+            u1,
+            u2,
+            u3,
+            u4,
+            u5,
+        ];
+        for t in titles {
+            if t.contains(CCY) {
+                *t = t.replace(CCY, ccy);
+            }
+        }
+        Ok(())
+    }
+
+    /// The 17 `col_*` titles, in [`COL_KEYS`] order.
+    pub fn trade_titles(&self) -> [&str; 17] {
+        let c = &self.trades;
+        [
+            &c.trade,
+            &c.kind,
+            &c.time,
+            &c.signal,
+            &c.price,
+            &c.qty,
+            &c.unread[0],
+            &c.pnl,
+            &c.unread[1],
+            &c.unread[2],
+            &c.fav_exc,
+            &c.unread[3],
+            &c.adv_exc,
+            &c.unread[4],
+            &c.cum_pnl,
+            &c.unread[5],
+            &c.bars,
+        ]
+    }
+
+    /// The `col_*` key of the title at `i` of [`ExportFormat::trade_titles`].
+    pub fn trade_key(i: usize) -> &'static str {
+        COL_KEYS[i]
+    }
+}
+
+/// Reads `<root>/tests/conformance/capture/format.tsv`; a `{ccy}` in a `col_*` title is resolved
+/// from `<root>/tests/conformance/syminfo.tsv` (`pin:06-format-ccy`), which is read only then.
 pub fn load_format(root: &Path) -> Result<ExportFormat, FixError> {
     let p = root.join(FORMAT_TSV);
     // COPY: `format.tsv` (< 4 KiB) once per distil, offline — the parser reads owned text — a
     // memory map rejected (no third-party crate, contract §2).
     let text = std::fs::read_to_string(&p)
         .map_err(|e| err(&p.display().to_string(), 0, format!("unreadable: {e}")))?;
-    parse_format(&text, &p.display().to_string())
+    let mut fmt = parse_format(&text, &p.display().to_string())?;
+    if fmt.has_ccy() {
+        let s = root.join(crate::chart::SYMINFO_TSV);
+        let sp = s.display().to_string();
+        // COPY: `syminfo.tsv` (8 lines) once per distil, offline — as `format.tsv` above.
+        let si = std::fs::read_to_string(&s)
+            .map_err(|e| err(&sp, 0, format!("unreadable ({CCY} in format.tsv): {e}")))?;
+        let si = crate::chart::parse_syminfo(&si).map_err(|e| err(&sp, 0, e))?;
+        fmt.resolve_ccy(&si.currency).map_err(|e| err(&sp, 0, e))?;
+    }
+    Ok(fmt)
 }
 
 /// Parses `format.tsv` text: every key of §4.7.3 plus `time_column`, `p_negzero` (optional, `no`),
@@ -194,6 +335,13 @@ pub fn parse_format(text: &str, path: &str) -> Result<ExportFormat, FixError> {
             || TRADE_KEYS.contains(&k)
             || SUM_KEYS.contains(&k)
             || k == "p_negzero";
+        if let Some((_, now)) = RETIRED.iter().find(|(old, _)| *old == k) {
+            return Err(err(
+                path,
+                ln,
+                format!("retired key `{k}`: now `{now}` (pin:06-trades-columns-recon)"),
+            ));
+        }
         if !known {
             return Err(err(path, ln, format!("unknown key `{k}`")));
         }
@@ -259,6 +407,15 @@ pub fn parse_format(text: &str, path: &str) -> Result<ExportFormat, FixError> {
         "gross" => PnlBasis::Gross,
         _ => return Err(err(path, pl, "pnl_basis is net|gross".into())),
     };
+    let (ov, ol) = need("duration_offset")?;
+    let duration_offset = num("duration_offset", (ov, ol))?;
+    if !(0..=1).contains(&duration_offset) {
+        return Err(err(
+            path,
+            ol,
+            "duration_offset is 0|1 (pin:06-duration-offset-bars)".into(),
+        ));
+    }
     let s = |k: &str| get(k).map_or(String::new(), |(v, _)| v.to_string());
     let has_trades = TRADE_KEYS.iter().any(|k| get(k).is_some());
     if has_trades {
@@ -292,7 +449,7 @@ pub fn parse_format(text: &str, path: &str) -> Result<ExportFormat, FixError> {
         data_window_exported: yes_no("data_window_exported", need("data_window_exported")?)?,
         pnl_basis,
         size_digits: size_digits as u8,
-        duration_offset: num("duration_offset", need("duration_offset")?)?,
+        duration_offset,
         prints_negzero: match get("p_negzero") {
             Some(v) => yes_no("p_negzero", v)?,
             None => false,
@@ -306,8 +463,17 @@ pub fn parse_format(text: &str, path: &str) -> Result<ExportFormat, FixError> {
             qty: s("col_qty"),
             pnl: s("col_pnl"),
             cum_pnl: s("col_cum_pnl"),
-            runup: s("col_runup"),
-            drawdown: s("col_drawdown"),
+            fav_exc: s("col_fav_exc"),
+            adv_exc: s("col_adv_exc"),
+            bars: s("col_bars"),
+            unread: [
+                s("col_size_value"),
+                s("col_return_pct"),
+                s("col_commission"),
+                s("col_fav_exc_pct"),
+                s("col_adv_exc_pct"),
+                s("col_cum_pnl_pct"),
+            ],
             types: [
                 s("type_entry_long"),
                 s("type_entry_short"),

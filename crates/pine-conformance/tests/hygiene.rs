@@ -680,29 +680,13 @@ fn syn_fixtures_read_no_bar_data() {
 /// [`I9_ENGINE_FINDINGS`]; the panicking set must equal that table exactly (a fix shows as a row
 /// leaving it, a new panic as red). `pin:06-hyg-i9-panic-table` — detection only: every fixture is
 /// still run in both dialects and nothing is treated as a pass.
-const I9_ENGINE_FINDINGS: &[(&str, &str, &str)] = &[
-    // 2026-10-17: pine-vm frame.rs:360 "set_f64_arg on an i64 entry" — an int-returning `ta.*bars`
-    // body writes its output through the f64 setter. Owner: pine-std (PVM-4).
-    (
-        "B088",
-        "panic",
-        "pine-std: ta.highestbars(syn, 14) writes an i64 output via set_f64_arg",
-    ),
-    (
-        "B091",
-        "panic",
-        "pine-std: ta.lowestbars(syn, 14) writes an i64 output via set_f64_arg",
-    ),
-    // 2026-10-17: f_F093_val2 = `na(x) ? na : x`, x = (timestamp(2024,2,30) − timestamp(2024,3,1))
-    // / 1000: v6 plots 0.0, v5 plots na while f_F093_isna2 agrees (0). The v5 const-int ÷ const-int
-    // (W1 truncation) path yields an int whose ternary with `na` plots na. Owner: pine-sema
-    // emission (W1, v5) — triage before any twin.
-    (
-        "F093",
-        "diverge",
-        "v5 plots na for a const-int 0 result of W1 truncating division; v6 0.0",
-    ),
-];
+///
+/// Fixed 2026-10-17 (r21), rows retired: B088/B091 (pine-std `bi_extreme` wrote the `int` result
+/// of `ta.highestbars`/`ta.lowestbars` via `set_f64_arg`; now `set_i64_arg`) and F093 (pine-sema
+/// lowering: a v5 W1 `const int / const int` that infer types `int` without folding it —
+/// `timestamp(…)` of literals — widened both operands to f64 and fed them to `I_DIV`; it now stays
+/// in the int lane, truncating, so `na(x) ? na : x` plots 0 in v5 as in v6).
+const I9_ENGINE_FINDINGS: &[(&str, &str, &str)] = &[];
 
 #[test]
 fn dialect_56_fixtures_are_invariant() {

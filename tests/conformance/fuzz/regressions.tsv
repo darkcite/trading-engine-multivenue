@@ -1,4 +1,5 @@
 # fix-fuzz 1 · D12 regressions (impl-06 §4.8.5): grammar TAB seed TAB id TAB bucket; id `-` = an engine-panic finding with no fixture yet (pin:06-regressions-panic-rows)
+# 2026-10-17 r21: seeds 4 (ta.highestbars int output) and 692 (ta.cmo inf−inf pair) FIXED in pine-std; their classes left KNOWN_PANICS, so both rows must now run clean
 grammar	seed	id	bucket
 1	4	-	SemanticBug
 1	692	-	SemanticBug

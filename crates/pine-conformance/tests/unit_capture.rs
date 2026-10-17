@@ -15,7 +15,11 @@ use pine_conformance::capture::{
 use pine_conformance::fixture::{Cell, Dialects, Expect, Fixture, FixtureId, Stamp, Tol};
 use pine_ir::{DiagCode, Dialect, FaultKind};
 
-/// A hand-made `format.tsv` (ours; the values are placeholders until probe-00 / probe-03).
+/// A hand-made `format.tsv` (ours; the values are placeholders until probe-00 / probe-03). The
+/// `col_*` titles are the List of Trades header recon 2026-10-17 read
+/// (`tests/capture/trades-header.recon-2026-10-17.txt`, `pin:06-trades-columns-recon`), the money
+/// columns spelled with `{ccy}` (`pin:06-format-ccy`); `type_*`, `open_signal` and `sum_*` are
+/// still guesses.
 const FORMAT: &str = "\
 # hand-made sample — pin:06-export-columns-verify-in-recon on every title below
 digits\t8
@@ -33,16 +37,23 @@ data_window_exported\tyes
 pnl_basis\tnet
 size_digits\t6
 duration_offset\t0
-col_trade\tTrade #
+col_trade\tTrade number
 col_type\tType
+col_time\tDate and time
 col_signal\tSignal
-col_time\tDate/Time
-col_price\tPrice
-col_qty\tQuantity
-col_pnl\tNet P&L
-col_cum_pnl\tCumulative P&L
-col_runup\tRun-up
-col_drawdown\tDrawdown
+col_price\tPrice {ccy}
+col_qty\tSize (qty)
+col_size_value\tSize (value)
+col_pnl\tNet PnL {ccy}
+col_return_pct\tReturn %
+col_commission\tCommission {ccy}
+col_fav_exc\tFavorable excursion {ccy}
+col_fav_exc_pct\tFavorable excursion %
+col_adv_exc\tAdverse excursion {ccy}
+col_adv_exc_pct\tAdverse excursion %
+col_cum_pnl\tCumulative PnL {ccy}
+col_cum_pnl_pct\tCumulative PnL %
+col_bars\tDuration (bars)
 type_entry_long\tEntry long
 type_entry_short\tEntry short
 type_exit_long\tExit long
@@ -59,8 +70,35 @@ sum_losses\tLosing trades
 ";
 
 fn fmt() -> ExportFormat {
-    parse_format(FORMAT, "format.sample.tsv").expect("sample format")
+    let mut f = parse_format(FORMAT, "format.sample.tsv").expect("sample format");
+    f.resolve_ccy("USDT").expect("ccy");
+    f
 }
+
+/// The recon header (BOM included) as read off the test-data file.
+fn recon_header() -> Vec<u8> {
+    std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/capture/trades-header.recon-2026-10-17.txt"),
+    )
+    .expect("recon header test data")
+}
+
+/// The recon header followed by `rows` (LF-terminated records).
+fn trades_export(header: &[u8], rows: &str) -> Vec<u8> {
+    let mut b = header.to_vec();
+    b.extend_from_slice(rows.as_bytes());
+    b
+}
+
+/// Hand-made List of Trades rows under the recon header's 17 columns: trade 1 closed long (exit
+/// record first), trade 2 an open short.
+const RECON_ROWS: &str = "\
+1,Exit long,2026-01-01T03:00Z,X,60200,0.5,30100,38.25,0.13,0,40.00,0.13,-5.50,-0.02,38.25,0.04,3
+1,Entry long,2026-01-01T00:00Z,L,60123.5,0.5,30061.75,38.25,0.13,0,40.00,0.13,-5.50,-0.02,38.25,0.04,3
+2,Entry short,2026-01-01T04:00Z,S,60300,1,60300,,,,,,,,,,
+2,Exit short,2026-01-01T05:00Z,Open,60250,1,60250,50.00,0.08,0,51.00,0.08,0,0,88.25,0.09,1
+";
 
 fn stamp(d: Dialect) -> CaptureStamp {
     CaptureStamp {
@@ -161,13 +199,10 @@ fn capture_parses_every_export_shape() {
     // A malformed value or a short row is refused.
     assert!(parse_chart_csv(b"time,f_A001_val\n2026-01-01T00:00Z,1,000\n", &f).is_err());
     assert!(parse_chart_csv(b"time,f_A001_val\n2026-01-01T00:00Z,abc\n", &f).is_err());
-    // List of Trades: a closed long, then an open short (exit row signal `Open`).
-    let trades =
-        "Trade #,Type,Signal,Date/Time,Price,Quantity,Net P&L,Cumulative P&L,Run-up,Drawdown\n\
-                  1,Entry long,L,2026-01-01T00:00Z,60123.5,0.5,,,,\n\
-                  1,Exit long,X,2026-01-01T03:00Z,60200,0.5,38.25,38.25,40.00,-5.50\n\
-                  2,Entry short,S,2026-01-01T04:00Z,60300,1,,,,\n\
-                  2,Exit short,Open,2026-01-01T05:00Z,60250,1,50.00,88.25,51.00,0\n";
+    // List of Trades: a closed long, then an open short (exit row signal `Open`); no BOM here.
+    let header = recon_header();
+    let plain = std::str::from_utf8(&header[3..]).unwrap();
+    let trades = format!("{plain}{RECON_ROWS}");
     let t = parse_trades_csv(trades.as_bytes(), &f).unwrap();
     assert_eq!(t.len(), 2);
     assert!(t[0].long && !t[1].long);
@@ -177,11 +212,11 @@ fn capture_parses_every_export_shape() {
     assert_eq!(t[0].qty.render(), "0.5");
     assert!(t[1].exit.is_none() && t[1].pnl.is_none());
     assert_eq!(t[1].runup.unwrap().render(), "51.00");
-    // A renamed column (the Premium UI) is named in the error.
-    let renamed = trades.replace("Net P&L", "Profit");
+    // A renamed column (the Premium UI) is named in the error, with its key.
+    let renamed = trades.replace("Net PnL USDT", "Profit USDT");
     let err = parse_trades_csv(renamed.as_bytes(), &f).unwrap_err();
     assert!(
-        err.contains("Net P&L") && err.contains("verify-in-recon"),
+        err.contains("`Net PnL USDT` (col_pnl)") && err.contains("verify-in-recon"),
         "{err}"
     );
     // Performance Summary (the offline CSV rendition of the report).
@@ -198,6 +233,123 @@ fn capture_parses_every_export_shape() {
         "f"
     )
     .is_err());
+}
+
+/// recon 2026-10-17: the List of Trades header as TradingView Premium writes it (UTF-8 BOM, comma,
+/// 17 columns) parses; the excursions land in `runup` / `drawdown`, the duration in `bars`.
+#[test]
+fn capture_trades_recon_header_parses() {
+    let header = recon_header();
+    assert_eq!(&header[..3], b"\xef\xbb\xbf", "the test data keeps the BOM");
+    let f = fmt();
+    let t = parse_trades_csv(&trades_export(&header, RECON_ROWS), &f).unwrap();
+    assert_eq!(t.len(), 2);
+    // Trade 1's exit record precedes its entry (pin:06-trades-row-order).
+    assert_eq!(t[0].entry_ms, 1_767_225_600_000);
+    assert_eq!(t[0].entry_px.render(), "60123.5");
+    let x = t[0].exit.as_ref().unwrap();
+    assert_eq!(
+        (x.ms - t[0].entry_ms, x.px.render()),
+        (3 * 3_600_000, "60200".into())
+    );
+    assert_eq!(t[0].runup.unwrap().render(), "40.00");
+    assert_eq!(t[0].drawdown.unwrap().render(), "-5.50");
+    assert_eq!(t[0].cum_pnl.unwrap().render(), "38.25");
+    assert_eq!(t[0].bars, Some(3));
+    // The open trade carries its excursions but no P&L and no duration.
+    assert!(t[1].exit.is_none() && t[1].bars.is_none());
+    assert_eq!(t[1].drawdown.unwrap().render(), "0");
+    // pin:06-duration-offset-bars — `+ 1` convention: printed 3 is 2 bars.
+    let g = parse_format(
+        &FORMAT.replace("duration_offset\t0", "duration_offset\t1"),
+        "g",
+    );
+    let mut g = g.unwrap();
+    g.resolve_ccy("USDT").unwrap();
+    let t1 = parse_trades_csv(&trades_export(&header, RECON_ROWS), &g).unwrap();
+    assert_eq!((t1[0].bars, t1[0].entry_ms), (Some(2), t[0].entry_ms));
+    assert!(parse_format(
+        &FORMAT.replace("duration_offset\t0", "duration_offset\t60000"),
+        "h"
+    )
+    .is_err());
+    // A second exit of one trade, or an exit without an entry, is refused.
+    let twice = format!("{RECON_ROWS}1,Exit long,2026-01-01T03:00Z,X,60200,0.5,,,,,,,,,,,3\n");
+    let err = parse_trades_csv(&trades_export(&header, &twice), &f).unwrap_err();
+    assert!(err.contains("exited twice"), "{err}");
+    let orphan = "3,Exit long,2026-01-01T03:00Z,X,60200,0.5,,,,,,,,,,,3\n";
+    assert!(parse_trades_csv(&trades_export(&header, orphan), &f).is_err());
+}
+
+/// A column `format.tsv` names but the export lacks is an error naming the title and its key —
+/// also for a column no `.fix` field reads.
+#[test]
+fn capture_trades_missing_column_is_named() {
+    let header = recon_header();
+    let text = std::str::from_utf8(&header).unwrap();
+    for (title, key) in [
+        ("Commission USDT", "col_commission"),
+        ("Duration (bars)", "col_bars"),
+        ("Adverse excursion USDT", "col_adv_exc"),
+    ] {
+        let cut = text
+            .replace(&format!(",{title},"), ",")
+            .replace(&format!(",{title}\n"), "\n");
+        assert_ne!(cut, text, "{title} is in the recon header");
+        let err = parse_trades_csv(cut.as_bytes(), &fmt()).unwrap_err();
+        assert!(err.contains(&format!("`{title}` ({key})")), "{err}");
+    }
+    // The guessed keys are retired, their successors named.
+    let old = FORMAT.replace("col_fav_exc\t", "col_runup\t");
+    let e = parse_format(&old, "f").unwrap_err().to_string();
+    assert!(e.contains("col_runup") && e.contains("col_fav_exc"), "{e}");
+    let old = FORMAT.replace("col_adv_exc\t", "col_drawdown\t");
+    let e = parse_format(&old, "f").unwrap_err().to_string();
+    assert!(
+        e.contains("col_drawdown") && e.contains("col_adv_exc"),
+        "{e}"
+    );
+}
+
+/// pin:06-format-ccy — `{ccy}` in a `col_*` title is the symbol currency: unresolved it refuses,
+/// `resolve_ccy` substitutes, `load_format` resolves it from `syminfo.tsv`.
+#[test]
+fn capture_format_ccy_substitution() {
+    let header = recon_header();
+    let raw = parse_format(FORMAT, "f").unwrap();
+    assert!(raw.has_ccy());
+    assert_eq!(raw.trades.price, "Price {ccy}");
+    let err = parse_trades_csv(&trades_export(&header, RECON_ROWS), &raw).unwrap_err();
+    assert!(err.contains("{ccy}"), "{err}");
+    let f = fmt();
+    assert!(!f.has_ccy());
+    assert_eq!(f.trades.price, "Price USDT");
+    assert_eq!(f.trades.fav_exc, "Favorable excursion USDT");
+    assert_eq!(
+        f.trades.qty, "Size (qty)",
+        "a title without {{ccy}} is untouched"
+    );
+    // Another currency names other titles: the USDT export then lacks them.
+    let mut usd = raw.clone();
+    usd.resolve_ccy("USD").unwrap();
+    let err = parse_trades_csv(&trades_export(&header, RECON_ROWS), &usd).unwrap_err();
+    assert!(err.contains("`Price USD` (col_price)"), "{err}");
+    assert!(raw.clone().resolve_ccy("").is_err());
+    // load_format reads syminfo.tsv only when a title spells {ccy}.
+    let root = std::env::temp_dir().join(format!("pine-conf-ccy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("tests/conformance/capture")).unwrap();
+    std::fs::write(root.join("tests/conformance/capture/format.tsv"), FORMAT).unwrap();
+    let e = pine_conformance::capture::load_format(&root).unwrap_err();
+    assert!(e.to_string().contains("syminfo.tsv"), "{e}");
+    let si = "mintick_1e6\t100000\npointvalue_1e6\t1000000\nticker\tBTCUSDT.P\n\
+              basecurrency\tBTC\ncurrency\tUSDT\ntype\tcrypto\nvenue\t1\nday_offset_s\t0\n";
+    std::fs::write(root.join("tests/conformance/syminfo.tsv"), si).unwrap();
+    let loaded = pine_conformance::capture::load_format(&root).unwrap();
+    assert_eq!(loaded, f);
+    let t = parse_trades_csv(&trades_export(&header, RECON_ROWS), &loaded).unwrap();
+    assert_eq!(t.len(), 2);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
