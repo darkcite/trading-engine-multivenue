@@ -9,7 +9,10 @@
 //! [`PM15_LOOKAHEAD`] are known: an unknown one is fetched by slug
 //! ([`crate::gamma15`]), checked under the venue law, and handed to the
 //! ingress thread as a [`PmWindowSpec`] over the spec ring. Each window is
-//! handed over once.
+//! handed over once — and, PM15-5b, the CURRENT window once more when the
+//! venue publishes its strike (`eventMetadata.priceToBeat`, ≈ 116 s after
+//! the open: re-read from [`STRIKE_AFTER_OPEN_NS`] every
+//! [`RETRY_STRIKE_NS`] until it is there).
 //!
 //! Failures retry: a fetch that failed (transport, a status other than
 //! 200, an empty answer — the market not listed yet) after
@@ -28,7 +31,7 @@ use std::sync::Arc;
 use core_net::{HttpsReq, Method};
 use core_ring::Producer;
 use core_time::{now_ns, WallAnchor};
-use core_types::pm_roll::{pm_window_at, PM_ROLLING_MAX};
+use core_types::pm_roll::{pm_window_at, pm_window_open_ns, PM_ROLLING_MAX};
 
 use crate::gamma15::{parse_window_spec, render_slug, PmLawErr, PmWindowSpec, PM_ASSET_MAX};
 use crate::pm15_loop::{Pm15Counter, Pm15Counters, PM15_SPEC_RING};
@@ -43,6 +46,12 @@ pub const PASS_NS: u64 = 2_000_000_000;
 pub const RETRY_FETCH_NS: u64 = 10_000_000_000;
 /// Retry after a venue-law refusal, ns.
 pub const RETRY_LAW_NS: u64 = 60_000_000_000;
+/// PM15-5b: a current window's published strike is looked for from this
+/// long after its open (the previous window resolves ≈ 116 s after its
+/// end), ns.
+pub const STRIKE_AFTER_OPEN_NS: u64 = 110_000_000_000;
+/// PM15-5b: until it is published, the strike is re-read this often, ns.
+pub const RETRY_STRIKE_NS: u64 = 10_000_000_000;
 /// Spacing between two fetches of one pass, ns (Gamma's pacing).
 const FETCH_GAP_NS: u64 = 150_000_000;
 /// The answer window (a window's event is ≈ 7 KiB).
@@ -75,6 +84,10 @@ pub struct Pm15Discovery {
     /// The window whose retry is scheduled per cell, and when.
     retry_win: [[u32; MEMO]; PM_ROLLING_MAX],
     retry_at: [[u64; MEMO]; PM_ROLLING_MAX],
+    /// PM15-5b: the window whose published strike was handed over per
+    /// cell (0 = none), and when its next re-read is due.
+    struck: [[u32; MEMO]; PM_ROLLING_MAX],
+    strike_at: [[u64; MEMO]; PM_ROLLING_MAX],
     target: [u8; 96],
 }
 
@@ -107,6 +120,8 @@ impl Pm15Discovery {
             found: [[0; MEMO]; PM_ROLLING_MAX],
             retry_win: [[0; MEMO]; PM_ROLLING_MAX],
             retry_at: [[0; MEMO]; PM_ROLLING_MAX],
+            struck: [[0; MEMO]; PM_ROLLING_MAX],
+            strike_at: [[0; MEMO]; PM_ROLLING_MAX],
             target: [0; 96],
         };
         let mut f = 0usize;
@@ -153,7 +168,9 @@ impl Pm15Discovery {
             return Err(FetchErr::Fetch);
         }
         let asset = &self.asset[f][..asset_len];
-        parse_window_spec(body, f, asset, window, out).map_err(FetchErr::Law)
+        parse_window_spec(body, f, asset, window, out).map_err(FetchErr::Law)?;
+        out.strike_1e6 = crate::gamma15::parse_price_to_beat(body);
+        Ok(())
     }
 
     /// One pass at wall time `wall_ns` (engine clock `now`): look up every
@@ -177,6 +194,27 @@ impl Pm15Discovery {
                 d += 1;
                 let cell = (w as usize) % MEMO;
                 if self.found[f][cell] == w {
+                    // PM15-5b: the current window, handed over without its
+                    // strike — re-read it once the venue can have published.
+                    let now = now_ns();
+                    if w != cur
+                        || self.struck[f][cell] == w
+                        || wall_ns < pm_window_open_ns(w).saturating_add(STRIKE_AFTER_OPEN_NS)
+                        || now < self.strike_at[f][cell]
+                    {
+                        continue;
+                    }
+                    let mut spec = PmWindowSpec::EMPTY;
+                    if self.fetch(f, w, &mut spec).is_ok() && spec.strike_1e6 > 0 {
+                        if prod.try_push_ref(&spec) {
+                            self.struck[f][cell] = w;
+                        } else {
+                            counters.inc(Pm15Counter::DiscoveryRingFull);
+                        }
+                    } else {
+                        self.strike_at[f][cell] = now.saturating_add(RETRY_STRIKE_NS);
+                    }
+                    sleep_unless_stopped(FETCH_GAP_NS, stop);
                     continue;
                 }
                 let now = now_ns();
@@ -188,6 +226,9 @@ impl Pm15Discovery {
                     Ok(()) => {
                         if prod.try_push_ref(&spec) {
                             self.found[f][cell] = w;
+                            if spec.strike_1e6 > 0 {
+                                self.struck[f][cell] = w;
+                            }
                             counters.inc(Pm15Counter::DiscoveryOk);
                         } else {
                             counters.inc(Pm15Counter::DiscoveryRingFull);

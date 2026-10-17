@@ -1511,8 +1511,11 @@ pub struct Pm15Counters {
     pub hold_mark: u64,
     /// Pricer holds: an observed second with no report.
     pub hold_observed: u64,
-    /// Pricer holds: shape (no strike, past the end, out of range).
+    /// Pricer holds: shape (past the end, out of range).
     pub hold_shape: u64,
+    /// PM15-5b: evaluations of a market with no strike — it opened before
+    /// the boot's reports and the venue has not published `priceToBeat`.
+    pub hold_strike: u64,
     /// Entries skipped: the belief under `p_min`.
     pub skip_belief: u64,
     /// Entries skipped: the belief held, not yet on `persist` seconds.
@@ -1560,7 +1563,7 @@ pub struct Pm15Counters {
 
 /// How many cumulative tallies [`Pm15Counters`] carries (its fields from
 /// `rolls` through `settled_unknown`, in order).
-pub const PM15_TALLIES: usize = 28;
+pub const PM15_TALLIES: usize = 29;
 
 /// The metric suffix of each tally, in [`Pm15Counters::tallies`] order.
 pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
@@ -1577,6 +1580,7 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
     "hold_mark",
     "hold_observed",
     "hold_shape",
+    "hold_strike",
     "skip_belief",
     "skip_persist",
     "skip_book",
@@ -1612,6 +1616,7 @@ impl Pm15Counters {
             self.hold_mark,
             self.hold_observed,
             self.hold_shape,
+            self.hold_strike,
             self.skip_belief,
             self.skip_persist,
             self.skip_book,

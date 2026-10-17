@@ -128,6 +128,9 @@ pub enum PmAction {
     Subscribe(u8),
     /// The slot's window opened: CREATED, the order law, the touches.
     Created(u8),
+    /// PM15-5b: slot `.0`'s window got its published strike — a repeat
+    /// CREATED carrying it (`v0`).
+    Strike(u8),
     /// A window settled (`v0` = `winner`); the slot is already free.
     Settled {
         /// The slot it held.
@@ -198,6 +201,8 @@ pub enum PmOffer {
     Pending,
     /// Already bound or pending.
     Duplicate,
+    /// PM15-5b: already bound, and this copy brought its published strike.
+    Strike,
     /// Over, or older than what the slot holds.
     Stale,
     /// No such family.
@@ -381,6 +386,15 @@ impl PmFamilies {
             return PmOffer::Bound;
         }
         if held.spec.window == spec.window {
+            if spec.strike_1e6 > 0 && held.spec.strike_1e6 == 0 {
+                // Not open yet: its CREATED will carry the strike.
+                let open = held.state != PmSlotState::Bound;
+                self.slot[s].spec.strike_1e6 = spec.strike_1e6;
+                if open {
+                    acts.push(PmAction::Strike(s as u8));
+                }
+                return PmOffer::Strike;
+            }
             return PmOffer::Duplicate;
         }
         if held.spec.window > spec.window {
@@ -388,6 +402,10 @@ impl PmFamilies {
         }
         if self.has_pending[s] {
             if self.pending[s].window == spec.window {
+                if spec.strike_1e6 > 0 && self.pending[s].strike_1e6 == 0 {
+                    // Bound later with its strike: the CREATED carries it.
+                    self.pending[s].strike_1e6 = spec.strike_1e6;
+                }
                 return PmOffer::Duplicate;
             }
             if self.pending[s].window > spec.window {
@@ -539,6 +557,37 @@ mod tests {
         let v = a.as_slice().to_vec();
         a.clear();
         v
+    }
+
+    /// PM15-5b: the venue's published strike reaches a bound window once —
+    /// as a repeat CREATED when it is open, on the CREATED itself when not.
+    #[test]
+    fn a_published_strike_is_handed_over_once() {
+        let w = pm_window_of_open(OPEN).unwrap();
+        let mut f = fams();
+        let mut a = PmActions::new();
+        let sp = spec(0, w, b"111111111111111111", b"222222222222222222");
+        let s = pm_roll_family(0, pm_pair_of_window(w));
+        assert_eq!(f.offer(&sp, (OPEN - 600) * S, &mut a), PmOffer::Bound);
+        take(&mut a);
+        // Before the open: kept, no action (the CREATED will carry it).
+        let mut struck = sp;
+        struck.strike_1e6 = 81_465_829_520;
+        assert_eq!(f.offer(&struck, (OPEN - 300) * S, &mut a), PmOffer::Strike);
+        assert!(a.as_slice().is_empty());
+        assert_eq!(f.slot(s).spec.strike_1e6, 81_465_829_520);
+        assert_eq!(f.offer(&struck, (OPEN - 200) * S, &mut a), PmOffer::Duplicate);
+        // A second window, open: the strike is a repeat CREATED.
+        let mut g = fams();
+        assert_eq!(g.offer(&sp, (OPEN + 10) * S, &mut a), PmOffer::Bound);
+        g.on_clock((OPEN + 10) * S, &mut a);
+        assert!(take(&mut a).contains(&PmAction::Created(s as u8)));
+        assert_eq!(g.offer(&struck, (OPEN + 130) * S, &mut a), PmOffer::Strike);
+        assert_eq!(take(&mut a), vec![PmAction::Strike(s as u8)]);
+        assert_eq!(g.offer(&struck, (OPEN + 140) * S, &mut a), PmOffer::Duplicate);
+        assert!(a.as_slice().is_empty());
+        // A zero strike changes nothing.
+        assert_eq!(g.offer(&sp, (OPEN + 150) * S, &mut a), PmOffer::Duplicate);
     }
 
     #[test]

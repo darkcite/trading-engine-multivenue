@@ -586,7 +586,7 @@ impl Pm15Strategy {
             return;
         }
         if m.strike_src == 0 {
-            self.counters.hold_shape += 1;
+            self.counters.hold_strike += 1;
             return;
         }
         let fair = match report_fair(

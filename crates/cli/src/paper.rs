@@ -9506,8 +9506,9 @@ pub struct Pm15MetricIds {
     pub gauges: [GaugeId; PM15_METRICS],
 }
 
-/// Size of the PM15 family: the tallies and the bound-slot gauge.
-pub const PM15_METRICS: usize = ingress_polymarket::pm15_loop::PM15_COUNTERS + 1;
+/// Size of the PM15 family: the tallies, the bound-slot gauge, and (PM15-5b)
+/// the two sockets' last failure (`core_net::WsErr` + 1; 0 = none yet).
+pub const PM15_METRICS: usize = ingress_polymarket::pm15_loop::PM15_COUNTERS + 3;
 
 /// Register the PM15 family (boot-only; the names are rendered once).
 fn register_pm15_metrics(reg: &mut MetricsRegistry) -> Result<Pm15MetricIds, &'static str> {
@@ -9526,6 +9527,12 @@ fn register_pm15_metrics(reg: &mut MetricsRegistry) -> Result<Pm15MetricIds, &'s
     gauges[i] = reg
         .register_gauge("engine_ingress_pm15_slots_bound")
         .map_err(|_| "register pm15 gauge")?;
+    gauges[i + 1] = reg
+        .register_gauge("engine_ingress_pm15_last_market_err")
+        .map_err(|_| "register pm15 gauge")?;
+    gauges[i + 2] = reg
+        .register_gauge("engine_ingress_pm15_last_rtds_err")
+        .map_err(|_| "register pm15 gauge")?;
     Ok(Pm15MetricIds { gauges })
 }
 
@@ -9539,6 +9546,14 @@ pub fn pm15_metric_values(c: &ingress_polymarket::pm15_loop::Pm15Counters) -> [u
         i += 1;
     }
     v[i] = c.slots_bound();
+    let mut k = 0usize;
+    while k < 2 {
+        v[i + 1 + k] = match c.last_ws_err(k) {
+            Some(e) => u64::from(e) + 1,
+            None => 0,
+        };
+        k += 1;
+    }
     v
 }
 

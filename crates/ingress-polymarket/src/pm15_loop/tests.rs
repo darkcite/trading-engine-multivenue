@@ -156,6 +156,41 @@ fn final_touch(p: &[u8], id: &[u8]) -> Option<(i64, i64)> {
     got
 }
 
+/// PM15-5b: the venue's published strike, offered after the window's
+/// CREATED, re-emits CREATED once with `v0` = the strike; a strike known
+/// at the bind rides the first CREATED.
+#[test]
+fn a_published_strike_re_emits_created_once() {
+    let spec = btc_spec();
+    let w = spec.window;
+    let inst = pm_instance_id(w, 0).unwrap();
+    let s = pm_roll_family(0, pm_pair_of_window(w));
+    let mut rig = Rig::new();
+    let mut wire = Wire::default();
+    let mut d = Pm15Driver::new(&[b"btc"], 5_000);
+    let t = (OPEN + 130) * 1_000_000_000;
+    d.offer(&spec, t, t, &mut rig.out(), &mut wire);
+    let ev = rig.lane_events();
+    assert_eq!((ev[0].v0, roll_kind(ev[0].venue_seq)), (0, ROLL_KIND_CREATED));
+    let mut struck = spec;
+    struck.strike_1e6 = 81_465_829_520;
+    d.offer(&struck, t + 1, t + 1, &mut rig.out(), &mut wire);
+    let ev = rig.lane_events();
+    assert_eq!(ev.len(), 1, "the repeat CREATED alone");
+    assert_eq!(roll_kind(ev[0].venue_seq), ROLL_KIND_CREATED);
+    assert_eq!(unpack_roll_seq(ev[0].venue_seq), (inst, PM_TWAP_S, s, false));
+    assert_eq!((ev[0].v0, ev[0].v1), (81_465_829_520, pm_window_end_ns(w) as i64));
+    d.offer(&struck, t + 2, t + 2, &mut rig.out(), &mut wire);
+    assert!(rig.lane_events().is_empty(), "once");
+    assert_eq!(rig.counters.get(Pm15Counter::StrikesPublished as usize), 1);
+
+    // Known at the bind: the first CREATED carries it.
+    let mut rig2 = Rig::new();
+    let mut d2 = Pm15Driver::new(&[b"btc"], 5_000);
+    d2.offer(&struck, t, t, &mut rig2.out(), &mut wire);
+    assert_eq!(rig2.lane_events()[0].v0, 81_465_829_520);
+}
+
 #[test]
 fn the_live_window_replays_into_ticks_rolls_and_its_settlement() {
     let spec = btc_spec();

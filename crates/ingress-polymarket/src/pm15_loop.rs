@@ -99,6 +99,8 @@ pub enum Pm15Counter {
     SpecsPending,
     /// A window offered again.
     SpecsDuplicate,
+    /// PM15-5b: a bound window's published strike, re-emitted on CREATED.
+    StrikesPublished,
     /// A window offered too late (over, or older than its slot's).
     SpecsStale,
     /// A window for a family that does not exist.
@@ -153,6 +155,7 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_COUNTERS] = [
     "specs_bound",
     "specs_pending",
     "specs_duplicate",
+    "strikes_published",
     "specs_stale",
     "specs_refused",
     "rolls_created",
@@ -415,6 +418,7 @@ impl Pm15Driver {
             PmOffer::Bound => Pm15Counter::SpecsBound,
             PmOffer::Pending => Pm15Counter::SpecsPending,
             PmOffer::Duplicate => Pm15Counter::SpecsDuplicate,
+            PmOffer::Strike => Pm15Counter::StrikesPublished,
             PmOffer::Stale => Pm15Counter::SpecsStale,
             PmOffer::Refused => Pm15Counter::SpecsRefused,
         };
@@ -598,6 +602,13 @@ impl Pm15Driver {
                     }
                 }
                 PmAction::Created(s) => self.created(s as usize, ts_ns, out),
+                PmAction::Strike(s) => {
+                    // A repeat CREATED carrying the strike: the ledger
+                    // treats a repeat as a no-op, the member takes `v0`.
+                    let s = s as usize;
+                    let ev = self.created_event(s, ts_ns);
+                    emit_event(&ev, out);
+                }
                 PmAction::Settled {
                     slot,
                     instance,
@@ -632,20 +643,26 @@ impl Pm15Driver {
             .store(self.bound() as u64, Ordering::Relaxed);
     }
 
-    /// CREATED, the two legs' order law, and the touches as they stand.
-    fn created<C: Capture>(&mut self, s: usize, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
-        let (instance, window) = (self.fams.slot(s).instance, self.fams.slot(s).spec.window);
+    /// Slot `s`'s CREATED: `v0` the published strike ×1e6 (0 until the
+    /// venue publishes it), `v1` the window's end ns.
+    fn created_event(&self, s: usize, ts_ns: NsTs) -> ChannelEvent {
+        let b = self.fams.slot(s);
         let (f, pair) = (s / PM_PAIRS, s % PM_PAIRS);
-        let ev = ChannelEvent::new(
+        ChannelEvent::new(
             ts_ns,
             VenueId::Polymarket,
             ChannelId::InstrumentRoll,
             pm_rolling_sym(f, pair, PM_LEG_UP),
-            pack_roll_seq(instance, PM_TWAP_S, s, false),
+            pack_roll_seq(b.instance, PM_TWAP_S, s, false),
             0,
-            0,
-            pm_window_end_ns(window) as i64,
-        );
+            b.spec.strike_1e6,
+            pm_window_end_ns(b.spec.window) as i64,
+        )
+    }
+
+    /// CREATED, the two legs' order law, and the touches as they stand.
+    fn created<C: Capture>(&mut self, s: usize, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
+        let ev = self.created_event(s, ts_ns);
         emit_event(&ev, out);
         out.counters.inc(Pm15Counter::RollsCreated);
         let mut leg = 0u32;
