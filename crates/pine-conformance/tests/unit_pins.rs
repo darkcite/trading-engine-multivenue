@@ -55,11 +55,16 @@ fn every_pin_has_fixtures() {
             );
         }
     }
-    // Before capture every decision is pending.
+    // Before capture every decision is pending: the generator's pre-capture view, not the disk (a
+    // working tree after a capture round holds captured fixtures).
+    let pre: Vec<Fixture> = pine_conformance::gen::generate()
+        .into_iter()
+        .map(|g| g.fix)
+        .collect();
     for p in PINS {
-        assert_eq!(pins::decide(p, &fx), Decision::Pending, "{}", p.name);
+        assert_eq!(pins::decide(p, &pre), Decision::Pending, "{}", p.name);
     }
-    let tsv = pins::tsv(&fx);
+    let tsv = pins::tsv(&pre);
     assert_eq!(tsv.lines().count(), 93);
     assert!(tsv
         .lines()

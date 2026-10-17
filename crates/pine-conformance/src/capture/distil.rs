@@ -128,6 +128,15 @@ fn head_tail(id: FixtureId, w: Window, n: usize, what: &str) -> Result<(usize, u
     Ok(if head { (0, k) } else { (n - k, n) })
 }
 
+/// Whether `f` declares both realtime flag plots (`f_<ID>_rt`, `f_<ID>_done`).
+fn has_rt_flags(f: &Fixture) -> bool {
+    let want = |s: &str| {
+        let t = format!("f_{}_{s}", f.id.as_str());
+        f.plots.iter().any(|p| p.title == t)
+    };
+    want("rt") && want("done")
+}
+
 /// The export column of `f`'s plot titled `f_<ID>_<suffix>`, or `Err` naming the fixture.
 fn rt_col(f: &Fixture, cols: &[usize], suffix: &str) -> Result<usize, String> {
     let title = format!("f_{}_{suffix}", f.id.as_str());
@@ -157,7 +166,10 @@ fn rt_col(f: &Fixture, cols: &[usize], suffix: &str) -> Result<usize, String> {
 ///   both 1 are eligible (the open realtime bar has `done = 0` and drops out with them); `tail n`
 ///   selects among them; the keys are `bars−n..bars` with `bars = history + realtime` of the `rt`
 ///   line — the rows `run.rs` steps for an `Rt` drive (§4.1.6), whose last `realtime` rows are the
-///   realtime bars.
+///   realtime bars. A `driver rt` fixture without the two flag plots (`pin:06-distil-rt-noflags`,
+///   C045 and E106) is selected by position instead: with `open` on its `rt` line the export's last
+///   rows including the open bar are the compared bars (`n ≤ bars`), without it the open last row is
+///   dropped and the last confirmed rows are (`n ≤ realtime`); the keys are `bars−n..bars`.
 ///
 /// `pin:06-distil-rt-rows` — the rt rule applies to `driver rt` fixtures (the live session of
 /// §4.7.8); a `mode realtime` fixture on another driver (E016–E032, E105: on-tick / on-fill
@@ -176,6 +188,49 @@ fn select(
     if f.driver == Driver::Rt {
         let rt =
             f.rt.ok_or_else(|| format!("{}: driver rt without an `rt` line", id.as_str()))?;
+        let total = rt.history + rt.realtime;
+        if !has_rt_flags(f) {
+            // pin:06-distil-rt-noflags — C045 (`rt … open`) and E106 carry no rt / done plot. The
+            // §4.7.8 procedure fixes which rows are compared: an `open` fixture is exported before
+            // its first realtime bar closes, so its last `n` rows are the history tail plus the open
+            // realtime bar (kept, keys `total−n..total`); any other is exported after at least
+            // `realtime` realtime bars closed, so the open last row is dropped and the last `n`
+            // confirmed rows are its realtime bars. The export itself cannot prove either.
+            let k = match f.window {
+                Window::Tail(k) if (rt.open && k <= total) || (!rt.open && k <= rt.realtime) => k,
+                _ => {
+                    return Err(format!(
+                        "{}: a driver-rt fixture without rt / done plots compares `tail n` with \
+                         n ≤ {} (pin:06-distil-rt-noflags)",
+                        id.as_str(),
+                        if rt.open { total } else { rt.realtime }
+                    ))
+                }
+            };
+            let n = if rt.open {
+                rows.len()
+            } else {
+                rows.len().checked_sub(1).ok_or_else(|| {
+                    format!(
+                        "{}: an empty export (no open realtime bar to drop)",
+                        id.as_str()
+                    )
+                })?
+            };
+            let (lo, hi) = head_tail(id, f.window, n, "row(s)")?;
+            let first = i64::from(total) - i64::from(k);
+            for (j, i) in (lo..hi).enumerate() {
+                picked.push((i, first + j as i64));
+            }
+            let out = picked
+                .iter()
+                .map(|&(i, key)| Row {
+                    key,
+                    cells: cols.iter().map(|c| rows[i].1[*c].clone()).collect(),
+                })
+                .collect();
+            return Ok((out, Some(total)));
+        }
         let (c_rt, c_done) = (rt_col(f, cols, "rt")?, rt_col(f, cols, "done")?);
         let k = match f.window {
             Window::Tail(k) if k <= rt.realtime => k,
@@ -197,7 +252,6 @@ fn select(
             elig.len(),
             "realtime row(s) with rt = done = 1",
         )?;
-        let total = rt.history + rt.realtime;
         let first = i64::from(total) - i64::from(k);
         for (j, &i) in elig[lo..hi].iter().enumerate() {
             picked.push((i, first + j as i64));

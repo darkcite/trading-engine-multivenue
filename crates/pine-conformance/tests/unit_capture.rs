@@ -115,16 +115,21 @@ fn real_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// A private tree holding copies of `ids`' tracked `.fix` files.
+/// A private tree holding `ids`' `.fix` files as the generator owns them (pre-capture), so a working
+/// tree with captured fixtures (after a capture round) does not change what these tests distil.
 fn tree(name: &str, ids: &[&str]) -> PathBuf {
+    static GEN: std::sync::OnceLock<Vec<pine_conformance::gen::Generated>> =
+        std::sync::OnceLock::new();
+    let gen = GEN.get_or_init(pine_conformance::gen::generate);
     let t = std::env::temp_dir().join(format!("pine-conf-capture-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&t);
     for id in ids {
         let g = &id[..1];
         let dir = t.join("tests/conformance/fixtures").join(g);
         std::fs::create_dir_all(&dir).unwrap();
-        let src = real_root().join(format!("tests/conformance/fixtures/{g}/{id}.fix"));
-        std::fs::copy(src, dir.join(format!("{id}.fix"))).unwrap();
+        let fid = FixtureId::parse(id).unwrap();
+        let src = gen.iter().find(|x| x.fix.id == fid).unwrap();
+        std::fs::write(dir.join(format!("{id}.fix")), src.fix.render()).unwrap();
     }
     std::fs::create_dir_all(t.join("tests/conformance/sheets/v6")).unwrap();
     t
@@ -871,13 +876,15 @@ fn capture_distil_rt_keeps_confirmed_realtime_rows() {
         err.contains("C039") && err.contains("rt = done = 1"),
         "{err}"
     );
-    // C045 (`rt … open`) carries no rt / done plot: refused, named.
+    // C045 (`rt … open`) carries no rt / done plot (pin:06-distil-rt-noflags): its last 65 rows,
+    // the open realtime bar included, keyed 0..65 (history 64 + realtime 1).
     let c45 = "f_C045_isconfirmed,f_C045_islast,f_C045_isnew,f_C045_isrealtime,f_C045_ishistory,\
                f_C045_isfirst,f_C045_islch";
-    let rows45: Vec<(i64, String)> = (0..70)
-        .map(|i| (t(i), "0,0,0,0,1,0,0".to_string()))
+    let mut rows45: Vec<(i64, String)> = (0..69)
+        .map(|i| (t(i), "1,0,1,0,1,0,0".to_string()))
         .collect();
-    let err = distil(
+    rows45.push((t(69), "0,1,0,1,0,0,0".to_string()));
+    distil(
         &sheet,
         &export_ms(c45, &rows45),
         None,
@@ -885,8 +892,58 @@ fn capture_distil_rt_keeps_confirmed_realtime_rows() {
         &stamp(Dialect::V6),
         false,
     )
+    .unwrap();
+    let f = load(&root, "C045");
+    assert_eq!(f.bars, Some(65));
+    let r = series(&f);
+    assert_eq!(r.len(), 65);
+    assert_eq!((r[0].key, r[64].key), (0, 64));
+    assert_eq!((text(&r[64], 0), text(&r[64], 3)), ("0", "1"));
+    assert_eq!((text(&r[63], 0), text(&r[63], 3)), ("1", "0"));
+    // Too few rows for the window.
+    let err = distil(
+        &sheet,
+        &export_ms(c45, &rows45[..40]),
+        None,
+        None,
+        &stamp(Dialect::V6),
+        false,
+    )
     .unwrap_err();
-    assert!(err.contains("C045") && err.contains("f_C045_rt"), "{err}");
+    assert!(err.contains("C045"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// pin:06-distil-rt-noflags — E106 (driver rt, no rt / done plot, not `open`): the open last row is
+/// dropped and the last `n` confirmed rows (the realtime bars the procedure waited for) are kept,
+/// keyed `bars−n..bars`.
+#[test]
+fn capture_distil_rt_without_flags_keeps_the_last_confirmed_rows() {
+    let root = tree("rtnf", &["E106"]);
+    let sheet = root.join("tests/conformance/sheets/v6/sheet-x.pine");
+    let t = |i: i64| spec::FROM_MS + i * 60_000;
+    let mut rows: Vec<(i64, String)> = (0..120).map(|i| (t(i), format!("{}", i % 2))).collect();
+    rows.push((t(120), "9".to_string()));
+    distil(
+        &sheet,
+        &export_ms("f_E106_pos", &rows),
+        None,
+        None,
+        &stamp(Dialect::V6),
+        false,
+    )
+    .unwrap();
+    let f = load(&root, "E106");
+    let rt = f.rt.unwrap();
+    let total = i64::from(rt.history + rt.realtime);
+    assert_eq!(f.bars, Some(rt.history + rt.realtime));
+    let r = series(&f);
+    assert_eq!(r.len(), 16);
+    assert_eq!((r[0].key, r[15].key), (total - 16, total - 1));
+    assert!(
+        r.iter().all(|x| text(x, 0) != "9"),
+        "the open row is dropped"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
