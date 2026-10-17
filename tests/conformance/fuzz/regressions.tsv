@@ -1,0 +1,4 @@
+# fix-fuzz 1 · D12 regressions (impl-06 §4.8.5): grammar TAB seed TAB id TAB bucket; id `-` = an engine-panic finding with no fixture yet (pin:06-regressions-panic-rows)
+grammar	seed	id	bucket
+1	4	-	SemanticBug
+1	692	-	SemanticBug

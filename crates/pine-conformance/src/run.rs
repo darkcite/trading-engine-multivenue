@@ -847,6 +847,142 @@ impl Runner {
         })
     }
 
+    /// D12 mode (b), §4.8.4: two `VmInstance`s of one `PineProgram` stepped alternately over the
+    /// fixture's `SynBars`, then the first `reset()` and re-run alone — `[a, b, a_after_reset]`,
+    /// every row of the run (the window is not applied). Fuzz-only; allocates outside its loops.
+    ///
+    /// `pin:06-interleaved-scope` — a `Syn`-driven indicator without sub-programs (the profiles
+    /// that run (b) with a broker or `request.*` are a later grammar version).
+    pub fn run_interleaved(
+        &mut self,
+        f: &Fixture,
+        d: Dialect,
+    ) -> Result<[RunOutcome; 3], RunError> {
+        let (text, sha) = self.source(f, d)?;
+        let prog = self.compile_text(f, &text, sha, d, false)?;
+        if f.driver != Driver::Syn
+            || !prog.subprograms.is_empty()
+            || prog.meta.kind == ScriptKind::Strategy
+        {
+            return Err(fix_err(
+                &f.script,
+                0,
+                "run_interleaved: a Syn-driven indicator without sub-programs only".into(),
+            ));
+        }
+        let sb = SynBars::new(
+            f.bars.unwrap_or(self.opts.syn_bars_default),
+            spec::FROM_MS,
+            spec::TIMEFRAME_S,
+        );
+        let n = sb.len();
+        let mut plot_ix: Vec<u16> = Vec::with_capacity(f.plots.len());
+        let mut src: Vec<usize> = Vec::with_capacity(f.plots.len());
+        for p in &f.plots {
+            let ix = prog
+                .syms
+                .get(&p.title)
+                .and_then(|s| prog.meta.plots.iter().position(|pd| pd.title == s))
+                .ok_or_else(|| {
+                    fix_err(
+                        &f.script,
+                        0,
+                        format!("plot title `{}` is not a plot", p.title),
+                    )
+                })?;
+            plot_ix.push(ix as u16);
+            src.push(usize::from(prog.meta.plots[ix].index));
+        }
+        let va = pine_vm::verify(&prog, &pine_std::BUILTINS).map_err(RunError::Verify)?;
+        let vb = pine_vm::verify(&prog, &pine_std::BUILTINS).map_err(RunError::Verify)?;
+        let mut ma = AlignedBuf::new(prog.layout.total_bytes);
+        let mut mb = AlignedBuf::new(prog.layout.total_bytes);
+        let mut a = VmInstance::new(va, ma.as_mut_slice());
+        let mut b = VmInstance::new(vb, mb.as_mut_slice());
+        let np = src.len();
+        let mut bufs = [
+            vec![f64::NAN; n as usize * np],
+            vec![f64::NAN; n as usize * np],
+            vec![f64::NAN; n as usize * np],
+        ];
+        let key_of = |i: u32| i64::from(i);
+        let mut fk = None;
+        let mut evals = [0u64; 3];
+        let mut none = None;
+        let mut no_subs: [SubRun<'_>; 0] = [];
+        let mut sa = SeriesStore::with_slots(&[]);
+        let mut sbs = SeriesStore::with_slots(&[]);
+        let mut bar = Bar::default();
+        let mut k = 0u32;
+        while k < n {
+            sb.bar(k, &mut bar);
+            step_chart_bar(
+                &bar,
+                &mut no_subs,
+                &mut sa,
+                &mut a,
+                &mut none,
+                &mut evals[0],
+            )
+            .map_err(|h| host_err(h, &key_of, &mut fk))?;
+            copy_row(&mut bufs[0], k as usize, &src, a.plots());
+            step_chart_bar(
+                &bar,
+                &mut no_subs,
+                &mut sbs,
+                &mut b,
+                &mut none,
+                &mut evals[1],
+            )
+            .map_err(|h| host_err(h, &key_of, &mut fk))?;
+            copy_row(&mut bufs[1], k as usize, &src, b.plots());
+            k += 1;
+        }
+        a.reset();
+        let mut sa = SeriesStore::with_slots(&[]);
+        let mut k = 0u32;
+        while k < n {
+            sb.bar(k, &mut bar);
+            step_chart_bar(
+                &bar,
+                &mut no_subs,
+                &mut sa,
+                &mut a,
+                &mut none,
+                &mut evals[2],
+            )
+            .map_err(|h| host_err(h, &key_of, &mut fk))?;
+            copy_row(&mut bufs[2], k as usize, &src, a.plots());
+            k += 1;
+        }
+        let keys: Vec<i64> = (0..n).map(key_of).collect();
+        let counters = [a.counters(), b.counters(), a.counters()];
+        let [p0, p1, p2] = bufs;
+        let mut out = [p0, p1, p2]
+            .into_iter()
+            .zip(evals)
+            .zip(counters)
+            .map(|((plots, e), c)| RunOutcome {
+                dialect: d,
+                plots,
+                keys: keys.clone(),
+                plot_ix: plot_ix.clone(),
+                trades: Vec::new(),
+                record: None,
+                bars: n,
+                evaluations: e,
+                counters: c,
+                source_sha256: sha,
+                syms: prog.syms.clone(),
+            });
+        let (x, y, z) = (
+            out.next().expect("3"),
+            out.next().expect("3"),
+            out.next().expect("3"),
+        );
+        Ok([x, y, z])
+    }
+
     /// Everything a fixture asserts: every declared dialect (and v5 ≡ v6 for `56`, I9), the
     /// `live_refuse` compile, the expectation under §4.4's tolerance.
     pub fn check(&mut self, f: &Fixture) -> Verdict {

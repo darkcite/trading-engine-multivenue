@@ -5,8 +5,8 @@
 //! green, 1 = a divergence or a gate failure, 2 = usage or an unreadable input. No clock.
 //!
 //! This edition implements `gen [--check]`, `sheets --dialect 5|6` (§4.7.5), `distil` (both forms,
-//! §4.7.5), `status`, `barhash --bars DIR [--write]` (§4.7.4) and `pins` (the §4.9.4 `pins.tsv` rows
-//! on stdout; `--decide` lands with `cmp.rs`, T16); every other subcommand is a usage error until its
+//! §4.7.5), `status`, `barhash --bars DIR [--write]` (§4.7.4), `shrink` (§4.8.5, T22) and `pins` (the
+//! §4.9.4 `pins.tsv` rows on stdout; `--decide` lands with `cmp.rs`, T16); every other subcommand is a usage error until its
 //! task lands. `pin:06-conf-root` — the workspace root is the current directory (DOCTRINE: commands
 //! run from the lane root); it must hold `tests/conformance/chart.json`.
 //!
@@ -22,7 +22,8 @@ use pine_ir::Dialect;
 const USAGE: &str = "usage: pine-conf gen [--check] | pine-conf sheets --dialect 5|6 \
 | pine-conf distil --sheet S --chart CSV [--trades CSV --perf CSV] --utc T --build B --dialect 5|6 [--verify] \
 | pine-conf distil --id ID --paste compiled|refused|runtime-error --utc T --build B --dialect 5|6 [--verify] \
-| pine-conf status | pine-conf pins | pine-conf barhash --bars DIR [--write]";
+| pine-conf status | pine-conf pins | pine-conf barhash --bars DIR [--write] \
+| pine-conf shrink --grammar V --seed S --mode mode-vs-mode|interleaved [--budget STEPS]";
 
 /// The vault capture directory (§4.7.10, untracked) and its `manifest.tsv`.
 ///
@@ -100,6 +101,83 @@ fn main() -> ExitCode {
         },
         ["status"] => status(root),
         ["distil", rest @ ..] => distil(root, rest),
+        ["shrink", rest @ ..] => shrink(root, rest),
+        _ => usage(),
+    }
+}
+
+/// `pine-conf shrink --grammar V --seed S --mode mode-vs-mode|interleaved [--budget STEPS]`
+/// (§3.12, §4.8.5): regenerates `(V, S)`, checks the divergence and shrinks it; prints the
+/// signature, the step count and the shrunk body. Exit 1 = a divergence (shrunk and printed), 0 =
+/// none, 2 = usage or a grammar version this build does not generate.
+///
+/// `pin:06-shrink-cli-defaults` — §3.12 names no dialect, profile or bar count: v6, `Indicator`,
+/// `DEFAULT_LIMITS.active_tiers` and 128 bars (the `fuzz_meta` sweeps' value).
+fn shrink(root: &Path, rest: &[&str]) -> ExitCode {
+    use pine_conformance::fuzz::{self, diff, GrammarConfig, Predicate, Profile, ShrinkBudget};
+    let get = |k: &str| {
+        rest.iter()
+            .position(|a| *a == k)
+            .and_then(|i| rest.get(i + 1).copied())
+    };
+    let (Some(v), Some(seed), Some(mode)) = (
+        get("--grammar").and_then(|v| v.parse::<u16>().ok()),
+        get("--seed").and_then(|s| s.parse::<u64>().ok()),
+        get("--mode"),
+    ) else {
+        return usage();
+    };
+    let budget = match get("--budget").map(|b| b.parse::<u32>()) {
+        None => ShrinkBudget::default(),
+        Some(Ok(max_steps)) => ShrinkBudget { max_steps },
+        Some(Err(_)) => return usage(),
+    };
+    if v != fuzz::GRAMMAR_VERSION {
+        eprintln!(
+            "pine-conf shrink: grammar {v} is not this build's {}",
+            fuzz::GRAMMAR_VERSION
+        );
+        return ExitCode::from(2);
+    }
+    let cfg = GrammarConfig::for_profile(
+        Profile::Indicator,
+        Dialect::V6,
+        pine_conformance::run::DEFAULT_LIMITS.active_tiers,
+    );
+    let g = fuzz::generate(seed, &cfg);
+    let h = match diff::Harness::new(root.to_path_buf(), "cli") {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("pine-conf shrink: {e:?}");
+            return ExitCode::from(2);
+        }
+    };
+    fn go<P: Predicate>(g: &fuzz::Generated, p: &mut P, b: ShrinkBudget) -> ExitCode {
+        let Some(sig) = p.diverges(&g.ast) else {
+            println!("pine-conf shrink: seed {} does not diverge", g.seed);
+            return ExitCode::SUCCESS;
+        };
+        let out = fuzz::shrink(g, &sig, p, b);
+        let exhausted = if out.steps == b.max_steps {
+            " (budget exhausted)"
+        } else {
+            ""
+        };
+        println!(
+            "grammar {} seed {} {:?}\n{} → {} lines in {} steps{exhausted}\n{}",
+            g.grammar_version,
+            g.seed,
+            out.signature,
+            out.lines_before,
+            out.lines_after,
+            out.steps,
+            fuzz::ast::render_body(&out.program)
+        );
+        ExitCode::from(1)
+    }
+    match mode {
+        "mode-vs-mode" => go(&g, &mut diff::ModeVsMode { h, bars: 128 }, budget),
+        "interleaved" => go(&g, &mut diff::Interleaved { h, bars: 128 }, budget),
         _ => usage(),
     }
 }

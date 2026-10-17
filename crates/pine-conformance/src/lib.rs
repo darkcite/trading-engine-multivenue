@@ -19,6 +19,7 @@ pub mod chart;
 pub mod cmp;
 pub mod dec;
 pub mod fixture;
+pub mod fuzz;
 pub mod gen;
 pub mod host;
 pub mod manifest;

@@ -572,3 +572,507 @@ fn refusal_codes_are_contract_codes() {
         let _ = Oracle::Tv;
     }
 }
+
+// ---- T19 completion (2026-10-17): I5a, I9, §4.3, I20, I25, §4.9.6–§4.9.7, the manifest freeze.
+
+use pine_conformance::fixture::{Dialects, Driver};
+use pine_conformance::run::{Runner, RunnerOptions, SkipReason};
+use pine_ir::Dialect;
+
+/// Pine tokens of `src` outside comments and string literals: `(token, followed_by_paren)`.
+/// A token is an identifier with its `.`-joined namespace (`syminfo.tickerid`, `ta.sma`).
+fn pine_tokens(src: &str) -> Vec<(String, bool)> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let id = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    while i < b.len() {
+        let c = b[i];
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < b.len() && b[i] != c {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+        } else if id(c) {
+            let s = i;
+            while i < b.len()
+                && (id(b[i]) || (b[i] == b'.' && b.get(i + 1).is_some_and(|n| id(*n))))
+            {
+                i += 1;
+            }
+            let mut j = i;
+            while j < b.len() && b[j] == b' ' {
+                j += 1;
+            }
+            if !c.is_ascii_digit() {
+                out.push((src[s..i].to_string(), b.get(j) == Some(&b'(')));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The fixture's script text, when it lives on disk (Z001–Z014 are impl-01's registry probes).
+fn script_text(f: &Fixture) -> Option<String> {
+    std::fs::read_to_string(workspace_root().join(&f.script)).ok()
+}
+
+/// I5 (first half): a `Syn` fixture's body outside its SYN-1 prelude reads no bar field.
+#[test]
+fn syn_fixtures_read_no_bar_data() {
+    const BAR: [&str; 13] = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "hl2",
+        "hlc3",
+        "ohlc4",
+        "hlcc4",
+        "time",
+        "time_close",
+        "bar_index",
+        "timenow",
+    ];
+    let mut n = 0;
+    for (_, f) in disk_fixtures() {
+        // pin:06-hyg-i5-parse-probes — Z001–Z014 are impl-01's registry compile probes (their
+        // `script` lies outside `tests/conformance/`, carries no SYN-1 prelude and is parsed, never
+        // stepped): I5 governs the scripts this crate generates.
+        if f.driver != Driver::Syn
+            || matches!(f.expect, Expect::Parse { .. })
+            || !f.script.starts_with(pine_conformance::FIXTURE_ROOT)
+        {
+            continue;
+        }
+        let Some(src) = script_text(&f) else { continue };
+        let body = src.replacen(pine_conformance::syn::SYN1_PRELUDE, "", 1);
+        for (t, _) in pine_tokens(&body) {
+            assert!(
+                !BAR.contains(&t.as_str())
+                    && !t.starts_with("syminfo.")
+                    && !t.starts_with("request."),
+                "{}: Syn body names `{t}`",
+                f.id.as_str()
+            );
+        }
+        n += 1;
+    }
+    assert!(n > 100, "{n} Syn scripts scanned");
+}
+
+/// I9: a `dialects 56` fixture's v5 and v6 outcomes are bit-identical (plots by `to_bits`, trades
+/// and the run record by `==`, errors by their rendering — `run::dialect_divergence`).
+///
+/// `pin:06-hyg-i9-standin` — invariance is ours against ours, so a `tv` fixture is run with its
+/// oracle relabelled `authored` (the stand-in syminfo is identical in both runs); Chart/SynSig
+/// fixtures without a bars root skip identically in both dialects and are counted.
+///
+/// A run that trips an engine `debug_assert!` is a FINDING for its owner, recorded in
+/// [`I9_ENGINE_FINDINGS`]; the panicking set must equal that table exactly (a fix shows as a row
+/// leaving it, a new panic as red). `pin:06-hyg-i9-panic-table` — detection only: every fixture is
+/// still run in both dialects and nothing is treated as a pass.
+const I9_ENGINE_FINDINGS: &[(&str, &str, &str)] = &[
+    // 2026-10-17: pine-vm frame.rs:360 "set_f64_arg on an i64 entry" — an int-returning `ta.*bars`
+    // body writes its output through the f64 setter. Owner: pine-std (PVM-4).
+    (
+        "B088",
+        "panic",
+        "pine-std: ta.highestbars(syn, 14) writes an i64 output via set_f64_arg",
+    ),
+    (
+        "B091",
+        "panic",
+        "pine-std: ta.lowestbars(syn, 14) writes an i64 output via set_f64_arg",
+    ),
+    // 2026-10-17: f_F093_val2 = `na(x) ? na : x`, x = (timestamp(2024,2,30) − timestamp(2024,3,1))
+    // / 1000: v6 plots 0.0, v5 plots na while f_F093_isna2 agrees (0). The v5 const-int ÷ const-int
+    // (W1 truncation) path yields an int whose ternary with `na` plots na. Owner: pine-sema
+    // emission (W1, v5) — triage before any twin.
+    (
+        "F093",
+        "diverge",
+        "v5 plots na for a const-int 0 result of W1 truncating division; v6 0.0",
+    ),
+];
+
+#[test]
+fn dialect_56_fixtures_are_invariant() {
+    let new_runner = || Runner::new(RunnerOptions::new(workspace_root())).expect("runner");
+    let mut runner = new_runner();
+    let (mut ran, mut skipped, mut divergent) = (0u32, 0u32, Vec::new());
+    let mut panicked: Vec<String> = Vec::new();
+    for (_, f) in disk_fixtures() {
+        if f.dialects != Dialects::BOTH || f.oracle == Oracle::TvOnly {
+            continue;
+        }
+        let mut g = f.clone();
+        if g.oracle.is_captured_kind() {
+            g.oracle = Oracle::Authored;
+        }
+        let both = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (runner.run(&g, Dialect::V6), runner.run(&g, Dialect::V5))
+        }));
+        let Ok((r6, r5)) = both else {
+            panicked.push(f.id.as_str().to_string());
+            runner = new_runner();
+            continue;
+        };
+        match (&r6, &r5) {
+            (Err(pine_conformance::run::RunError::Skip(_)), _) => skipped += 1,
+            _ => ran += 1,
+        }
+        if let Some(at) = pine_conformance::run::dialect_divergence(&r6, &r5) {
+            let cell = |r: &Result<pine_conformance::run::RunOutcome, _>| {
+                r.as_ref().ok().and_then(|o| {
+                    let row = o.keys.iter().position(|k| *k == at.0)?;
+                    o.plots.get(row * o.plot_ix.len() + at.1).copied()
+                })
+            };
+            println!(
+                "I9 DIVERGENT {} {at:?} v6={:?}/{:?} v5={:?}/{:?}",
+                f.id.as_str(),
+                cell(&r6),
+                r6.as_ref().err(),
+                cell(&r5),
+                r5.as_ref().err()
+            );
+            divergent.push(f.id.as_str().to_string());
+        }
+    }
+    println!("I9: ran {ran}, skipped {skipped}, divergent {divergent:?}, panicked {panicked:?}");
+    assert!(ran > 100, "{ran} dialect-56 fixtures ran");
+    let known = |k: &str| -> Vec<String> {
+        I9_ENGINE_FINDINGS
+            .iter()
+            .filter(|(_, kind, _)| *kind == k)
+            .map(|(id, _, _)| id.to_string())
+            .collect()
+    };
+    assert_eq!(
+        divergent,
+        known("diverge"),
+        "dialect-divergence findings table moved"
+    );
+    // The panic findings are pine-vm `debug_assert!` trips, compiled out of a release build
+    // (pin:06-regressions-panic-debug-only).
+    let want_panics = if cfg!(debug_assertions) {
+        known("panic")
+    } else {
+        Vec::new()
+    };
+    assert_eq!(panicked, want_panics, "engine-panic findings table moved");
+}
+
+/// §4.3: re-derives the twinning rules from `pine_spec` — rule 1's switch rows (a `Switch` row
+/// whose v5 and v6 defaults differ never has a `56` fixture), rule 2 (a `56` fixture calls no
+/// builtin `pine_spec` lists in one dialect only), rule 4 (group A's bool rows are the v5/v6 twins
+/// A065–A080 ↔ A081–A096) — and checks every `twin` is mutual and in the other dialect.
+///
+/// `pin:06-hyg-split-entry-level` — rule 2 is checked per entry (the entry's `versions` and the
+/// union of its overloads' `versions`): a call's overload is not resolved here.
+#[test]
+fn dialect_split_matches_spec_tables() {
+    let all = disk_fixtures();
+    let by_id: std::collections::BTreeMap<String, &Fixture> = all
+        .iter()
+        .map(|(_, f)| (f.id.as_str().to_string(), f))
+        .collect();
+    let both = |m: pine_spec::VersionMask| m.has(Dialect::V5) && m.has(Dialect::V6);
+    // Rule 1: switch rows whose dialect defaults differ.
+    let split: Vec<&str> = pine_spec::SWITCHES
+        .iter()
+        .filter(|s| {
+            s.mech == pine_spec::SwMech::Switch && s.v5 != s.v6 && !s.pin.as_str().is_empty()
+        })
+        .map(|s| s.pin.as_str())
+        .collect();
+    assert!(!split.is_empty());
+    // pin:06-hyg-split-switch-pair — §4.9.2 lists `56` fixtures for a W row whose observable is
+    // invariant (F001–F003 for W1), so rule 1 is checked as: a split row that has fixtures has a
+    // `5` fixture and a `6` fixture, every one of them twinned.
+    for p in &split {
+        let carriers: Vec<&Fixture> = all
+            .iter()
+            .map(|(_, f)| f)
+            .filter(|f| f.pins.iter().any(|q| q == p))
+            .collect();
+        if carriers.is_empty() {
+            continue;
+        }
+        for d in [Dialects::V5, Dialects::V6] {
+            let one: Vec<&&Fixture> = carriers.iter().filter(|f| f.dialects == d).collect();
+            assert!(!one.is_empty(), "{p}: no `{}` fixture", d.text());
+            for f in one {
+                assert!(
+                    f.twin.is_some(),
+                    "{}: split row {p} untwinned",
+                    f.id.as_str()
+                );
+            }
+        }
+    }
+    for (_, f) in &all {
+        let id = f.id.as_str();
+        // Rule 2.
+        if f.dialects == Dialects::BOTH {
+            if let Some(src) = script_text(f) {
+                for (t, call) in pine_tokens(&src) {
+                    let Some(e) = pine_spec::lookup(&t).filter(|_| call) else {
+                        continue;
+                    };
+                    let ovs = e.overloads();
+                    let mut m = 0u8;
+                    for o in ovs {
+                        m |= o.versions.0;
+                    }
+                    let in_both = both(e.versions) && (ovs.is_empty() || m == 0b11);
+                    assert!(
+                        in_both,
+                        "{id}: `56` fixture calls `{t}`, listed in one dialect only"
+                    );
+                }
+            }
+        }
+        // Twins are mutual and cross-dialect.
+        if let Some(t) = f.twin {
+            let o = by_id
+                .get(t.as_str())
+                .unwrap_or_else(|| panic!("{id}: twin {} missing", t.as_str()));
+            assert_eq!(
+                o.twin,
+                Some(f.id),
+                "{id}: twin {} is not mutual",
+                t.as_str()
+            );
+            assert!(
+                f.dialects != Dialects::BOTH
+                    && o.dialects != Dialects::BOTH
+                    && o.dialects != f.dialects,
+                "{id}: twin {} is not the other dialect",
+                t.as_str()
+            );
+        }
+    }
+    // Rule 4: A(64 + k) is v5, A(80 + k) is v6, twinned with each other.
+    for k in 1..=16u16 {
+        let v5 = by_id[&format!("A{:03}", 64 + k)];
+        let v6 = by_id[&format!("A{:03}", 80 + k)];
+        assert_eq!(v5.dialects, Dialects::V5, "{}", v5.id.as_str());
+        assert_eq!(v6.dialects, Dialects::V6, "{}", v6.id.as_str());
+        assert_eq!(v5.twin, Some(v6.id), "{}", v5.id.as_str());
+    }
+}
+
+/// I20 (§4.5.9): every skip is explained by the environment — no bars root ⇒ exactly the
+/// Chart/SynSig fixtures whose expectation is not `Refuse`; tiers ⇒ exactly the inactive-tier ones;
+/// `tv_only` ⇒ exactly E106, E110, D060 — in the runner's precedence (tier, tv_only, bars).
+#[test]
+fn skips_are_declared() {
+    let opts = RunnerOptions::new(workspace_root());
+    let active = opts.limits.active_tiers;
+    let mut runner = Runner::new(opts).expect("runner");
+    let (mut got, mut want) = (Vec::new(), Vec::new());
+    let mut tv_only = Vec::new();
+    for (_, f) in disk_fixtures() {
+        let id = f.id.as_str().to_string();
+        let bit = if (1..=8).contains(&f.tier) {
+            1u8 << (f.tier - 1)
+        } else {
+            0
+        };
+        let explained = if bit & active == 0 {
+            Some(SkipReason::TierInactive { tier: f.tier })
+        } else if f.oracle == Oracle::TvOnly {
+            tv_only.push(id.clone());
+            Some(SkipReason::TvOnly)
+        } else if matches!(f.driver, Driver::Chart | Driver::SynSig)
+            && !matches!(f.expect, Expect::Refuse { .. })
+        {
+            Some(SkipReason::NoBarsRoot)
+        } else {
+            None
+        };
+        if let Some(s) = explained {
+            want.push((id.clone(), s));
+        }
+        if let Err(pine_conformance::run::RunError::Skip(s)) =
+            runner.run(&f, pine_conformance::run::primary_dialect(f.dialects))
+        {
+            got.push((id, s));
+        }
+    }
+    println!("I20: {} skips", got.len());
+    assert_eq!(
+        got, want,
+        "a skip the environment does not explain (or a missing one)"
+    );
+    tv_only.sort();
+    assert_eq!(tv_only, ["D060", "E106", "E110"]);
+}
+
+/// I25: the Declined set of §4.6.2 is exactly `triage::DECLINED_CODES`, every code inside contract
+/// §3.3's allocation (sema 3000–3999 live codes, `pine-std` 5000–5099, `pine-broker` 5100–5199);
+/// the retired 3025/3033 and `DeferredBuiltin` 3024 are in no set.
+#[test]
+fn declined_codes_match_the_contract_ranges() {
+    use pine_conformance::triage::{is_declined_code, DECLINED_CODES};
+    use pine_ir::DiagCode;
+    assert_eq!(
+        DECLINED_CODES,
+        [
+            (3016, 3023),
+            (3026, 3032),
+            (3042, 3053),
+            (5001, 5001),
+            (5002, 5002),
+            (5100, 5109)
+        ]
+    );
+    for (lo, hi) in DECLINED_CODES {
+        assert!(lo <= hi);
+        for c in lo..=hi {
+            let in_alloc = match c {
+                3000..=3999 => (1..=53).contains(&(c - 3000)) && c != 3025 && c != 3033,
+                5000..=5199 => true,
+                _ => false,
+            };
+            assert!(in_alloc, "{c} outside contract §3.3");
+            assert!(is_declined_code(DiagCode(c)));
+        }
+    }
+    for c in [
+        3024u16, 3025, 3033, 3015, 3041, 5000, 5003, 5099, 5110, 7001,
+    ] {
+        assert!(!is_declined_code(DiagCode(c)), "{c} is not Declined");
+    }
+}
+
+/// §4.9.6's `pin:05-*` names, transcribed from the spec table.
+const SECTION_4_9_6: [&str; 21] = [
+    "pin:05-path-tie",
+    "pin:05-trail-same-segment",
+    "pin:05-cash-per-order",
+    "pin:05-pct-equity-time",
+    "pin:05-pyramiding-check",
+    "pin:05-margin-funds-check",
+    "pin:05-qty-rounding",
+    "pin:05-bad-qty",
+    "pin:05-cof-close-tick",
+    "pin:05-cof-next-tick",
+    "pin:05-drawdown-sampling",
+    "pin:05-exit-reservation",
+    "pin:05-exit-qty-per-trade",
+    "pin:05-price-rounding",
+    "pin:05-openprofit-fees",
+    "pin:05-same-id-entry",
+    "pin:05-exit-persist-flat",
+    "pin:05-close-all-keeps-pending",
+    "pin:05-trade-trim",
+    "pin:05-v5-order-limit",
+    "pin:05-fill-limits",
+];
+
+/// §4.9.7's names, transcribed from the spec table (`pin:01-array-suffix-type` appears in two rows).
+const SECTION_4_9_7: [&str; 38] = [
+    "pin:00-rma-seed",
+    "pin:00-dataset-start",
+    "pin:00-color-consts",
+    "pin:00-tf-multiplier",
+    "pin:00-for-bound",
+    "pin:01-mixed-indent",
+    "pin:01-bracket-wrap",
+    "pin:01-v5-paren-wrap",
+    "pin:01-string-line-wrap",
+    "pin:01-version-form",
+    "pin:01-version-conflict",
+    "pin:01-local-type-decl",
+    "pin:01-var-field",
+    "pin:01-array-suffix-type",
+    "pin:01-ternary-assoc",
+    "pin:01-unknown-escape",
+    "pin:01-multiline-string-value",
+    "pin:01-import-version-form",
+    "pin:02-shadow-builtin",
+    "pin:02-color-alpha",
+    "pin:02-na-condition",
+    "pin:02-v5-num-to-bool",
+    "pin:02-var-qualifier",
+    "pin:02-for-step",
+    "pin:02-fn-global-assign",
+    "pin:02-int-cast",
+    "pin:02-once-flag",
+    "pin:03-hist-dynamic-offset",
+    "pin:03-float-mod",
+    "pin:04-ta-reference",
+    "pin:04-string-edges",
+    "pin:04-color-edges",
+    "pin:04-collection-edges",
+    "pin:04-strategy-edges",
+    "pin:04-exchange-tz",
+    "pin:04-time-edges",
+    "pin:04-math-random",
+    "pin:10-shell-decl-args",
+];
+
+/// §7.7: every `FOREIGN_SWITCH_PINS` entry is a §4.9.6–§4.9.7 name, each exactly once, with the
+/// owner its `pin:NN-` prefix names; and the two tables are covered in full (§4.9.8: 21 + 38).
+#[test]
+fn foreign_switch_pins_are_section_4_9_names() {
+    use pine_conformance::pins::FOREIGN_SWITCH_PINS;
+    let mut names: Vec<&str> = SECTION_4_9_6
+        .iter()
+        .chain(SECTION_4_9_7.iter())
+        .copied()
+        .collect();
+    names.sort_unstable();
+    let n = names.len();
+    names.dedup();
+    assert_eq!(names.len(), n, "the transcription repeats a name");
+    let mut got: Vec<&str> = FOREIGN_SWITCH_PINS.iter().map(|(p, _)| *p).collect();
+    got.sort_unstable();
+    assert_eq!(got, names);
+    for (p, owner) in FOREIGN_SWITCH_PINS {
+        let nn = &p["pin:".len().."pin:".len() + 2];
+        assert_ne!(nn, "06", "{p}: this spec's own pins are not foreign");
+        assert_eq!(*owner, format!("impl-{nn}"), "{p}");
+    }
+}
+
+/// The manifest freeze (T19): the generator-owned columns of `manifest.tsv` (every column but
+/// `captured`, which the capture month fills) hash to the frozen value, and the header carries the
+/// frozen counts. A deliberate catalogue change re-freezes both here, reviewed.
+///
+/// `pin:06-manifest-freeze-mask` — the spec freezes "the manifest" without naming its form; the
+/// freeze is over the header and the generator-owned columns, so capture never trips it.
+#[test]
+fn manifest_is_frozen() {
+    const HEADER: &str =
+        "# fix 2 · pine-conf gen · A 96 B 124 C 46 D 62 E 121 F 98 Z 19 · total 566";
+    const FROZEN_SHA256: &str = "278009dad060fa802c5f3201b7fc19ed8a519cd2dc1480ee9e0632b8edfbd4a9";
+    let text =
+        std::fs::read_to_string(workspace_root().join(pine_conformance::manifest::MANIFEST_TSV))
+            .unwrap();
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some(HEADER));
+    let mut masked = String::new();
+    let mut rows = 0;
+    for l in lines {
+        let cols: Vec<&str> = l.split('\t').collect();
+        masked.push_str(&cols[..cols.len() - 1].join("\t"));
+        masked.push('\n');
+        rows += 1;
+    }
+    assert_eq!(rows, 566);
+    let sha = core_crypto::sha256(masked.as_bytes());
+    let hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, FROZEN_SHA256, "manifest generator-owned columns moved");
+}
