@@ -3013,6 +3013,58 @@ const fn build() -> Built {
             Blk::Coll,
         ),
     );
+    // R-P5 (CAR-R27-1 applied): the UDT field rows, v6 — `sort` / `sort_indices` by an int, float
+    // or string field, `binary_search*` by an int or float field, keyed through
+    // `Frame::obj_field`; the field arrives as sema's folded selector (`pin:02-udt-field-selector`).
+    put(
+        &mut b,
+        ov::ARRAY_SORT_AT,
+        row(ov::ARRAY_SORT_AT, c3::bi_array_sort_at, 16, 0, Blk::None),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_SORT_INDICES_AT,
+        row(
+            ov::ARRAY_SORT_INDICES_AT,
+            c3::bi_array_sort_indices_at,
+            16,
+            COLL,
+            Blk::Coll,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_BINARY_SEARCH_AT,
+        row(
+            ov::ARRAY_BINARY_SEARCH_AT,
+            cs::bi_array_binary_search_at,
+            4,
+            0,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT,
+        row(
+            ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT,
+            cs::bi_array_binary_search_leftmost_at,
+            4,
+            0,
+            Blk::None,
+        ),
+    );
+    put(
+        &mut b,
+        ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT,
+        row(
+            ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT,
+            cs::bi_array_binary_search_rightmost_at,
+            4,
+            0,
+            Blk::None,
+        ),
+    );
     put(
         &mut b,
         ov::MAP_COPY,

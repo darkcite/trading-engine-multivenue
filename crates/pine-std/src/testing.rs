@@ -36,6 +36,12 @@ pub enum Src {
     Out(u16, u8),
     /// A reserved slot (`pine_ir::abi::*`).
     Reserved(Lane, u16),
+    /// A fresh UDT object (an i64 input: its `CollRef`): an `Object` site of its own, `O_NEW`
+    /// with one field per entry, then each field stored from its source in order (`O_SET_F` /
+    /// `O_SET_I` with `NA_TRACKED`, by the entry's lane), every evaluation — what sema emits for
+    /// `T.new(…)` (impl-02 §4.14.7). A string field takes a `Src::Str` (a `CONST` ref). For the
+    /// UDT field rows (R-P5), which need objects the other sources cannot build.
+    Obj(&'static [(Lane, Src)]),
 }
 
 /// One builtin call of a test script.
@@ -275,9 +281,42 @@ impl Slots {
     }
 }
 
-fn load(t: &mut Tb, e: u16, src: Src, outs: &[Vec<u16>]) -> u16 {
+/// The user slots `src` needs in each lane, into `nf` / `ni` (an object: its handle and its
+/// fields' sources).
+fn count(l: Lane, src: Src, nf: &mut u32, ni: &mut u32) {
+    if matches!(src, Src::Reserved(..) | Src::Out(..)) {
+        return;
+    }
+    *if l == Lane::F64 { &mut *nf } else { &mut *ni } += 1;
+    if let Src::Obj(fields) = src {
+        for &(fl, fs) in fields {
+            count(fl, fs, nf, ni);
+        }
+    }
+}
+
+fn load(t: &mut Tb, slots: &mut Slots, e: u16, src: Src, outs: &[Vec<u16>]) -> u16 {
     let slot = e & argwin::SLOT_MASK;
     match src {
+        Src::Obj(fields) => {
+            assert!(argwin::is_i64(e), "an object is an i64 input");
+            let n = fields.len() as u16;
+            let site = t.state(StateKind::Object, 32 + 8 * u32::from(n));
+            t.emit(op::O_NEW, 0, slot, site, n);
+            for (k, &(fl, fs)) in fields.iter().enumerate() {
+                let fe = match fs {
+                    Src::Reserved(..) | Src::Out(..) => 0,
+                    _ => slots.take(t, fl),
+                };
+                let v = load(t, slots, fe, fs, outs) & argwin::SLOT_MASK;
+                if fl == Lane::F64 {
+                    t.emit(op::O_SET_F, 0, slot, k as u16, v);
+                } else {
+                    t.emit(op::O_SET_I, pine_ir::flg::NA_TRACKED, slot, k as u16, v);
+                }
+            }
+            e
+        }
         Src::Reserved(Lane::F64, s) => argwin::f64(s),
         Src::Reserved(Lane::I64, s) => argwin::i64(s),
         Src::Out(k, j) => outs[k as usize][j as usize],
@@ -350,10 +389,8 @@ impl Harness {
     pub fn try_build_plots(s: &Script<'_>, user_plots: u32) -> Result<Harness, VerifyError> {
         let (mut nf, mut ni) = (1u32, 2u32); // i(0): feed column, i(1): probe base
         for c in s.calls {
-            for (l, src) in c.inputs {
-                if !matches!(src, Src::Reserved(..) | Src::Out(..)) {
-                    *if *l == Lane::F64 { &mut nf } else { &mut ni } += 1;
-                }
+            for &(l, src) in c.inputs {
+                count(l, src, &mut nf, &mut ni);
             }
             for l in c.outputs {
                 *if *l == Lane::F64 { &mut nf } else { &mut ni } += 1;
@@ -385,7 +422,7 @@ impl Harness {
                     Src::Reserved(..) | Src::Out(..) => 0,
                     _ => slots.take(&t, l),
                 };
-                win.push(load(&mut t, e, src, &outs));
+                win.push(load(&mut t, &mut slots, e, src, &outs));
             }
             let mut o = Vec::new();
             for &l in c.outputs {

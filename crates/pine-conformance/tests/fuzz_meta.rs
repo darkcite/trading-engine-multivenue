@@ -139,6 +139,19 @@ fn grammar_3_admits_the_rows_served_in_r27b() {
     }
 }
 
+/// The grammar-3 sample digest, the same sample: recorded at r29 (pine-std's tier-3 UDT rows are
+/// outside the alphabet: `DEFAULT_LIMITS.active_tiers` is `0b0011`, so grammar 3 is r27b's).
+const GRAMMAR_3_SAMPLE_SHA256: &str =
+    "80b5a03a73c8c6515bc9487034e5c8332a5892e92ec2fada3b73a92fbc994713";
+
+/// §4.8.5 for grammar 3: its programs stay byte-identical while the alphabet's tiers stand.
+#[test]
+fn grammar_3_seeds_are_byte_identical() {
+    let got = grammar_sample_digest(3);
+    println!("grammar-3 sample digest {got}");
+    assert_eq!(got, GRAMMAR_3_SAMPLE_SHA256);
+}
+
 /// Counts `input` calls in `e`, asserting each takes one literal `defval`.
 fn input_calls(e: &Expr, s: u64) -> u32 {
     match e {

@@ -26,7 +26,7 @@ pub(crate) mod part3;
 pub(crate) mod split;
 pub(crate) mod stats;
 
-use pine_ir::{elem, CollHeader, CollKind, CollRef, FaultKind, SiteId, StrRef, Ty, NA_I64};
+use pine_ir::{argwin, elem, CollHeader, CollKind, CollRef, FaultKind, SiteId, StrRef, Ty, NA_I64};
 use pine_vm::Frame;
 
 /// Bytes of an `array.slice` site's block: the header only. A slice is a view onto its owner's
@@ -203,6 +203,24 @@ pub(crate) const fn elem_ty(enc: i64) -> Option<Ty> {
     } else {
         Some(Ty::Udt)
     }
+}
+
+/// The field index and field type a UDT `*_AT` row's `sort_field` argument names (R-P5,
+/// impl-04 §4.16.6). `pin:02-udt-field-selector` — pine-sema folds the `const int` index or
+/// `const string` name to one `int` constant, `index | (field Ty as i64) << 32`: the index in
+/// bits 0..32, the field's `Ty` byte in bits 32..40, bits 40..64 zero (pine-sema `overload.rs`
+/// `udt_selector` writes it). Anything sema cannot have built — an f64 entry, na, negative,
+/// stray high bits, an unassigned `Ty` — is `Internal` (sema and std disagree).
+pub(crate) fn udt_selector(f: &Frame<'_>, e: u16) -> Result<(u32, Ty), FaultKind> {
+    if !argwin::is_i64(e) {
+        return Err(FaultKind::Internal);
+    }
+    let s = match f.i64_arg(e) {
+        Some(s) if s >= 0 && s >> 40 == 0 => s,
+        _ => return Err(FaultKind::Internal),
+    };
+    let ty = Ty::from_u8((s >> 32) as u8).ok_or(FaultKind::Internal)?;
+    Ok((s as u32, ty))
 }
 
 /// Region tag of an owned-cell word (§4.16.1): the `PERSIST` tag, which no element ever holds as

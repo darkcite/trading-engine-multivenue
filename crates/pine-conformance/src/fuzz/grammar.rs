@@ -22,6 +22,8 @@
 //! `defval`; no `v := input(…)` (a reassigned whole value names a second input `v`, `3050`).
 //! Grammar 3 = grammar 2 + the rows pine-std began serving in r27b ([`FUZZ_SERVED_V3`]): a row
 //! `pine_std::served` newly calls served grows the alphabet too, so it lands under a version.
+//! Tier-3 rows (array / map / UDT methods, served since r27–r29) stay outside every alphabet while
+//! the fuzz configs read `DEFAULT_LIMITS.active_tiers = 0b0011`; raising that mask is a version.
 
 use pine_ir::{Dialect, Qual, Ty};
 use pine_spec::{params, pf, rets};

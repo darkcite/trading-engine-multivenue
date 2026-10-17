@@ -2813,6 +2813,20 @@ impl Lower<'_> {
                 });
                 continue;
             }
+            if p.name.as_str() == "sort_field" {
+                if let Some(search) = crate::overload::udt_field_row(o.id) {
+                    // R-P5: the folded field selector, never the argument as written. A non-UDT
+                    // array was refused `3024 … unserved=1` in pass 3: lowered as written.
+                    if let Some(bits) = self.udt_selector(n, o, search, given)? {
+                        av.push(Arg::Const {
+                            lane: Lane::I64,
+                            bits,
+                            valid: true,
+                        });
+                        continue;
+                    }
+                }
+            }
             let mut any = false;
             for &(r, v) in given {
                 if r == row {
@@ -2831,6 +2845,48 @@ impl Lower<'_> {
             }
         }
         Ok(av)
+    }
+
+    /// The `sort_field` selector of a UDT field row (R-P5, `pin:02-udt-field-selector`): the
+    /// same fold pass 3 checked (`overload::udt_selector`, refusals `3007` there), over the
+    /// `id` argument's element type and the `sort_field` argument's folded value, else the row's
+    /// default. `index | (field Ty as i64) << 32`, decoded by pine-std's `coll::udt_selector`.
+    /// `None` when `id` is not an `array<UDT>` (`pin:02-udt-rows-udt-only`: refused in pass 3).
+    fn udt_selector(
+        &self,
+        n: NodeId,
+        o: &'static pine_spec::Overload,
+        search: bool,
+        given: &[(u16, NodeId)],
+    ) -> Result<Option<u64>, Diag> {
+        let ps = pine_spec::params(o);
+        let node = |name: &str| {
+            given
+                .iter()
+                .find(|&&(r, _)| ps[usize::from(r)].name.as_str() == name)
+                .map(|&(_, v)| v)
+        };
+        let Some(el) = node("id")
+            .and_then(|v| self.ty(v))
+            .filter(|t| t.ty == Ty::Array)
+            .map(|t| t.a)
+            .filter(|&a| a & (pine_ir::elem::SCALAR | pine_ir::elem::ENUM) == 0)
+        else {
+            return Ok(None);
+        };
+        let sel = match node("sort_field") {
+            Some(v) => self.cur().k.get(v.0 as usize).copied().flatten(),
+            None => crate::overload::sort_field_default(o),
+        };
+        let fields: Vec<(Sym, TypeQ)> = self
+            .t
+            .udts
+            .get(usize::from(el & pine_ir::elem::DECL_MASK))
+            .map(|u| u.fields.iter().map(|f| (f.0, f.1)).collect())
+            .unwrap_or_default();
+        crate::overload::udt_selector(search, &fields, sel, self.syms)
+            .map(|s| Some(s as u64))
+            .map_err(|m| diag(ReasonCode::Internal, self.ast.span(n), m))
     }
 
     /// A synthetic parameter's value (§4.14.5 rule 1, impl-04 §3.4).

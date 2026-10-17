@@ -2,8 +2,9 @@
 // Copyright 2026 Anton (darkcite)
 
 //! `array.*` part 3 (impl-04 §4.16.6, T34 rest): `fill` (in place, never grows), `variance` /
-//! `stdev` of a float array (two-pass), and the element-copying rows `copy`, `from`, `concat`.
-//! Every body checks everything before its first write (§4.16.5, I14); a creator's own checks
+//! `stdev` of a float array (two-pass), and the element-copying rows `copy`, `from`, `concat`;
+//! the string `sort` / `sort_indices` and (R-P5) the UDT field `sort` / `sort_indices` (`*_AT`,
+//! keyed through `Frame::obj_field`) on one in-place heap sort. Every body checks everything before its first write (§4.16.5, I14); a creator's own checks
 //! that need the new block's layout follow its init (`pin:04-coll-size-check-after-init`).
 
 use super::array::{declared, flags, word_of};
@@ -527,30 +528,34 @@ fn str_of<'a>(c: &'a Cmp<'_, '_>, w: u64) -> Option<&'a [u8]> {
 /// ints signed, strings bytewise (§4.16.6, `pin:04-collection-edges`).
 fn asc(c: &Cmp<'_, '_>, a: u64, b: u64) -> Ordering {
     match c.elem {
-        Ty::Float => {
-            let (x, y) = (f64::from_bits(a), f64::from_bits(b));
-            match (x.is_nan(), y.is_nan()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                _ => x.total_cmp(&y),
-            }
-        }
         Ty::String => match (str_of(c, a), str_of(c, b)) {
             (None, None) => Ordering::Equal,
             (None, Some(_)) => Ordering::Greater,
             (Some(_), None) => Ordering::Less,
             (Some(x), Some(y)) => x.cmp(y),
         },
-        _ => {
-            let na = NA_I64 as u64;
-            match (a == na, b == na) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                _ => (a as i64).cmp(&(b as i64)),
-            }
-        }
+        ty => num_asc(ty, a, b),
+    }
+}
+
+/// [`asc`] of two non-string words: floats by `total_cmp` (na last, `−0.0` before `+0.0`), any
+/// other type as a signed int (na last).
+fn num_asc(ty: Ty, a: u64, b: u64) -> Ordering {
+    if matches!(ty, Ty::Float) {
+        let (x, y) = (f64::from_bits(a), f64::from_bits(b));
+        return match (x.is_nan(), y.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            _ => x.total_cmp(&y),
+        };
+    }
+    let na = NA_I64 as u64;
+    match (a == na, b == na) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        _ => (a as i64).cmp(&(b as i64)),
     }
 }
 
@@ -580,14 +585,11 @@ fn before_idx(c: &Cmp<'_, '_>, a: u64, b: u64) -> bool {
     o.then(a.cmp(&b)) == Ordering::Less
 }
 
-/// A sort comparator: `a` goes before `b`.
-type Before = fn(&Cmp<'_, '_>, u64, u64) -> bool;
-
 /// Sift `root` down the max-heap `p[..end]` under `before` (the root goes last).
 ///
 /// # Safety
 /// As [`heap_sort`]; `root < end <= n`.
-unsafe fn sift(p: *mut u64, root: usize, end: usize, cx: &Cmp<'_, '_>, before: Before) {
+unsafe fn sift<C>(p: *mut u64, root: usize, end: usize, cx: &C, before: fn(&C, u64, u64) -> bool) {
     let mut r = root;
     loop {
         let mut ch = 2 * r + 1;
@@ -608,12 +610,13 @@ unsafe fn sift(p: *mut u64, root: usize, end: usize, cx: &Cmp<'_, '_>, before: B
     }
 }
 
-/// Heap sort of the `n` words at `p` under `before` — O(n log n), in place, an index loop, no
-/// allocation and no closure (`cx` carries what the named comparator reads).
+/// Heap sort of the `n` words at `p` under `before` (`a` goes before `b`) — O(n log n), in place,
+/// an index loop, no allocation and no closure (`cx` carries what the named comparator reads: a
+/// [`Cmp`] for the scalar rows, an [`ObjCmp`] for the UDT field rows).
 ///
 /// # Safety
 /// `p` names `n` initialised, exclusively owned words for the call (no `&` / `&mut` to them).
-unsafe fn heap_sort(p: *mut u64, n: usize, cx: &Cmp<'_, '_>, before: Before) {
+unsafe fn heap_sort<C>(p: *mut u64, n: usize, cx: &C, before: fn(&C, u64, u64) -> bool) {
     let mut s = n / 2;
     while s > 0 {
         s -= 1;
@@ -726,6 +729,191 @@ fn sort_indices(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fau
     Ok(())
 }
 
+// ---- UDT field sort, sort_indices (R-P5, CAR-R27-1) -------------------------------------------
+
+/// What a UDT field comparator reads: the frame (each object's field through
+/// `Frame::obj_field`, a string key's bytes), the source words (`sort_indices`: the elements the
+/// indices name, from `base`), the field, its type and the order.
+struct ObjCmp<'a, 'f> {
+    f: &'a Frame<'f>,
+    src: *const u64,
+    base: u32,
+    field: u32,
+    key: Ty,
+    desc: bool,
+}
+
+/// The key of element `w`: field `c.field` of the object it names. Every element passed
+/// [`objects_ok`] before the sort began and a sort writes only the array's words, never an
+/// object's block, so the read cannot fault; the na key in the arm that cannot run keeps the
+/// comparator total.
+fn obj_key(c: &ObjCmp<'_, '_>, w: u64) -> u64 {
+    let r = c.f.obj_field(CollRef(w), c.field);
+    debug_assert!(r.is_ok(), "an element objects_ok passed faults mid-sort");
+    match r {
+        Ok(k) => k,
+        Err(_) => NA_I64 as u64,
+    }
+}
+
+/// Ascending order of two field keys of type `ty`, the scalar rows' order ([`asc`]): na last;
+/// floats by `total_cmp`, ints signed, strings bytewise. A string field holds a `CONST` or
+/// `PERSIST` `StrRef` (impl-02 §4.14.7) — never an owned-cell word, whose tag is also `PERSIST`
+/// (§4.16.1) — so its bytes come from `Frame::str_bytes`, not [`str_of`].
+fn key_asc(f: &Frame<'_>, ty: Ty, a: u64, b: u64) -> Ordering {
+    if !matches!(ty, Ty::String) {
+        return num_asc(ty, a, b);
+    }
+    let na = NA_I64 as u64;
+    match (a == na, b == na) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        _ => f.str_bytes(StrRef(a)).cmp(f.str_bytes(StrRef(b))),
+    }
+}
+
+/// `a` goes before `b`: element words of an `array<UDT>` by their field keys (`sort`, as
+/// [`before_val`]: descending = the ascending order reversed, so an na field first).
+fn before_obj(c: &ObjCmp<'_, '_>, a: u64, b: u64) -> bool {
+    let o = key_asc(c.f, c.key, obj_key(c, a), obj_key(c, b));
+    if c.desc {
+        o == Ordering::Greater
+    } else {
+        o == Ordering::Less
+    }
+}
+
+/// `a` goes before `b`: indices into an `array<UDT>` (`sort_indices`, as [`before_idx`]) — by
+/// field key in the order, ties by index ascending.
+fn before_obj_idx(c: &ObjCmp<'_, '_>, a: u64, b: u64) -> bool {
+    // SAFETY: `a`, `b` < the source window's length; `base + len <= owner_len <= cap` words.
+    let (wa, wb) = unsafe {
+        (
+            *c.src.add((c.base as u64 + a) as usize),
+            *c.src.add((c.base as u64 + b) as usize),
+        )
+    };
+    let o = key_asc(c.f, c.key, obj_key(c, wa), obj_key(c, wb));
+    let o = if c.desc { o.reverse() } else { o };
+    o.then(a.cmp(&b)) == Ordering::Less
+}
+
+/// Every element of `o`'s window names a live object with field `field`, checked before any
+/// write (§4.16.5, I14): `pin:04-udt-sort-na-object` — an na element is `ScriptRefused` (each
+/// element is a key, and reading a field of an na object faults as `O_GET_*` does); a stale or
+/// non-object element is `ScriptRefused`, a field past the object's `Internal`
+/// (`Frame::obj_field`).
+fn objects_ok(f: &Frame<'_>, o: &Owned, field: u32) -> Result<(), FaultKind> {
+    let (_, words) = f.coll(o.owner)?;
+    let end = (o.base + o.len) as usize;
+    let mut i = o.base as usize;
+    while i < end {
+        if words[i] == NA_I64 as u64 {
+            return Err(FaultKind::ScriptRefused);
+        }
+        f.obj_field(CollRef(words[i]), field)?;
+        i += 1;
+    }
+    Ok(())
+}
+
+/// The field and key type of a UDT sort's selector (`pin:02-udt-field-selector`): an int,
+/// float or string field; any other type is `Internal` (sema refuses it, 3007).
+fn sort_field(f: &Frame<'_>, e: u16) -> Result<(u32, Ty), FaultKind> {
+    match super::udt_selector(f, e)? {
+        s @ (_, Ty::Int | Ty::Float | Ty::String) => Ok(s),
+        _ => Err(FaultKind::Internal),
+    }
+}
+
+/// `array.sort(id, order, sort_field)` of an `array<UDT>` (v6) — `[id, order, sel]`: the element
+/// words sorted in place by the field `sel` names, with the scalar rows' sort and order — the
+/// heap sort of [`sort_str`], na field last ascending / first descending. A view sorts its
+/// window of the owner. `pin:04-udt-sort-ties` — the reference is silent on stability; the
+/// scalar rows' in-place sort is not stable, which no scalar array can observe (equal keys are
+/// equal values), but two objects with equal keys are distinct: their order after the sort is
+/// the heap sort's (deterministic, a function of the input order alone), not necessarily their
+/// input order. `sort_indices` is stable (`(key, index)`).
+fn sort_at(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 3 {
+        return Err(FaultKind::Internal);
+    }
+    let o = array(f, args[0])?;
+    if !matches!(o.elem, Ty::Udt) {
+        return Err(FaultKind::Internal);
+    }
+    let desc = order(f, args[1])?;
+    let (field, key) = sort_field(f, args[2])?;
+    objects_ok(f, &o, field)?;
+    let wp: *mut u64 = f.coll_mut(o.owner)?.1.as_mut_ptr();
+    let cx = ObjCmp {
+        f,
+        src: wp,
+        base: 0,
+        field,
+        key,
+        desc,
+    };
+    // SAFETY: the owner's window `[base, base + len)` (`array` checked it), journaled by
+    // `coll_mut` above, unmoved (F8); no reference to it is live (the comparator reads only the
+    // objects' blocks — other sites' — and CONST / PERSIST string bytes, F6).
+    unsafe { heap_sort(wp.add(o.base as usize), o.len as usize, &cx, before_obj) };
+    Ok(())
+}
+
+/// `array.sort_indices(id, order, sort_field)` of an `array<UDT>` (v6) —
+/// `[__elem, __key, __cap, id, order, sel, out]`: a new `array<int>` of the reference's indices
+/// sorted by the field `sel` names, `(key, index)` pairs as the scalar row (deterministic, = a
+/// stable sort); the source is not modified. More elements than `__cap` is `PoolFull`.
+fn sort_indices_at(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 7 {
+        return Err(FaultKind::Internal);
+    }
+    let o = array(f, args[3])?;
+    if f.i64_arg(args[0]).and_then(elem_ty) != Some(Ty::Int) || !matches!(o.elem, Ty::Udt) {
+        return Err(FaultKind::Internal);
+    }
+    // An `array<UDT>` source is never this site's own `array<int>` result.
+    debug_assert!(o.owner.site() != site);
+    let desc = order(f, args[4])?;
+    let (field, key) = sort_field(f, args[5])?;
+    objects_ok(f, &o, field)?;
+    let sp: *const u64 = f.coll(o.owner)?.1.as_ptr();
+    let (r, _) = create(
+        f,
+        site,
+        CollKind::Array,
+        Ty::Int,
+        Ty::Void,
+        f.i64_arg(args[2]),
+        o.len,
+    )?;
+    let dp: *mut u64 = {
+        let (_, words) = f.coll_mut(r)?;
+        let mut k = 0usize;
+        while k < o.len as usize {
+            words[k] = k as u64;
+            k += 1;
+        }
+        words.as_mut_ptr()
+    };
+    let cx = ObjCmp {
+        f,
+        src: sp,
+        base: o.base,
+        field,
+        key,
+        desc,
+    };
+    // SAFETY: the new block's first `len` words (`create` checked `len <= cap`), journaled by
+    // `coll_mut` above, unmoved (F8), no reference to them live; the comparator reads the source
+    // block and the objects' blocks (other sites', F6) and CONST / PERSIST string bytes.
+    unsafe { heap_sort(dp, o.len as usize, &cx, before_obj_idx) };
+    f.set_i64_arg(args[6], Some(r.0 as i64));
+    Ok(())
+}
+
 // ---- the rows (pine-vm `flag_ok`: a fault the row's flags do not declare is `Internal`) ----
 
 /// The `array.fill` row.
@@ -768,6 +956,18 @@ pub fn bi_array_sort_indices(
     args: &[u16],
 ) -> Result<(), FaultKind> {
     sort_indices(f, site, args).map_err(|k| declared(flags(ov::ARRAY_SORT_INDICES_AF), k))
+}
+/// The `array.sort` row of an `array<UDT>` by field (v6).
+pub fn bi_array_sort_at(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    sort_at(f, args).map_err(|k| declared(flags(ov::ARRAY_SORT_AT), k))
+}
+/// The `array.sort_indices` row of an `array<UDT>` by field (v6).
+pub fn bi_array_sort_indices_at(
+    f: &mut Frame<'_>,
+    site: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    sort_indices_at(f, site, args).map_err(|k| declared(flags(ov::ARRAY_SORT_INDICES_AT), k))
 }
 /// The `array.concat` row.
 pub fn bi_array_concat(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {

@@ -876,6 +876,103 @@ pub(crate) fn unserved(ov: OverloadId, at: Span) -> Option<Diag> {
     Some(deferred(e, " unserved=1", at))
 }
 
+/// The UDT field rows (R-P5, Pine 2026: `array.sort(id, order, sort_field)` etc. order an
+/// `array<UDT>` by one field of its elements; v6 only).
+const UDT_SORT_ROWS: [OverloadId; 2] = [
+    pine_spec::ov::ARRAY_SORT_AT,
+    pine_spec::ov::ARRAY_SORT_INDICES_AT,
+];
+const UDT_SEARCH_ROWS: [OverloadId; 3] = [
+    pine_spec::ov::ARRAY_BINARY_SEARCH_AT,
+    pine_spec::ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT,
+    pine_spec::ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT,
+];
+
+/// `Some(search)` for a UDT field row: `false` for `sort` / `sort_indices`, `true` for the
+/// three `binary_search*`.
+pub(crate) fn udt_field_row(ov: OverloadId) -> Option<bool> {
+    if UDT_SORT_ROWS.contains(&ov) {
+        Some(false)
+    } else if UDT_SEARCH_ROWS.contains(&ov) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The row's own `sort_field` default (pine-spec `{"k": "int", "v": 0}`), as a folded value.
+pub(crate) fn sort_field_default(o: &Overload) -> Option<K> {
+    let p = pine_spec::params(o)
+        .iter()
+        .find(|p| p.name.as_str() == "sort_field")?;
+    match p.default.kind {
+        pine_spec::DefaultKind::Int => Some(K::Int(p.default.bits as i64)),
+        _ => None,
+    }
+}
+
+/// The selector a UDT field row passes to pine-std for its `sort_field` argument `sel` (the
+/// folded `const int` index or `const string` name; `None` when it does not fold), over the
+/// element type's fields `(name, type)` in declaration order.
+///
+/// `pin:02-udt-field-selector` — the reference: "An "int" `sort_field` argument specifies a
+/// field by its index, where 0 refers to the first field in the type declaration. A "string"
+/// argument specifies a field by its name"; `sort` / `sort_indices` take "any field of the type
+/// "int", "float", or "string""; `binary_search*` "any of the type's "int" or "float" fields".
+/// Folded here to one `int` constant, `index | (field Ty as i64) << 32` — the index in bits
+/// 0..32, the field's `pine_ir::Ty` byte in bits 32..40 (`Int` 1, `Float` 2, `String` 5), bits
+/// 40..64 zero — which pine-std's `coll::udt_selector` decodes (its `Internal` on any other
+/// shape). The reference is silent on a bad selector; the literal reading refuses at compile,
+/// all as `3007`: a selector that does not fold, a negative or out-of-range index, a name no
+/// field has, and a field of any other type (`bool`, `color`, an enum, a UDT, a collection).
+pub(crate) fn udt_selector(
+    search: bool,
+    fields: &[(Sym, TypeQ)],
+    sel: Option<K>,
+    syms: &SymTable,
+) -> Result<i64, String> {
+    let i = match sel {
+        Some(K::Int(i)) if i >= 0 && (i as u64) < fields.len() as u64 => i as usize,
+        Some(K::Int(i)) => {
+            return Err(format!(
+                "`sort_field` {i} names no field (the type has {})",
+                fields.len()
+            ))
+        }
+        Some(K::Str(s)) => {
+            let want = syms.resolve_bytes(s);
+            match fields.iter().position(|f| syms.resolve_bytes(f.0) == want) {
+                Some(i) => i,
+                None => {
+                    let name = String::from_utf8_lossy(want);
+                    return Err(format!(
+                        "`sort_field` \"{name}\" names no field of the type"
+                    ));
+                }
+            }
+        }
+        _ => return Err("`sort_field` is a constant int index or string name".to_owned()),
+    };
+    let ft = fields[i].1.ty;
+    let ok = if search {
+        matches!(ft, Ty::Int | Ty::Float)
+    } else {
+        matches!(ft, Ty::Int | Ty::Float | Ty::String)
+    };
+    if !ok {
+        let want = if search {
+            "int or float"
+        } else {
+            "int, float or string"
+        };
+        return Err(format!(
+            "`sort_field` names field {i} of type {}; this function takes an {want} field",
+            ty_name(fields[i].1)
+        ));
+    }
+    Ok(i as i64 | (ft as i64) << 32)
+}
+
 /// Where an omitted parameter's value comes from (A4.1: pine-sema resolves every `Derived`
 /// default at the call site; pass 4 lowers it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

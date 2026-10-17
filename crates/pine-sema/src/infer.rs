@@ -1214,6 +1214,71 @@ impl<'a, 's> Infer<'a, 's> {
         None
     }
 
+    /// Every field of UDT `decl`, `(name, declared type)` in declaration order.
+    fn udt_fields(&mut self, decl: u16) -> Vec<(Sym, TypeQ)> {
+        let Some(&(f, d)) = self.udts.get(decl as usize) else {
+            return Vec::new();
+        };
+        let Some(ast) = self.files[f] else {
+            return Vec::new();
+        };
+        let Node::TypeDecl { fields, .. } = ast.node(d) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(fields.len());
+        for &fd in fields {
+            if let Node::FieldDecl { ty, name, .. } = ast.node(fd) {
+                let t = type_ref(ast, &*self.syms, ty, Qual::Series, &|p| self.named(f, p))
+                    .unwrap_or(void());
+                out.push((ast.sym(name), t));
+            }
+        }
+        out
+    }
+
+    /// R-P5: a UDT field row's element type, `val` and `sort_field` selector
+    /// (`pin:02-udt-field-selector`, `overload::udt_selector`; lowering folds the same selector).
+    /// `pin:02-udt-rows-udt-only` — the `*_AT` rows are served for an `array<UDT>` only. Their
+    /// `T` also admits `bool`, `color` and enums (and, with an explicit `sort_field`, `int`,
+    /// `float`, `string`), but the reference says neither how such an array orders nor what
+    /// `sort_field` does on one, so those calls keep the `3024 … unserved=1` they had before
+    /// R-P5. A search's `val` must be an int or a float: its field is one, and the reference's
+    /// `string` `val` meets no int / float field (`3007`).
+    fn udt_field_check(
+        &mut self,
+        e: &pine_spec::Entry,
+        ov: &pine_spec::Overload,
+        search: bool,
+        argv: &[Arg],
+        bound: &[Option<u16>],
+        at: Span,
+    ) -> Option<Diag> {
+        let ps = pine_spec::params(ov);
+        let arg = |name: &str| {
+            (0..argv.len())
+                .find(|&k| bound[k].is_some_and(|r| ps[r as usize].name.as_str() == name))
+                .map(|k| argv[k])
+        };
+        let id = arg("id")?;
+        let el = id.t.a;
+        if id.t.ty != Ty::Array || el & (pine_ir::elem::SCALAR | pine_ir::elem::ENUM) != 0 {
+            return Some(overload::deferred(e, " unserved=1", at));
+        }
+        let full = e.full_str();
+        if search && arg("val").is_some_and(|v| !matches!(v.t.ty, Ty::Int | Ty::Float)) {
+            let msg = format!("`{full}`: `val` of an array of objects is an int or a float");
+            return Some(diag(ReasonCode::TypeMismatch, at, msg));
+        }
+        let sel = match arg("sort_field") {
+            Some(a) => a.k,
+            None => overload::sort_field_default(ov),
+        };
+        let fields = self.udt_fields(el & pine_ir::elem::DECL_MASK);
+        overload::udt_selector(search, &fields, sel, &*self.syms)
+            .err()
+            .map(|m| diag(ReasonCode::TypeMismatch, at, format!("`{full}`: {m}")))
+    }
+
     // ---- history ----------------------------------------------------------------------------
 
     fn hist(&mut self, n: NodeId, base: NodeId, offset: NodeId) -> Ex {
@@ -1872,6 +1937,11 @@ impl<'a, 's> Infer<'a, 's> {
                 }
                 if let Some(d) = overload::unserved(p.ov, at) {
                     self.diags.push(d);
+                }
+                if let Some(search) = overload::udt_field_row(p.ov) {
+                    if let Some(d) = self.udt_field_check(e, ov, search, argv, &p.bound, at) {
+                        self.diags.push(d);
+                    }
                 }
                 let input_k = match ov.input {
                     Some(kind) => {

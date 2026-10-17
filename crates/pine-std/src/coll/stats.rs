@@ -3,14 +3,15 @@
 
 //! `array.*` part 2 (impl-04 §4.16.6, T34): `sort` of numeric arrays and `reverse` in place, the
 //! float reductions `sum` / `avg` on the §4.9 kernel, the int `sum`, `min` / `max` (with `nth`), `range`,
-//! `every` / `some`, `binary_search*`. Each works on the root owner's words seen by the reference (a view sorts or
+//! `every` / `some`, `binary_search*` (and, R-P5, the UDT field `binary_search*_AT` through
+//! `Frame::obj_field`). Each works on the root owner's words seen by the reference (a view sorts or
 //! reverses its window of the owner). No scratch, no allocation.
 
 use super::array::{declared, flags};
 use super::{resolve, Owned};
 use crate::simd;
 use core::cmp::Ordering;
-use pine_ir::{CollKind, FaultKind, SiteId, Ty, NA_I64};
+use pine_ir::{CollKind, CollRef, FaultKind, SiteId, Ty, NA_I64};
 use pine_spec::ov;
 use pine_vm::Frame;
 
@@ -385,6 +386,95 @@ fn binary_search<const MODE: u8>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), 
     Ok(())
 }
 
+// ---- UDT field search (R-P5, CAR-R27-1) ----------------------------------------------------
+
+/// The search key of UDT element `w`: field `field` of the object it names, as [`key`] reads an
+/// element (an int field converts, an na field is NaN). `pin:04-udt-sort-na-object`: an na
+/// element is `ScriptRefused` (a field read of an na object, as `O_GET_*`); a stale or non-object
+/// one faults as `Frame::obj_field` does.
+#[inline(always)]
+fn obj_key(f: &Frame<'_>, w: u64, field: u32, float: bool) -> Result<f64, FaultKind> {
+    if w == NA {
+        return Err(FaultKind::ScriptRefused);
+    }
+    Ok(key(f.obj_field(CollRef(w), field)?, float))
+}
+
+/// [`bisect`] over the field keys of a UDT window: the same probes, each element's key read
+/// through `Frame::obj_field`.
+fn bisect_obj<const LE: bool>(
+    f: &Frame<'_>,
+    w: &[u64],
+    field: u32,
+    float: bool,
+    v: f64,
+) -> Result<usize, FaultKind> {
+    let (mut lo, mut hi) = (0usize, w.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let x = obj_key(f, w[mid], field, float)?;
+        if if LE { x <= v } else { x < v } {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// `array.binary_search{,_leftmost,_rightmost}(id, val, sort_field)` of an `array<UDT>`
+/// (`MODE` 0 / 1 / 2) — `[id, val, sel, out]`: [`binary_search`] over the int or float field
+/// `sel` names (`pin:02-udt-field-selector`), answers and pins as the scalar rows
+/// (`pin:04-binary-search`). `val` is an int (i64 entry; na → NaN) or a float, compared as
+/// `f64`; sema refuses a string `val` and a field that is not int / float (3007). Only the
+/// elements the bisection reads are touched, so an na element among them is `ScriptRefused`
+/// (`pin:04-udt-sort-na-object`); one it does not read is not.
+fn binary_search_at<const MODE: u8>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
+    use pine_ir::argwin::is_i64;
+    if args.len() != 4 || !is_i64(args[3]) {
+        return Err(FaultKind::Internal);
+    }
+    let o = array(f, args[0])?;
+    if !matches!(o.elem, Ty::Udt) {
+        return Err(FaultKind::Internal);
+    }
+    let (field, fty) = super::udt_selector(f, args[2])?;
+    let float = match fty {
+        Ty::Float => true,
+        Ty::Int => false,
+        _ => return Err(FaultKind::Internal),
+    };
+    if crate::sw::pick(FEQ, f.dialect()) != 0 {
+        // `round9` needs `$op.eq_round9`'s decimal kernel, not landed here (as the scalar rows).
+        return Err(FaultKind::Internal);
+    }
+    let v = if is_i64(args[1]) {
+        match f.i64_arg(args[1]) {
+            Some(x) => x as f64,
+            None => f64::NAN,
+        }
+    } else {
+        f.f64_arg(args[1])
+    };
+    let r = if v.is_nan() {
+        -1
+    } else {
+        let (_, words) = f.coll(o.owner)?;
+        let w = &words[o.base as usize..(o.base + o.len) as usize];
+        let lo = bisect_obj::<false>(f, w, field, float, v)?;
+        let found = lo < w.len() && obj_key(f, w[lo], field, float)? == v;
+        match (MODE, found) {
+            (0, true) | (1, true) => lo as i64,
+            (0, false) => -1,
+            (1, false) => lo as i64 - 1,
+            (_, true) => bisect_obj::<true>(f, w, field, float, v)? as i64 - 1,
+            (_, false) => lo as i64,
+        }
+    };
+    f.set_i64_arg(args[3], Some(r));
+    Ok(())
+}
+
 // ---- the rows ------------------------------------------------------------------------------
 
 /// The `array.sort` rows (float / int).
@@ -443,6 +533,32 @@ pub fn bi_array_binary_search_rightmost(
 ) -> Result<(), FaultKind> {
     binary_search::<2>(f, args)
         .map_err(|k| declared(flags(ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AF), k))
+}
+/// The `array.binary_search` row of an `array<UDT>` by field (v6).
+pub fn bi_array_binary_search_at(
+    f: &mut Frame<'_>,
+    _: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    binary_search_at::<0>(f, args).map_err(|k| declared(flags(ov::ARRAY_BINARY_SEARCH_AT), k))
+}
+/// The `array.binary_search_leftmost` row of an `array<UDT>` by field (v6).
+pub fn bi_array_binary_search_leftmost_at(
+    f: &mut Frame<'_>,
+    _: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    binary_search_at::<1>(f, args)
+        .map_err(|k| declared(flags(ov::ARRAY_BINARY_SEARCH_LEFTMOST_AT), k))
+}
+/// The `array.binary_search_rightmost` row of an `array<UDT>` by field (v6).
+pub fn bi_array_binary_search_rightmost_at(
+    f: &mut Frame<'_>,
+    _: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    binary_search_at::<2>(f, args)
+        .map_err(|k| declared(flags(ov::ARRAY_BINARY_SEARCH_RIGHTMOST_AT), k))
 }
 /// The `array.sum` row of an int array.
 pub fn bi_array_sum_i(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
