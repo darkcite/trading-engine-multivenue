@@ -8,7 +8,7 @@
 //! - **market** — `wss://ws-subscriptions-clob.polymarket.com/ws/market`
 //!   with the custom features on: the bound windows' tokens, subscribed and
 //!   unsubscribed as they roll; `book`, `price_change`, `tick_size_change`,
-//!   `last_trade_price` and `market_resolved`. Text `PING` every 10 s.
+//!   `last_trade_price` and `market_resolved`. Text `PING` every 5 s.
 //! - **rtds** — the Chainlink reports ([`crate::rtds`]). Text `PING` every 5 s.
 //!
 //! The windows come from the discovery thread ([`crate::pm15_discovery`])
@@ -62,8 +62,10 @@ use crate::{scan_venue_time_ms, DEFAULT_TICK_RING_CAP};
 pub const PM15_MARKET_HOST: &str = "ws-subscriptions-clob.polymarket.com";
 /// The market socket's path.
 pub const PM15_MARKET_PATH: &str = "/ws/market";
-/// The market socket's keepalive cadence, ns.
-pub const PM15_MARKET_PING_NS: u64 = 10_000_000_000;
+/// The market socket's keepalive cadence, ns. 5 s, as RTDS's: at 10 s the
+/// venue closed the socket 4 times in a 900 s probe (`last_market_err` 8,
+/// Closed) while RTDS at 5 s never dropped.
+pub const PM15_MARKET_PING_NS: u64 = 5_000_000_000;
 /// Capacity of the discovery → ingress spec ring.
 pub const PM15_SPEC_RING: usize = 64;
 /// Legs: two per slot.

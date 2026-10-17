@@ -1,0 +1,24 @@
+[package]
+name         = "exec-polymarket"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "PM15-6: the slot-9 Polymarket CLOB V2 order arm — FAK taker, Exchange V2 EIP-712 (EOA, proxy, Safe, Deposit Wallet), L2 HMAC, the user channel's fills."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The SHA-256 / HMAC / base64 the L2 auth needs (dependency-free).
+core-crypto   = { workspace = true }
+# The in-place JSON scanners (find_field, skip_string, scan_price_1e6).
+core-parse    = { workspace = true }
+core-types    = { workspace = true }
+# PM15-6a: the Exchange V2 order, ClobAuth and the POLY_1271 wrapper.
+signer-eip712 = { workspace = true }
+# The decoded API secret is wiped on drop.
+zeroize       = { workspace = true }
+memchr        = { workspace = true }

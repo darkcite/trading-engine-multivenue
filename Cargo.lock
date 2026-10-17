@@ -153,6 +153,7 @@ dependencies = [
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
+ "exec-polymarket",
  "exec-router",
  "ingress-ai",
  "ingress-binance",
@@ -865,6 +866,18 @@ dependencies = [
  "rcgen",
  "rustls",
  "secp256k1",
+ "signer-eip712",
+ "zeroize",
+]
+
+[[package]]
+name = "exec-polymarket"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "core-parse",
+ "core-types",
+ "memchr",
  "signer-eip712",
  "zeroize",
 ]

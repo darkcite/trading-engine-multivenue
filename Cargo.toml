@@ -89,6 +89,8 @@ members = [
     "crates/signer-ed25519",
     # BX6: the Binance execution arm (engine half + gateway thread)
     "crates/exec-binance",
+    # PM15-6: the slot-9 Polymarket CLOB V2 arm (FAK taker; engine half + gateway thread)
+    "crates/exec-polymarket",
 
     # --- engine + UI ---
     "crates/engine",
@@ -246,6 +248,7 @@ signer-evm      = { path = "crates/signer-evm" }
 signer-ed25519  = { path = "crates/signer-ed25519" }
 exec-binance    = { path = "crates/exec-binance" }
 exec-hyperevm   = { path = "crates/exec-hyperevm" }
+exec-polymarket = { path = "crates/exec-polymarket" }
 
 engine          = { path = "crates/engine" }
 engine-snapshot = { path = "crates/engine-snapshot" }

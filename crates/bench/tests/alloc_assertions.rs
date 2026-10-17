@@ -20485,3 +20485,104 @@ fn pm15_ingress_driver_and_member_are_zero_alloc() {
     assert_eq!(allocs, 0, "gate 114: slot 9's member allocated {allocs} times ({bytes} B)");
     std::hint::black_box((wire.0, ct));
 }
+
+/// PM15-6a gate 115: the slot-9 arm's order path without a socket — the
+/// FAK amounts, the struct hash and signature (EOA and the Deposit
+/// Wallet's wrapper), the per-order tail and dynamic head, the L2 MAC over
+/// the request's spans, the answer's read and a user-channel frame's scan.
+/// Zero bytes per order.
+#[test]
+fn pm15_exec_order_path_is_zero_alloc() {
+    use exec_polymarket::amounts::fak_buy;
+    use exec_polymarket::l2::L2Secret;
+    use exec_polymarket::render::{
+        render_dynamic_head, render_order_tail, render_token_prefix, render_ts, DYN_HEAD_MAX, PREFIX_MAX,
+        TAIL_MAX,
+    };
+    use exec_polymarket::response::{read_order_answer, Verdict};
+    use exec_polymarket::sign::{sign_order, SIG_MAX};
+    use exec_polymarket::userws::{scan_user_frame, UserEvt, KIND_TRADE};
+    use signer_eip712::pmv2::{
+        eip55, exchange_separator, u256_from_decimal, OrderV2, CHAIN_POLYGON, EXCHANGE_V2, SIDE_BUY, SIG_EOA,
+        SIG_POLY_1271,
+    };
+
+    const N: u64 = 256;
+    let key = [0x42u8; 32];
+    let sk = signer_eip712::parse_secret_key(&key).unwrap();
+    let me = signer_eip712::address_from_private_key(&key).unwrap();
+    let me_text = eip55(&me);
+    let tok_dec: &[u8] = b"74913418352376030655968323928940542465856871160803692353977404305259528321778";
+    let tok = u256_from_decimal(tok_dec).unwrap();
+    let sep = exchange_separator(b"2", CHAIN_POLYGON, EXCHANGE_V2);
+    let secret = L2Secret::from_base64(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+    let api_key: &[u8] = b"00000000-0000-0000-0000-000000000000";
+    let mut prefix = [0u8; PREFIX_MAX];
+    let mut tail = [0u8; TAIL_MAX];
+    let mut dynh = [0u8; DYN_HEAD_MAX];
+    let mut sig = [0u8; SIG_MAX];
+    let mut ts = [0u8; 20];
+    let mut evts = [UserEvt::BLANK; 4];
+    let p = render_token_prefix(&me_text, &me_text, tok_dec, SIG_EOA, &mut prefix);
+    let answer: &[u8] = br#"{"success":true,"errorMsg":"","orderID":"0x72e7378745dcfb7f03ad3bb1663fc00a91332015d6000399d131536361deaf9a","status":"matched","makingAmount":"2.5","takingAmount":"4.5454","tradeIDs":["t1"]}"#;
+    let frame: &[u8] = br#"{"event_type":"trade","type":"TRADE","id":"28c4d2eb-bbea-40e7-a9f0-b2fdb56b2c2e","taker_order_id":"0x72e7378745dcfb7f03ad3bb1663fc00a91332015d6000399d131536361deaf9a","asset_id":"74913418352376030655968323928940542465856871160803692353977404305259528321778","side":"BUY","size":"4.5454","price":"0.55","status":"MATCHED","trader_side":"TAKER","maker_orders":[{"order_id":"0xab","price":"0.45","side":"BUY"}],"timestamp":"1792217690300"}"#;
+
+    let mut bytes_out = 0usize;
+    let mut accepted = 0u64;
+    let mut fills = 0u64;
+    // Warm-up: the first signature builds the process's secp256k1 signing
+    // context (a boot cost, 208 B once) — taken before the count.
+    let warm = OrderV2 {
+        salt: 1,
+        maker: me,
+        signer: me,
+        token_id: tok,
+        maker_amount: 1,
+        taker_amount: 1,
+        timestamp_ms: 1,
+        metadata: [0; 32],
+        builder: [0; 32],
+        side: SIDE_BUY,
+        signature_type: SIG_EOA,
+        _pad: [0; 6],
+    };
+    sign_order(&sk, &sep, CHAIN_POLYGON, &warm, &mut sig).unwrap();
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < N {
+        let a = fak_buy(250_000_000 - i * 10_000, 950_000, 10_000).unwrap();
+        let sig_type = if i % 2 == 0 { SIG_EOA } else { SIG_POLY_1271 };
+        let o = OrderV2 {
+            salt: 479_249_096_354 + i,
+            maker: me,
+            signer: me,
+            token_id: tok,
+            maker_amount: a.maker,
+            taker_amount: a.taker,
+            timestamp_ms: 1_792_217_690_123 + i,
+            metadata: [0; 32],
+            builder: [0; 32],
+            side: SIDE_BUY,
+            signature_type: sig_type,
+            _pad: [0; 6],
+        };
+        let s = sign_order(&sk, &sep, CHAIN_POLYGON, &o, &mut sig).unwrap();
+        let t = render_order_tail(o.salt, &a, o.timestamp_ms, &sig[..s.sig_len], api_key, &mut tail);
+        let tn = render_ts(1_792_217_690 + i, &mut ts);
+        let mac = secret.sign(&[&ts[..tn], b"POST", b"/order", &prefix[..p], &tail[..t]]);
+        let d = render_dynamic_head(&mac, &ts[..tn], Some(p + t), &mut dynh);
+        bytes_out += d + t;
+        if read_order_answer(200, answer).verdict == Verdict::Accepted {
+            accepted += 1;
+        }
+        let r = scan_user_frame(frame, &mut evts).unwrap();
+        if r.events == 1 && evts[0].kind == KIND_TRADE {
+            fills += 1;
+        }
+        i += 1;
+    }
+    let (allocs, nbytes, _) = g.delta();
+    std::hint::black_box((bytes_out, &tail, &dynh));
+    assert_eq!((accepted, fills), (N, N), "gate 115: every answer accepted and every frame a fill");
+    assert_eq!(allocs, 0, "gate 115: the Polymarket order path allocated {allocs} times ({nbytes} B)");
+}
