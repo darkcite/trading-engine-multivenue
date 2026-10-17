@@ -41,11 +41,10 @@ held-quote law; in the live mask since the go-live, 2026-09-26 20:15Z
 `~/multivenue/hcv.toml`; a live slot 7 refuses the boot; its book persists
 in `hcv-state.tsv` by contract since HC11b, written off the engine thread;
 risk-policy "HYPERCALL — slot 7") · 8 pine (third-party Pine scripts,
-`strategy-pine`, PVM impl-08; PAPER ONLY by ruling 2026-10-16: a live
-`[exec.slot.8]` refuses at parse, `--arm-live 8` at boot, the AI's enable is
-refused; not in `all`; a `STRATEGY` naming it refuses the boot until T19's
-`--pine`). Member timers run per
-slot (each on its own period). The engine boots the `STRATEGY` named in
+`strategy-pine`, PVM impl-08; boots in PAPER only, with `--pine <manifest>`
+(F19 both ways; ruling 2026-10-16); not in `all`; live is refused at parse
+(`[exec.slot.8]`), by `--arm-live 8` and for the AI's enable). Member timers
+run per slot (each on its own period). The engine boots the `STRATEGY` named in
 `~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh`: `+`-joined
 member names or `ai` (= ai-exec+vm, 48), any order, parsed once by
 `strategy_set::parse_strategy`; `multivenue-engine strategy-mask <STRATEGY>`

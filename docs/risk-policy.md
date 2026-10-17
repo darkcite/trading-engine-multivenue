@@ -16928,19 +16928,86 @@ Hyperliquid (O-PVM-2). Lead ruling: `all` keeps meaning the eight production mem
    at `PINE_SLOT` on its own as well.
 3. **AI plane.** `EnableStrategy(8)` is refused and counted (`enable_refused`): the AI never
    arms third-party code. `DisableStrategy(8)` and `HaltRequest` are honoured.
-4. **A boot that names pine (F19).** Until impl-08 T19 lands `--pine <manifest>`, this binary
-   cannot configure slot 8, and the set arm boots `requested & configured` — `ai+pine` would
-   have booted as `ai`, silently. The `run` command (`Cmd::Run`, before `run` is entered: before
-   the config load, the ingress threads, the exec artifact and every live or gateway arm)
-   refuses any `--strategy` naming pine, exit 1: "pine: requested by --strategy but this binary
-   cannot configure it (impl-08 T19 --pine) — boot aborted" (`cli::pine_boot::check_requested`).
-   `strategy-mask` still resolves the name (`pine` → `256\tpine`), so a `STRATEGY` naming it
-   passes the wrapper and refuses at the boot. The unconfigured member's own `on_start` refuses
-   too (F19).
+4. **The T19 boot — `--pine <manifest>` is required both ways (F19).** Slot 8 boots in PAPER
+   only, and only with `--pine`. The set arm boots `requested & configured`, so without this
+   check `ai+pine` would boot as `ai`, silently. The `run` command checks it in `Cmd::Run`, before
+   `run` is entered: before the config load, the ingress threads, the exec artifact and every live
+   or gateway arm (`cli::pine_boot::check_run`, exit 1). Each of these refuses: a `--strategy`
+   naming pine without `--pine`; `--pine` without pine in the mask; `--pine` beside a `--strategy`
+   that is not a set mask (a legacy arm such as `ev` or `rule-tree`, or a typo,
+   `pin:08-run-legacy-strategy-refused`). `strategy-mask` still resolves the name (`pine` →
+   `256\tpine`), so a `STRATEGY` naming it passes the wrapper and the boot decides. The
+   unconfigured member's own `on_start` refuses too (F19). A configured boot (`pine_boot::build`,
+   then the member's load) holds each of the following, fail-closed:
+   - **Facts come from venue discovery** (operator ruling R-08-T19-1, 2026-10-17,
+     `pin:08-facts-from-discovery`). Every route symbol's `PineSymbolFacts` is read from the boot
+     REST discovery the run already performs: Hyperliquid `meta` `szDecimals`, Binance
+     `exchangeInfo` filters. A missing fact refuses the boot. There is never a default.
+   - **Slot 8's route is paper or off.** It is the router's resolved row (`ExecBoot::slots`). A
+     live slot 8 never reaches here (refusals 1–2).
+   - **Paper boots flat.** A non-empty `boot_state` off Live is refused (`6013`,
+     `pin:08-boot-state-live-only`).
+   - **`oid_epoch != 0`.** An epoch of 0 is refused at load (`6006`, `pin:08-epoch-zero-refused`).
+     With epoch 0, every own fill decodes as a prior boot's and paper re-fires without bound. The
+     epoch is the boot's UTC second.
+   - **The 2^29 broker-oid bound** (`1 ≤ oid < 2^29`, what the client oid can carry) is an
+     `assert!` in every build, not a `debug_assert!` (`host::dispatch_one`, impl-08 §4.6).
+   - **No slot-8 order carries `ORDER_FLAG_POST_ONLY`** (`pin:08-no-post-only-paper`). The bit
+     selects the paper queue law, under which a cancel or modify `Ok` means only "sent". Slot 8
+     settles on `Ok`, and with the bit it would share xmm's 32-order / 8-symbol queue table.
+     `ORDER_KIND_MAKER` keeps the strict-cross law.
+   - **`ORDER_FLAG_REDUCE_ONLY` goes on reducing orders only** (the broker's reduce-only sizing:
+     exits, closes, the D13 flatten, the guards' `CloseAll`; `pin:08-order-flags-set`). The
+     paper matcher and the exec router ignore the bit, so on paper the broker's sizing is the
+     guard. The bit is a second guard, on live venues only.
+   - **`activation_ns` is taken from the matcher's table** (`pin:08-activation-from-matcher-table`,
+     found by G5). It is `core_fill::ACTIVATION_NS_DEFAULT[..8]`, the table `PaperMatcher` judges
+     by. With zeros, an IoC was reported cancelled and then filled.
 
 **No rollback door is needed.** No live order from slot 8 can exist (refusals 1–3), so an
 older binary never meets a slot-8 cloid or cid; S16-R5's door stays shut. Slot 8's live-arming
 ruling must reopen this.
+
+**The pine-broker requote cap (`pin:05-requote-replaces-prev`; operator ruling 2026-10-17:
+ACCEPTED).** A requote is one `Modify` (E-7). An increasing `Modify` is judged in gates 5–6
+with `prev`'s unfilled quantity **replaced** by the new size, not added to it
+(`outstanding − prev + new`). Every other outstanding order still counts, a `Replaced`
+predecessor included. **The documented bound:** exposure may exceed `cap_instance` (and
+`cap_day`) only by `prev`'s fill that is in flight when the `Modify` lands, which is at most
+`prev`'s unfilled quantity. Reducing requotes are unchanged (`new ≤ |pos| − R`, with `prev`
+still in `R`). Counting `prev` beside its own replacement refused every requote at a
+`cap_instance` of one unit and turned each into Cancel + Submit. **Re-review this before any
+live pine route.** The spec text is impl-05 §4.12.4 rule 4 and I39 (amendment AMEND-05).
+
+**The pine-broker day roll.**
+- `pin:05-boot-day-seed-kept` (R-08-T16-1): the first roll, with no adopted day, adopts its UTC
+  day and keeps the `reconcile_boot` seed. Zeroing the seed there let a restart spend the day
+  cap twice.
+- `pin:05-roll-day-forward-only`: an earlier day never rolls. A stale event therefore cannot
+  zero the day notional or lift a day-scoped halt, and its notional counts toward the adopted
+  day.
+- **Open — FIX-BEFORE-LIVE:** a forward jump caused by one future-stamped venue fill still rolls
+  the day. That zeroes the day notional and lifts a day-scoped halt early. Before any live pine
+  route, cap a forward roll at the event clock's day.
+
+**B'1 trade routing.** Trade events reach slot 8 only. `StrategySet::on_venue_event` hands a
+`ChannelId::Trade` event to the pine member, when it is enabled, and returns before the regime
+tap and the member fan-out. Every other member's event stream is therefore byte-identical to
+the pre-B'1 one (xmm's prints ride their own `TradePrint` lane).
+- An ingress sheds a routed print, and counts it once, when the event ring is at
+  `EVENT_RING_SIZE − EVENT_TRADE_RESERVE` or fuller. Since
+  `EVENT_TRADE_RESERVE = EVENT_RING_SIZE / 4`, a Trade burst always leaves room for every
+  non-trade channel (Funding, AssetCtx, Mark, InstrumentRoll).
+- Any non-zero `engine_ingress_<venue>_trade_shed_total` is an alert, and it makes that session
+  ineligible for 8g.
+- The route is EMPTY, so no lane pushes a Trade for slot 8, unless `--pine` names route
+  symbols. A route symbol on a lane without Trade capture refuses (`6006`).
+- The commit that wires the route into the boot carries its own risk review.
+
+**Observability.** Slot 8's 5 s pine drain (the metrics mirror, `incidents.log`, the tape) runs
+only when metrics are enabled. It ticks inside the `/metrics` mirror block. A pine boot without
+`--metrics` still opens `incidents.log` and the tape, but it drains nothing into them and
+mirrors nothing.
 
 **Bench.** `bench/benches/hot_path.rs` builds `StrategySet::new(BUILT_MASK)`, so
 `strategy_set/on_tick_all` now includes the inert pine member (one branch and one counter); a
@@ -16950,6 +17017,13 @@ ruling must reopen this.
 `slot8_section_defaults_and_ranges`, `slot8_live_requires_three_keys`,
 `exec_toml_without_slot8_section_is_unchanged`); `cli` `exec_boot`
 `pine_slot_8_is_refused_in_every_live_arm`; `cli` `pine_boot`
-`a_requested_pine_refuses_and_nothing_else_does` and `tests/pine_boot_refusal.rs` (the real
-binary); `strategy-set` `pine_is_slot_8_by_name_only_and_all_excludes_it`,
-`pine_enable_8_refused_disable_8_honoured`, `pine_receives_only_fills_attributed_to_slot_8`.
+`pine_requires_the_flag_both_ways`, `pine_with_a_legacy_strategy_refuses`,
+`tests/pine_boot_refusal.rs` (the real binary) and `tests/pine_t19.rs`
+(`facts_come_from_discovery`, `build_is_paper_flat_and_configures`); `strategy-set`
+`pine_is_slot_8_by_name_only_and_all_excludes_it`, `pine_enable_8_refused_disable_8_honoured`,
+`pine_receives_only_fills_attributed_to_slot_8`, `a_trade_print_changes_no_existing_member`;
+`strategy-pine` `tests/fault.rs` `no_slot8_order_is_post_only`; `pine-broker`
+`tests/native_maker.rs` (`a_requote_at_a_cap_of_one_unit_is_one_modify_not_cancel_and_submit`,
+`a_requote_keeps_every_other_outstanding_order_in_its_gates_and_never_passes_the_cap`) and
+`native` `an_event_stamped_on_an_earlier_day_never_rolls_the_day`; `ingress-binance`
+`binance_every_shed_print_is_counted_once`.

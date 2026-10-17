@@ -930,7 +930,8 @@ fn corpus() -> Vec<(String, ExecMode, PineProgram)> {
     let mut out = Vec::new();
     for f in files {
         let src = std::fs::read_to_string(&f).expect("readable");
-        let d = if src.starts_with("//@version=5") {
+        // The SPDX pair precedes the version line (license gate I26); detect the dialect by line.
+        let d = if src.lines().any(|l| l.starts_with("//@version=5")) {
             Dialect::V5
         } else {
             Dialect::V6

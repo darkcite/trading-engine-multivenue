@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
 //@version=6
 indicator("security")
 m = ta.sma(close, 5)
