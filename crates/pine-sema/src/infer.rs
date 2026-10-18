@@ -852,7 +852,11 @@ impl<'a, 's> Infer<'a, 's> {
                 then,
                 otherwise,
             } => {
-                self.condition(cond);
+                // §4.4.2: the qualifier of `c ? a : b` is the strongest of all three operands —
+                // a series condition makes the value series even when both arms are literals
+                // (r37 I9 finding F120: v5 typed `bar_index >= 0 ? K : 0` const, so W1's v5
+                // const division truncated a series value). `pin:02-ternary-qual-cond`.
+                let qc = self.condition(cond);
                 self.cond += 1;
                 let a = self.expr(then);
                 let b = self.expr(otherwise);
@@ -863,7 +867,13 @@ impl<'a, 's> Infer<'a, 's> {
                     match unify(a, b) {
                         Some(t) => Ex {
                             may_na: a.may_na || b.may_na,
-                            ..Ex::of(t, None)
+                            ..Ex::of(
+                                TypeQ {
+                                    qual: join(t.qual, qc),
+                                    ..t
+                                },
+                                None,
+                            )
                         },
                         None => {
                             let msg = format!(
@@ -1017,10 +1027,12 @@ impl<'a, 's> Infer<'a, 's> {
     }
 
     /// A condition: `bool`, or a v5 numeric (MG-4: v6 needs the cast, `3007`).
-    fn condition(&mut self, c: NodeId) {
+    /// Type-checks a condition and returns its qualifier (`Const` when it is refused, so a
+    /// refusal never strengthens anything downstream).
+    fn condition(&mut self, c: NodeId) -> Qual {
         let e = self.expr(c);
         if e.bad {
-            return;
+            return Qual::Const;
         }
         let want = TypeQ::scalar(Ty::Bool, Qual::Series);
         if conv(e.t, want, self.d, self.rd).is_none() {
@@ -1032,6 +1044,7 @@ impl<'a, 's> Infer<'a, 's> {
             );
             self.refuse(ReasonCode::TypeMismatch, at, msg);
         }
+        e.t.qual
     }
 
     fn switch(&mut self, subject: Option<NodeId>, arms: &[NodeId]) -> Ex {
@@ -1045,7 +1058,9 @@ impl<'a, 's> Infer<'a, 's> {
             };
             match (pattern, s) {
                 (None, _) => has_default = true,
-                (Some(p), None) => self.condition(p),
+                (Some(p), None) => {
+                    self.condition(p);
+                }
                 (Some(p), Some(s)) => {
                     let e = self.expr(p);
                     if !e.bad && !s.bad && unify(s, e).is_none() {

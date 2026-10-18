@@ -175,8 +175,9 @@ struct Rig {
     gw: Option<thread::JoinHandle<Phase>>,
     stop: Arc<AtomicBool>,
     seq: u64,
-    /// The last feed's start (its event time E, on the wall clock).
-    fed_at: Instant,
+    /// The last feed's event time E (`core_time::now_ns`, the clock the settle window is
+    /// defined on — PL1's `until = E + live_settle_ms × 1e6`).
+    fed_ts: u64,
     close_px: i64,
     _dir: Dir,
 }
@@ -461,7 +462,7 @@ impl Rig {
             gw: Some(gw),
             stop,
             seq: 0,
-            fed_at: Instant::now(),
+            fed_ts: 0,
             close_px: ASK,
             _dir: Dir(dir),
         };
@@ -494,8 +495,8 @@ impl Rig {
     /// touch (a realtime evaluation), both at the engine's clock; then a turn.
     fn feed(&mut self) {
         self.seq += 1;
-        self.fed_at = Instant::now();
         let ts = core_time::now_ns();
+        self.fed_ts = ts;
         let ms = wall_ms();
         let ev = ChannelEvent::new(
             ts,
@@ -692,16 +693,27 @@ fn an_ioc_miss_settles_after_the_window() {
     let venue = Venue::start();
     venue.with(|v| v.ioc_plan.push_back(0));
     let mut r = Rig::boot(&venue, Opts::new(ENTRY));
-    // The feed whose evaluation dispatched the IoC: its start is E_dispatch on the wall clock.
+    // The feed whose evaluation dispatched the IoC: its E is E_dispatch.
     r.until("the first IoC", |r| r.k().submits == 1);
-    let sent = r.fed_at;
+    let sent = r.fed_ts;
     r.until("the venue's EXPIRED", |_| {
         venue.with(|v| v.orders.iter().any(|o| o.status == "EXPIRED"))
     });
-    r.until("the window reports it", |r| r.k().cancelled_reported == 1);
+    // The window's report of THIS IoC: a re-entry the script submits while the IoC is still in
+    // its window may meet a full submit ring (the gateway still holding the first) and is
+    // reported at once (`SubmitErr::RingFull`, §4.5.4) — that is a different oid, so it is not
+    // counted here (a timing seen under a detached launchd run, 2026-10-19).
+    r.until("the window reports it", |r| {
+        let k = r.k();
+        k.cancelled_reported == 1 + k.submit_errors
+    });
+    // The window is in E (the engine's `CLOCK_MONOTONIC_RAW`), so it is measured in E: the
+    // feed that reported the miss sits at or past `E_dispatch + live_settle_ms`.
     assert!(
-        sent.elapsed() >= Duration::from_millis(u64::from(SETTLE_MS)),
-        "reported inside the window"
+        r.fed_ts - sent >= u64::from(SETTLE_MS) * 1_000_000,
+        "reported inside the window: {} ns after the dispatch feed (window {} ms)",
+        r.fed_ts - sent,
+        SETTLE_MS
     );
     assert_eq!(r.pine_pos(), 0);
     r.until("the re-entry fills", |r| r.pine_pos() > 0);

@@ -699,16 +699,12 @@ fn syn_fixtures_read_no_bar_data() {
 /// `timestamp(…)` of literals — widened both operands to f64 and fed them to `I_DIV`; it now stays
 /// in the int lane, truncating, so `na(x) ? na : x` plots 0 in v5 as in v6).
 ///
-/// r37 (2026-10-18): F120 (the probe sheet r34's P1) — pine-sema types a ternary with a series
-/// condition and literal arms (`bar_index >= 0 ? 9223372036854775807 : 0`) `const` in v5, so W1's
-/// v5 `const_trunc` truncates a series division: `mul` `(imax * 2) / imax` plots 0 in v5 and
-/// −2.168404344971009e−19 in v6 (a scratch variant: `sq / 7` 433857214 vs 433857214.28571427).
-/// The qualifier of `c ? a : b` is the strongest of the three (series); finding for pine-sema.
-const I9_ENGINE_FINDINGS: &[(&str, &str, &str)] = &[(
-    "F120",
-    "diverge",
-    "pine-sema: a series-condition ternary of literals is const in v5 (W1 truncates)",
-)];
+/// Fixed r37 (2026-10-19), row retired: F120 (the probe sheet r34's P1) — pine-sema typed a
+/// ternary with a series condition and literal arms (`bar_index >= 0 ? 9223372036854775807 : 0`)
+/// `const` in v5, so W1's v5 `const_trunc` truncated a series division (`mul` plotted 0 in v5,
+/// −2.168404344971009e−19 in v6); the ternary's qualifier now joins its condition's
+/// (`pin:02-ternary-qual-cond`).
+const I9_ENGINE_FINDINGS: &[(&str, &str, &str)] = &[];
 
 #[test]
 fn dialect_56_fixtures_are_invariant() {
