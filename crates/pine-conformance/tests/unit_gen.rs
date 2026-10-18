@@ -209,8 +209,13 @@ fn group_a_amended_examples_are_byte_identical() {
 fn group_f_table_is_98_and_unique() {
     use pine_conformance::gen::group_f;
     let cells = group_f::cells();
-    // r29 (2026-10-17): F099–F119 appended (`group_f2`, the next capture session's fixtures).
-    assert_eq!(cells.len(), 119, "F001–F098 (§4.2.6) + F099–F119 (r29)");
+    // r29 (2026-10-17): F099–F119 appended (`group_f2`, the next capture session's fixtures);
+    // r34 (2026-10-18, R-P26): F120–F128 (`group_f3`, the probe sheet r34).
+    assert_eq!(
+        cells.len(),
+        128,
+        "F001–F098 (§4.2.6) + F099–F119 (r29) + F120–F128 (r34)"
+    );
     let mut seen = std::collections::HashSet::new();
     for (i, c) in cells.iter().enumerate() {
         let id = c.script.id;
@@ -402,21 +407,27 @@ fn group_b_wide_is_derived_from_spec() {
     use pine_conformance::gen::group_b::{self, FIXED_NAMES, IMPLICIT_BAR_READERS};
     let cells = group_b::cells();
     let (w, c) = group_b::derived_counts();
-    assert_eq!(cells.len(), 76 + w + c, "76 fixed + B-wide + B-chart");
+    assert_eq!(
+        cells.len(),
+        76 + w + c + 3,
+        "76 fixed + B-wide + B-chart + r34's B125–B127"
+    );
     for (i, cell) in cells.iter().enumerate() {
         assert_eq!(
             cell.script.id,
             FixtureId::from_parts(Group::B, i as u16 + 1),
             "dense (I6)"
         );
-        // Data-derived ids carry no pin line (I15); B001–B076 carry pin:04-ta-reference.
+        // Data-derived ids carry no pin line (I15); B001–B076 carry pin:04-ta-reference; r34's
+        // B125 / B126 name pin:04-pivot-levels-provisional, B127 none.
         assert_eq!(
             cell.pins.iter().any(|p| p == "pin:04-ta-reference"),
             i < 76,
             "{}",
             cell.script.id.as_str()
         );
-        assert_eq!(cell.pins.is_empty(), i >= 76);
+        let pivot = i >= 76 + w + c && i < 76 + w + c + 2;
+        assert_eq!(cell.pins.is_empty(), i >= 76 && !pivot);
     }
     // Authored readings (B007, B061, B064–B069, B076) are named, distinct and discriminate.
     for cell in &cells {
@@ -483,7 +494,7 @@ fn group_b_wide_is_derived_from_spec() {
         assert!(names.contains(&x), "{x}");
     }
     // B-chart: Chart, align time, tail 256, after B-wide.
-    for cell in &cells[76 + w..] {
+    for cell in &cells[76 + w..76 + w + c] {
         assert_eq!(cell.run.driver, Driver::Chart);
         assert_eq!(cell.run.align, Align::Time);
         assert_eq!(cell.window, pine_conformance::fixture::Window::Tail(256));
@@ -675,7 +686,7 @@ fn group_f_r29_block_is_laid_out() {
     use pine_conformance::fixture::{Expect, Oracle};
     use pine_conformance::gen::group_f;
     let cells = group_f::cells();
-    for c in &cells[98..] {
+    for c in &cells[98..119] {
         let n = c.script.id.number();
         let tier = if matches!(n, 104 | 115..=119) { 1 } else { 3 };
         assert_eq!(c.tier, tier, "F{n:03} tier");
@@ -708,4 +719,434 @@ fn group_f_r29_block_is_laid_out() {
         .map(|r| r.name.as_str())
         .collect();
     assert_eq!(f103, ["c_half", "c_zero", "c_one"]);
+}
+
+// ---- r34 (2026-10-18, R-P26): the probe sheet r34's fixtures (vault capture/probes-r34) --------
+
+/// Row `row`'s values of reading `name` of generated cell `id` (`na` as NaN).
+fn reading_row(id: &str, name: &str, row: usize) -> Vec<f64> {
+    use pine_conformance::fixture::{Cell, ReadingBody};
+    let cells = pine_conformance::gen::cells();
+    let c = cells
+        .iter()
+        .find(|c| c.script.id.as_str() == id)
+        .unwrap_or_else(|| panic!("{id}"));
+    let r = c
+        .readings
+        .iter()
+        .find(|r| r.name == name)
+        .unwrap_or_else(|| panic!("{id} reading {name}"));
+    let ReadingBody::Rows(rows) = &r.body else {
+        panic!("{id} {name}: not rows")
+    };
+    rows[row]
+        .cells
+        .iter()
+        .map(|c| match c {
+            Cell::Na => NA,
+            Cell::Val { v, .. } => *v,
+        })
+        .collect()
+}
+
+/// F120–F128: ids, dialects, the SYN-1 driver, windows, tiers, pins and the sheet's readings.
+#[test]
+fn group_f_r34_block_is_laid_out() {
+    use pine_conformance::fixture::{Driver, Expect, Oracle, Tol, Window};
+    use pine_conformance::gen::group_f;
+    let cells = group_f::cells();
+    type Want = (
+        u16,
+        Window,
+        u8,
+        Option<&'static str>,
+        &'static [&'static str],
+    );
+    let want: [Want; 9] = [
+        (
+            120,
+            Window::Head(64),
+            1,
+            Some("pin:06-int-width"),
+            &["binary64", "i64_wrapping", "i64_saturating"],
+        ),
+        (
+            121,
+            Window::Head(64),
+            1,
+            Some("pin:06-nonfinite"),
+            &["r_op", "r_na", "r_fold"],
+        ),
+        (
+            122,
+            Window::Head(64),
+            1,
+            Some("pin:U06-float-eq-v6"),
+            &["exact", "abs_1e10", "abs_1e10_all"],
+        ),
+        (
+            123,
+            Window::Head(16),
+            1,
+            Some("pin:U04-round-ties"),
+            &["r_int", "r_f64", "r_band"],
+        ),
+        (
+            124,
+            Window::Head(4),
+            1,
+            Some("pin:02-fold-sig15-ties"),
+            &["ieee_fold", "sig15_fold", "sig15_fold_literals"],
+        ),
+        (125, Window::Head(16), 1, None, &[]),
+        (
+            126,
+            Window::Head(1),
+            3,
+            Some("pin:04-array-percentrank"),
+            &["size_minus_one", "non_na_count"],
+        ),
+        (
+            127,
+            Window::Head(32),
+            1,
+            Some("pin:04-cog-tv-order"),
+            &["rolling", "fresh_plain", "fresh_neumaier"],
+        ),
+        (
+            128,
+            Window::Head(16),
+            1,
+            Some("pin:02-ta-in-loop-restart-scope"),
+            &["per_call", "restart"],
+        ),
+    ];
+    for (n, window, tier, pin, readings) in want {
+        let c = &cells[usize::from(n) - 1];
+        assert_eq!(c.script.id, FixtureId::from_parts(Group::F, n));
+        assert_eq!(c.script.dialects, Dialects::BOTH, "F{n}");
+        assert_eq!(
+            (c.oracle, &c.expect),
+            (Oracle::Tv, &Expect::Pending),
+            "F{n}"
+        );
+        assert_eq!(c.run.driver, Driver::Syn, "F{n}");
+        assert_eq!(c.script.prelude, Prelude::Syn1, "F{n}");
+        assert_eq!(c.window, window, "F{n}");
+        assert_eq!(c.tier, tier, "F{n}");
+        let pins: Vec<String> = pin.iter().map(|p| p.to_string()).collect();
+        assert_eq!(c.pins, pins, "F{n}");
+        let names: Vec<&str> = c.readings.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, readings, "F{n}");
+        for r in &c.readings {
+            let pine_conformance::fixture::ReadingBody::Rows(rows) = &r.body else {
+                panic!("F{n} {}", r.name)
+            };
+            let k = match window {
+                Window::Head(k) => k as usize,
+                _ => unreachable!(),
+            };
+            assert_eq!(rows.len(), k, "F{n} {}: one row per window row", r.name);
+            assert!(rows
+                .iter()
+                .all(|row| row.cells.len() == c.script.plots.len()));
+        }
+        // pin:06-f128-sum-tol: F128's `val` alone is not `exact`.
+        for (k, t) in c.tols.iter().enumerate() {
+            let want = if n == 128 && k == 1 {
+                Tol::Ulp(12)
+            } else {
+                Tol::Exact
+            };
+            assert_eq!(*t, want, "F{n} plot {k}");
+        }
+    }
+    // The sheet's plot names, in order (P1 and P4 in full).
+    let names = |n: usize| -> Vec<String> {
+        cells[n - 1]
+            .script
+            .plots
+            .iter()
+            .map(|(_, k)| k.clone())
+            .collect()
+    };
+    assert_eq!(
+        names(120),
+        ["eqadd", "eqlit", "mod", "wrap", "mul", "sq", "castna", "cast", "sub"]
+    );
+    assert_eq!(
+        names(123),
+        [
+            "e14", "e46", "e77", "e161", "e219", "e275", "e99", "tie", "ntie", "n0", "n1", "n2",
+            "n3", "n4"
+        ]
+    );
+}
+
+/// The r34 readings reproduce the probe sheet's computed predictions (P1–P5, P7, P14, P15); where
+/// the sheet prints a value its own formula forms differently in binary64 (R-f64's e46 / e219),
+/// the formula is followed and the ticks are checked.
+#[test]
+fn r34_readings_reproduce_the_sheet() {
+    let same_row = |id: &str, name: &str, want: &[f64]| same(&reading_row(id, name, 0), want);
+    let p63 = 2f64.powi(63);
+    // P1 (F120).
+    same_row(
+        "F120",
+        "binary64",
+        &[
+            1.0,
+            1.0,
+            0.0,
+            1.0,
+            2.0,
+            3037000500.0 * 3037000500.0,
+            0.0,
+            1e30,
+            0.0,
+        ],
+    );
+    same_row(
+        "F120",
+        "i64_wrapping",
+        &[
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            -2.168404344971009e-19,
+            -9223372036709301616i64 as f64,
+            1.0,
+            NA,
+            1.0,
+        ],
+    );
+    same_row(
+        "F120",
+        "i64_saturating",
+        &[0.0, 0.0, 1.0, 1.0, 1.0, p63, 0.0, p63, 1.0],
+    );
+    // P2 (F121): R-fold's `nz` (+inf) exports as an empty cell (pin:06-r34-inf-export).
+    same_row("F121", "r_op", &[0.0, 1.0, 0.0, 1.0, 7.0, NA]);
+    same_row("F121", "r_na", &[1.0, 1.0, 1.0, 1.0, 7.0, NA]);
+    same_row("F121", "r_fold", &[1.0, 0.0, 1.0, 0.0, NA, NA]);
+    // P3 (F122), row 0: the first seven columns; `diff` ≈ 5e-11.
+    for (name, want) in [
+        ("exact", [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
+        ("abs_1e10", [1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
+        ("abs_1e10_all", [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+    ] {
+        let r = reading_row("F122", name, 0);
+        same(&r[..7], &want);
+        assert!((r[7] - 5e-11).abs() < 1e-12, "{name} diff {}", r[7]);
+    }
+    // P4 (F123).
+    same_row(
+        "F123",
+        "r_int",
+        &[
+            76430.3, 76724.5, 77797.1, 63807.5, 64068.8, 78058.4, 76825.7, 76430.3, -76430.3,
+            1000.1, 1000.1, 1000.1, 1000.1, 1000.1,
+        ],
+    );
+    same_row(
+        "F123",
+        "r_band",
+        &[
+            76430.2, 76724.5, 77797.0, 63807.4, 64068.8, 78058.4, 76825.7, 76430.3, -76430.3,
+            1000.1, 1000.1, 1000.1, 1000.0, 1000.0,
+        ],
+    );
+    let ticks: [i64; 14] = [
+        764302, 767244, 777970, 638074, 640687, 780583, 768256, 764303, -764302, 10000, 10000,
+        10000, 10000, 10000,
+    ];
+    same_row("F123", "r_f64", &ticks.map(|t| t as f64 * 0.1));
+    // P5 (F124).
+    same_row(
+        "F124",
+        "ieee_fold",
+        &[
+            0.30000000000000004,
+            0.19999999999999998,
+            0.30000000000000004,
+            1.0 / 3.0,
+            2.0 / 3.0,
+            1.0 + f64::EPSILON,
+            1234567890123.12,
+            1.0,
+        ],
+    );
+    let sig = [
+        0.3,
+        0.2,
+        0.3,
+        0.333333333333333,
+        0.666666666666667,
+        1.0 + f64::EPSILON,
+        1234567890123.13,
+        1.0,
+    ];
+    same_row("F124", "sig15_fold", &sig);
+    let mut lit = sig;
+    lit[5] = 1.0;
+    same_row("F124", "sig15_fold_literals", &lit);
+    // P7 (F126).
+    same_row(
+        "F126",
+        "size_minus_one",
+        &[100.0, 33.333333333333336, 66.66666666666667, 100.0],
+    );
+    same_row(
+        "F126",
+        "non_na_count",
+        &[75.0, 25.0, 66.66666666666667, 75.0],
+    );
+    // P14 (F127): rows 15, 16, 18 as the sheet computed them (isna, val).
+    for (row, roll, fresh) in [
+        (15, 19686.159999999996, 19686.16),
+        (16, 20008.699999999997, 20008.7),
+        (18, 20588.51, 20588.510000000002),
+    ] {
+        same(&reading_row("F127", "rolling", row), &[0.0, roll]);
+        same(&reading_row("F127", "fresh_plain", row), &[0.0, fresh]);
+        same(&reading_row("F127", "fresh_neumaier", row), &[0.0, fresh]);
+    }
+    // The two fresh forms part on rows 21, 22, 25 (the sheet: "not separated on SYN-1").
+    for row in [21, 22, 25] {
+        assert_ne!(
+            reading_row("F127", "fresh_plain", row)[1].to_bits(),
+            reading_row("F127", "fresh_neumaier", row)[1].to_bits(),
+            "row {row}"
+        );
+    }
+    // P15 (F128), rows 0–3; `per_call` within F128's ulp 12 of the sheet's fresh-sum figures.
+    let near = |a: f64, b: f64| {
+        (a.is_nan() && b.is_nan()) || (a.to_bits() as i64 - b.to_bits() as i64).abs() <= 12
+    };
+    for (row, pc, rs) in [
+        (0, NA, NA),
+        (1, 14019.150000000001, NA),
+        (2, 14261.85, 13263.869999999999),
+        (3, 13121.67, 14069.400000000001),
+    ] {
+        let p = reading_row("F128", "per_call", row);
+        let r = reading_row("F128", "restart", row);
+        assert!(near(p[1], pc), "per_call row {row}: {}", p[1]);
+        same(&r, &[if rs.is_nan() { 1.0 } else { 0.0 }, rs]);
+    }
+}
+
+/// CAR-R33-9 / §4.9.2: B068 and B069's `restart` blocks equal their captured series, bit for bit
+/// (the r37 re-distil); the captures and script hashes are untouched.
+#[test]
+fn b068_b069_restart_readings_equal_their_captures() {
+    use pine_conformance::fixture::{Cell, Expect, Fixture, ReadingBody};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let v = |c: &Cell| match c {
+        Cell::Na => NA,
+        Cell::Val { v, .. } => *v,
+    };
+    for id in ["B068", "B069"] {
+        let p = format!("tests/conformance/fixtures/B/{id}.fix");
+        let t = std::fs::read_to_string(root.join(&p)).unwrap();
+        let f = Fixture::parse(&t, &p).unwrap();
+        let Expect::Series(series) = &f.expect else {
+            panic!("{id}: captured series")
+        };
+        let r = f.readings.iter().find(|r| r.name == "restart").unwrap();
+        let ReadingBody::Rows(rows) = &r.body else {
+            panic!("{id}")
+        };
+        assert_eq!(rows.len(), series.len());
+        for (a, b) in rows.iter().zip(series) {
+            assert_eq!(a.key, b.key);
+            let (x, y): (Vec<f64>, Vec<f64>) = (
+                a.cells.iter().map(v).collect(),
+                b.cells.iter().map(v).collect(),
+            );
+            same(&x, &y);
+        }
+    }
+    // F083's `join` follows U01 `sma` (na on row 0), its capture.
+    same(&reading_row("F083", "join", 0), &[1.0, NA]);
+}
+
+/// B125–B127 (P8, P12): after B-chart, chart-driven, `align time`; B125 / B126 plot the eleven
+/// levels of three types each; B127 is v6 over 2024-10-28 18:00–23:00 UTC.
+#[test]
+fn group_b_r34_block_is_laid_out() {
+    use pine_conformance::fixture::{Align, Driver, Window};
+    use pine_conformance::gen::group_b::{self, B127_WINDOW, PIVOT_TYPES, R34_FIRST};
+    let cells = group_b::cells();
+    let (w, c) = group_b::derived_counts();
+    assert_eq!(
+        usize::from(R34_FIRST),
+        77 + w + c,
+        "the r34 rows follow B-chart"
+    );
+    for (j, types) in PIVOT_TYPES.iter().enumerate() {
+        let cell = &cells[usize::from(R34_FIRST) - 1 + j];
+        assert_eq!(
+            cell.script.id,
+            FixtureId::from_parts(Group::B, R34_FIRST + j as u16)
+        );
+        assert_eq!(cell.script.plots.len(), 33);
+        assert_eq!(cell.script.dialects, Dialects::BOTH);
+        assert_eq!(
+            (cell.run.driver, cell.run.align, cell.window, cell.tier),
+            (Driver::Chart, Align::Time, Window::Tail(256), 3)
+        );
+        assert_eq!(cell.pins, ["pin:04-pivot-levels-provisional"]);
+        for (t, (ty, tag)) in types.iter().enumerate() {
+            for i in 0..=10usize {
+                let (e, k) = &cell.script.plots[11 * t + i];
+                assert_eq!(k, &format!("{tag}{i}"));
+                assert!(e.contains(&format!("(\"{ty}\", {i})")), "{e}");
+            }
+        }
+    }
+    let b127 = &cells[usize::from(R34_FIRST) + 1];
+    assert_eq!(b127.script.dialects, Dialects::V6);
+    assert_eq!(
+        (b127.run.driver, b127.run.align, b127.window, b127.tier),
+        (Driver::Chart, Align::Time, B127_WINDOW, 1)
+    );
+    assert!(b127.pins.is_empty() && b127.readings.is_empty());
+}
+
+/// R-P26 / `pin:06-sheet-round-r34`: the r34 fixtures pack on new sheets only — every sheet that
+/// holds one holds no fixture of an earlier round.
+#[test]
+fn r34_fixtures_pack_on_their_own_sheets() {
+    use pine_conformance::gen::sheet;
+    use pine_ir::Dialect;
+    for d in [Dialect::V5, Dialect::V6] {
+        for s in sheet::sheets(d) {
+            let rounds: std::collections::BTreeSet<u8> =
+                s.ids.iter().map(|id| sheet::round(*id)).collect();
+            assert_eq!(rounds.len(), 1, "{} mixes rounds", s.name);
+        }
+    }
+    let r34 = |d| -> Vec<String> {
+        sheet::sheets(d)
+            .into_iter()
+            .filter(|s| sheet::round(s.ids[0]) == 2)
+            .map(|s| s.name)
+            .collect()
+    };
+    assert_eq!(
+        r34(Dialect::V6),
+        [
+            "sheet-B-16",
+            "sheet-B-17",
+            "sheet-B-v6-02",
+            "sheet-F-14",
+            "sheet-F-15"
+        ]
+    );
+    assert_eq!(
+        r34(Dialect::V5),
+        ["sheet-B-16", "sheet-B-17", "sheet-F-14", "sheet-F-15"]
+    );
 }

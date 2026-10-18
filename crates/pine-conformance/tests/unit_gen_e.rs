@@ -52,10 +52,10 @@ fn group_e_baseline_header_is_byte_identical() {
             "{}: {n} header lines",
             c.script.id.as_str()
         );
-        // W18: only E069/E070 omit the margins.
+        // W18: only E069/E070 and r34's E134 (E069 with the liquidation price) omit the margins.
         assert_eq!(
             !d.contains("margin_long ="),
-            matches!(c.script.id.number(), 69 | 70),
+            matches!(c.script.id.number(), 69 | 70 | 134),
             "{}",
             c.script.id.as_str()
         );
@@ -107,8 +107,9 @@ fn group_e_market_cycles_in_range() {
 fn group_e_is_121_and_laid_out() {
     let cells = group_e::cells();
     // r29 (2026-10-17): E122–E132 appended (history ticks E122–E127 compile `realtime`; E122,
-    // E123 and E128 are `Syn` plots-only rows, `align step`).
-    assert_eq!(cells.len(), 132);
+    // E123 and E128 are `Syn` plots-only rows, `align step`); r34 (2026-10-18, R-P26): E133–E138,
+    // the probe sheet r34's broker probes (SynSig, `align time`, `pos` first).
+    assert_eq!(cells.len(), 138);
     for (i, c) in cells.iter().enumerate() {
         let n = i as u16 + 1;
         assert_eq!(c.script.id, FixtureId::from_parts(Group::E, n), "dense");
@@ -158,6 +159,26 @@ fn group_e_is_121_and_laid_out() {
     }
     let ds = |n: usize| cells[n - 1].script.dialects;
     assert_eq!((ds(69), ds(70)), (Dialects::V5, Dialects::V6));
+    // r34 P10: E134–E136 v5, E137 v6 (E135's twin); E133 / E138 `56`.
+    assert_eq!(
+        [ds(133), ds(134), ds(135), ds(136), ds(137), ds(138)],
+        [
+            Dialects::BOTH,
+            Dialects::V5,
+            Dialects::V5,
+            Dialects::V5,
+            Dialects::V6,
+            Dialects::BOTH
+        ]
+    );
+    assert_eq!(
+        cells[134].script.twin,
+        Some(FixtureId::from_parts(Group::E, 137))
+    );
+    for n in 134..=137usize {
+        let p = &cells[n - 1].script.plots;
+        assert_eq!(p[1].1, "liq", "E{n:03}");
+    }
     for n in [99usize, 101, 103] {
         assert_eq!((ds(n), ds(n + 1)), (Dialects::V5, Dialects::V6));
         assert_eq!(
@@ -208,6 +229,12 @@ fn group_e_is_121_and_laid_out() {
         (130, "pin:05-price-rounding"),
         (131, "pin:05-price-rounding"),
         (132, "pin:05-margin-funds-check"),
+        (133, "pin:05-net-f64-fees-provisional"),
+        (134, "pin:W18-margin-default"),
+        (135, "pin:05-margin-funds-check"),
+        (136, "pin:W18-margin-default"),
+        (137, "pin:05-margin-funds-check"),
+        (138, "pin:05-exit-qty-per-trade"),
     ] {
         assert!(pinned(n, p), "E{n:03} {p}");
     }

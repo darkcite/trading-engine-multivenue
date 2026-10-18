@@ -1,0 +1,24 @@
+fix	2
+id	E137
+group	E
+title	margin 0, 250 % of equity
+pin	pin:W18-margin-default
+pin	pin:05-margin-funds-check
+script	tests/conformance/fixtures/E/E137.pine
+script_sha256	1456f0932883453b8c601ee0f7b7a4a695e58e7364e23c815c6b123c13e3bbe8
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	synsig
+align	time
+dialects	6
+twin	E135
+mode	bar_close
+bars	-
+window	time	1776297600000	1791849600000
+oracle	tv
+tier	1
+plot	f_E137_pos	exact
+plot	f_E137_liq	exact
+pending

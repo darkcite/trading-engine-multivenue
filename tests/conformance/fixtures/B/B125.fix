@@ -1,0 +1,53 @@
+fix	2
+id	B125
+group	B
+title	ta.pivot_point_levels: Traditional, Fibonacci, Woodie
+pin	pin:04-pivot-levels-provisional
+script	tests/conformance/fixtures/B/B125.pine
+script_sha256	1c1c48324007718171b2eeec5c595119b7e08d7c1c838123c298d444578312cd
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	tv
+tier	3
+plot	f_B125_t0	exact
+plot	f_B125_t1	exact
+plot	f_B125_t2	exact
+plot	f_B125_t3	exact
+plot	f_B125_t4	exact
+plot	f_B125_t5	exact
+plot	f_B125_t6	exact
+plot	f_B125_t7	exact
+plot	f_B125_t8	exact
+plot	f_B125_t9	exact
+plot	f_B125_t10	exact
+plot	f_B125_f0	exact
+plot	f_B125_f1	exact
+plot	f_B125_f2	exact
+plot	f_B125_f3	exact
+plot	f_B125_f4	exact
+plot	f_B125_f5	exact
+plot	f_B125_f6	exact
+plot	f_B125_f7	exact
+plot	f_B125_f8	exact
+plot	f_B125_f9	exact
+plot	f_B125_f10	exact
+plot	f_B125_w0	exact
+plot	f_B125_w1	exact
+plot	f_B125_w2	exact
+plot	f_B125_w3	exact
+plot	f_B125_w4	exact
+plot	f_B125_w5	exact
+plot	f_B125_w6	exact
+plot	f_B125_w7	exact
+plot	f_B125_w8	exact
+plot	f_B125_w9	exact
+plot	f_B125_w10	exact
+pending

@@ -16,6 +16,7 @@ pub mod group_d;
 pub mod group_e;
 pub mod group_f;
 pub mod group_f2;
+pub mod group_f3;
 pub mod group_z;
 pub mod readings;
 pub mod sheet;
@@ -96,7 +97,8 @@ pub struct Generated {
 }
 
 /// Every cell the generator emits today: groups A (T5), F (T6), C (T7), B (T8), D (T9), E (T10–T11),
-/// Z015–Z019 (T12).
+/// Z015–Z019 (T12); r29's and r34's appended blocks (r34: B125–B127, E133–E138, F120–F128, the probe
+/// sheet r34, R-P26).
 ///
 /// `pin:06-pins-from-table` — a pin §4.9's table assigns to a cell that its group's rows do not
 /// already name (impl-04's `string`/`color`/`collection-edges` over groups A and F,

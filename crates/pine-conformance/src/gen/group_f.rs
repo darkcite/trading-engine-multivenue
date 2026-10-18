@@ -761,7 +761,8 @@ fn f098_reading(name: &str, f: fn(f64, f64) -> f64) -> Reading {
 /// table (§4.9.4); the order is the table's (the owner's default first where it names one).
 ///
 /// `pin:06-f083-join-ema-default` — F083's `join` row is `ta.ema(syn, 6)` on row 0 under
-/// `pin:U01-ema-seed`'s default (`first_value`: `syn` itself). `pin:06-f088-typed-na` — F088's
+/// `pin:U01-ema-seed`'s default: `sma` since CI-014 (r33a), so `na` until six values exist (r37
+/// re-distil, R-P26; it was `first_value`'s `syn` itself). `pin:06-f088-typed-na` — F088's
 /// typed `na` offset is a declared `int` holding `na`. `pin:06-f092-one-reading` — F092's second
 /// reading ("the printed length") has no name and no value we may author (no TradingView-derived
 /// values), so only `na` is written; a printed capture decides `Neither` and escalates.
@@ -783,7 +784,7 @@ fn fpins() -> Vec<Fp> {
             plain1("each_iteration", &[7.0]),
         ]
     };
-    let join = ema(&x1, 6, EmaSeed::First)[0];
+    let join = ema(&x1, 6, EmaSeed::Sma)[0];
     vec![
         Fp {
             ds: V5,
@@ -1060,11 +1061,12 @@ fn fpin_cell(p: Fp) -> Cell {
     }
 }
 
-/// Every group-F cell: F001–F098, then r29's F099–F119 (`group_f2`, appended so no captured id
-/// moves).
+/// Every group-F cell: F001–F098, then r29's F099–F119 (`group_f2`) and r34's F120–F128
+/// (`group_f3`), appended so no captured id moves.
 pub fn cells() -> Vec<Cell> {
     let mut c: Vec<Cell> = rows().iter().map(cell).collect();
     c.extend(fpins().into_iter().map(fpin_cell));
     c.extend(super::group_f2::cells());
+    c.extend(super::group_f3::cells());
     c
 }

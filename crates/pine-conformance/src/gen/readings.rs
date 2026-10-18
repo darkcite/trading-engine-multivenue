@@ -760,6 +760,84 @@ pub const BROKER_READINGS: &[(&str, &str, &str, &str)] = &[
         "fill_whole",
         "it fills at the order-bar-close quantity (a margin call may follow)",
     ),
+    // r34 (2026-10-18, R-P26): the probe sheet r34's broker probes (P9–P11), predictions as the
+    // sheet states them; the first trade's order bar close 77249.5 is E069's (P10).
+    (
+        "E133",
+        FEES,
+        "fill_price",
+        "fee = 0.001 * 10 * px, px the slipped fill (px 78865.1 -> 788.651)",
+    ),
+    (
+        "E133",
+        FEES,
+        "pre_slippage",
+        "fee = 0.001 * 10 * (px - 5.0), the price before 50 ticks of slippage (-> 788.601)",
+    ),
+    (
+        "E133",
+        FEES,
+        "cent_rounded",
+        "the fill_price fee cut to cents (-> 788.65)",
+    ),
+    (
+        "E134 E135 E136 E137",
+        W18,
+        "v5_default_0",
+        "W18 as documented, no cap: 32.362669 / 32.362669 / the funds check / 32.362669",
+    ),
+    (
+        "E134 E135 E136 E137",
+        W18,
+        "v5_default_100",
+        "the v5 default is 100, the funds check reduces: 12.945067 / 32.362669 / 12.945067 / 32.362669",
+    ),
+    (
+        "E134 E135 E136 E137",
+        W18,
+        "equity_cap",
+        "a 100 % of equity sizing cap whatever the margin: 12.945067 on all four",
+    ),
+    (
+        "E136",
+        FUNDS,
+        "reduce",
+        "under v5_default_0: 12.945067 (the quantity the funds allow)",
+    ),
+    (
+        "E136",
+        FUNDS,
+        "reject",
+        "under v5_default_0: no trade",
+    ),
+    (
+        "E138",
+        EXIT_QTY,
+        "per_trade",
+        concat!(
+            "ours (the engine, r37): after the first take-profit bar pos / ot / ct / s0 / s1 = ",
+            "2 / 1 / 2 / 2 / na — a leg of min(1, 2) per covered trade, FIFO closing both from ",
+            "the oldest trade (the sheet's 2 / 2 / 2 / 1 / 1 has each leg close its own trade)"
+        ),
+    ),
+    (
+        "E138",
+        EXIT_QTY,
+        "per_call",
+        "3 / 2 / 1 / 1 / 2 (one budget of 1, oldest trade first)",
+    ),
+    (
+        "E138",
+        EXIT_QTY,
+        "per_position",
+        "3 / 2 / 1 / 1 / 2 (one leg of 1 for the position; told from per_call by the exit rows)",
+    ),
+    (
+        "E138",
+        EXIT_QTY,
+        "second_entry_refused",
+        "ot 1 before any exit, b1 na (the pyramided second entry is not taken)",
+    ),
 ];
 
 const HT_NEXT: &str = "pin:05-hist-tick-next-point";
@@ -768,3 +846,389 @@ const HT_COF: &str = "pin:05-hist-tick-cof";
 const HT_FILL: &str = "pin:05-hist-tick-fill-first";
 const ROUND: &str = "pin:05-price-rounding";
 const FUNDS: &str = "pin:05-margin-funds-check";
+const FEES: &str = "pin:05-net-f64-fees-provisional";
+const W18: &str = "pin:W18-margin-default";
+const EXIT_QTY: &str = "pin:05-exit-qty-per-trade";
+
+// ---- r34 (2026-10-18, R-P26): the probe sheet r34's readings, written before its capture --------
+
+/// Neumaier's compensated sum of `xs` in order — pine-std's `state::neumaier` fold (`ta.sma`'s
+/// `win_fresh_sum`, `ewma_step`'s SMA seed, the `pin:04-sma-fresh-sum` law).
+pub fn neumaier_sum(xs: &[f64]) -> f64 {
+    let (mut s, mut c) = (0.0f64, 0.0f64);
+    for &v in xs {
+        let t = s + v;
+        c += if s.abs() >= v.abs() {
+            (s - t) + v
+        } else {
+            (v - t) + s
+        };
+        s = t;
+    }
+    s + c
+}
+
+/// The plain sum of `xs` in order.
+pub fn plain_sum(xs: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for &v in xs {
+        s += v;
+    }
+    s
+}
+
+/// pine-std's rolling window (`state::win_push` / `win_repoint`, `math.sum`'s block), operation
+/// for operation: the evicted value is subtracted before the new one is added, and every
+/// `WIN_RECOMPUTE` accepted values the sum is recomputed plainly, newest first. A twin, `Clone`
+/// so a restart can copy the committed block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollSum {
+    win: Vec<f64>,
+    len: usize,
+    sum: f64,
+    recompute: u32,
+}
+
+/// pine-std `state::WIN_RECOMPUTE`.
+pub const WIN_RECOMPUTE: u32 = 1024;
+
+impl RollSum {
+    /// A cold window of `len` (its first execution's `win_repoint`).
+    pub fn new(len: usize) -> Self {
+        Self {
+            win: Vec::with_capacity(len + 1),
+            len,
+            sum: 0.0,
+            recompute: WIN_RECOMPUTE,
+        }
+    }
+
+    /// `math.sum(v, len)` on one execution (a non-na `v`): the sum once `len` values exist.
+    pub fn push(&mut self, v: f64) -> f64 {
+        if self.win.len() == self.len {
+            self.sum -= self.win.remove(0);
+        }
+        self.sum += v;
+        self.win.push(v);
+        if self.recompute == 0 {
+            let mut s = 0.0;
+            for k in (0..self.win.len()).rev() {
+                s += self.win[k];
+            }
+            self.sum = s;
+            self.recompute = WIN_RECOMPUTE;
+        } else {
+            self.recompute -= 1;
+        }
+        if self.win.len() < self.len {
+            NA
+        } else {
+            self.sum
+        }
+    }
+}
+
+/// pine-std's `ta.sma` block (`pin:04-sma-fresh-sum`): the last `len` values, a fresh Neumaier sum
+/// oldest first, `/ len`; `na` until `len` values exist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreshSma {
+    win: Vec<f64>,
+    len: usize,
+}
+
+impl FreshSma {
+    /// A cold window.
+    pub fn new(len: usize) -> Self {
+        Self {
+            win: Vec::with_capacity(len + 1),
+            len,
+        }
+    }
+
+    /// One execution on a non-na `v`.
+    pub fn push(&mut self, v: f64) -> f64 {
+        if self.win.len() == self.len {
+            self.win.remove(0);
+        }
+        self.win.push(v);
+        if self.win.len() < self.len {
+            NA
+        } else {
+            neumaier_sum(&self.win) / self.len as f64
+        }
+    }
+}
+
+/// pine-std's `ta.ema` block (`state::ewma_step`, `Smoother::Ema`, `pin:04-ewma-tv-arith`) under
+/// U01 `sma` (decided, CI-014): the first `len` values summed Neumaier-compensated, `/ len`, then
+/// `v + α·(x − v)`, `α = 2 / (len + 1)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmaSma {
+    value: f64,
+    acc: f64,
+    n: u32,
+    seeded: bool,
+}
+
+impl EmaSma {
+    /// A cold block.
+    pub const fn new() -> Self {
+        Self {
+            value: 0.0,
+            acc: 0.0,
+            n: 0,
+            seeded: false,
+        }
+    }
+
+    /// One execution on a non-na `v`.
+    pub fn push(&mut self, v: f64, len: u32) -> f64 {
+        self.n = self.n.saturating_add(1);
+        if self.seeded {
+            let a = 2.0 / (f64::from(len) + 1.0);
+            self.value += a * (v - self.value);
+            return self.value;
+        }
+        let t = self.acc + v;
+        self.value += if self.acc.abs() >= v.abs() {
+            (self.acc - t) + v
+        } else {
+            (v - t) + self.acc
+        };
+        self.acc = t;
+        if self.n >= len {
+            self.value = (self.acc + self.value) / f64::from(len);
+            self.seeded = true;
+            self.value
+        } else {
+            NA
+        }
+    }
+}
+
+impl Default for EmaSma {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// U13 `restart` (CAR-R33-9, decided by B068 B069): on every bar each of the `execs` executions
+/// of an in-loop site starts from the block committed at the previous bar, and the block the last
+/// execution leaves is kept. `exec(block, bar, k)` is one execution; per bar, the outputs in order.
+pub fn restart_runs<S: Clone>(
+    init: S,
+    bars: usize,
+    execs: usize,
+    mut exec: impl FnMut(&mut S, usize, usize) -> f64,
+) -> Vec<Vec<f64>> {
+    let mut committed = init;
+    let mut out = Vec::with_capacity(bars);
+    for t in 0..bars {
+        let mut row = Vec::with_capacity(execs);
+        let mut last = None;
+        for k in 0..execs {
+            // COPY: the committed block per execution (≤ 3 per bar, generator time) — the law
+            // itself (every execution starts from the committed image); a shared block rejected:
+            // it is `per_call`.
+            let mut b = committed.clone();
+            row.push(exec(&mut b, t, k));
+            last = Some(b);
+        }
+        if let Some(b) = last {
+            committed = b;
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// U13 `per_call`: one block advanced by every execution, in order; per bar, the outputs.
+pub fn per_call_runs<S>(
+    init: S,
+    bars: usize,
+    execs: usize,
+    mut exec: impl FnMut(&mut S, usize, usize) -> f64,
+) -> Vec<Vec<f64>> {
+    let mut block = init;
+    (0..bars)
+        .map(|t| (0..execs).map(|k| exec(&mut block, t, k)).collect())
+        .collect()
+}
+
+/// `acc = 0.0; acc += out` over one bar's executions, in order (B068 B069 F128's accumulator).
+pub fn acc_sum(outs: &[f64]) -> f64 {
+    let mut acc = 0.0;
+    for &o in outs {
+        acc += o;
+    }
+    acc
+}
+
+/// sema's constant fold of a float to 15 significant digits (`fold::sig15`, CAR-R33-4): Rust's
+/// `{:.14e}`, which rounds an exact decimal tie to even (`pin:02-fold-sig15-ties`); non-finite
+/// passes through.
+pub fn sig15_even(x: f64) -> f64 {
+    if !x.is_finite() {
+        return x;
+    }
+    format!("{x:.14e}").parse().unwrap_or(NA)
+}
+
+/// 15 significant digits with an exact decimal tie away from zero (the probe sheet's P5
+/// alternative): the exact decimal expansion (`{:.767e}`, every digit of a binary64), cut after
+/// 15 digits, rounded up in magnitude when the rest is ≥ one half.
+pub fn sig15_away(x: f64) -> f64 {
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    let s = format!("{:.767e}", x.abs());
+    let (mant, exp) = s.split_once('e').unwrap_or((&s, "0"));
+    let mut keep: Vec<u8> = mant.bytes().filter(u8::is_ascii_digit).collect();
+    let up = keep.get(15).is_some_and(|&d| d >= b'5');
+    keep.truncate(15);
+    if up {
+        let mut i = keep.len();
+        loop {
+            if i == 0 {
+                keep.insert(0, b'1');
+                break;
+            }
+            i -= 1;
+            if keep[i] == b'9' {
+                keep[i] = b'0';
+            } else {
+                keep[i] += 1;
+                break;
+            }
+        }
+    }
+    let mut e: i32 = exp.parse().unwrap_or(0);
+    if keep.len() > 15 {
+        keep.truncate(15);
+        e += 1;
+    }
+    let mut text = String::with_capacity(24);
+    for (i, &d) in keep.iter().enumerate() {
+        text.push(char::from(d));
+        if i == 0 {
+            text.push('.');
+        }
+    }
+    text.push_str(&format!("e{e}"));
+    let v: f64 = text.parse().unwrap_or(NA);
+    v.copysign(x)
+}
+
+/// CAR-R33-7's `abs_1e10`: `|a − b| ≤ 1e-10`, false on `na`.
+pub fn eq_tol(a: f64, b: f64) -> bool {
+    !(a.is_nan() || b.is_nan()) && (a - b).abs() <= 1e-10
+}
+
+/// The probe sheet's P3 reading "tolerance on every comparison": `a > b` iff `a − b > 1e-10`
+/// (false on `na`); `a ≥ b` is `a > b` or `eq_tol`.
+pub fn gt_tol(a: f64, b: f64) -> bool {
+    a - b > 1e-10
+}
+
+/// See [`gt_tol`].
+pub fn ge_tol(a: f64, b: f64) -> bool {
+    gt_tol(a, b) || eq_tol(a, b)
+}
+
+/// `pin:U04-round-ties`' R-int — pine-std's `math.round_to_mintick` (`math::bi_round_to_mintick`)
+/// operation for operation: `to_1e6(x)` (half away), an integer tie (`half_up`, else away from
+/// zero), the multiple of `mintick_1e6` back through `from_1e6`.
+pub fn mintick_int(x: f64, mintick_1e6: i64, half_up: bool) -> f64 {
+    if !x.is_finite() {
+        return NA;
+    }
+    let v = (x * 1e6).round() as i64;
+    let m = mintick_1e6;
+    let (q, rem) = (v.div_euclid(m), v.rem_euclid(m));
+    let up = 2 * i128::from(rem) > i128::from(m)
+        || (2 * i128::from(rem) == i128::from(m) && (half_up || v > 0));
+    let q = if up { q + 1 } else { q };
+    q.checked_mul(m).map_or(NA, |t| t as f64 / 1e6)
+}
+
+/// The probe sheet's R-f64: `round(x / mintick) · mintick` with a half-up `round` of the f64
+/// quotient, the product formed in binary64 as written.
+pub fn mintick_f64(x: f64, mintick: f64) -> f64 {
+    round(x / mintick, RoundTie::Up) * mintick
+}
+
+/// The probe sheet's R-band: `x` rounds up iff the **exact** distance of `|x|` below the decimal
+/// tie is at most `1 / band_den` ticks (`1e-10` ticks: `band_den = 10¹⁰`, CAR-R33-7's constant),
+/// else to the nearest tick; an exact tie away from zero (U04 `half_away`, decided); the sign
+/// restored. Exact rational arithmetic on the binary64 (`|x| = m · 2^e`).
+///
+/// `pin:06-r34-band-formation` — the result is the correctly rounded decimal `ticks / D`
+/// (`D = 10⁶ / mintick_1e6`), the formation the captured events show (E058 trade 275: 78058.4,
+/// where `ticks × 0.1` forms 78058.40000000001).
+pub fn mintick_band(x: f64, mintick_1e6: i64, band_den: u128) -> f64 {
+    if !x.is_finite() {
+        return NA;
+    }
+    debug_assert!(mintick_1e6 > 0 && 1_000_000 % mintick_1e6 == 0);
+    let d = (1_000_000 / mintick_1e6) as u128;
+    let bits = x.abs().to_bits();
+    let (exp, frac) = ((bits >> 52) & 0x7ff, bits & ((1u64 << 52) - 1));
+    let (m, e) = if exp == 0 {
+        (u128::from(frac), -1074i64)
+    } else {
+        (u128::from(frac | (1u64 << 52)), exp as i64 - 1075)
+    };
+    let ticks: u128 = if e >= 0 {
+        (m * d) << e
+    } else {
+        let s = (-e) as u32;
+        debug_assert!(s < 100, "mintick_band: |x| too small for the u128 form");
+        let num = m * d;
+        let lo = num >> s;
+        let r = num - (lo << s);
+        let half = 1u128 << (s - 1);
+        // On a tick; at or above the tie (an exact tie goes away from zero); within the band
+        // below it; else down.
+        if r == 0 {
+            lo
+        } else if r >= half || (half - r) * band_den <= (1u128 << s) {
+            lo + 1
+        } else {
+            lo
+        }
+    };
+    (ticks as f64 / d as f64).copysign(x)
+}
+
+/// `array.percentrank(a, i)`'s two surviving denominators (`pin:04-array-percentrank`, P7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankDen {
+    /// `/ (size − 1)` — pine-std's reading.
+    SizeMinusOne,
+    /// `/ the non-na count`.
+    NonNaCount,
+}
+
+/// `100 · #(other elements ≤ a[i]) / den` — an `na` element is never `≤` (pine-std's
+/// `coll/order.rs` `percentrank` form, `(100 · count) / den`).
+pub fn percentrank(a: &[f64], i: usize, den: RankDen) -> f64 {
+    let r = a[i];
+    if r.is_nan() {
+        return NA;
+    }
+    let mut c = 0u32;
+    for (k, &v) in a.iter().enumerate() {
+        if k != i && !v.is_nan() && v <= r {
+            c += 1;
+        }
+    }
+    let d = match den {
+        RankDen::SizeMinusOne => a.len() - 1,
+        RankDen::NonNaCount => a.iter().filter(|v| !v.is_nan()).count(),
+    };
+    if d == 0 {
+        NA
+    } else {
+        (100.0 * f64::from(c)) / d as f64
+    }
+}

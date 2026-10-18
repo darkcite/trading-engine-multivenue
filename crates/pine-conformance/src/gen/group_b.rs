@@ -5,7 +5,8 @@
 //!
 //! B-core (B001–B060, `B(6·f + e + 1)`), B-pin (B061–B076), then the data-derived blocks: B-wide
 //! (every remaining satisfiable tier-1 `ta.*` of `pine_spec`, by name) and B-chart (every
-//! [`IMPLICIT_BAR_READERS`] name). B-wide and B-chart carry no `pin` line (I15).
+//! [`IMPLICIT_BAR_READERS`] name). B-wide and B-chart carry no `pin` line (I15). r34 (R-P26)
+//! appends the probe sheet's B125–B127 after them ([`R34_FIRST`]).
 //!
 //! Row notation as group F: `@` stands for `_<ID>`; each leading `>` is one block level.
 
@@ -14,7 +15,8 @@ use pine_spec::{params, pf, rets, Tier};
 
 use super::emit::{Line, Prelude, Script};
 use super::readings::{
-    ema, monotone, pair, rising, row as arow, sma, sma_last_n_valid, sma_mean_of_valid, EmaSeed, NA,
+    acc_sum, ema, monotone, pair, restart_runs, rising, row as arow, sma, sma_last_n_valid,
+    sma_mean_of_valid, EmaSeed, EmaSma, FreshSma, NA,
 };
 use super::{Cell, Run};
 use crate::fixture::{
@@ -325,10 +327,18 @@ fn rising_readings(up: bool, v6: bool) -> Vec<Reading> {
     ]
 }
 
-/// `pin:U13-ta-in-loop` readings of B068 (`ta.sma(syn, 5)`) and B069 (`ta.ema(syn + i, 5)`, the
-/// U01 default seed) over `head 128`: `per_call` feeds one block the three iterations' inputs in
-/// order each step; `per_iteration` keeps one block per iteration index. `acc` sums the three
-/// outputs from `0.0`, in iteration order.
+/// `pin:U13-ta-in-loop` readings of B068 (`ta.sma(syn, 5)`) and B069 (`ta.ema(syn + i, 5)`) over
+/// `head 128`: `per_call` feeds one block the three iterations' inputs in order each step;
+/// `per_iteration` keeps one block per iteration index (both the r27 twins: a plain fresh sum,
+/// B069's EMA seeded `first_value`); `acc` sums the three outputs from `0.0`, in iteration order.
+///
+/// `restart` (CAR-R33-9, U13's default since r33i; r37 re-distil, R-P26): every execution on a bar
+/// starts from the block committed at the previous bar and the last one is kept
+/// (`readings::restart_runs`), over pine-std's arithmetic — `ta.sma`'s fresh Neumaier sum
+/// (`FreshSma`), `ta.ema` under U01 `sma` (`EmaSma`, decided CI-014). It equals both captured
+/// series bit for bit (`unit_gen::b068_b069_restart_readings_equal_their_captures`). B068's three
+/// calls see one source, so its `restart` and `per_iteration` rows agree within its tolerance —
+/// B068 alone cannot tell them apart (CAR-R33-9); B069 decides.
 fn loop_readings(is_ema: bool) -> Vec<Reading> {
     let x = syn_n(128);
     let f = |s: &[f64]| {
@@ -353,9 +363,16 @@ fn loop_readings(is_ema: bool) -> Vec<Reading> {
     let per_iter: Vec<Vec<f64>> = (0..3)
         .map(|k| f(&(0..128).map(|i| input(i, k)).collect::<Vec<_>>()))
         .collect();
+    let restart: Vec<Vec<f64>> = if is_ema {
+        restart_runs(EmaSma::new(), 128, 3, |b, t, k| b.push(input(t, k), 5))
+    } else {
+        restart_runs(FreshSma::new(5), 128, 3, |b, t, k| b.push(input(t, k)))
+    };
+    let restart: Vec<f64> = restart.iter().map(|r| acc_sum(r)).collect();
     vec![
         reading("per_call", pair_rows(&sum3(|i, k| per_call_out[3 * i + k]))),
         reading("per_iteration", pair_rows(&sum3(|i, k| per_iter[k][i]))),
+        reading("restart", pair_rows(&restart)),
     ]
 }
 
@@ -683,7 +700,83 @@ pub fn derived_counts() -> (usize, usize) {
     (wide().len(), IMPLICIT_BAR_READERS.len())
 }
 
-/// Every group-B cell: B001–B076, then B-wide, then B-chart.
+/// The first id of the probe sheet r34's B rows (R-P26), appended after B-chart so no captured id
+/// moves (I6): `77 + B-wide + B-chart` today (`group_b_r34_block_is_laid_out`).
+pub const R34_FIRST: u16 = 125;
+
+/// P8's six `ta.pivot_point_levels` types, two scripts of three (TradingView's 64-plot limit: 33
+/// plots each), with each type's plot tag.
+pub const PIVOT_TYPES: [[(&str, &str); 3]; 2] = [
+    [("Traditional", "t"), ("Fibonacci", "f"), ("Woodie", "w")],
+    [("Classic", "c"), ("DM", "d"), ("Camarilla", "k")],
+];
+
+/// B127's window (P12): the bars opening 2024-10-28 18:00 … 22:00 UTC.
+pub const B127_WINDOW: Window = Window::Time {
+    from_ms: 1_730_138_400_000,
+    to_ms: 1_730_160_000_000,
+};
+
+/// The probe sheet r34's B rows (vault `capture/probes-r34-2026-10-18.md`): B125 / B126 (P8,
+/// every level `i = 0..10` of three types each, through a function so each call site keeps its own
+/// state, `pin:04-pivot-levels-provisional`; tier 3 for `array.get`) and B127 (P12, the volume,
+/// `ta.nvi` / `ta.pvi` steps and close around the 2024-10-28 20:00 UTC outage bar; `dialects 6`, no
+/// pin: the bar root's missing value is the question). Chart, `align time`, no prelude. No reading:
+/// the sheet predicts ours only (the Help Center formulas), or TradingView's value is the answer.
+fn r34_rows(first: u16) -> Vec<Row> {
+    let mut o = Vec::new();
+    for (j, types) in PIVOT_TYPES.iter().enumerate() {
+        let names: Vec<&str> = types.iter().map(|(t, _)| *t).collect();
+        let mut plots = Vec::new();
+        for (ty, tag) in types {
+            for i in 0..=10 {
+                plots.push((
+                    format!("lv@(\"{ty}\", {i})"),
+                    format!("{tag}{i}"),
+                    Tol::Exact,
+                ));
+            }
+        }
+        let body = vec![
+            "lv@(t@, i@) =>".to_string(),
+            ">a@ = ta.pivot_point_levels(t@, timeframe.change(\"D\"))".to_string(),
+            ">array.get(a@, i@)".to_string(),
+        ];
+        let title = format!("ta.pivot_point_levels: {}", names.join(", "));
+        let mut r = row(first + j as u16, title, body, plots);
+        r.prelude = Prelude::None;
+        r.window = Window::Tail(256);
+        r.run = chart_run();
+        r.tier = 3;
+        r.pins = vec!["pin:04-pivot-levels-provisional"];
+        o.push(r);
+    }
+    let w = |e: &str| format!("w@ ? {e} : na");
+    let plots = [
+        ("volume", "vol"),
+        ("ta.nvi - ta.nvi[1]", "dnvi"),
+        ("ta.pvi - ta.pvi[1]", "dpvi"),
+        ("close", "c"),
+    ]
+    .iter()
+    .map(|(e, k)| (w(e), k.to_string(), Tol::Exact))
+    .collect();
+    let mut r = row(
+        first + 2,
+        "the 2024-10-28 20:00 UTC bar: volume, nvi, pvi".into(),
+        vec!["w@ = time >= 1730138400000 and time <= 1730156400000".to_string()],
+        plots,
+    );
+    r.about.push("bar root".into());
+    r.ds = Dialects::V6;
+    r.prelude = Prelude::None;
+    r.window = B127_WINDOW;
+    r.run = chart_run();
+    o.push(r);
+    o
+}
+
+/// Every group-B cell: B001–B076, then B-wide, then B-chart, then the r34 rows (B125–B127).
 pub fn cells() -> Vec<Cell> {
     let mut rows = Vec::new();
     for f in 0..10 {
@@ -701,5 +794,7 @@ pub fn cells() -> Vec<Cell> {
         rows.push(chart_row(n, r));
         n += 1;
     }
+    debug_assert_eq!(n, R34_FIRST, "B-wide / B-chart moved the r34 ids");
+    rows.extend(r34_rows(n));
     rows.into_iter().map(cell).collect()
 }

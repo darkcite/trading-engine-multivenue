@@ -24,6 +24,7 @@
 //! `pin:06-sheet-round` (r29) — a fixture appended after a capture round packs only with the
 //! fixtures of its own round, so the sheets already captured keep their committed bytes (§4.7.9
 //! re-pastes the committed sheets) and the new fixtures land on new sheets numbered after them.
+//! r34 (2026-10-18, R-P26) opens round 2 for the probe sheet r34's fixtures ([`R33_LAST`]).
 
 use std::path::Path;
 
@@ -60,13 +61,33 @@ pub const R28_LAST: [(Group, u16); 6] = [
     (Group::Z, 19),
 ];
 
-/// The capture round of `id`: 0 for the ids captured through r28, 1 for r29's.
+/// The last id of every group captured through r33 (the probe sheet r34's "last captured" line:
+/// A096 B124 C046 D062 E132 F119 Z019). `pin:06-sheet-round-r34` — B's block is closed here too:
+/// the r34 probes B125–B127 are hand-authored rows appended after the data-derived tail, so they
+/// pack on new sheets and `sheet-B-15` keeps its committed bytes.
+pub const R33_LAST: [(Group, u16); 7] = [
+    (Group::A, 96),
+    (Group::B, 124),
+    (Group::C, 46),
+    (Group::D, 62),
+    (Group::E, 132),
+    (Group::F, 119),
+    (Group::Z, 19),
+];
+
+/// The capture round of `id`: 0 for the ids captured through r28, 1 for r29's, 2 for the probe
+/// sheet r34's (appended after [`R33_LAST`]).
 pub fn round(id: FixtureId) -> u8 {
-    let last = R28_LAST
-        .iter()
-        .find(|(g, _)| *g == id.group())
-        .map_or(u16::MAX, |(_, n)| *n);
-    u8::from(id.number() > last)
+    let last = |t: &[(Group, u16)]| {
+        t.iter()
+            .find(|(g, _)| *g == id.group())
+            .map_or(u16::MAX, |(_, n)| *n)
+    };
+    if id.number() > last(&R33_LAST) {
+        2
+    } else {
+        u8::from(id.number() > last(&R28_LAST))
+    }
 }
 
 /// `tests/conformance/sheets/v<d>`.

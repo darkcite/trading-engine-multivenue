@@ -1,0 +1,23 @@
+fix	2
+id	B127
+group	B
+title	the 2024-10-28 20:00 UTC bar: volume, nvi, pvi
+script	tests/conformance/fixtures/B/B127.pine
+script_sha256	1f34d4ef7bdf7fb1cb5e97468e3183a26eeeb11989e5c2b6ea74877561b52cfb
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	chart
+align	time
+dialects	6
+mode	bar_close
+bars	-
+window	time	1730138400000	1730160000000
+oracle	tv
+tier	1
+plot	f_B127_vol	exact
+plot	f_B127_dnvi	exact
+plot	f_B127_dpvi	exact
+plot	f_B127_c	exact
+pending

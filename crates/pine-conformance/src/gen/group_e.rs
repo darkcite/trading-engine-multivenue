@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! Group E — the broker (impl-06 §4.2.5, E001–E121; r29 appends E122–E132). GENERATOR-TIME ONLY.
+//! Group E — the broker (impl-06 §4.2.5, E001–E121; r29 appends E122–E132, r34 E133–E138).
+//! GENERATOR-TIME ONLY.
 //!
 //! `Driver::SynSig` (SYN-T decides *when*, the chart *at what price*), `align time`,
 //! `window time FROM_MS TO_MS`, `dialects 56`, `mode bar_close`, oracle `tv` (body pending until
@@ -1438,6 +1439,133 @@ fn part3() -> Vec<Row> {
     o
 }
 
+/// E133–E138 (r34, R-P26): the probe sheet r34's broker probes (vault
+/// `capture/probes-r34-2026-10-18.md`). Every reading predicts List-of-Trades rows or a chart
+/// bar's position (chart prices), so all are named in `readings::BROKER_READINGS`.
+///
+/// * E133 (P9, E-costs) — E064's fee base made visible: 10 contracts, 0.1 %, 50 ticks of slippage,
+///   E-ord's market entry; plots the open trade's fee, entry price and max run-up, the net and open
+///   profit (`pin:05-net-f64-fees-provisional`). `pin:06-r34-e133-pos` — the house `pos` plot
+///   leads, as on every SynSig row (the sheet's five columns follow).
+/// * E134–E137 (P10, E-margin) — E069's body (250 % of equity, a market entry) with `liq =
+///   strategy.margin_liquidation_price`: E134 v5 without margin arguments, E135 v5 margin 0, E136
+///   v5 margin 100, E137 v6 margin 0 (E135's twin); `pin:W18-margin-default` and
+///   `pin:05-margin-funds-check` together.
+/// * E138 (P11, E-pin5) — E112 made deterministic: two entries of 2 on SYN-T's first two steps
+///   (pyramiding 2), then `strategy.exit(qty = 1, profit = 1)` one tick away while long
+///   (`pin:05-exit-qty-per-trade`).
+fn part4() -> Vec<Row> {
+    let mut o = Vec::new();
+    let mut h = Hdr::base();
+    h.qty_value = "10";
+    h.comm_value = "0.1";
+    h.slippage = "50";
+    let mut r = shaped(
+        133,
+        "commission percent on a slipped fill",
+        h,
+        Shape::EntryMarket,
+    );
+    r.body.push("open_@ = strategy.opentrades > 0".to_string());
+    r.plots.extend(
+        [
+            ("open_@ ? strategy.opentrades.commission(0) : na", "fee"),
+            ("open_@ ? strategy.opentrades.entry_price(0) : na", "px"),
+            ("open_@ ? strategy.opentrades.max_runup(0) : na", "runup"),
+            ("strategy.netprofit", "np"),
+            ("strategy.openprofit", "op"),
+        ]
+        .map(|(e, k)| (e.to_string(), k.to_string())),
+    );
+    r.pins.push("pin:05-net-f64-fees-provisional");
+    o.push(r);
+    for (n, ds, twin, margin, title) in [
+        (
+            134u16,
+            Dialects::V5,
+            0u16,
+            None,
+            "no margin arguments, 250 % of equity (E069 with the liquidation price)",
+        ),
+        (
+            135,
+            Dialects::V5,
+            137,
+            Some(("0", "0")),
+            "margin 0, 250 % of equity",
+        ),
+        (
+            136,
+            Dialects::V5,
+            0,
+            Some(("100", "100")),
+            "margin 100, 250 % of equity",
+        ),
+        (
+            137,
+            Dialects::V6,
+            135,
+            Some(("0", "0")),
+            "margin 0, 250 % of equity",
+        ),
+    ] {
+        let mut h = Hdr::base();
+        h.margin = margin;
+        h.qty_type = Some("strategy.percent_of_equity");
+        h.qty_value = "250";
+        let mut r = shaped(n, title, h, Shape::EntryMarket);
+        r.ds = ds;
+        r.twin = twin;
+        r.plots.push((
+            "strategy.margin_liquidation_price".to_string(),
+            "liq".to_string(),
+        ));
+        r.pins
+            .extend(["pin:W18-margin-default", "pin:05-margin-funds-check"]);
+        o.push(r);
+    }
+    let mut h = Hdr::base();
+    h.pyramiding = 2;
+    h.qty_value = "2";
+    let mut b = when(
+        "_on and (_n == 1 or _n == 2)",
+        &["strategy.entry(\"L\", strategy.long)"],
+    );
+    b.extend(when(
+        &and("_on and _n >= 3", LONG),
+        &["strategy.exit(\"X\", \"L\", qty = 1, profit = 1, loss = 100000)"],
+    ));
+    let mut r = row(
+        138,
+        "an exit qty over two trades, legs one tick away",
+        h,
+        b,
+        None,
+    );
+    r.plots.extend(
+        [
+            ("strategy.opentrades", "ot"),
+            ("strategy.closedtrades", "ct"),
+            (
+                "strategy.opentrades > 0 ? strategy.opentrades.size(0) : na",
+                "s0",
+            ),
+            (
+                "strategy.opentrades > 1 ? strategy.opentrades.size(1) : na",
+                "s1",
+            ),
+            (
+                "strategy.opentrades > 1 ? strategy.opentrades.entry_bar_index(1) : na",
+                "b1",
+            ),
+        ]
+        .map(|(e, k)| (e.to_string(), k.to_string())),
+    );
+    r.pins.push("pin:05-exit-qty-per-trade");
+    o.push(r);
+    o
+}
+
 fn line(t: &str, id: FixtureId) -> Line {
     let sfx = format!("_{}", id.as_str());
     let depth = t.bytes().take_while(|&c| c == b'>').count();
@@ -1472,7 +1600,10 @@ fn block(n: u16) -> &'static str {
         122..=127 => "E-hist",
         128 => "E-r-p2",
         129..=131 => "E-round",
-        _ => "E-size",
+        132 => "E-size",
+        133 => "E-costs",
+        134..=137 => "E-margin",
+        _ => "E-pin5",
     }
 }
 
@@ -1549,6 +1680,7 @@ fn rows() -> Vec<Row> {
     let mut rs = part1();
     rs.extend(part2());
     rs.extend(part3());
+    rs.extend(part4());
     rs.sort_by_key(|r| r.n);
     for r in &mut rs {
         r.pins.extend(table_pins(r.n));
@@ -1556,7 +1688,7 @@ fn rows() -> Vec<Row> {
     rs
 }
 
-/// Every group-E cell (E001–E121, then r29's E122–E132).
+/// Every group-E cell (E001–E121, then r29's E122–E132 and r34's E133–E138).
 pub fn cells() -> Vec<Cell> {
     rows().into_iter().map(cell).collect()
 }

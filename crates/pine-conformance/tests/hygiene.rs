@@ -625,6 +625,13 @@ fn script_text(f: &Fixture) -> Option<String> {
     std::fs::read_to_string(workspace_root().join(&f.script)).ok()
 }
 
+/// `pin:06-r34-bar-reads` (r34, R-P26) — the probe sheet r34's F120 F121 F123 F125 read
+/// `bar_index` / `close` exactly as the sheet writes them (a constant made a series without
+/// arithmetic; a series zero no fold sees, `gen/group_f3.rs`). A `Syn` run steps `SynBars`
+/// (`bar_index` the step, `close` one constant), so those two names are allowed there and nowhere
+/// else.
+const R34_BAR_READS: [&str; 4] = ["F120", "F121", "F123", "F125"];
+
 /// I5 (first half): a `Syn` fixture's body outside its SYN-1 prelude reads no bar field.
 #[test]
 fn syn_fixtures_read_no_bar_data() {
@@ -656,7 +663,11 @@ fn syn_fixtures_read_no_bar_data() {
         }
         let Some(src) = script_text(&f) else { continue };
         let body = src.replacen(pine_conformance::syn::SYN1_PRELUDE, "", 1);
+        let r34 = R34_BAR_READS.contains(&f.id.as_str());
         for (t, _) in pine_tokens(&body) {
+            if r34 && (t == "bar_index" || t == "close") {
+                continue;
+            }
             assert!(
                 !BAR.contains(&t.as_str())
                     && !t.starts_with("syminfo.")
@@ -687,7 +698,17 @@ fn syn_fixtures_read_no_bar_data() {
 /// lowering: a v5 W1 `const int / const int` that infer types `int` without folding it —
 /// `timestamp(…)` of literals — widened both operands to f64 and fed them to `I_DIV`; it now stays
 /// in the int lane, truncating, so `na(x) ? na : x` plots 0 in v5 as in v6).
-const I9_ENGINE_FINDINGS: &[(&str, &str, &str)] = &[];
+///
+/// r37 (2026-10-18): F120 (the probe sheet r34's P1) — pine-sema types a ternary with a series
+/// condition and literal arms (`bar_index >= 0 ? 9223372036854775807 : 0`) `const` in v5, so W1's
+/// v5 `const_trunc` truncates a series division: `mul` `(imax * 2) / imax` plots 0 in v5 and
+/// −2.168404344971009e−19 in v6 (a scratch variant: `sq / 7` 433857214 vs 433857214.28571427).
+/// The qualifier of `c ? a : b` is the strongest of the three (series); finding for pine-sema.
+const I9_ENGINE_FINDINGS: &[(&str, &str, &str)] = &[(
+    "F120",
+    "diverge",
+    "pine-sema: a series-condition ternary of literals is const in v5 (W1 truncates)",
+)];
 
 #[test]
 fn dialect_56_fixtures_are_invariant() {
@@ -981,6 +1002,17 @@ const R29_AHEAD_OF_LINKAGE: [&str; 9] = [
     "pin:04-udt-sort-na-object",
 ];
 
+/// r34 (2026-10-18, R-P26): the foreign pins the probe sheet r34's fixtures decide, published ahead
+/// of the §4.9.6 / §4.9.7 linkage pass as r29's were.
+const R34_AHEAD_OF_LINKAGE: [&str; 6] = [
+    "pin:02-fold-sig15-ties",
+    "pin:02-ta-in-loop-restart-scope",
+    "pin:04-array-percentrank",
+    "pin:04-cog-tv-order",
+    "pin:04-pivot-levels-provisional",
+    "pin:05-net-f64-fees-provisional",
+];
+
 /// §4.9.7's names, transcribed from the spec table (`pin:01-array-suffix-type` appears in two rows).
 const SECTION_4_9_7: [&str; 38] = [
     "pin:00-rma-seed",
@@ -1032,6 +1064,7 @@ fn foreign_switch_pins_are_section_4_9_names() {
         .iter()
         .chain(SECTION_4_9_7.iter())
         .chain(R29_AHEAD_OF_LINKAGE.iter())
+        .chain(R34_AHEAD_OF_LINKAGE.iter())
         .copied()
         .collect();
     names.sort_unstable();
@@ -1057,12 +1090,14 @@ fn foreign_switch_pins_are_section_4_9_names() {
 #[test]
 fn manifest_is_frozen() {
     const HEADER: &str =
-        "# fix 2 · pine-conf gen · A 96 B 124 C 46 D 62 E 132 F 119 Z 19 · total 598";
+        "# fix 2 · pine-conf gen · A 96 B 127 C 46 D 62 E 138 F 128 Z 19 · total 616";
     // Re-frozen 2026-10-17 (R-P2): C029 gained `pin:06-na-object-field`. R-P3: C044 / D053 / D054
     // are pending (rewritten as tick-independent relations, awaiting their re-capture). Re-frozen
     // r29 (2026-10-17): E122–E132 and F099–F119 appended for the next capture session (pending;
-    // F109 / F111 / F113 authored `refuse 3005`); no existing row changed.
-    const FROZEN_SHA256: &str = "3852fd5b2c2862d236685e5bfd8babd7cf56b722a6407996c7264ea140b100e2";
+    // F109 / F111 / F113 authored `refuse 3005`); no existing row changed. Re-frozen r37
+    // (2026-10-18, R-P26): the probe sheet r34's B125–B127, E133–E138 and F120–F128 appended
+    // (pending); no existing row changed.
+    const FROZEN_SHA256: &str = "152758a4b3336f1a9bcc28d111efabcb0555b12afdab85cb4a1150b7c02f175c";
     let text =
         std::fs::read_to_string(workspace_root().join(pine_conformance::manifest::MANIFEST_TSV))
             .unwrap();
@@ -1076,7 +1111,7 @@ fn manifest_is_frozen() {
         masked.push('\n');
         rows += 1;
     }
-    assert_eq!(rows, 598);
+    assert_eq!(rows, 616);
     let sha = core_crypto::sha256(masked.as_bytes());
     let hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(hex, FROZEN_SHA256, "manifest generator-owned columns moved");

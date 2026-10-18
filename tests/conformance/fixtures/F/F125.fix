@@ -1,0 +1,27 @@
+fix	2
+id	F125
+group	F
+title	which additive chains TradingView re-associates
+script	tests/conformance/fixtures/F/F125.pine
+script_sha256	42db69e789a445f91c94c1955ba399fe3e35ed6ae5fbda70786d2b61e4744edc
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	pending
+tv_build	pending
+captured_in	pending
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	16
+oracle	tv
+tier	1
+plot	f_F125_c1	exact
+plot	f_F125_c1r	exact
+plot	f_F125_c2r	exact
+plot	f_F125_var	exact
+plot	f_F125_mul	exact
+plot	f_F125_close	exact
+plot	f_F125_half	exact
+plot	f_F125_call	exact
+pending

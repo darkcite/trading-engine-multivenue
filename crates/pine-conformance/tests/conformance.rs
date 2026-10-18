@@ -109,8 +109,9 @@ fn standin_fixtures_hold_the_known_pass_set() {
     let mut runner = Runner::new(standin_options("pass-set")).expect("runner");
     assert_eq!(runner.syminfo_source(), SyminfoSource::StandIn);
     let all = load_all();
-    // r29 (2026-10-17): 566 + E122–E132 + F099–F119 (pending, or the v5 twins' authored refusals).
-    assert_eq!(all.len(), 598, "fixture count");
+    // r29 (2026-10-17): 566 + E122–E132 + F099–F119 (pending, or the v5 twins' authored refusals);
+    // r37 (2026-10-19): + the r34 probes F120–F128, B125–B127, E133–E138 (pending, R-P26).
+    assert_eq!(all.len(), 616, "fixture count");
     let (mut pass, mut gaps, mut skips) = (Vec::new(), Vec::new(), Vec::new());
     let mut smoke: Vec<String> = Vec::new();
     for f in all.iter().filter(|f| ours(f)) {

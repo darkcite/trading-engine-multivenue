@@ -329,8 +329,9 @@ fn triage_is_deterministic_over_the_manifest() {
             n += 1;
         }
     }
-    // r29 (2026-10-17): 566 + E122–E132 + F099–F119.
-    assert_eq!(n, 598);
+    // r29 (2026-10-17): 566 + E122–E132 + F099–F119; r34 (R-P26): + B125–B127, E133–E138,
+    // F120–F128.
+    assert_eq!(n, 616);
 }
 
 /// `tests/golden/report_B011.txt`; `PINE_CONF_BLESS=1` rewrites it (review the diff).

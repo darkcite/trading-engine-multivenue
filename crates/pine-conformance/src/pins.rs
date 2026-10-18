@@ -7,8 +7,11 @@
 //! `PINS` is exactly the rows of §4.9.2–§4.9.3 and §4.9.6–§4.9.7 (94 names, §4.9.8 — the 94th,
 //! `pin:06-na-object-field`, is R-P2's, 2026-10-17) plus r29's ten (the capture session's
 //! history-tick, tier-3 and R-P15 pins: `pin:U17-hist-close-isnew`, five `pin:05-hist-tick-*`,
-//! four `pin:04-*`; 104, pending the §4.9 linkage pass); a row's ids are
-//! split by the fixture's declared `dialects`. Where a row's fixture list is narrower than the
+//! four `pin:04-*`; 104, pending the §4.9 linkage pass) plus r34's six (the probe sheet r34, R-P26,
+//! 2026-10-18: `pin:02-fold-sig15-ties`, `pin:02-ta-in-loop-restart-scope`,
+//! `pin:04-array-percentrank`, `pin:04-cog-tv-order`, `pin:04-pivot-levels-provisional`,
+//! `pin:05-net-f64-fees-provisional`; 110); a row's ids are split by the fixture's declared
+//! `dialects`. r34 also adds its probes to existing rows and names the sheet's readings there. Where a row's fixture list is narrower than the
 //! generator's assignment, the generator's is kept and the widening is pinned:
 //! * `pin:06-na-compare-v6-bool` — `pin:06-na-compare` also lists A085/A086 (the v6 bool row's
 //!   `na == na` / `na != na` cells; §4.2.1 gives both bool rows the pin, `pin:06-a-w13-scope`).
@@ -245,10 +248,11 @@ pub static PINS: &[Pin] = &[
     },
     Pin {
         name: "pin:W18-margin-default",
-        v5: &["E069"],
-        v6: &["E070"],
+        v5: &["E069", "E134", "E135", "E136"],
+        v6: &["E070", "E137"],
         both: &[],
-        readings: &[],
+        // r34 (P10): the sheet's three readings of E134–E137 (`readings::BROKER_READINGS`).
+        readings: &["v5_default_0", "v5_default_100", "equity_cap"],
     },
     Pin {
         name: "pin:W23-exit-legs",
@@ -296,8 +300,9 @@ pub static PINS: &[Pin] = &[
         name: "pin:U04-round-ties",
         v5: &[],
         v6: &[],
-        both: &["F015", "F016"],
-        readings: &["half_up", "half_away"],
+        both: &["F015", "F016", "F123"],
+        // r34 (P4): F123's `math.round_to_mintick` readings beside `math.round`'s tie rules.
+        readings: &["half_up", "half_away", "r_int", "r_f64", "r_band"],
     },
     Pin {
         name: "pin:U05-int-of-na",
@@ -310,8 +315,9 @@ pub static PINS: &[Pin] = &[
         name: "pin:U06-float-eq-v6",
         v5: &["F061"],
         v6: &["F062"],
-        both: &[],
-        readings: &["exact", "round9"],
+        both: &["F122"],
+        // r34 (P3): CAR-R33-7's `abs_1e10` (`==` / `!=` only) and the every-comparison tolerance.
+        readings: &["exact", "round9", "abs_1e10", "abs_1e10_all"],
     },
     Pin {
         name: "pin:U07-str-match-none",
@@ -360,7 +366,8 @@ pub static PINS: &[Pin] = &[
         v5: &[],
         v6: &[],
         both: &["B068", "B069"],
-        readings: &["per_call", "per_iteration"],
+        // CAR-R33-9 (decided `restart`, r33i); B068 / B069's `restart` blocks landed r37.
+        readings: &["per_call", "per_iteration", "restart"],
     },
     Pin {
         name: "pin:U14-ternary-unselected-arm",
@@ -453,15 +460,17 @@ pub static PINS: &[Pin] = &[
         name: "pin:06-int-width",
         v5: &[],
         v6: &[],
-        both: &["F011", "F012", "F013", "F037", "F040", "F047"],
-        readings: &[],
+        both: &["F011", "F012", "F013", "F037", "F040", "F047", "F120"],
+        // r34 (P1, CAR-R33-5): F120's readings.
+        readings: &["binary64", "i64_wrapping", "i64_saturating"],
     },
     Pin {
         name: "pin:06-nonfinite",
         v5: &[],
         v6: &[],
-        both: &["F020", "F024", "F025", "F026"],
-        readings: &[],
+        both: &["F020", "F024", "F025", "F026", "F121"],
+        // r34 (P2, CAR-R33-6): F121's readings.
+        readings: &["r_op", "r_na", "r_fold"],
     },
     Pin {
         name: "pin:06-ltf-intrabar",
@@ -518,8 +527,8 @@ pub static PINS: &[Pin] = &[
     },
     Pin {
         name: "pin:05-margin-funds-check",
-        v5: &[],
-        v6: &[],
+        v5: &["E134", "E135", "E136"],
+        v6: &["E137"],
         both: &["E055", "E071", "E072", "E132"],
         // r29: CI-042's probe (E132) names the readings (`readings::BROKER_READINGS`).
         readings: &["reject", "reduce", "fill_whole"],
@@ -573,8 +582,14 @@ pub static PINS: &[Pin] = &[
         name: "pin:05-exit-qty-per-trade",
         v5: &[],
         v6: &[],
-        both: &["E112"],
-        readings: &["per_trade", "per_call"],
+        both: &["E112", "E138"],
+        // r34 (P11): the sheet's two further models of E112.
+        readings: &[
+            "per_trade",
+            "per_call",
+            "per_position",
+            "second_entry_refused",
+        ],
     },
     Pin {
         name: "pin:05-price-rounding",
@@ -633,6 +648,14 @@ pub static PINS: &[Pin] = &[
         v6: &[],
         both: &["E120", "E121"],
         readings: &["at_limit", "at_start"],
+    },
+    // r34 (P9, R-P26): the fee base of a slipped fill (E064 trade 34).
+    Pin {
+        name: "pin:05-net-f64-fees-provisional",
+        v5: &[],
+        v6: &[],
+        both: &["E133"],
+        readings: &["fill_price", "pre_slippage", "cent_rounded"],
     },
     // r29 (R-P6, impl-05 §4.8.9): the history-tick pins, provisional default first.
     // R-P18 (2026-10-17): `three_points_and_close_confirmed` states TradingView's E122 outcome
@@ -877,6 +900,22 @@ pub static PINS: &[Pin] = &[
         both: &[],
         readings: &["var_like", "varip_like"],
     },
+    // r34 (P5, CAR-R33-4): whether folds of `+ − * /` round to 15 digits, and the tie rule.
+    Pin {
+        name: "pin:02-fold-sig15-ties",
+        v5: &[],
+        v6: &[],
+        both: &["F124"],
+        readings: &["ieee_fold", "sig15_fold", "sig15_fold_literals"],
+    },
+    // r34 (P15, CAR-R33-9): whether `math.*` stateful calls in a loop restart as `ta.*` do.
+    Pin {
+        name: "pin:02-ta-in-loop-restart-scope",
+        v5: &[],
+        v6: &[],
+        both: &["F128"],
+        readings: &["per_call", "restart"],
+    },
     Pin {
         name: "pin:03-hist-dynamic-offset",
         v5: &[],
@@ -964,6 +1003,29 @@ pub static PINS: &[Pin] = &[
         both: &[],
         readings: &["runtime_fault", "na_last", "na_first"],
     },
+    // r34 (R-P26): the probe sheet's tier-3 and `ta.*` pins (P7, P14, P8).
+    Pin {
+        name: "pin:04-array-percentrank",
+        v5: &[],
+        v6: &[],
+        both: &["F126"],
+        readings: &["size_minus_one", "non_na_count"],
+    },
+    Pin {
+        name: "pin:04-cog-tv-order",
+        v5: &[],
+        v6: &[],
+        both: &["F127"],
+        readings: &["rolling", "fresh_plain", "fresh_neumaier"],
+    },
+    // The sheet predicts ours only (the Help Center formulas): decided by the capture itself.
+    Pin {
+        name: "pin:04-pivot-levels-provisional",
+        v5: &[],
+        v6: &[],
+        both: &["B125", "B126"],
+        readings: &[],
+    },
     Pin {
         name: "pin:04-strategy-edges",
         v5: &[],
@@ -1039,6 +1101,7 @@ pub static FOREIGN_SWITCH_PINS: &[(&str, &str)] = &[
     ("pin:05-trade-trim", "impl-05"),
     ("pin:05-v5-order-limit", "impl-05"),
     ("pin:05-fill-limits", "impl-05"),
+    ("pin:05-net-f64-fees-provisional", "impl-05"),
     ("pin:05-hist-tick-runs", "impl-05"),
     ("pin:05-hist-tick-next-point", "impl-05"),
     ("pin:05-hist-tick-immediately", "impl-05"),
@@ -1071,6 +1134,8 @@ pub static FOREIGN_SWITCH_PINS: &[(&str, &str)] = &[
     ("pin:02-fn-global-assign", "impl-02"),
     ("pin:02-int-cast", "impl-02"),
     ("pin:02-once-flag", "impl-02"),
+    ("pin:02-fold-sig15-ties", "impl-02"),
+    ("pin:02-ta-in-loop-restart-scope", "impl-02"),
     ("pin:03-hist-dynamic-offset", "impl-03"),
     ("pin:03-float-mod", "impl-03"),
     ("pin:04-ta-reference", "impl-04"),
@@ -1081,6 +1146,9 @@ pub static FOREIGN_SWITCH_PINS: &[(&str, &str)] = &[
     ("pin:04-binary-search", "impl-04"),
     ("pin:04-udt-sort-ties", "impl-04"),
     ("pin:04-udt-sort-na-object", "impl-04"),
+    ("pin:04-array-percentrank", "impl-04"),
+    ("pin:04-cog-tv-order", "impl-04"),
+    ("pin:04-pivot-levels-provisional", "impl-04"),
     ("pin:04-strategy-edges", "impl-04"),
     ("pin:04-exchange-tz", "impl-04"),
     ("pin:04-time-edges", "impl-04"),
