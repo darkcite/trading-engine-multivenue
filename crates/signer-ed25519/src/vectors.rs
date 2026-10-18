@@ -19,7 +19,7 @@
 
 use core::fmt;
 
-use crate::{Ed25519Signer, SignerErr, PUBLIC_KEY_LEN, SIG_B64_LEN, SIG_B64_PCT_MAX, SIG_LEN};
+use crate::{verify, Ed25519Signer, SignerErr, PUBLIC_KEY_LEN, SIG_B64_LEN, SIG_B64_PCT_MAX, SIG_LEN};
 
 /// One known answer: a seed, the public key it must derive, a message and
 /// the signature it must produce — raw, and as its two wire renders.
@@ -108,6 +108,11 @@ pub enum SelfTestErr {
     Signature(usize),
     /// Vector `i` signed to a different percent-encoded signature.
     SignaturePct(usize),
+    /// PMJ J2: vector `i`'s raw signature differs from the RFC's bytes.
+    SignatureRaw(usize),
+    /// PMJ J2: vector `i`'s signature did not verify under its key, or a
+    /// one-bit corruption of it did.
+    Verify(usize),
 }
 
 impl fmt::Display for SelfTestErr {
@@ -125,6 +130,12 @@ impl fmt::Display for SelfTestErr {
                 f,
                 "ed25519 self-test: vector {i} produced a different percent-encoded signature"
             ),
+            SelfTestErr::SignatureRaw(i) => {
+                write!(f, "ed25519 self-test: vector {i} produced a different raw signature")
+            }
+            SelfTestErr::Verify(i) => {
+                write!(f, "ed25519 self-test: vector {i} did not verify as it must")
+            }
         }
     }
 }
@@ -164,6 +175,17 @@ pub fn self_test_with(vectors: &[KnownAnswer]) -> Result<(), SelfTestErr> {
         let n = signer.sign_b64_pct(v.msg, &mut pct);
         if &pct[..n] != v.sig_b64_pct.as_bytes() {
             return Err(SelfTestErr::SignaturePct(i));
+        }
+        // PMJ J2: the raw path, and verification both ways.
+        let mut raw = [0u8; SIG_LEN];
+        signer.sign_raw(v.msg, &mut raw);
+        if raw != v.sig {
+            return Err(SelfTestErr::SignatureRaw(i));
+        }
+        let mut flipped = v.sig;
+        flipped[0] ^= 0x01;
+        if !verify(&v.public, v.msg, &v.sig) || verify(&v.public, v.msg, &flipped) {
+            return Err(SelfTestErr::Verify(i));
         }
         i += 1;
     }
@@ -268,6 +290,19 @@ mod tests {
         let mut t = RFC8032;
         t[1].msg = &[0x73];
         assert_eq!(self_test_with(&t), Err(SelfTestErr::Signature(1)));
+        // PMJ J2: a raw signature byte the RFC does not print — the renders
+        // are literals, so only the raw comparison sees it.
+        let mut v = 0usize;
+        while v < RFC8032.len() {
+            let mut b = 0usize;
+            while b < SIG_LEN {
+                let mut t = RFC8032;
+                t[v].sig[b] ^= 0x01;
+                assert_eq!(self_test_with(&t), Err(SelfTestErr::SignatureRaw(v)), "raw {v}:{b}");
+                b += 1;
+            }
+            v += 1;
+        }
     }
 
     #[test]
