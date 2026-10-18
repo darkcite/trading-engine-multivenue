@@ -2164,12 +2164,14 @@ mod tests {
     #[test]
     fn strategy_labels_cover_sixteen_slots() {
         let members = [
-            "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv", "pine",
+            "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv", "pine", "pm15",
         ];
         for (i, m) in members.iter().enumerate() {
             assert_eq!(strategy_label(i as u8), *m);
         }
-        for id in 9..MAX_STRATEGY_SLOTS {
+        assert_eq!(strategy_label(8), "pine");
+        assert_eq!(strategy_label(9), "pm15");
+        for id in 10..MAX_STRATEGY_SLOTS {
             assert_eq!(strategy_label(id), "reserved", "slot {id}");
         }
         assert_eq!(strategy_label(MAX_STRATEGY_SLOTS), "unknown");

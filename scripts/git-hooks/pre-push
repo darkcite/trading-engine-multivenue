@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
+# scripts/git-hooks/pre-push — the Git law below Claude.
+#
+# CLAUDE.md: "Pushes are the operator's, by hand." settings.json rules and
+# .claude/hooks/guard-bash.py hold only inside Claude Code CLI sessions; a
+# Cowork session runs commands through the desktop bridge, where neither
+# applies. This hook holds for every caller: a push needs the operator's
+# explicit switch in the environment.
+#
+#   MV_OPERATOR_PUSH=1 git push origin main      # the operator, by hand
+#
+# NOT INSTALLED by default. To install (the operator's call):
+#   ln -s ../../scripts/git-hooks/pre-push .git/hooks/pre-push
+# To remove:
+#   rm .git/hooks/pre-push
+set -u
+if [ "${MV_OPERATOR_PUSH:-0}" = "1" ]; then
+    exit 0
+fi
+printf '%s\n' \
+    "pre-push: refused — pushes are the operator's, by hand (CLAUDE.md Git law)." \
+    "          Re-run as: MV_OPERATOR_PUSH=1 git push …" 1>&2
+exit 1

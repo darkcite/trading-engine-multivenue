@@ -851,3 +851,17 @@ def test_the_har_panel_is_wired_into_the_page() -> None:
     # thresholds are the worker's (one place).
     assert "E && E.har" in html and "W && W.har" in html
     assert "WH.red_day_age_s" in html and "WH.amber_drift" in html
+
+
+
+def test_the_pm15_panel_reads_the_engine_metrics() -> None:
+    html = claude_worker.dashboard.HTML_PATH.read_text(encoding="utf-8")
+    # Slot 9's block joins the strategies panel; it reads /metrics through
+    # the dashboard's own engine proxy (no new route, nothing off-host).
+    assert "function pm15Block()" in html and "xmmBlock() + pm15Block()" in html
+    assert "fetch('/api/engine/metrics'" in html and "setInterval(pollMetrics" in html
+    assert "/api/engine/metrics" in claude_worker.dashboard._ENGINE_ROUTES
+    for name in ("rolls_total", "skip_book_total", "takes_submitted_total", "pnl_usd_1e6", "halted"):
+        assert f"g('{name}')" in html, name
+    # PM15-8c: the live arm's rows (engine_pm15_arm_* / engine_pm15_gw_*).
+    assert "engine_pm15_arm_" in html and "a('worth_usd_1e6')" in html and "w('redeemed_total')" in html

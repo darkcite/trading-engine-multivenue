@@ -6,6 +6,86 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-16 — BIN15 trades the late-window law only: the old arms, their keys, counters and sidecar blocks are removed (BIN15 H90 G3)
+
+**What changed** (ruling O-GL-2; the removed law and its recovery commit,
+`9cde761`, are in vault doc 38)
+- `strategy-bin15`: the coverage entry (O9/P3/R0/S5/S5b), Arm A (takes and
+  closes), Arm B (the paper maker: quotes, MODIFY, CANCEL, raced fills) and
+  the null arm are removed. The member's ONE trading law is the H90 late
+  entry (`late` module); the S-law pricer stays as the logged counterfactual
+  (`ctl_*`) and the calibration ledger and never trades.
+  - Every order is a BUY IoC of the favoured side; bit 63 of the client oid
+    (the null-arm flag) is always 0.
+  - `FamilyState` 512 → 384 B (the quote, coverage-entry and arm fields);
+    `PendingLeg` loses `prev_oid`; `QuoteUndo` is gone.
+  - `on_order_event` handles `REJECTED` only (the member rests nothing).
+- `strategy_core::Bin15Counters` and the `engine_bin15_*` Prometheus family
+  (41 → 25 counters): `quotes_submitted`, `quotes_filled`, `quotes_expired`,
+  `quotes_modified`, `quotes_modify_refused`, `quotes_cancelled`,
+  `quotes_cancel_refused`, `quotes_raced`, `closes_submitted`,
+  `skipped_tau`, `skipped_book`, `skipped_inventory`, `skipped_partial`,
+  `skipped_entry_price`, `skipped_entry_persist` and
+  `skipped_entry_elapsed` are removed.
+- `core_config::bin15`: 36 → 23 keys. The 13 retired keys (`e_take_1e6`,
+  `h_quote_1e6`, `tau_min_take_ns`, `tau_min_quote_ns`, `requote_thr_1e6`,
+  `clip_qty_1e6`, `maker_enabled`, `null_arm`, `entry_usd_1e6`,
+  `e_entry_1e6`, `entry_min_px_1e6`, `entry_persist_polls`,
+  `entry_elapsed_max_ns`) are REFUSED by name at parse ("retired with the
+  old arms … delete the line"), never silently ignored.
+  `tail_refuse_ns` and `mark_stale_ns` are now bounded by `tau_ns`.
+- The `bin15:` boot tell loses the entry law and the day-cap warning.
+- `backtest --member bin15 --emit-detail` no longer writes the
+  `bin15_entries`, `bin15_first_fires` or `bin15_entry_law` blocks; the
+  ledger's `arm` column is written 0 (kept for the column count), and
+  `entered` is the late law's.
+- `claude_worker.bin15_accrue`: the accrual merges the ledger and the late
+  stores only. `entries.tsv` and `first_fires.tsv` stay as the retired law's
+  closed record (`report`, `status` and `relabel` read them). `accrue` loses
+  `--entries` and `--first-fires`. `bin15_fit`'s `KNOBS` and
+  `bin15.toml.example` follow the 23 keys.
+- Alloc gate 52 is renamed `bin15_member_roll_tick_reprice_is_zero_alloc`
+  (was `bin15_member_roll_tick_reprice_take_is_zero_alloc`). It measures
+  the S-law pricer at full width with the late law off and asserts zero
+  submits; gate 52b (the late law) is unchanged.
+- `scripts/bin15-flip.sh`: `LIVE_SIZING` names the kept sizing keys
+  (`late_usd_1e6`, `cap_instance_usd_1e6`, `cap_day_usd_1e6`); the price
+  floor check (a retired key) is gone.
+
+**Operator action:** **delete the 13 retired lines from `~/multivenue/bin15.toml`
+(and any `bin15.paper-s7.toml`) BEFORE the new binary boots.** An artifact
+that still carries one is refused, and slot 3 does not boot.
+
+## 2026-10-16 — HIP-4 outcome prices: the venue's five-significant-figure law replaces the 1e-4 tick (BIN15 H90 G2)
+
+**What changed**
+- `exec_hyperliquid::rules::OutcomeRules::check` accepts a price with at most
+  `PX_SIG_FIGS` = 5 significant figures in [0.00001, 0.99999]. It was a 1e-4
+  tick in [0.001, 0.999]. Mainnet accepted and filled IoCs at 0.99909 and
+  0.99911 (vault doc 33 §9 / §9b), so the old rule refused real asks.
+  - New: `OutcomeRules::sig_figs_ok` and `OutcomeRules::PX_SIG_FIGS`.
+  - `TICK_1E8` stays, as the outcome battery's and the probe's own walking
+    step only.
+- `strategy_bin15::Bin15Strategy::on_grid` follows the same law at ×1e6:
+  - a price ≥ 0.1 is a multiple of 10;
+  - `GRID_PX_MIN_1E6` = 10 and `GRID_PX_MAX_1E6` = 999 990;
+  - the new `PX_SIG_FIGS`.
+  - `GRID_TICK_1E6` (1e-4) remains only as the smallest edge a law may ask
+    for.
+- Agreement:
+  - `cli::bin15_boot` holds both at compile time (`PX_SIG_FIGS`, lot, range,
+    $1).
+  - Its agreement test now walks EVERY ×1e6 price (was a step of 50).
+- **The harness:** `backtest::fill`'s HIP-4 grid gate calls `OutcomeRules::check`.
+  The `PREDICTION_TICK_1E6`, `PREDICTION_LOT_1E6`, `PREDICTION_PX_MIN_1E6`,
+  `PREDICTION_PX_MAX_1E6` and `PREDICTION_MIN_NOTIONAL_1E6` constants are
+  removed. Replays of tapes with five-figure asks can now fill them.
+- `hl_outcome_probe::venue_price` is `OutcomeRules`' law, with no copy of its
+  own.
+
+**Operator action:** none. Paper and replay entries at five-figure asks (such
+as 0.94372) are no longer skipped (`skipped_grid`).
+
 ## 2026-10-16 — Binance options: `venue_time_ms`, the stale flag and `engine_ingress_binance_options_*` (HK42)
 
 **What changed**

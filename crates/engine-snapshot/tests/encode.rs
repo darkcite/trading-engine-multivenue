@@ -644,15 +644,14 @@ fn slot_masks_encode_whole_and_the_slot_rows_carry_sixteen() {
     let h = body.find("\"halted\":[\"").expect("exec.halted");
     let end = h + body[h..].find(']').unwrap();
     assert_eq!(body[h..end].matches(',').count() + 1, SNAPSHOT_SLOTS);
-    // Slots 9–15 are reserved; 0–8 keep their members (slot 8 is the Pine
-    // member since PVM impl-08 T4).
-    assert!(SLOT_NAMES[9..]
-        .iter()
-        .all(|n| *n == engine_snapshot::RESERVED_SLOT_NAME));
-    assert!(SLOT_NAMES[..9]
-        .iter()
-        .all(|n| *n != engine_snapshot::RESERVED_SLOT_NAME));
+    // Slots 10–15 are reserved; 0–9 keep their members (slot 8 is the Pine
+    // member since PVM impl-08 T4, slot 9 is PM15 since PM15-5).
     assert_eq!(SLOT_NAMES[8], "pine");
+    assert_eq!(SLOT_NAMES[9], "pm15");
+    for (i, n) in SLOT_NAMES.iter().enumerate() {
+        let member = i < 10;
+        assert_eq!(*n != engine_snapshot::RESERVED_SLOT_NAME, member, "slot {i}");
+    }
 }
 
 #[test]

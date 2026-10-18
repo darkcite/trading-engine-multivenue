@@ -44,6 +44,8 @@ pub mod instrument_class;
 /// PVM impl-08 T1/T2: the Pine member's manifest (`~/multivenue/pine/<name>.toml`)
 /// and the `[exec.slot.8.pine]` section.
 pub mod pine;
+/// PM15 (slot 9): the `pm15.toml` artifact.
+pub mod pm15;
 /// RG2: the regime detector's parameter artifact (`regime.toml`) + seed file.
 pub mod regime;
 pub mod universe;

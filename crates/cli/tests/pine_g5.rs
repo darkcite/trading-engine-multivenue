@@ -39,8 +39,8 @@ use strategy_pine::WarmSlice;
 use strategy_set::{StrategySet, BIT_PINE};
 
 const _: () = assert!(
-    engine::NUM_TICK_LANES == 8
-        && engine::NUM_EVENT_LANES == 8
+    engine::NUM_TICK_LANES == 9
+        && engine::NUM_EVENT_LANES == 9
         && engine::NUM_OPT_LANES == 4
         && engine::NUM_FILL_LANES == 5
         && engine::NUM_DEPTH_LANES == 2
@@ -212,6 +212,8 @@ fn rig(tag: &str, scripts: &[ScriptSpec]) -> Rig {
     let (_e, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_f, t6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_g, t7) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // PM15-2/3 (main): engine lane 8 carries the rolling 15m ingress.
+    let (_g8, t8) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     type Ev = Ring<ChannelEvent, { core_types::EVENT_RING_SIZE }>;
     let (ep, e0) = Ev::new().split();
     let (_h, e1) = Ev::new().split();
@@ -221,6 +223,7 @@ fn rig(tag: &str, scripts: &[ScriptSpec]) -> Rig {
     let (_l, e5) = Ev::new().split();
     let (_m, e6) = Ev::new().split();
     let (_n, e7) = Ev::new().split();
+    let (_n8, e8) = Ev::new().split();
     type Dp = Ring<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>;
     let (_o, d0) = Dp::new().split();
     let (_p, d1) = Dp::new().split();
@@ -241,8 +244,8 @@ fn rig(tag: &str, scripts: &[ScriptSpec]) -> Rig {
     let mut eng = Engine::new(
         set,
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5, t6, t7],
-        [e0, e1, e2, e3, e4, e5, e6, e7],
+        [t0, t1, t2, t3, t4, t5, t6, t7, t8],
+        [e0, e1, e2, e3, e4, e5, e6, e7, e8],
         [d0, d1],
         [o0, o1, o2, o3],
         sc,

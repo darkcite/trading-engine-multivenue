@@ -769,18 +769,9 @@ pub struct ModelOutcome {
 // BIN15 O3: the HIP-4 prediction grid + per-instance settlement
 // ---------------------------------------------------------------
 
-/// Price tick of a HIP-4 outcome market: 1e-4 ⇒ 100 in ×1e6 units.
-pub const PREDICTION_TICK_1E6: i64 = 100;
-/// Size lot: whole contracts ⇒ 1e6 in ×1e6 units.
-pub const PREDICTION_LOT_1E6: i64 = 1_000_000;
-/// Tradable price band, ×1e6: `[0.001, 0.999]`.
-pub const PREDICTION_PX_MIN_1E6: i64 = 1_000;
-/// Upper end of the band.
-pub const PREDICTION_PX_MAX_1E6: i64 = 999_000;
-/// Minimum order notional: 1 USDC, ×1e6 — the venue's measured refusal
-/// `Order must have minimum value of 1 USDC.` (2026-09-15/19; was $10,
-/// the perps rule, until 2026-09-19 — see `docs/migration.md`).
-pub const PREDICTION_MIN_NOTIONAL_1E6: i64 = 1_000_000;
+// The HIP-4 price, size, range and $1 law is the venue arm's
+// `exec_hyperliquid::rules::OutcomeRules` (five significant figures since
+// BIN15 H90 G2): the harness refuses exactly what the gateway would.
 
 /// One instance's settlement schedule on a ROLLING slot.
 ///
@@ -2425,10 +2416,8 @@ impl FillEngine {
         {
             return false;
         }
-        px % PREDICTION_TICK_1E6 != 0
-            || qty % PREDICTION_LOT_1E6 != 0
-            || !(PREDICTION_PX_MIN_1E6..=PREDICTION_PX_MAX_1E6).contains(&px)
-            || (px as i128 * qty as i128) / 1_000_000 < i128::from(PREDICTION_MIN_NOTIONAL_1E6)
+        exec_hyperliquid::rules::OutcomeRules::check(px.saturating_mul(100), qty.saturating_mul(100))
+            .is_err()
     }
 
     /// BIN15 P5 (F7): every prediction-class fill this engine booked,
@@ -3603,13 +3592,14 @@ mod tests {
     fn grid_refusals_are_counted_and_bit_identical_elsewhere() {
         let sym = hl_slot_sym();
         let mut e = binary_engine();
-        // Off the 1e-4 tick; a fractional contract; below the band;
-        // above the band; under the 1 USDC minimum ($0.50, then $0.99).
+        // Six significant figures (H90 G2: the law is five); a fractional
+        // contract; below the band; above the band; under the 1 USDC
+        // minimum ($0.50, then $0.99).
         for (px, qty) in [
-            (500_050i64, 100_000_000i64),
+            (500_055i64, 100_000_000i64),
             (500_000, 100_500_000),
-            (900, 100_000_000),
-            (999_100, 100_000_000),
+            (5, 100_000_000_000),
+            (999_995, 100_000_000),
             (500_000, 1_000_000),
             (330_000, 3_000_000),
         ] {
@@ -3627,10 +3617,14 @@ mod tests {
         // 1 000 contracts, so a 100-lot order at the bottom of the
         // band is refused for its notional, not for its price.
         let mut e = binary_engine();
-        e.intake(&order(sym, Side::Bid, 999_000, 100_000_000, 1), 1);
+        e.intake(&order(sym, Side::Bid, 999_990, 100_000_000, 1), 1);
         e.intake(&order(sym, Side::Bid, 1_000, 1_000_000_000, 2), 2);
         // 0.50 x 2 contracts = exactly $1.
         e.intake(&order(sym, Side::Bid, 500_000, 2_000_000, 3), 3);
+        // Five figures off the old 1e-4 tick: mainnet filled 0.99909.
+        e.intake(&order(sym, Side::Bid, 999_090, 100_000_000, 4), 4);
+        // The bottom of the band at exactly $1: 100 000 contracts at 0.00001.
+        e.intake(&order(sym, Side::Bid, 10, 100_000_000_000, 5), 5);
         assert_eq!(e.finish().prediction_grid_refused, 0);
         let mut e = binary_engine();
         e.intake(&order(sym, Side::Bid, 1_000, 100_000_000, 1), 1);

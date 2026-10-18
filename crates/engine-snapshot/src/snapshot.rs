@@ -39,8 +39,8 @@ pub const RECENT_ORDERS: usize = 64;
 /// Fills kept in the `recent` ring.
 pub const RECENT_FILLS: usize = 64;
 /// Strategy-set slots mirrored (the wire-stable slot map): every slot
-/// a [`SlotMask`] can name — 0–7 are the members, 8–15 are reserved
-/// (S16-R5) and read zeros. Schema 3 widened it from 8 (S16-5).
+/// a [`SlotMask`] can name — 0–7 and 9 (PM15) are the members, 8 and
+/// 10–15 are reserved (S16-R5) and read zeros. Schema 3 widened it from 8 (S16-5).
 pub const SNAPSHOT_SLOTS: usize = MAX_STRATEGY_SLOTS as usize;
 /// The name of a slot no member stands in — the same word
 /// `cli::exec_boot::UNBUILT_SLOT_NAME` uses (its snapshot-parity test
@@ -82,7 +82,9 @@ pub const RUN_DIR_MAX: usize = 160;
 /// **Slots 8–15 appeared in schema 3 (S16-5)** as
 /// [`RESERVED_SLOT_NAME`]; a member taking one later is additive in the
 /// same way — **slot 8 is `"pine"` since PVM impl-08 T4** (2026-10-16; the
-/// Pine member, paper only). This is a copy of the `strategy-set` member table's names
+/// Pine member, paper only) and **slot 9 is `strategy-pm15` since PM15-5
+/// (2026-10-17)** — both additive (`"reserved"` → a name); 10–15 stay
+/// reserved. This is a copy of the `strategy-set` member table's names
 /// (the snapshot crate does not link the members): the cli's
 /// `exec_boot` snapshot-parity test is the guard against drift.
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
@@ -95,7 +97,7 @@ pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
     "xmm",
     "hcv",
     "pine",
-    RESERVED_SLOT_NAME,
+    "pm15",
     RESERVED_SLOT_NAME,
     RESERVED_SLOT_NAME,
     RESERVED_SLOT_NAME,

@@ -15050,6 +15050,58 @@ independent rebuild exact). **Plan:** vault doc 33. **Nothing here arms a slot.*
   `bin15_late_fires`, `bin15_late_law`) and the stores
   (`claude_worker.bin15_late`) landed with L3.
 
+## BIN15 H90 G3–G4 — the late law alone, and slot 3 LIVE at the $2 / $5 dust frame (rulings O-GL-1..5, 2026-10-16)
+
+**Rulings:** vault doc 37 (O-GL-1..5). **Evidence:** docs 32 and 34 (OOS2:
+H1 not confirmed — C1/C2 pass, the H90 rule fails B2' and B6 on 5.8 days;
+under the engine's own persistence 2, 17 of 17 won). **The removed law:**
+doc 38, recoverable from `9cde761`.
+
+- **G3 — one trading law.** The member trades the H90 late entry only (the
+  section above). The coverage entry, Arm A, Arm B and the null arm are
+  removed from the code; their 13 artifact keys are refused by name. The
+  S-law pricer stays as the logged counterfactual and the ledger.
+  "Today's early coverage entry keeps running on paper as the control
+  (O-H90-2)" above is superseded: there is no control arm any more; the
+  control is the logged `late_ctl_*` counterfactual. `tau_min_take_ns`
+  no longer exists; `tail_refuse_ns` holds the S-law pricer only.
+- **G4 — the frame is the operator's, not a bar's.** O-GL-3: "arm live,
+  keep armed", on the live account in `.env` (≈ $5 USDC), with **no gate
+  wait**: H1's "not confirmed" (doc 34) does not block it, by ruling. It is
+  a FILL test on dust, not a confirmation of the edge.
+
+### BIN15 H90 G4 — slot 3 LIVE at the $2 / $5 frame (operator ruling O-GL-3, 2026-10-16)
+
+Armed by `scripts/bin15-flip.sh live --gateway` (slot 3 on its own
+WebSocket gateway arm, off the engine thread), at a safe minute.
+
+| layer | key | value | why |
+|---|---|--:|---|
+| member (`bin15.toml` live cut) | `late_usd_1e6` | $2 | one order fits the account twice |
+| member | `cap_instance_usd_1e6` | $2 | one entry per instance |
+| member | `cap_day_usd_1e6` | $5 | the ruling's day cap: ≈ the whole balance |
+| exec (`[exec.slot.3]`) | `max_order_usd_1e6` | $2 | = the member's order |
+| exec | `cap_instance_usd_1e6` | $2 | = the member's |
+| exec | `cap_day_usd_1e6` | $5 | = the member's |
+| exec | `max_open_orders` | 8 | IoC only; four 15 m families end on the same second |
+| exec | `halt_on_loss_usd_1e6` | $4 | halts with ≥ $1 (the venue's minimum) left |
+| exec | `halt_on_recon_drift_usd_1e6` | $1 | on a $5 account, $1 is a large drift |
+| exec | `request_topup_weight` | 1 000 requests ($0.50) | XMM XH5c-2: one purchase must cost at most a quarter of the $4 loss bound (5 000 = $2.50 was refused at boot, 2026-10-16 20:37Z) |
+| exec | `halt_on_reject_streak` / `halt_on_asset_refusal_streak` | 5 / 3 | unchanged |
+| exec | `halt_on_ws_gap_ms` / `halt_on_recon_stale_ms` | 30 s / 300 s | unchanged |
+| exec | `halt_on_alo_reject_pct` | 20 | the gateway's window halt (XH-7) |
+
+- **Every other line of the live cut is the paper artifact's**, byte for
+  byte (the late law at its ruled values: [2, 30) s, p ≥ 0.90, 2 c,
+  persistence 2, k 1.55). The paper copy stays as `bin15.paper-s7.toml`,
+  which the nightly accrual replays at paper's $100 / $1 000 / $30 000.
+- **The agent's approval expires 2026-10-19 ~13:54Z.** After it, every live
+  order is refused, and the reject streak halts slot 3. Renewing it is the
+  operator's.
+- **Disarm:** `scripts/bin15-flip.sh paper` (halts slot 3 through
+  `exec.HALT`, checks the venue shows nothing of ours resting, restarts at a
+  safe minute), or `echo 3 >> ~/multivenue/exec.HALT` for an immediate halt.
+
 ## HK — the housekeeping lane (2026-10-13)
 
 Section A of the 2026-10-13 survey, one `HK:` commit per cut on `main`
@@ -17353,3 +17405,364 @@ entry before any arming. **OPEN until then.**
     symbol, the smallest size. The arming change (lifting the paper-only refusals for slot 8 on
     Binance only, PB9 called from `exec_boot`, the PL2 permit, the operator's `exec.toml`) is the
     operator's act at R2 — no session makes it.
+
+## PM15 — slot 9: H90 on Polymarket's 15-minute up/down markets (2026-10-17)
+
+**Ask (Anton):** "so please start implementation on main branch (when done
+we will branch it like we did for bin15), use slot 9, account will be
+provided when coding is done". **Plans:** project docs
+`claude/pm15-build-plan-2026-10-17.md` (the build order) and
+`claude/pm15-6-exec-plan-2026-10-17.md` (the order arm); the wire facts in
+`claude/pm15-clob-v2-spec-2026-10-17.md`; the research in vault docs 36 v2
+and 39 (the P0 pre-registration, sha256 `d06d0038…488e`, registered
+06:01Z). **Commits (main, not pushed — R-PM-5):** `3feceac` PM15-2/3,
+`5849b4e` PM15-4, `1c8b014` PM15-5, `babf584` PM15-6a, `03a3191` PM15-8a,
+`a9987fa` PM15-5b, `a391129` PM15-5c, `cc6900b` PM15-6b, `ef8b22c` PM15-5d,
+`860ab76` PM15-6c, `1d41a11` PM15-6d, `a0d7ca7` PM15-6e, `4597be6` PM15-8b
+(the dashboard's slot-9 panel), `19e2d77` PM15-7, `ac84a1f` PM15-8c, PM15-6f (the last
+section).
+**Deployed PAPER 2026-10-17 09:22Z (`03a3191`); `a9987fa` (PM15-5b) since 09:49Z; `ef8b22c` (PM15-5d) since 11:41Z.**
+
+| id | ruling (operator, 2026-10-17) |
+|---|---|
+| R-PM-1 | Build the whole stack now; the P0 pre-registration first (hashed before the confirmatory window opens 10-18 00:00Z). P0's result gates arming slot 9 live beyond the dust test. |
+| R-PM-2 | Paper inside main's engine. Restarts only at safe minutes, through the exec gate (slot 3 is LIVE). |
+| R-PM-3 | Both marks: RTDS Chainlink and the HL/Binance BBO now; PolyBolt becomes primary once credentials exist. |
+| R-PM-4 | All seven assets subscribed (BTC ETH SOL XRP HYPE DOGE BNB); **only BTC and ETH may arm live**. |
+| R-PM-5 | One `PM15:` commit per phase on main, explicit paths, never pushed. |
+| R-PM-6 | Redemption through Polymarket's relayer (gasless). |
+| R-PM-7 | Jurisdiction eligible (operator). |
+| R-PM-8 | $250 per order and per market, a −$500 session loss bound, no day cap; paper runs the same frame. |
+| R-PM-9 | Slot 9 (the S16-R5 ruling a reserved slot needs); the account arrives when the coding is done. |
+| R-PM-10 | A push notification every 45 min. |
+
+### Slot 9, the member (`strategy-pm15`, PM15-5)
+
+- **S16-R5 amended:** slot 9 is built (`BIT_PM15` 0x0200, `BUILT_MASK`
+  0x02FF); **`ALL_MASK` = 0x00FF** — `--strategy all` does not include
+  pm15, so no existing boot picks it up unasked. Slots 8 and 10–15 stay
+  reserved. `/state`, the TUI, the dashboard and `audit_pnl` name slot 9
+  `pm15`.
+- **The law** (doc 39 §4, frozen): τ ∈ [2, 20) s; the favoured side
+  p ≥ 0.90 for 2 consecutive report seconds; an IoC at an ask ≤ p − 0.02;
+  at most 4 IoCs per market. The pricer is `core-twaplock::report`
+  (Chainlink reports on their own second, samples [T−60, T−1]).
+- **The strike:** the RTDS mean of [open − 60, open − 1] (within 0.1–15
+  ppm of the venue's, measured). Gamma publishes a window's `priceToBeat`
+  only when that window resolves, so during a window the reports are the
+  only source. A window open before the boot has no strike (counted
+  `strikes_missing`, `hold_strike`) and is never traded.
+- **The caps:** $250 per order, $250 committed per market (fills plus the
+  one in flight), the session's realised loss at −$500 halts the member.
+  No day cap.
+- **Paper fills (PM15-5c):** the held-quote law (`core_fill::held`, the
+  HC11 law Hypercall's IoCs already use): an IoC fills at the leg's quote
+  in force **350 ms after submit** — the activation Δ (200 ms, the
+  unmeasured-venue assumption) plus the venue's taker hold (150 ms on its
+  crypto markets since 2026-09-04) — at the touch, capped by its size, or
+  gets nothing. The strict-cross law it replaces waited for the leg's
+  first tick after activation: on a delta feed a quiet leg sends none, so
+  an order the venue would fill was cancelled at its TTL. The fee
+  0.07·p·(1 − p) per share; settlement +1 / 0 per share at
+  `market_resolved`. The offline harness has no held law (as for
+  Hypercall): slot 9's paper is judged in the engine only.
+- **`exec_router::LEDGER_ROWS` 16 → 32:** seven PM families take 14 rows
+  (two token pairs each, by window parity) beside bin15's HL families.
+- **The bin15 guard:** `strategy_bin15` reads Hyperliquid rolls only — a
+  Polymarket roll would otherwise reach slot 3's family table.
+
+### Live is refused today — three switches
+
+1. `exec.toml` has no `[exec.slot.9]`: slot 9 is paper.
+2. `--arm-live` must name 9 as well (LAW E-1's second switch), and slot 9
+   is live on exactly `["polymarket"]`: since PM15-6c `LIVE_ARM_VENUES`
+   holds Polymarket for slot 9 alone (any other slot naming it refuses
+   the boot), and the arm boots only through the venue gate below.
+3. P0 (doc 39) must read PASS, or a ruling override it, before the flip
+   arms beyond the dust test; and `pm15.toml live_assets` ⊆ {btc, eth} is
+   enforced by the member and again by the arm's admission (PM15-6 D-9).
+
+### PM15-6a — the order path without a socket (`babf584`)
+
+The signing and wire layer of `exec-polymarket`, pinned by the official
+SDKs' vectors (`py-clob-client-v2` f11b2c0, `clob-client-v2` 27633b3,
+`rs-clob-client-v2` 561830b), reproduced by the boot self-test in the
+binary that signs:
+
+- the Exchange V2 order (domain `"2"`; `"3"` for ExchangeV3) and the
+  Deposit Wallet's ERC-7739 wrapper (signature type 3 — every account
+  deployed since 2026-05-04); `orderID` = the order digest;
+- the FAK BUY amounts law: pUSD rounded down to the cent, shares
+  truncated to the tick's grain — the SDKs' market rule, in integers
+  (the implied limit maker / taker is never below the member's price);
+- the L2 MAC over the request's own spans (URL-safe base64, the query
+  unsigned);
+- the answer read **fail closed**: accepted, refused by class, or
+  in doubt (unreadable, 5xx without a reason) — never a release;
+- the user channel's `trade` (the fill) and `order` events read at the
+  object's top level only (`maker_orders[]` repeats `price`).
+
+Alloc gate 115: amounts, sign (types 0 and 3), render, MAC, answer and
+frame at 0 B per order.
+
+### The market socket's keepalive (PM15-6a)
+
+At a 10 s `PING` the venue closed the rolling market socket 4 times in a
+900 s probe (`last_market_err` 8, Closed); at 5 s — RTDS's cadence, which
+never dropped — 0 in 900 s.
+
+### The deploy (2026-10-17)
+
+- **Dry check first:** `multivenue-engine pm15-check` (PM15-8a) parses the
+  universe file and `pm15.toml` and resolves the families and nowcast
+  venues exactly as `run` does — no socket, no thread, no `.env`.
+- `~/multivenue/g5/pm15-deploy.sh` at 09:20Z (a safe minute, off every
+  drain): backups `universe.toml.bak-20261017T0920Z-pm15` and
+  `strategy.conf.bak-20261017T0920Z-pm15`; `pm15.toml` installed (sha256
+  `69d96643…21f1`; `families` btc … bnb, `perp` HL for six and
+  `binance-usdm:bnbusdt` for BNB, `live_assets` btc + eth); `[polymarket]
+  rolling` added after `markets` (the universe refresher rewrites only
+  that array); `STRATEGY=…+pm15`; the installed files re-checked; then the
+  gated restart (slot 0010 forced — exec gate PASSED 09:21Z).
+- **Booted `03a3191f4613`** at 09:22:39Z: mask 767 requested and
+  configured, halted none on all sixteen slots, slot 3 enabled; the
+  rolling ingress up in its first minute (27 716 frames, 14 slots bound,
+  7 rolls, 178 marks, 0 parse errors, 0 reconnects).
+- **Rollback:** `~/multivenue/g5/pm15-rollback.sh` restores the stamped
+  backups, sets `pm15.toml` aside and requests the gated restart.
+- **Noted:** the 08:33Z drain had booted `1c8b014` (PM15-5) — the release
+  binary in main's checkout had been rebuilt for the rolling-ingress
+  probe; pm15 was not in `STRATEGY`, so slot 9 was inert, and slot 3 ran
+  unchanged.
+
+### PM15-5c — a quiet book is not a stale one (2026-10-17)
+
+The first paper windows priced and then skipped 385 of 440 evaluations as
+"no fresh ask": the member called a touch older than 3 s stale, while the
+ingress emits a leg's touch only when it changes — and a favourite at
+0.99 in the last 20 s often does not.
+
+- **The ingress re-asserts every touch at each `PONG`** of the market
+  socket (a `PING` every 5 s; the socket delivers in order, so every frame
+  before the `PONG` has been read): `touches_reasserted`.
+- **It withdraws every touch when the session drops** — a stale tick,
+  both sides zero — so neither the member nor the paper book trusts a dead
+  socket's book: `touches_withdrawn`. The market socket's idle law is 12 s
+  (it was 30 s): two missed `PONG`s and a margin, well inside a 20 s late
+  window.
+- **The member's freshness bound is 8 s** (the `PING` period plus 3 s),
+  and the book gate names three reasons: `skip_book` (no ask: none quoted,
+  or withdrawn), `skip_book_old` (8 s without a change or a `PONG`),
+  `skip_law` (no tick yet).
+- **Paper:** the held-quote law above.
+- **The published-strike re-read is gone** (PM15-5b's): the venue writes a
+  window's `priceToBeat` only once it resolves. `strikes_published` is
+  gone with it; a window that opened before the boot stays untradeable
+  (`hold_strike`, about one window per family per restart).
+
+Live safety is unchanged by the bound: a FAK is matched by the venue at
+its own book, never above the member's limit `p − e`.
+
+### PM15-5d — a re-asserted touch is not judged by its old stamp (`ef8b22c`)
+
+5c's re-assertion carried the leg's last venue stamp, so the feed clock
+judged an unchanged touch stale exactly when it was re-asserted. The
+re-asserted touch is now stamped `venue_ms = 0` (the clock does not judge
+it); the member's own 8 s bound is the only freshness law on it. Seen
+since: in the last ~25 s of a window the favourite usually has **no ask
+at all** (its bid 0.99 / 0.999) — the remaining `skip_book` is the
+venue's book, not the feed.
+
+### PM15-6b — the arm's cores, socket-free (`cc6900b`)
+
+`exec-polymarket`'s three threads' cores, each driven by a test rig:
+
+- **`PmArm`** (the engine's `OrderDispatch` for slot 9): admission —
+  slot 9, a rolling leg, its family in `live_families` (⊆ BTC, ETH: D-9),
+  an IoC BUY at 0 < p < 1, a free row, not halted; the push is one 64 B
+  ring write. Fills only from the user channel's `trade` (E-5), each
+  trade id booked once; retirements only after the fills; a `FAILED`
+  after a booked match halts the slot.
+- **pm-gw** (`PmGateway`): one blocking request per pass — the order
+  (SENT before the POST; the retry law D-12), else recon
+  (`/data/trades?market=&after=`, paged, at most one per 2 s), else the
+  account read. An answer it cannot read is IN DOUBT (the stake held
+  until recon), never a release.
+- **pm-user** (`PmUserDriver`): the user channel, `PING` every 5 s; a
+  session lost asks recon for every open order.
+
+Alloc gate 130: the arm's submit and drain and the gateway's submit at
+0 B.
+
+### PM15-6c — the venue gate, the interlock, the composition
+
+- **The interlock:** slot 9 live on exactly `["polymarket"]`, Polymarket
+  live on slot 9 alone; `PNL_JUDGING_VENUES` gains Polymarket (the arm
+  judges its own bound).
+- **The boot** (`cli::pm15_live`), each step a refusal that aborts the
+  boot when slot 9 is armed: the pm15 member in `--strategy` and
+  `live_assets` naming a family it carries; the self-test (every pinned
+  vector, in the binary that signs); the account from `PM15_SIG_TYPE`,
+  `PM15_OWNER_KEY`, `PM15_WALLET`, `PM15_API_KEY`, `PM15_API_SECRET`,
+  `PM15_API_PASSPHRASE` (the wrapper sources them; never printed); the
+  venue gate — `GET /version` = 2, `/auth/ban-status/closed-only` false,
+  the pUSD balance readable and its CTF Exchange V2 allowance at least
+  `max(halt_on_loss, max_order)`. The per-market half of D-8 is
+  discovery's own law: a window that is neg-risk, not 0.07 / exponent 1 /
+  taker-only, or not on a 0.01 / 0.001 tick never reaches the arm.
+- **The session anchor** (`pm15-pnl-anchor.state` beside `exec.toml`):
+  the pUSD balance at the session's first boot, restored by every later
+  boot for the same owner (another owner's file refuses). The arm reads
+  the account every 30 s (one request per pass, never in a window's last
+  30 s): pUSD plus each watched token's balance; a leg unredeemed after
+  settlement is worth its cost, a settled loser 0. The E7 loss bound,
+  drift, the reject streak, the user channel's gap and recon's age halt
+  the slot through `HaltSignal`.
+- **The composition:** `SlotSplit(9, SlotSplit(3, …, bin15_gw), pm15)`,
+  `NO_SLOT` when slot 9 is not live; the discovery thread tees every
+  window spec to pm-gw's token table.
+- **`multivenue-engine pm-exec --self-test`** (offline) and
+  **`--key-check`** (online, read-only: the venue gate with no allowance
+  floor, the balance and allowance printed). Exit 0 or 78.
+- **Paper unchanged:** with slot 9 paper nothing above is built (no tee,
+  no thread, no socket).
+
+### PM15-6d — redemption through the relayer (R-PM-6, plan D-10)
+
+- **Which legs:** a won leg, or one whose roll settled unknown, is asked
+  redeemed once (`CMD_REDEEM`) at the first account read that shows the
+  venue holding it. A leg its roll settled against leaves the arm's ledger
+  at settlement (worth 0, never redeemed; its tokens stay in the wallet,
+  unwatched).
+- **Where:** on pm-gw, after the account read in its idle path, one
+  request per pass, never in a window's last 30 s (the late law orders
+  only there), on its own keep-alive client to
+  `relayer-v2.polymarket.com`. No fourth thread: pm-gw holds the token
+  table the condition ids come from.
+- **The batch:** a market ripens 3 min after its ask; up to 8 ripe markets
+  go in one Deposit Wallet `Batch` the owner signs (deadline + 240 s):
+  the wallet's nonce (`GET /v1/account/transactions/params`), `POST
+  /submit`, then `GET /v1/account/transactions/<id>` every 2 s. `MINED` /
+  `CONFIRMED` redeem the batch; `FAILED` / `INVALID`, a refused submit or
+  90 polls without a terminal state cost each market a try, and a market
+  is dropped after three (redeem it by hand). The quota answer (429) costs
+  no try; a failed request waits 5 min. The boot's first batch begins with
+  `CTF.setApprovalForAll(CtfCollateralAdapter, true)`; each market is
+  `CtfCollateralAdapter.redeemPositions(pUSD, 0, condition, [1, 2])`.
+- **The ledger:** a redeemed leg leaves when its venue balance reads 0;
+  that read is not judged (its pUSD may predate the credit) — the next
+  one is.
+- **Never a halt:** an unredeemed leg is worth its cost in the arm's
+  ledger (conservative); no order depends on the redemption.
+- **The boot:** signature type 3 with `PM15_RELAYER_API_KEY`, proved by
+  reading the wallet's relayer nonce; `PM15_REDEEM=hand` boots without a
+  redeemer (asks counted, `redeem_off`); any other signature type refuses
+  unless redemption is by hand. `pm-exec --key-check` reads the nonce too.
+- **Pinned:** spec J.4's batch (the approval and one market; digest
+  `fdd9b2c8…34b3`, signature `5dc1610b…711c`) and a second batch (two
+  markets, nonce 31), both re-derived by an independent EIP-712 library
+  (eth-account 0.14); J.4 runs in the boot self-test. Alloc gate 131: a
+  full batch cycle at 0 B.
+
+### PM15-6e — the operator's tools: the checks, the miss probe, the flip
+
+- **`scripts/pm15-exec.sh self-test | key-check | miss-probe`** runs
+  `multivenue-engine pm-exec` with slot 9's account sourced from the repo
+  `.env` into the binary's environment (the script prints none of it):
+  the pinned vectors (offline); the venue gate read-only with the
+  relayer key proved; and **the miss probe — ONE order**: a $1 FAK BUY
+  on BTC's current window priced at the tick, on the leg whose lowest ask
+  is the higher, sent through pm-gw's own submit path. It refuses with
+  under 5 min left in the window or a lowest ask under 0.05 on that leg,
+  so it cannot fill; the venue's "no match" answer proves the order's
+  signature, its amounts and the clock (spec K.1, K.13) with nothing
+  bought. Any other answer is reported (an acceptance or a doubt costs at
+  most $1).
+- **`scripts/pm15-flip.sh status | live | paper`** edits only
+  `[exec.slot.9]` and `ARM_LIVE` / `EXEC_TOML` (stamped backups), sets
+  the session anchor aside (every `live` starts a new session) and
+  restarts nothing: the next gated restart applies it. The live section
+  is R-PM-8's frame — $250 an order and a market, `halt_on_loss` $500,
+  `max_open_orders` 8, `halt_on_recon_stale_ms` 180 000 (the account read
+  pauses in each window's quiet tail and skips judging the read that sees
+  a redemption), and `cap_day_usd_1e6` **$100 000, out of reach** (two
+  live families × 96 windows × $250 = $48 000 a UTC day; the config law
+  refuses 0). A test pins that the section resolves through the
+  interlock at those numbers.
+- **`live` refuses** unless the committed risk policy has a line that
+  begins with the gate word — `PM15-LIVE-GATE: P0 PASS` for P0's result,
+  or `PM15-LIVE-GATE: ruled` for an operator ruling (R-PM-1); this entry
+  quotes them mid-line, so it opens nothing — `pm15.toml` exists and
+  `STRATEGY` names pm15, `exec.HALT` does not name slot 9, and the key
+  check passes.
+
+### PM15-7 — PolyBolt, dormant (R-PM-3)
+
+- **Why:** RTDS's price topics — the strike's and the pricer's source
+  today — are "legacy for reference prices" since PolyBolt's launch
+  (2026-09-15); no removal date is announced. PolyBolt
+  (`wss://ws-live-v2.polymarket.com/ws`) serves `price.crypto` (Chainlink
+  by default since 2026-10-02) and `price.crypto.twap` (the 60-s TWAP the
+  markets settle on) behind an `op: auth` frame with the account's CLOB
+  API credentials.
+- **Built:** `ingress_polymarket::polybolt` — the auth and subscribe
+  frames rendered in place, and the parser of a report into RTDS's own
+  record (`full_accuracy_value` when present, else `value` quoted or
+  bare, each rounded half up from its digits; a stamp in Unix ms or ISO
+  8601 UTC; the channel's `seq` and `dropped`). RTDS's 18-decimal
+  conversion is shared (`rtds::fav_px`). Alloc gate 132: the frames and
+  the parse at 0 B.
+- **Dormant:** nothing in the engine reads it. The shapes are the
+  migration guide's; the raw frames need credentials.
+  `scripts/pm15-exec.sh polybolt-probe [--assets btc,eth] [--seconds N]`
+  (`multivenue-engine pm15-polybolt-probe`) prints them live — the first
+  frames raw (one naming the API key withheld), the per-asset price and
+  TWAP every 10 s — before PolyBolt becomes slot 9's mark, which is its
+  own cut and its own entry here.
+
+### PM15-8c — the live arm on `/metrics`
+
+`exec_polymarket::stats::PmExecStats`: one block of relaxed atomics per
+writer, each on its own cache lines — the arm (engine thread: its 25
+tallies, then halted, reconciled, the account's worth, the anchor, the
+drift) and pm-gw (its 17 tallies, the redeemer's 10, then halted) —
+published at most once a second, mirrored as `engine_pm15_arm_*` and
+`engine_pm15_gw_*` (a tally `…_total`, a level bare). A paper boot never
+builds the arm: the family reads 0. The dashboard's slot-9 panel shows the
+arm's rows once it is live (submitted, acks, refused, in doubt, fills,
+reads, the worth against the anchor, the drift, the redemptions).
+
+### PM15-6f — a restart keeps the legs the account holds
+
+Before it, a restart emptied the arm's ledger: a held leg vanished from
+the worth — a false loss against the restored session anchor — and a won
+leg was never redeemed.
+
+- **pm-gw's held table** (`exec_polymarket::held`, ≤ 32 legs — the arm's
+  ledger size; `WATCH_MAX` 16 → 32, and a full table refuses instead of
+  evicting): every leg the arm holds, from its `CMD_WATCH` at each fill
+  (shares and cost), its `CMD_REDEEM` at settlement (won / unknown) and
+  its `WATCH_STOP` when the leg leaves — with the token's decimal id and
+  the market's condition copied while the window's row exists, so the
+  reads and the redemption outlive the token table.
+- **`pm15-held.state`** beside `exec.toml`: the table written whole
+  (through a temporary, renamed) at each change, on pm-gw's idle path,
+  never in a window's quiet tail (a failed write retries in 30 s).
+- **The boot** restores it to both: the arm's ledger (at cost; a settled
+  leg as it was left) and pm-gw's reads and redemption (a settled leg
+  asked again). Another account's file refuses the boot. A new session's
+  anchor is the pUSD plus the inherited legs at cost.
+- **A leg the restarted engine will never see settle** (its window ended
+  before the boot; the ingress tracks the current and next ones) is
+  expired 900 s after its window's end — after the ingress's own
+  10-minute retirement, so a settlement the engine sees always comes
+  first: asked redeemed and told to the arm (`EVT_EXPIRED`), which books
+  it settled unknown, at 0; its later zero balance reads as redeemed,
+  never as a drift.
+
+### Open
+
+- A `/state` pm15 section (the dashboard's panel reads `/metrics`).
+- PolyBolt as the mark, after `polybolt-probe` has run on the account.
+- When the account exists: `pm15-exec.sh key-check`, then `miss-probe`,
+  then P0's result or a ruling, then `pm15-flip.sh live`.

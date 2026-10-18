@@ -15,6 +15,7 @@ members = [
     "crates/core-ring",
     "crates/core-simd",
     "crates/core-time",
+    "crates/core-twaplock",
     "crates/core-types",
 
     # --- ingress adapters (one per external source) ---
@@ -62,6 +63,7 @@ members = [
     # HC11 (O-HC18): the slot-7 member, Hypercall S1 — DARK, paper only
     "crates/strategy-hcv",
     "crates/strategy-bin15",
+    "crates/strategy-pm15",
     "crates/strategy-rule-tree",
     "crates/strategy-set",
     "crates/strategy-vm",
@@ -100,6 +102,8 @@ members = [
     "crates/signer-ed25519",
     # BX6: the Binance execution arm (engine half + gateway thread)
     "crates/exec-binance",
+    # PM15-6: the slot-9 Polymarket CLOB V2 arm (FAK taker; engine half + gateway thread)
+    "crates/exec-polymarket",
 
     # --- engine + UI ---
     "crates/engine",
@@ -209,6 +213,7 @@ core-simd    = { path = "crates/core-simd" }
 core-time    = { path = "crates/core-time" }
 core-types   = { path = "crates/core-types" }
 core-vol     = { path = "crates/core-vol" }
+core-twaplock = { path = "crates/core-twaplock" }
 core-fill    = { path = "crates/core-fill" }
 core-amm     = { path = "crates/core-amm" }
 
@@ -239,6 +244,7 @@ strategy-hyparb       = { path = "crates/strategy-hyparb" }
 strategy-xmm          = { path = "crates/strategy-xmm" }
 strategy-hcv          = { path = "crates/strategy-hcv" }
 strategy-bin15        = { path = "crates/strategy-bin15" }
+strategy-pm15         = { path = "crates/strategy-pm15" }
 strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
 strategy-set          = { path = "crates/strategy-set" }
 strategy-vm           = { path = "crates/strategy-vm" }
@@ -267,6 +273,7 @@ signer-evm      = { path = "crates/signer-evm" }
 signer-ed25519  = { path = "crates/signer-ed25519" }
 exec-binance    = { path = "crates/exec-binance" }
 exec-hyperevm   = { path = "crates/exec-hyperevm" }
+exec-polymarket = { path = "crates/exec-polymarket" }
 
 engine          = { path = "crates/engine" }
 engine-snapshot = { path = "crates/engine-snapshot" }

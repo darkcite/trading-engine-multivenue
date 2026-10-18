@@ -1,0 +1,19 @@
+[package]
+name         = "strategy-pm15"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "PM15 member (slot 9): the H90 late-window law on Polymarket's rolling 15-minute crypto up/down binaries — Chainlink TWAP lock, IoC taker, paper P&L at settlement."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-fill     = { workspace = true }
+core-time     = { workspace = true }
+core-twaplock = { workspace = true }
+core-types    = { workspace = true }
+strategy-core = { workspace = true }

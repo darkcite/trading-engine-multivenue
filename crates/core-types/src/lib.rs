@@ -48,6 +48,9 @@ pub use instrument_class::{InstrumentClass, ALL_CLASSES, INSTRUMENT_CLASSES};
 /// the top-of-book streams that carry no sequence number.
 pub mod arrival_seq;
 pub use arrival_seq::ArrivalSeq;
+/// PM15: Polymarket's rolling 15-minute up/down families — the slot pool,
+/// the window arithmetic and the roll-event conventions.
+pub mod pm_roll;
 
 // ---------------------------------------------------------------
 // Identifiers
@@ -1548,7 +1551,10 @@ pub enum ChannelId {
     AssetCtx = 5,
     /// Whole-venue mid sweep (HL `allMids`).
     AllMids = 6,
-    /// HIP-4 outcome lifecycle (HL `outcomeMetaUpdates`).
+    /// HIP-4 outcome lifecycle (HL `outcomeMetaUpdates`). PM15: on
+    /// venue byte Polymarket, a rolling leg's ORDER LAW — its price tick
+    /// and minimum size, at creation and at every `tick_size_change`
+    /// (see [`pm_roll`]).
     OutcomeMeta = 7,
     /// Polymarket `price_change` rows that did not move the touch (the
     /// touch-moving ones become Ticks).
@@ -1608,6 +1614,12 @@ pub enum ChannelId {
     /// | 32..48 | settlement TWAP seconds (`seconds:`, 0 = settle at `T`) |
     /// | 48..56 | family index in the boot `rolling` list |
     /// | 56..64 | 0 = created, 1 = settled |
+    ///
+    /// PM15: the same channel carries Polymarket's rolling 15-minute
+    /// up/down families (venue byte Polymarket): the instance id
+    /// (window × 8 + family) in the outcome field, the slot pair
+    /// (2 × family + window parity) in the family field, and the strike
+    /// unpublished at creation — see [`pm_roll`].
     InstrumentRoll = 13,
     /// HC3: ONE quote provider's side of a Hypercall indicative quote —
     /// the per-provider detail behind the venue's `best_bid`/`best_ask`
@@ -2606,6 +2618,11 @@ pub const STRATEGY_SLOT_VM: u8 = 5;
 /// slot `strategy-rule-tree` held until it was unlinked).
 /// [`AiCmdKind::SetBinarySpec`] commands must target exactly this slot.
 pub const STRATEGY_SLOT_BIN15: u8 = 3;
+
+/// Strategy-set slot of `strategy-pm15` (PM15-5, 2026-10-17): H90 on
+/// Polymarket's rolling 15-minute up/down markets. Slot 9 was reserved
+/// until then, so no capture carries another member's rows under it.
+pub const STRATEGY_SLOT_PM15: u8 = 9;
 
 /// `AiCmd::side` sentinel meaning "no side" (every kind except
 /// `OrderIntent`).

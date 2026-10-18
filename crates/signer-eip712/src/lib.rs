@@ -54,6 +54,12 @@ pub mod hyperliquid;
 /// struct hashes over the request body's own bytes. Sign-only; additive.
 pub mod hypercall;
 
+/// Polymarket CLOB V2 (PM15-6a): the Exchange V2 order, the L1
+/// `ClobAuth`, the Deposit Wallet's ERC-7739 wrapper — pinned by the
+/// official SDKs' vectors. Sign-only; additive (the V1 order above is the
+/// pre-cutover form).
+pub mod pmv2;
+
 use std::sync::OnceLock;
 
 pub use secp256k1::SecretKey;

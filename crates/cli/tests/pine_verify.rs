@@ -202,19 +202,19 @@ fn record(tag: &str) -> Recorded {
     let run = dir.join("capture").join(format!("run-{RUN_EPOCH_NS}"));
     std::fs::create_dir_all(&run).expect("run dir");
     let (mut tp, t0) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-    let tl: [_; 7] = core::array::from_fn(|_| Ring::<Tick, TICK_RING_SIZE>::new().split().1);
+    let tl: [_; 8] = core::array::from_fn(|_| Ring::<Tick, TICK_RING_SIZE>::new().split().1);
     type Ev = Ring<ChannelEvent, { core_types::EVENT_RING_SIZE }>;
     let (mut ep, e0) = Ev::new().split();
-    let el: [_; 7] = core::array::from_fn(|_| Ev::new().split().1);
+    let el: [_; 8] = core::array::from_fn(|_| Ev::new().split().1);
     type Dp = Ring<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>;
     type Op = Ring<core_types::OptSummary, { core_types::OPT_RING_SIZE }>;
-    let [t1, t2, t3, t4, t5, t6, t7] = tl;
-    let [e1, e2, e3, e4, e5, e6, e7] = el;
+    let [t1, t2, t3, t4, t5, t6, t7, t8] = tl;
+    let [e1, e2, e3, e4, e5, e6, e7, e8] = el;
     let mut eng = Engine::new(
         set,
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5, t6, t7],
-        [e0, e1, e2, e3, e4, e5, e6, e7],
+        [t0, t1, t2, t3, t4, t5, t6, t7, t8],
+        [e0, e1, e2, e3, e4, e5, e6, e7, e8],
         core::array::from_fn(|_| Dp::new().split().1),
         core::array::from_fn(|_| Op::new().split().1),
         Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new()

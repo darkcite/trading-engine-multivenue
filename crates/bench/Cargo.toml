@@ -50,6 +50,9 @@ opt-registry         = { workspace = true }
 book-builder         = { workspace = true }
 strategy-ai-exec     = { workspace = true }
 strategy-bin15       = { workspace = true }
+# PM15 gate 114: the rolling 15m ingress driver and slot 9's member.
+strategy-pm15        = { workspace = true }
+core-twaplock        = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }
@@ -65,6 +68,9 @@ exec-binance         = { workspace = true, features = ["testvenue"] }
 signer-eip712        = { workspace = true }
 # HC9 gate 84: the Hypercall arm's render + sign + answer scan.
 exec-hypercall       = { workspace = true }
+# PM15-6a gate 115: the Polymarket arm's amounts, sign, render, L2 MAC,
+# answer and user-channel scans.
+exec-polymarket      = { workspace = true }
 # HYPARB H1 gate 63: the AMM walk + arb solve.
 core-amm             = { workspace = true }
 # HYPARB H7 gate 64: the EVM sign + hash + hex render.

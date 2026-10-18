@@ -437,6 +437,13 @@ pub trait StrategyCounters {
         Bin15Counters::default()
     }
 
+    /// PM15: slot 9's observables (`engine_pm15_*`), mirrored by the cli's
+    /// generic 5 s block like [`Self::bin15_counters`].
+    #[inline]
+    fn pm15_counters(&self) -> Pm15Counters {
+        Pm15Counters::default()
+    }
+
     /// BIN15 O4b: copy the per-family view into `out`, returning how
     /// many families are CONFIGURED (not how many are live — a dormant
     /// slot still has a row, because "no instance" is the observation).
@@ -1512,6 +1519,177 @@ pub struct XmmPerpView {
 }
 const _: () = assert!(core::mem::size_of::<XmmPerpView>() == 72);
 
+/// PM15 (slot 9): the Polymarket 15-minute H90 member's observables.
+///
+/// The tallies are cumulative (the cli mirrors them as deltas into
+/// `engine_pm15_<name>_total`, names in [`PM15_COUNTER_NAMES`] order —
+/// [`Pm15Counters::tallies`]); the levels below them are gauges. Every
+/// `hold_*` / `skip_*` is a REASON, the bin15 law: the operator of a
+/// silent member needs to know which gate held.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pm15Counters {
+    /// `InstrumentRoll` created events bound to a market slot.
+    pub rolls: u64,
+    /// Settled rolls that closed a market with a winner.
+    pub rolls_settled: u64,
+    /// Settled rolls with no winner known (retired unresolved).
+    pub rolls_unknown: u64,
+    /// Rolls refused on shape (a venue, slot or family byte not ours).
+    pub rolls_refused: u64,
+    /// Strikes estimated from the Chainlink reports (`[open−60, open−1]`).
+    pub strikes_computed: u64,
+    /// Windows whose strike could not be estimated (reports missing).
+    pub strikes_missing: u64,
+    /// Pricer runs inside the window that produced a price.
+    pub reprices: u64,
+    /// Pricer holds: under the σ minimum.
+    pub hold_sigma: u64,
+    /// Pricer holds: no fresh fast-venue mid or basis.
+    pub hold_nowcast: u64,
+    /// Pricer holds: the newest report too old.
+    pub hold_mark: u64,
+    /// Pricer holds: an observed second with no report.
+    pub hold_observed: u64,
+    /// Pricer holds: shape (past the end, out of range).
+    pub hold_shape: u64,
+    /// Evaluations of a market with no strike: it opened before the
+    /// boot's reports (the venue publishes `priceToBeat` only once the
+    /// window resolves, so none exists while it trades).
+    pub hold_strike: u64,
+    /// Entries skipped: the belief under `p_min`.
+    pub skip_belief: u64,
+    /// Entries skipped: the belief held, not yet on `persist` seconds.
+    pub skip_persist: u64,
+    /// Entries skipped: no ask on the favoured leg (none quoted, or the
+    /// market socket went down — its stale tick).
+    pub skip_book: u64,
+    /// Entries skipped: the favoured leg's touch neither changed nor was
+    /// re-asserted by the socket's `PONG` within `TOUCH_FRESH_NS`.
+    pub skip_book_old: u64,
+    /// Entries skipped: the favoured leg has no order law (tick) yet.
+    pub skip_law: u64,
+    /// Entries skipped: the ask not `e` under the belief.
+    pub skip_price: u64,
+    /// Entries skipped: a cap, the order count or the minimum size.
+    pub skip_cap: u64,
+    /// Entries skipped: the session loss bound is spent.
+    pub skip_halt: u64,
+    /// IoCs submitted.
+    pub takes_submitted: u64,
+    /// IoCs that filled (any quantity).
+    pub takes_filled: u64,
+    /// IoCs that reached their deadline with nothing filled.
+    pub takes_unfilled: u64,
+    /// Submits the dispatcher refused.
+    pub submit_refused: u64,
+    /// Fills booked against a pending IoC.
+    pub fills: u64,
+    /// PM15-6b: fills booked by their client id after the pending was
+    /// written off (a live fill the taker hold delayed).
+    pub late_fills: u64,
+    /// Fills no pending nor live market owned.
+    pub unknown_fills: u64,
+    /// Settled markets where a position of ours won.
+    pub settled_won: u64,
+    /// Settled markets where a position of ours lost.
+    pub settled_lost: u64,
+    /// Settled markets whose winner was unknown with a position open.
+    pub settled_unknown: u64,
+    // ---- levels (gauges) ----
+    /// Realised session P&L ×1e6 USD, fees included.
+    pub pnl_1e6: i64,
+    /// Fees paid this session ×1e6 USD.
+    pub fees_1e6: i64,
+    /// Notional bought this session ×1e6 USD.
+    pub bought_1e6: i64,
+    /// Cost of the positions not yet settled ×1e6 USD.
+    pub open_cost_1e6: i64,
+    /// Markets live right now.
+    pub markets_live: u64,
+    /// `1` once the session loss bound is spent (entries stop).
+    pub halted: u64,
+}
+
+/// How many cumulative tallies [`Pm15Counters`] carries (its fields from
+/// `rolls` through `settled_unknown`, in order).
+pub const PM15_TALLIES: usize = 31;
+
+/// The metric suffix of each tally, in [`Pm15Counters::tallies`] order.
+pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
+    "rolls",
+    "rolls_settled",
+    "rolls_unknown",
+    "rolls_refused",
+    "strikes_computed",
+    "strikes_missing",
+    "reprices",
+    "hold_sigma",
+    "hold_nowcast",
+    "hold_mark",
+    "hold_observed",
+    "hold_shape",
+    "hold_strike",
+    "skip_belief",
+    "skip_persist",
+    "skip_book",
+    "skip_book_old",
+    "skip_law",
+    "skip_price",
+    "skip_cap",
+    "skip_halt",
+    "takes_submitted",
+    "takes_filled",
+    "takes_unfilled",
+    "submit_refused",
+    "fills",
+    "late_fills",
+    "unknown_fills",
+    "settled_won",
+    "settled_lost",
+    "settled_unknown",
+];
+
+impl Pm15Counters {
+    /// The tallies in [`PM15_COUNTER_NAMES`] order.
+    #[must_use]
+    pub const fn tallies(&self) -> [u64; PM15_TALLIES] {
+        [
+            self.rolls,
+            self.rolls_settled,
+            self.rolls_unknown,
+            self.rolls_refused,
+            self.strikes_computed,
+            self.strikes_missing,
+            self.reprices,
+            self.hold_sigma,
+            self.hold_nowcast,
+            self.hold_mark,
+            self.hold_observed,
+            self.hold_shape,
+            self.hold_strike,
+            self.skip_belief,
+            self.skip_persist,
+            self.skip_book,
+            self.skip_book_old,
+            self.skip_law,
+            self.skip_price,
+            self.skip_cap,
+            self.skip_halt,
+            self.takes_submitted,
+            self.takes_filled,
+            self.takes_unfilled,
+            self.submit_refused,
+            self.fills,
+            self.late_fills,
+            self.unknown_fills,
+            self.settled_won,
+            self.settled_lost,
+            self.settled_unknown,
+        ]
+    }
+}
+
 /// BIN15 counters (`engine_bin15_*`), mirrored by the cli's generic 5 s
 /// block. Defined HERE for the reason [`IcdpCounters`] is.
 ///
@@ -1539,23 +1717,6 @@ pub struct Bin15Counters {
     pub takes_filled: u64,
     /// Arm A IoCs that reached their deadline unfilled.
     pub takes_unfilled: u64,
-    /// Arm B resting quotes emitted.
-    pub quotes_submitted: u64,
-    /// Arm B quotes that filled (any quantity), counted when the
-    /// fill arrives under the id the member is currently tracking.
-    ///
-    /// E5: a fill that raced a reprice and came back under the id the
-    /// order carried BEFORE it moved is [`Self::quotes_raced`]
-    /// instead — it belongs to an order the member has already
-    /// replaced, and counting it here would say a resting quote
-    /// filled when a retired one did.
-    pub quotes_filled: u64,
-    /// Arm B quotes that reached their TTL unfilled.
-    pub quotes_expired: u64,
-    /// Closing takes emitted (the only sell the member ever sends).
-    pub closes_submitted: u64,
-    /// Re-prices held: `τ` under the arm's minimum.
-    pub skipped_tau: u64,
     /// Re-prices held: inside `tail_refuse_ns`.
     pub skipped_tail: u64,
     /// Re-prices held: no underlying mark, a cold forecast or a price
@@ -1571,47 +1732,10 @@ pub struct Bin15Counters {
     /// which is the failure that prices four families off a frozen
     /// number while their books track reality.
     pub skipped_mark_stale: u64,
-    /// Re-prices held: the binary book is one-sided or empty.
-    pub skipped_book: u64,
-    /// Re-prices held: a closing take with nothing to close.
-    pub skipped_inventory: u64,
     /// Re-prices held: a notional cap left no room.
     pub skipped_cap: u64,
     /// Re-prices held: the price or size fell off the HIP-4 grid.
     pub skipped_grid: u64,
-    /// **E5: re-prices held because the resting quote is PARTIALLY
-    /// FILLED.**
-    ///
-    /// A MODIFY replaces the venue's remaining size wholesale, so
-    /// moving a partially-filled quote means the member's
-    /// `filled_1e6`/`qty_1e6` pair and the venue's remainder have to
-    /// agree across a race — which is where double-count bugs live.
-    /// A quote that is already working does not need the help; its
-    /// TTL will end it.
-    pub skipped_partial: u64,
-    /// BIN15 P3 (F6): coverage entries NOT taken because the ask did
-    /// not clear `p̂ − e_entry`.
-    ///
-    /// Not a defect — it is the arm working. The bar is `p > a` plus a
-    /// margin, so an instance whose favourite is priced at or above the
-    /// model's own belief is one the member declines to pay for. A
-    /// counter that stays at zero while entries fire on every instance
-    /// means the bound is not binding and the arm is a market order
-    /// wearing a price limit.
-    pub skipped_entry_price: u64,
-    /// BIN15 S5: coverage entries NOT taken YET because the price test
-    /// has not held on `entry_persist_polls` consecutive distinct book
-    /// snapshots. Counted per reprice, like `skipped_entry_price`; zero
-    /// for ever under `entry_persist_polls = 1` (the pre-S5 law).
-    pub skipped_entry_persist: u64,
-    /// BIN15 S5: instances whose coverage entry the elapsed ceiling
-    /// CLOSED — past `entry_elapsed_max_ns` with no run of passing
-    /// snapshots under way (none began by then, or the one that did was
-    /// broken after it). Counted ONCE per instance, not per reprice, so it
-    /// reads as instances; zero for ever with no ceiling. A closed
-    /// instance is silent after, so `skipped_entry_price` stops counting
-    /// its refusals too.
-    pub skipped_entry_elapsed: u64,
     /// Configured families with no live instance (a level, not a total).
     pub families_dormant: u64,
     /// Fills matched to one of this member's pendings.
@@ -1625,53 +1749,6 @@ pub struct Bin15Counters {
     /// things at once and mask the disagreement it exists to report.
     /// See [`Self::settlement_fills`].
     pub unknown_fills: u64,
-    /// **E5 (LAW E-7): Arm B quotes repriced in place with a MODIFY**
-    /// rather than left to expire.
-    ///
-    /// Before E5 this member had no cancel path, so a live quote
-    /// could only be replaced by letting its TTL run out —
-    /// `requote_ttl_ns` was the replace cadence, not a nicety. These
-    /// are the reprices that no longer wait.
-    pub quotes_modified: u64,
-    /// E5: MODIFY attempts the dispatcher refused. The resting quote
-    /// is still at its old price, still reserving its cap room, and
-    /// the member changed nothing.
-    ///
-    /// **`NoSuchOrder` is the common one and is not a defect** — a
-    /// fill or a TTL beat the reprice, which is a race the venue
-    /// wins fair and square.
-    pub quotes_modify_refused: u64,
-    /// **E5 (LAW E-8): Arm B quotes the member CANCELLED** because
-    /// their `ttl_ns` lapsed. The venue has no server-side TTL on
-    /// Gtc/Alo orders, so a quote nobody cancels rests forever —
-    /// before E5 the member simply forgot it, which was correct in
-    /// paper and would have stranded a live quote.
-    pub quotes_cancelled: u64,
-    /// E5: CANCEL attempts the dispatcher did not perform, for any
-    /// reason other than the order already being gone — including a
-    /// dispatcher that does not implement the verb at all
-    /// (`SubmitErr::Unsupported`, which is what every `Ctx` taking
-    /// the trait default answers).
-    ///
-    /// The member clears its own book at its own deadline either way,
-    /// so against a LIVE arm a non-zero value is a quote the member
-    /// has stopped tracking and the venue may still hold — which is
-    /// what E6's reconciliation exists to find. Against a paper arm
-    /// it means the dispatcher never learned to cancel, and its own
-    /// TTL law is what retires the order; read the two apart by which
-    /// arm the slot is routed to, not by this number alone.
-    ///
-    /// `NoSuchOrder` is excluded on purpose — there the order really
-    /// is gone, which is what the member wanted.
-    pub quotes_cancel_refused: u64,
-    /// E5: fills that booked against a quote's PREVIOUS client id —
-    /// a fill that raced a reprice and was answered under the id the
-    /// order had before it moved.
-    ///
-    /// Expected to be small and non-zero. Before the one-generation
-    /// memory these landed in `unknown_fills` and moved no position,
-    /// so the member believed it held less than it did.
-    pub quotes_raced: u64,
     /// Fills the VENUE generated to settle an instance
     /// (`FILL_FLAG_SETTLEMENT`) rather than a trade the member asked
     /// for.

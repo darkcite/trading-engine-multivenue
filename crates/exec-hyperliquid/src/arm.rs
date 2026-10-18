@@ -4631,7 +4631,8 @@ mod tests {
         assert_eq!(arm.submit(&stale), Err(DispatchError::NoLiveRoute));
         let unbound = leg_order(2, INST_B, LEG_YES + 2, ORDER_KIND_MAKER, Side::Bid, 300_000);
         assert_eq!(arm.submit(&unbound), Err(DispatchError::NoLiveRoute));
-        let off = leg_order(3, INST_B, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_050);
+        // Six significant figures (0.300055): H90 G2's law is five.
+        let off = leg_order(3, INST_B, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_055);
         assert_eq!(arm.submit(&off), Err(DispatchError::Unroutable));
         let c = arm.outcome_counters().expect("outcome mode");
         assert_eq!(

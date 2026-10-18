@@ -3,8 +3,9 @@
 
 //! # core-crypto
 //!
-//! Handwritten SHA-256, HMAC-SHA256 and base64 (RFC 4648 standard
-//! alphabet). Zero heap allocation, zero external dependencies.
+//! Handwritten SHA-256, HMAC-SHA256 and base64 (RFC 4648: the standard
+//! alphabet, the URL-safe one, and a decoder that takes both). Zero heap
+//! allocation, zero external dependencies.
 //!
 //! ## Who uses this
 //!
@@ -20,6 +21,10 @@
 //!   as percent-encoded base64 ([`base64_encode_pct`]). Ed25519 itself is
 //!   NOT here — ruling O-BX5 puts it in `signer-ed25519`, on `ring` — so
 //!   this crate stays dependency-free.
+//! * Polymarket CLOB L2 auth (PM15-6a): the API secret is URL-safe base64
+//!   ([`base64_decode`], once at boot) and `POLY_SIGNATURE` is the
+//!   URL-safe, `=`-padded base64 of `HMAC-SHA256(ts + METHOD + path +
+//!   body)` ([`base64url_encode`]).
 //!
 //! ## Hot-path posture
 //!
@@ -321,6 +326,16 @@ pub fn sha256(data: &[u8]) -> [u8; SHA256_LEN] {
 /// and two 64-byte pads, the key XORed straight into them (no copy of
 /// it; the zero bytes past a short key leave the pads' constants).
 pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_LEN] {
+    hmac_sha256_parts(key, &[msg])
+}
+
+/// HMAC-SHA256 of the CONCATENATION of `parts` under `key`, without
+/// concatenating: the inner context absorbs each slice where it lies.
+///
+/// Polymarket's L2 MAC covers `ts ‖ METHOD ‖ path ‖ body` — four spans
+/// of the request already rendered in its own buffer (PM15-6a, zero-copy:
+/// no staging of the message). Zero-alloc.
+pub fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; SHA256_LEN] {
     // A key longer than the block is its digest (RFC 2104 §2).
     let long;
     let k: &[u8] = if key.len() > SHA256_BLOCK {
@@ -340,7 +355,11 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_LEN] {
 
     let mut inner = Sha256::new();
     inner.update(&ipad);
-    inner.update(msg);
+    let mut j = 0usize;
+    while j < parts.len() {
+        inner.update(parts[j]);
+        j += 1;
+    }
     let inner_digest = inner.finalize();
 
     let mut outer = Sha256::new();
@@ -393,6 +412,9 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 // ---------------------------------------------------------------
 
 const B64_ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// RFC 4648 §5, the URL- and filename-safe alphabet (`-` and `_` for `+`
+/// and `/`).
+const B64_URL_ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Encoded length for `n` input bytes (including `=` padding).
 #[inline(always)]
@@ -408,7 +430,80 @@ pub const fn base64_encoded_len(n: usize) -> usize {
 /// via the bounds check (fail-fast doctrine). Zero-alloc.
 pub fn base64_encode(input: &[u8], dst: &mut [u8]) -> usize {
     debug_assert!(dst.len() >= base64_encoded_len(input.len()));
-    b64_render::<false>(input, dst)
+    b64_render::<false, false>(input, dst)
+}
+
+/// Encode `input` with the URL-safe alphabet (RFC 4648 §5) **and** `=`
+/// padding into `dst`, returning [`base64_encoded_len`]`(input.len())`.
+///
+/// Polymarket's L2 `POLY_SIGNATURE` is this encoding of an HMAC-SHA256
+/// tag (44 characters). `dst` too small is a programmer error, as for
+/// [`base64_encode`]. Zero-alloc.
+pub fn base64url_encode(input: &[u8], dst: &mut [u8]) -> usize {
+    debug_assert!(dst.len() >= base64_encoded_len(input.len()));
+    b64_render::<false, true>(input, dst)
+}
+
+/// Upper bound of [`base64_decode`]'s output for `n` encoded bytes.
+#[inline(always)]
+pub const fn base64_decoded_max_len(n: usize) -> usize {
+    n.div_ceil(4) * 3
+}
+
+/// A base64 text [`base64_decode`] refuses.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum B64Err {
+    /// A byte outside both alphabets (and not trailing `=`).
+    Char,
+    /// A length no padding completes (`len % 4 == 1`), or `=` before the end.
+    Shape,
+    /// `dst` shorter than [`base64_decoded_max_len`].
+    Dst,
+}
+
+/// Decode `input` into `dst`; returns the bytes written. **Both
+/// alphabets** (standard `+/` and URL-safe `-_`) and **padding present or
+/// absent** are accepted — the forms Polymarket's SDKs accept for an API
+/// secret. Boot-time (an API secret is decoded once); zero-alloc.
+///
+/// # Errors
+/// [`B64Err`] — nothing in `dst` is meaningful then.
+pub fn base64_decode(input: &[u8], dst: &mut [u8]) -> Result<usize, B64Err> {
+    let mut n = input.len();
+    while n > 0 && input[n - 1] == b'=' {
+        n -= 1;
+    }
+    if input.len() - n > 2 || n % 4 == 1 {
+        return Err(B64Err::Shape);
+    }
+    if dst.len() < base64_decoded_max_len(n) {
+        return Err(B64Err::Dst);
+    }
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    let mut o = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        let c = input[i];
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => return Err(B64Err::Shape),
+            _ => return Err(B64Err::Char),
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            dst[o] = (acc >> bits) as u8;
+            o += 1;
+        }
+        i += 1;
+    }
+    Ok(o)
 }
 
 /// Upper bound of [`base64_encode_pct`]'s output for `n` input bytes:
@@ -432,36 +527,38 @@ pub const fn base64_pct_encoded_max_len(n: usize) -> usize {
 /// release aborts on the bounds check). Zero-alloc.
 pub fn base64_encode_pct(input: &[u8], dst: &mut [u8]) -> usize {
     debug_assert!(dst.len() >= base64_pct_encoded_max_len(input.len()));
-    b64_render::<true>(input, dst)
+    b64_render::<true, false>(input, dst)
 }
 
-/// The one base64 walk behind both encoders: 3-byte groups, then the
-/// padded tail. `PCT` escapes each character as it is written; `false`
-/// monomorphizes to the plain encoder.
+/// The one base64 walk behind the encoders: 3-byte groups, then the
+/// padded tail. `PCT` escapes each character as it is written; `URL`
+/// picks the URL-safe alphabet; `<false, false>` monomorphizes to the
+/// plain encoder.
 #[inline(always)]
-fn b64_render<const PCT: bool>(input: &[u8], dst: &mut [u8]) -> usize {
+fn b64_render<const PCT: bool, const URL: bool>(input: &[u8], dst: &mut [u8]) -> usize {
+    let alpha: &[u8; 64] = if URL { B64_URL_ALPHA } else { B64_ALPHA };
     let mut i = 0usize;
     let mut o = 0usize;
     while i + 3 <= input.len() {
         let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
-        o += b64_put::<PCT>(B64_ALPHA[((n >> 18) & 0x3F) as usize], &mut dst[o..]);
-        o += b64_put::<PCT>(B64_ALPHA[((n >> 12) & 0x3F) as usize], &mut dst[o..]);
-        o += b64_put::<PCT>(B64_ALPHA[((n >> 6) & 0x3F) as usize], &mut dst[o..]);
-        o += b64_put::<PCT>(B64_ALPHA[(n & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(alpha[((n >> 18) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(alpha[((n >> 12) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(alpha[((n >> 6) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(alpha[(n & 0x3F) as usize], &mut dst[o..]);
         i += 3;
     }
     let rem = input.len() - i;
     if rem == 1 {
         let n = (input[i] as u32) << 16;
-        o += b64_put::<PCT>(B64_ALPHA[((n >> 18) & 0x3F) as usize], &mut dst[o..]);
-        o += b64_put::<PCT>(B64_ALPHA[((n >> 12) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(alpha[((n >> 18) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(alpha[((n >> 12) & 0x3F) as usize], &mut dst[o..]);
         o += b64_put::<PCT>(b'=', &mut dst[o..]);
         o += b64_put::<PCT>(b'=', &mut dst[o..]);
     } else if rem == 2 {
         let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
-        o += b64_put::<PCT>(B64_ALPHA[((n >> 18) & 0x3F) as usize], &mut dst[o..]);
-        o += b64_put::<PCT>(B64_ALPHA[((n >> 12) & 0x3F) as usize], &mut dst[o..]);
-        o += b64_put::<PCT>(B64_ALPHA[((n >> 6) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(alpha[((n >> 18) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(alpha[((n >> 12) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(alpha[((n >> 6) & 0x3F) as usize], &mut dst[o..]);
         o += b64_put::<PCT>(b'=', &mut dst[o..]);
     }
     o
@@ -848,5 +945,86 @@ mod tests {
             assert_eq!(&back[..m], &plain[..p], "input {input:?}");
             v += 1;
         }
+    }
+
+    // ---- PM15-6a: URL-safe encode, the any-alphabet decode ----
+
+    #[test]
+    fn base64url_rfc4648_vectors_and_the_two_alphabet_bytes() {
+        let cases: [(&[u8], &[u8]); 4] = [
+            (b"", b""),
+            (b"f", b"Zg=="),
+            (b"foob", b"Zm9vYg=="),
+            (b"foobar", b"Zm9vYmFy"),
+        ];
+        let mut dst = [0u8; 16];
+        for (input, want) in cases {
+            let n = base64url_encode(input, &mut dst);
+            assert_eq!(&dst[..n], want);
+        }
+        // 0xfb 0xff: `+/` in the standard alphabet, `-_` URL-safe.
+        let n = base64_encode(&[0xfb, 0xff], &mut dst);
+        assert_eq!(&dst[..n], b"+/8=");
+        let n = base64url_encode(&[0xfb, 0xff], &mut dst);
+        assert_eq!(&dst[..n], b"-_8=");
+    }
+
+    #[test]
+    fn base64_decode_takes_both_alphabets_with_or_without_padding() {
+        let mut out = [0u8; 8];
+        for text in [&b"-_8="[..], b"+/8=", b"-_8", b"+/8"] {
+            let n = base64_decode(text, &mut out).unwrap();
+            assert_eq!(&out[..n], &[0xfb, 0xff], "{text:?}");
+        }
+        let n = base64_decode(b"Zm9vYmFy", &mut out).unwrap();
+        assert_eq!(&out[..n], b"foobar");
+        let n = base64_decode(b"", &mut out).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(base64_decode(b"Zm9v!mFy", &mut out), Err(B64Err::Char));
+        assert_eq!(base64_decode(b"Zm9vY", &mut out), Err(B64Err::Shape));
+        assert_eq!(base64_decode(b"Zg===", &mut out), Err(B64Err::Shape));
+        assert_eq!(base64_decode(b"Z=g=", &mut out), Err(B64Err::Shape));
+        assert_eq!(base64_decode(b"Zm9vYmFyZm9v", &mut out[..8]), Err(B64Err::Dst));
+    }
+
+    /// Polymarket's SDK HMAC secret vector: 43 `A`s and `=` are 32 zero bytes.
+    #[test]
+    fn base64_decode_reads_the_sdk_secret_and_round_trips_every_pair() {
+        let mut out = [0xAAu8; 33];
+        let n = base64_decode(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", &mut out).unwrap();
+        assert_eq!(n, 32);
+        assert!(out[..32].iter().all(|b| *b == 0));
+        let mut enc = [0u8; 4];
+        let mut dec = [0u8; 3];
+        let mut v = 0u32;
+        while v < 0x1_0000 {
+            let input = [(v >> 8) as u8, v as u8];
+            let e = base64url_encode(&input, &mut enc);
+            let d = base64_decode(&enc[..e], &mut dec).unwrap();
+            assert_eq!(&dec[..d], &input);
+            let e = base64_encode(&input, &mut enc);
+            let d = base64_decode(&enc[..e], &mut dec).unwrap();
+            assert_eq!(&dec[..d], &input);
+            v += 1;
+        }
+    }
+
+    /// The parts form equals the one-shot form at every split of one
+    /// RFC 4231 case-2 message.
+    #[test]
+    fn hmac_parts_equals_the_one_shot_at_every_split() {
+        let key = b"Jefe";
+        let msg = b"what do ya want for nothing?";
+        let whole = hmac_sha256(key, msg);
+        let mut i = 0usize;
+        while i <= msg.len() {
+            let mut j = i;
+            while j <= msg.len() {
+                assert_eq!(hmac_sha256_parts(key, &[&msg[..i], &msg[i..j], &msg[j..]]), whole);
+                j += 1;
+            }
+            i += 1;
+        }
+        assert_eq!(hmac_sha256_parts(key, &[]), hmac_sha256(key, b""));
     }
 }

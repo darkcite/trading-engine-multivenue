@@ -89,7 +89,8 @@ pub const FILL_RING_SIZE: usize = 1_024;
 
 /// Number of tick lanes: 0 = Polymarket, 1 = Binance, 2 = OKX,
 /// 3 = Deribit, 4 = Hyperliquid, 5 = Bybit (WS9), 6 = MEXC (MX2),
-/// 7 = Hypercall (HC1).
+/// 7 = Hypercall (HC1), 8 = Polymarket's ROLLING 15-minute families
+/// (PM15, [`PM15_LANE`]).
 /// Lane indices are BOOT-WIRED and NO LONGER equal `VenueId as usize`
 /// past lane 4:
 /// `VenueId::Ai = 5` has no tick lane (AI commands ride their own
@@ -97,7 +98,14 @@ pub const FILL_RING_SIZE: usize = 1_024;
 /// `VenueId::Mexc = 7` lane 6; `VenueId::HyperEvm = 8` has none (pool
 /// events ride the signal lane), so `VenueId::Hypercall = 9` occupies
 /// lane 7 — see [`tick_lane_of`].
-pub const NUM_TICK_LANES: usize = 8;
+pub const NUM_TICK_LANES: usize = 9;
+
+/// PM15: the lane of Polymarket's ROLLING 15-minute families — ticks and
+/// events of their own ingress thread (`ingress_polymarket::pm15_loop`),
+/// beside the static markets' lane 0. Its ticks and events carry venue
+/// byte Polymarket, so [`tick_lane_of`] does not name it: the boot wires
+/// it by index.
+pub const PM15_LANE: usize = 8;
 
 /// Tick-lane index for a market-data venue (WS9 — the lane↔venue
 /// identity broke when Bybit's discriminant landed past `Ai`).
@@ -2728,10 +2736,15 @@ mod tests {
         assert_eq!(tick_lane_of(VenueId::Bybit), Some(5));
         assert_eq!(tick_lane_of(VenueId::Mexc), Some(6));
         assert_eq!(tick_lane_of(VenueId::Hypercall), Some(7));
+        // PM15: the rolling families' lane is the last, and no venue maps
+        // to it (its records carry the Polymarket byte; boot wires it).
+        assert_eq!(PM15_LANE, NUM_TICK_LANES - 1);
+        assert_ne!(tick_lane_of(VenueId::Polymarket), Some(PM15_LANE));
         assert_eq!(tick_lane_of(VenueId::Ai), None);
         assert_eq!(tick_lane_of(VenueId::HyperEvm), None);
-        // The last market venue occupies the last lane — no gaps.
-        assert_eq!(NUM_TICK_LANES, 8);
+        // The last market venue occupies lane 7, PM15's rolling families
+        // lane 8 (`PM15_LANE`) — no gaps.
+        assert_eq!(NUM_TICK_LANES, 9);
         assert_eq!(NUM_EVENT_LANES, NUM_TICK_LANES);
     }
 

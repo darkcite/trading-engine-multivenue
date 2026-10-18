@@ -18,14 +18,18 @@ use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// 512 → 640 at XMM XH4f (2026-09-27): slot 6's gateway family
 /// (`engine_exec_hlgw_*`, 65 counters) on a worst case — every slot
 /// live, both arms — measured at 453; 518 with it. 16 KiB more.
-pub const MAX_COUNTERS: usize = 640;
+/// 640 → 768 at PM15-2 (2026-10-17): the worst case sat at ≈ 595, and the
+/// PM15 lane's ingress (14) and its member (slot 9) need the room. 16 KiB.
+pub const MAX_COUNTERS: usize = 768;
 /// Maximum number of gauges per registry. 128 → 384 in Phase 8a:
 /// per-bucket tick-age gauges (one per `engine::SYM_BUCKETS`),
 /// per-venue ingress state + coverage gauges, and headroom for the
 /// Phase-8e completeness harness. 384 → 512 at XMM XH4f: the same
 /// family's 28 gauges on a worst case measured at 379 (407 with it) — a
 /// gateway boot alone overflowed 384. 16 KiB more (a gauge is 128 B).
-pub const MAX_GAUGES: usize = 512;
+/// 512 → 640 at PM15-2 (2026-10-17): the worst case sat at ≈ 471 and the
+/// PM15 ingress family alone is 29. 16 KiB more.
+pub const MAX_GAUGES: usize = 640;
 /// Maximum metric-name length (bytes). 63 ASCII + a NUL terminator
 /// keeps `[u8; 64]` aligned on cache lines.
 pub const NAME_MAX: usize = 63;
@@ -150,11 +154,11 @@ pub struct MetricsRegistry {
 // size above is stated in these units.
 const _: () = assert!(core::mem::size_of::<Counter>() == 128);
 const _: () = assert!(core::mem::size_of::<Gauge>() == 128);
-const _: () = assert!(core::mem::size_of::<MetricsRegistry>() == 147_520);
+const _: () = assert!(core::mem::size_of::<MetricsRegistry>() == 180_288);
 
 impl MetricsRegistry {
-    /// Build an empty registry: 144 KiB of zero-init data (640 counters and
-    /// 512 gauges, 128 B each — a 64 B name, its length and the value,
+    /// Build an empty registry: 176 KiB of zero-init data (768 counters and
+    /// 640 gauges, 128 B each — a 64 B name, its length and the value,
     /// padded to two cache lines by the 64 B alignment), built on the
     /// caller's stack (a 2 MiB test thread holds it; a 4 096-row trial did
     /// not).

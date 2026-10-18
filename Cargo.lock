@@ -141,6 +141,7 @@ dependencies = [
  "core-ring",
  "core-settle",
  "core-time",
+ "core-twaplock",
  "core-types",
  "core-vol",
  "criterion",
@@ -152,6 +153,7 @@ dependencies = [
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
+ "exec-polymarket",
  "exec-router",
  "ingress-ai",
  "ingress-binance",
@@ -187,6 +189,7 @@ dependencies = [
  "strategy-icdp",
  "strategy-latency-arb",
  "strategy-pine",
+ "strategy-pm15",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -353,6 +356,7 @@ dependencies = [
  "core-regime",
  "core-ring",
  "core-time",
+ "core-twaplock",
  "core-types",
  "core-vol",
  "engine",
@@ -362,6 +366,7 @@ dependencies = [
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
+ "exec-polymarket",
  "exec-router",
  "ingress-ai",
  "ingress-binance",
@@ -396,6 +401,7 @@ dependencies = [
  "strategy-hyparb",
  "strategy-icdp",
  "strategy-pine",
+ "strategy-pm15",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -559,6 +565,13 @@ name = "core-time"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "core-twaplock"
+version = "0.1.0"
+dependencies = [
+ "core-regime",
 ]
 
 [[package]]
@@ -868,6 +881,26 @@ dependencies = [
  "rcgen",
  "rustls",
  "secp256k1",
+ "signer-eip712",
+ "zeroize",
+]
+
+[[package]]
+name = "exec-polymarket"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-crypto",
+ "core-fill",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "exec-gateway",
+ "ingress-polymarket",
+ "memchr",
+ "mio 0.8.11",
  "signer-eip712",
  "zeroize",
 ]
@@ -2131,6 +2164,7 @@ dependencies = [
  "core-fill",
  "core-regime",
  "core-time",
+ "core-twaplock",
  "core-types",
  "core-vol",
  "strategy-core",
@@ -2231,6 +2265,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-pm15"
+version = "0.1.0"
+dependencies = [
+ "core-fill",
+ "core-time",
+ "core-twaplock",
+ "core-types",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-rule-tree"
 version = "0.1.0"
 dependencies = [
@@ -2257,6 +2302,7 @@ dependencies = [
  "strategy-hcv",
  "strategy-hyparb",
  "strategy-pine",
+ "strategy-pm15",
  "strategy-vm",
  "strategy-vrp",
  "strategy-xmm",

@@ -32,6 +32,7 @@
 
 use std::path::Path;
 
+use core_types::pm_roll::{pm_slot_sym, PM_ROLLING_MAX, PM_ROLLING_STRIDE, PM_SLOT_TAGS};
 use core_types::{make_symbol_id, SymbolId, VenueId};
 
 // ---------------------------------------------------------------
@@ -404,6 +405,16 @@ impl OptionsPolicy {
 pub struct Universe {
     /// `[polymarket] markets` — market entries in file order.
     pub pm_markets: Vec<PmMarket>,
+    /// PM15: `[polymarket] rolling` — ROLLING 15-minute up/down families
+    /// as `updown:<asset>:15m` (lowercase asset, the slug's own
+    /// spelling), in file order. Absent or empty is the pre-PM15 boot,
+    /// bit for bit.
+    ///
+    /// A family is not an instrument: it is three reserved `SymbolId`
+    /// slots — two token pairs by window parity and `[mark]`
+    /// (`core_types::pm_roll`) —
+    /// whose venue tokens are rebound every 15 minutes.
+    pub pm_rolling: Vec<String>,
     /// `[binance] spot` — lowercase stream symbols in file order.
     pub binance_spot: Vec<String>,
     /// `[binance] usdm` — USDS-M futures stream symbols in file order.
@@ -535,6 +546,10 @@ pub struct Instrument {
 pub struct AllocatedUniverse {
     /// Flattened PM tokens (a YES/NO entry contributes YES then NO).
     pub pm_tokens: Vec<PmToken>,
+    /// PM15: the rolling slots, FIVE rows per `[polymarket] rolling`
+    /// family — `[up0]`, `[down0]`, `[up1]`, `[down1]`, `[mark]` — from the
+    /// `core_types::pm_roll` pool (`polymarket-rolling:<key>[<slot>]`).
+    pub pm_rolling: Vec<Instrument>,
     /// Binance spot instruments.
     pub bn_spot: Vec<Instrument>,
     /// Binance USDS-M futures instruments.
@@ -623,6 +638,7 @@ enum Section {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Slot {
     PmMarkets,
+    PmRolling,
     BnSpot,
     BnUsdm,
     BnUsdmDated,
@@ -660,6 +676,8 @@ enum Slot {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum ElemKind {
     PmMarket,
+    /// PM15: a rolling-family key, `updown:<asset>:15m`.
+    PmRolling,
     BnSymbol,
     /// WS5: dated-future stream symbols (`btcusdt_260327`) — the
     /// spot/usdm alphabet plus the delivery-name underscore.
@@ -702,6 +720,7 @@ struct PendingArray {
 #[derive(Default)]
 struct Builder {
     pm_markets: Option<Vec<String>>,
+    pm_rolling: Option<Vec<String>>,
     bn_spot: Option<Vec<String>>,
     bn_usdm: Option<Vec<String>>,
     bn_usdm_dated: Option<Vec<String>>,
@@ -877,6 +896,7 @@ fn comment_cut(raw: &str) -> usize {
 fn slot_for(section: Section, key: &str) -> Option<Slot> {
     match (section, key) {
         (Section::Polymarket, "markets") => Some(Slot::PmMarkets),
+        (Section::Polymarket, "rolling") => Some(Slot::PmRolling),
         (Section::Binance, "spot") => Some(Slot::BnSpot),
         (Section::Binance, "usdm") => Some(Slot::BnUsdm),
         (Section::Binance, "usdm_dated") => Some(Slot::BnUsdmDated),
@@ -922,6 +942,7 @@ fn unknown_key_msg(section: Section, key: &str) -> String {
 fn elem_kind(slot: Slot) -> ElemKind {
     match slot {
         Slot::PmMarkets => ElemKind::PmMarket,
+        Slot::PmRolling => ElemKind::PmRolling,
         Slot::BnSpot | Slot::BnUsdm => ElemKind::BnSymbol,
         Slot::BnUsdmDated => ElemKind::BnDatedSymbol,
         Slot::BnCoinm => ElemKind::BnCoinmSymbol,
@@ -1051,6 +1072,7 @@ fn scan_string(
 fn validate_elem(kind: ElemKind, s: &str, line_no: usize) -> Result<(), UniverseError> {
     match kind {
         ElemKind::PmMarket => validate_pm_entry(s, line_no),
+        ElemKind::PmRolling => validate_pm_rolling(s, line_no),
         ElemKind::BnSymbol => validate_bn_symbol(s, line_no),
         ElemKind::BnDatedSymbol => validate_bn_dated_symbol(s, line_no),
         ElemKind::BnCoinmSymbol => validate_bn_coinm_symbol(s, false, line_no),
@@ -1124,6 +1146,52 @@ fn validate_pm_entry(s: &str, line_no: usize) -> Result<(), UniverseError> {
             format!("bad PM entry `{s}` (more than one `:`)"),
         )),
     }
+}
+
+/// PM15: the asset of a validated `[polymarket] rolling` key
+/// (`updown:<asset>:15m` → `<asset>`, the slug's spelling).
+#[must_use]
+pub fn pm_rolling_asset(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix("updown:")?;
+    let asset = rest.strip_suffix(":15m")?;
+    if asset.is_empty() || asset.contains(':') {
+        return None;
+    }
+    Some(asset)
+}
+
+/// PM15: `updown:<asset>:15m` — the slug's own spelling: `<asset>` is
+/// 1..=15 bytes of `[a-z0-9]` (`btc-updown-15m-<open epoch>`). Only the
+/// 15-minute period exists; the 5-minute family is a later lane.
+fn validate_pm_rolling(s: &str, line_no: usize) -> Result<(), UniverseError> {
+    let mut it = s.split(':');
+    let kind = it.next().unwrap_or("");
+    let asset = it.next().unwrap_or("");
+    let period = it.next().unwrap_or("");
+    if it.next().is_some() || kind != "updown" {
+        return Err(err(
+            line_no,
+            format!("rolling family `{s}`: want updown:<asset>:15m"),
+        ));
+    }
+    if period != "15m" {
+        return Err(err(
+            line_no,
+            format!("rolling family `{s}`: only the 15m period exists"),
+        ));
+    }
+    if asset.is_empty()
+        || asset.len() > 15
+        || !asset
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        return Err(err(
+            line_no,
+            format!("rolling family `{s}`: asset must be 1..=15 bytes of [a-z0-9]"),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_bn_symbol(s: &str, line_no: usize) -> Result<(), UniverseError> {
@@ -1371,6 +1439,11 @@ fn store_array(
                 return Err(dup("markets"));
             }
         }
+        Slot::PmRolling => {
+            if b.pm_rolling.replace(items).is_some() {
+                return Err(dup("rolling"));
+            }
+        }
         Slot::BnSpot => {
             if b.bn_spot.replace(items).is_some() {
                 return Err(dup("spot"));
@@ -1612,6 +1685,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
             }),
         }
     }
+    let pm_rolling = b.pm_rolling.unwrap_or_default();
     let binance_spot = b.bn_spot.unwrap_or_default();
     let binance_usdm = b.bn_usdm.unwrap_or_default();
     let binance_usdm_dated = b.bn_usdm_dated.unwrap_or_default();
@@ -1630,6 +1704,11 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
 
     // Caps.
     check_cap(pm_markets.len(), PM_MARKETS_MAX, "PM markets")?;
+    check_cap(
+        pm_rolling.len(),
+        PM_ROLLING_MAX,
+        "Polymarket rolling families",
+    )?;
     check_cap(binance_spot.len(), VENUE_LIST_MAX, "Binance spot symbols")?;
     check_cap(binance_usdm.len(), VENUE_LIST_MAX, "Binance usdm symbols")?;
     check_cap(
@@ -1699,6 +1778,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     }
     check_unique(&hl_coins, "Hyperliquid coin")?;
     check_unique(&hl_rolling, "Hyperliquid rolling family")?;
+    check_unique(&pm_rolling, "Polymarket rolling family")?;
     check_unique(&bybit_spot, "Bybit spot symbol")?;
     check_unique(&bybit_linear, "Bybit linear symbol")?;
     check_unique(&mexc_spot, "MEXC spot symbol")?;
@@ -1829,6 +1909,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
 
     Ok(Universe {
         pm_markets,
+        pm_rolling,
         binance_spot,
         binance_usdm,
         binance_usdm_dated,
@@ -1971,6 +2052,22 @@ pub fn allocate_with_anchors(
                 push_token(yes, true, &mut flat, &mut out);
                 push_token(no, false, &mut flat, &mut out);
             }
+        }
+    }
+
+    // PM15: five rows per ROLLING family — the two Up/Down pairs (window
+    // parity) and the mark (`core_types::pm_roll::PM_SLOT_TAGS`).
+    // slots. Which window a slot means at a time is a
+    // `ChannelId::InstrumentRoll` event, never a manifest column.
+    for f in 0..u.pm_rolling.len() {
+        let key = &u.pm_rolling[f];
+        for off in 0..PM_ROLLING_STRIDE {
+            let name = format!("{key}[{}]", PM_SLOT_TAGS[off as usize]);
+            out.pm_rolling.push(Instrument {
+                sym: pm_slot_sym(f, off),
+                descriptor: format!("polymarket-rolling:{name}"),
+                name,
+            });
         }
     }
 
@@ -2155,6 +2252,7 @@ pub fn allocate_with_anchors(
         all.push((t.sym, t.token_id.as_str()));
     }
     for group in [
+        &out.pm_rolling,
         &out.bn_spot,
         &out.bn_usdm,
         &out.bn_dated,
@@ -2847,6 +2945,72 @@ map = ["0:0", "1:1"]
         assert!(parse(&many).is_err(), "over HL_ROLLING_MAX");
         assert!(parse(
             "[hyperliquid]\nrolling = [\"out:BTC:15m\"]\nrolling = [\"native:ETH:1d\"]\n"
+        )
+        .is_err());
+    }
+
+    /// PM15: the `[polymarket] rolling` key. Absent is the pre-PM15 boot;
+    /// each family allocates five slots from the `core_types::pm_roll`
+    /// pool, clear of the static tokens and the legacy anchors.
+    #[test]
+    fn pm_rolling_families_parse_allocate_and_refuse_every_other_shape() {
+        let u = parse(&format!("[polymarket]\nmarkets = [\"{T1}\"]\n")).unwrap();
+        assert!(u.pm_rolling.is_empty(), "absent = empty = bit-identical");
+        let a = allocate(&u).unwrap();
+        assert!(a.pm_rolling.is_empty(), "no rolling rows without the key");
+
+        let u = parse(&format!(
+            "[polymarket]\nmarkets = [\"{T1}\", \"{T2}:{T3}\"]\nrolling = [\"updown:btc:15m\", \"updown:eth:15m\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(u.pm_rolling, vec!["updown:btc:15m", "updown:eth:15m"]);
+        assert_eq!(pm_rolling_asset(&u.pm_rolling[1]), Some("eth"));
+        assert_eq!(pm_rolling_asset("updown:btc:5m"), None);
+        assert_eq!(pm_rolling_asset("updown::15m"), None);
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.pm_rolling.len(), 10, "five slots per family");
+        let mut k = 0usize;
+        for (f, key) in ["updown:btc:15m", "updown:eth:15m"].iter().enumerate() {
+            for (off, tag) in ["up0", "down0", "up1", "down1", "mark"].iter().enumerate() {
+                let row = &a.pm_rolling[k];
+                assert_eq!(row.descriptor, format!("polymarket-rolling:{key}[{tag}]"));
+                assert_eq!(row.sym, pm_slot_sym(f, off as u32));
+                assert_eq!(
+                    core_types::pm_roll::pm_rolling_of(row.sym),
+                    Some((f, off as u32))
+                );
+                k += 1;
+            }
+        }
+        // The static tokens keep their ids: the anchor and flat + 1.
+        assert_eq!(a.pm_tokens[0].sym, LEGACY_PM_ANCHOR_SYM);
+        assert_eq!(a.pm_tokens[1].sym, make_symbol_id(VenueId::Polymarket, 2));
+
+        for bad in [
+            "rolling = [\"updown:BTC:15m\"]",
+            "rolling = [\"updown:btc:5m\"]",
+            "rolling = [\"updown:btc:1h\"]",
+            "rolling = [\"updown:btc\"]",
+            "rolling = [\"updown:btc:15m:x\"]",
+            "rolling = [\"updown::15m\"]",
+            "rolling = [\"up-or-down:btc:15m\"]",
+            "rolling = [\"updown:sixteencharsassetx:15m\"]",
+            "rolling = [\"updown:b-c:15m\"]",
+        ] {
+            let src = format!("[polymarket]\n{bad}\n");
+            assert!(parse(&src).is_err(), "{bad}");
+        }
+        assert!(
+            parse("[polymarket]\nrolling = [\"updown:btc:15m\", \"updown:btc:15m\"]\n").is_err()
+        );
+        let mut many = String::from("[polymarket]\nrolling = [");
+        for i in 0..=PM_ROLLING_MAX {
+            many.push_str(&format!("\"updown:a{i}:15m\","));
+        }
+        many.push_str("]\n");
+        assert!(parse(&many).is_err(), "over PM_ROLLING_MAX");
+        assert!(parse(
+            "[polymarket]\nrolling = [\"updown:btc:15m\"]\nrolling = [\"updown:eth:15m\"]\n"
         )
         .is_err());
     }

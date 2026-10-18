@@ -85,6 +85,11 @@ pub fn render_instruments(
     for t in &allocated.pm_tokens {
         push_desc_row(&mut out, t.sym, &t.token_id);
     }
+    // PM15: the rolling slots (empty without `[polymarket] rolling`, so
+    // a pre-PM15 boot's manifest is byte-identical).
+    for i in &allocated.pm_rolling {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
     for i in &allocated.bn_spot {
         push_desc_row(&mut out, i.sym, &i.descriptor);
     }
@@ -188,8 +193,9 @@ pub fn build_descriptor_entries(
         push(t.token_id.clone(), t.sym);
     }
     for i in allocated
-        .bn_spot
+        .pm_rolling
         .iter()
+        .chain(allocated.bn_spot.iter())
         .chain(allocated.bn_usdm.iter())
         .chain(allocated.bn_dated.iter())
         .chain(allocated.bn_coinm.iter())

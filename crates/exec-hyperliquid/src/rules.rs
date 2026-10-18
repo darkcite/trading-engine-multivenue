@@ -57,34 +57,56 @@ pub enum RuleErr {
     Lot,
     /// Price × size is below $10 (a perp) or $1 (an outcome leg).
     MinNotional,
-    /// XH4i-3a: an outcome leg's price outside [0.001, 0.999].
+    /// XH4i-3a: an outcome leg's price outside [0.00001, 0.99999].
     Range,
 }
 
 /// **XH4i-3a — a HIP-4 outcome leg's rules,** applied locally like the
 /// perps' and CHECKED ONLY: an order that breaks one is refused, never
-/// rounded — the member (BIN15) keeps to the venue's grid itself and
-/// skips what is off it, so a rounded order would be one it never asked
-/// for. Measured, not read from a doc (BIN15's `GRID_*`, held in agreement
-/// with these at compile time by the cli's `bin15_boot`): a tick of 1e-4
-/// of a dollar, whole contracts, a price in [0.001, 0.999], and $1 of
-/// notional — the venue
-/// refuses `Order must have minimum value of 1 USDC.` (testnet,
-/// 2026-09-15 and -19).
+/// rounded — the member (BIN15) keeps to the venue's law itself and skips
+/// what breaks it, so a rounded order would be one it never asked for.
+/// Measured, not read from a doc (BIN15's `GRID_*` / `PX_SIG_FIGS`, held in
+/// agreement with these at compile time by the cli's `bin15_boot`):
+/// - **price:** at most [`Self::PX_SIG_FIGS`] significant figures, in
+///   [0.00001, 0.99999]. BIN15 H90 G2 (2026-10-16): mainnet accepted and
+///   filled IoCs at 0.99909 and 0.99911 (doc 33 §9 / §9b). The 1e-4 tick
+///   this carried until then was stricter than the venue and refused real
+///   asks;
+/// - **size:** whole contracts;
+/// - **notional:** $1. The venue refuses `Order must have minimum value of
+///   1 USDC.` (testnet, 2026-09-15 and -19).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct OutcomeRules;
 
 impl OutcomeRules {
-    /// The price tick, ×1e8 (1e-4).
+    /// The most significant figures a price may carry.
+    pub const PX_SIG_FIGS: u32 = 5;
+    /// The coarse 1e-4 step, ×1e8. NOT the venue's law (see
+    /// [`Self::check`]): the outcome battery's and the probe's own walking
+    /// step only.
     pub const TICK_1E8: i64 = 10_000;
     /// The lot, ×1e8: one whole contract.
     pub const LOT_1E8: i64 = 100_000_000;
-    /// The lowest price, ×1e8 (0.001).
-    pub const PX_MIN_1E8: i64 = 100_000;
-    /// The highest price, ×1e8 (0.999).
-    pub const PX_MAX_1E8: i64 = 99_900_000;
+    /// The lowest price, ×1e8 (0.00001).
+    pub const PX_MIN_1E8: i64 = 1_000;
+    /// The highest price, ×1e8 (0.99999).
+    pub const PX_MAX_1E8: i64 = 99_999_000;
     /// $1 in 1e8 × 1e8 units (price 1e8 × size 1e8).
     pub const MIN_NOTIONAL_1E16: i128 = 10_000_000_000_000_000;
+
+    /// Whether `px_1e8` (> 0) has at most [`Self::PX_SIG_FIGS`] significant
+    /// figures: it is a multiple of `10^(digits − 5)`.
+    #[inline]
+    #[must_use]
+    pub const fn sig_figs_ok(px_1e8: i64) -> bool {
+        let mut digits = 0u32;
+        let mut q = px_1e8;
+        while q > 0 {
+            q /= 10;
+            digits += 1;
+        }
+        digits <= Self::PX_SIG_FIGS || px_1e8 % POW10[(digits - Self::PX_SIG_FIGS) as usize] == 0
+    }
 
     /// Whether the order may be sent as is.
     ///
@@ -94,11 +116,11 @@ impl OutcomeRules {
         if px_1e8 <= 0 || sz_1e8 <= 0 {
             return Err(RuleErr::NonPositive);
         }
-        if px_1e8 % Self::TICK_1E8 != 0 {
-            return Err(RuleErr::Price);
-        }
         if px_1e8 < Self::PX_MIN_1E8 || px_1e8 > Self::PX_MAX_1E8 {
             return Err(RuleErr::Range);
+        }
+        if !Self::sig_figs_ok(px_1e8) {
+            return Err(RuleErr::Price);
         }
         if sz_1e8 % Self::LOT_1E8 != 0 {
             return Err(RuleErr::Lot);
@@ -227,9 +249,9 @@ mod tests {
 
     const E8: i64 = 100_000_000;
 
-    /// XH4i-3a: an outcome leg's rules check and never round — the grid's
-    /// edges, the tick, whole contracts, $1 (4 @ 0.30 rests, 3 @ 0.30 is
-    /// the venue's own refusal, measured).
+    /// XH4i-3a / H90 G2: an outcome leg's rules check and never round — the
+    /// range's edges, five significant figures, whole contracts, $1 (4 @ 0.30
+    /// rests, 3 @ 0.30 is the venue's own refusal, measured).
     #[test]
     fn an_outcome_leg_is_checked_never_rounded() {
         let ok = |px: i64, sz: i64| OutcomeRules::check(px, sz);
@@ -239,20 +261,21 @@ mod tests {
             Err(RuleErr::MinNotional),
             "3 @ 0.30"
         );
-        assert_eq!(ok(100_000, 1_000 * E8), Ok(()), "0.001, the lowest price");
-        assert_eq!(ok(99_900_000, 2 * E8), Ok(()), "0.999, the highest");
-        assert_eq!(ok(90_000, 2_000 * E8), Err(RuleErr::Range), "below 0.001");
-        assert_eq!(ok(99_910_000, 2 * E8), Err(RuleErr::Range), "above 0.999");
+        assert_eq!(ok(99_909_000, 2 * E8), Ok(()), "0.99909: mainnet filled it (doc 33 §9)");
+        assert_eq!(ok(99_911_000, 2 * E8), Ok(()), "0.99911: mainnet filled it (doc 33 §9b)");
+        assert_eq!(ok(94_372_000, 2 * E8), Ok(()), "0.94372: five figures");
+        assert_eq!(ok(94_372_500, 2 * E8), Err(RuleErr::Price), "0.943725: six figures");
+        assert_eq!(ok(1_000, 200_000 * E8), Ok(()), "0.00001, the lowest price");
+        assert_eq!(ok(99_999_000, 2 * E8), Ok(()), "0.99999, the highest");
+        assert_eq!(ok(999, 200_000 * E8), Err(RuleErr::Range), "below 0.00001");
+        assert_eq!(ok(99_999_001, 2 * E8), Err(RuleErr::Range), "above 0.99999");
         assert_eq!(
             ok(E8, 2 * E8),
             Err(RuleErr::Range),
             "1.0 is no binary's price"
         );
-        assert_eq!(
-            ok(30_005_000, 4 * E8),
-            Err(RuleErr::Price),
-            "finer than 1e-4"
-        );
+        assert_eq!(ok(1_234_500, 100 * E8), Ok(()), "0.012345: five figures");
+        assert_eq!(ok(1_234_560, 100 * E8), Err(RuleErr::Price), "0.0123456: six");
         assert_eq!(
             ok(30_000_000, 4 * E8 + 1),
             Err(RuleErr::Lot),

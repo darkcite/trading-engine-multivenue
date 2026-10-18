@@ -1,0 +1,39 @@
+[package]
+name         = "exec-polymarket"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "PM15-6: the slot-9 Polymarket CLOB V2 order arm — FAK taker, Exchange V2 EIP-712 (EOA, proxy, Safe, Deposit Wallet), L2 HMAC, the user channel's fills."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# PM15-6b: OrderDispatch, Retired, DispatchError (the arm's trait).
+clob-dispatcher = { workspace = true }
+# PM15-6b: the IoC kind the arm admits.
+core-fill     = { workspace = true }
+# PM15-6b: HttpsReq (pm-gw's request cycle), Header, Method, PostErr.
+core-net      = { workspace = true }
+# PM15-6b: the user ring and the discovery tee's spec ring.
+core-ring     = { workspace = true }
+core-time     = { workspace = true }
+# PM15-6b: the engine ⇄ pm-gw duplex, the halt word, boxed tables.
+exec-gateway  = { workspace = true }
+# PM15-6b: PmWindowSpec (the token table's input) and Pm15Wire.
+ingress-polymarket = { workspace = true }
+# PM15-6c: pm-user's poll over the user channel's socket.
+mio           = { workspace = true }
+# The SHA-256 / HMAC / base64 the L2 auth needs (dependency-free).
+core-crypto   = { workspace = true }
+# The in-place JSON scanners (find_field, skip_string, scan_price_1e6).
+core-parse    = { workspace = true }
+core-types    = { workspace = true }
+# PM15-6a: the Exchange V2 order, ClobAuth and the POLY_1271 wrapper.
+signer-eip712 = { workspace = true }
+# The decoded API secret is wiped on drop.
+zeroize       = { workspace = true }
+memchr        = { workspace = true }

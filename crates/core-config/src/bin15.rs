@@ -73,22 +73,14 @@ fn err(msg: impl Into<String>) -> Bin15Error {
 /// Every key the grammar accepts. An unknown key is a REFUSAL: a
 /// typo'd `e_take_1e6` that silently took the default is a member
 /// trading an edge nobody chose.
-const BIN15_KEYS: [&str; 36] = [
+const BIN15_KEYS: [&str; 23] = [
     "families",
     "underlying",
     "tau_ns",
-    "e_take_1e6",
-    "h_quote_1e6",
-    "tau_min_take_ns",
-    "tau_min_quote_ns",
     "tail_refuse_ns",
     "requote_ttl_ns",
-    "requote_thr_1e6",
-    "clip_qty_1e6",
     "cap_instance_usd_1e6",
     "cap_day_usd_1e6",
-    "maker_enabled",
-    "null_arm",
     "phi_lut",
     "recal_early",
     "recal_mid",
@@ -100,33 +92,12 @@ const BIN15_KEYS: [&str; 36] = [
     // refused at the grammar before any bound could be checked. An
     // optional key still has to be a KNOWN key.
     "scale_1e9",
-    // BIN15 O9: the coverage-entry notional. Optional; absent = 0 =
-    // the edge law alone, which is what every artifact before
-    // 2026-09-13 carries.
-    "entry_usd_1e6",
     // BIN15 P0 (F4): the underlying mark's shelf life. Optional; absent
     // = the STATED default 5 s, which is the parser's law for an
     // optional key — and the only honest default, because an artifact
     // written before this key existed was priced by a member with no
     // age gate at all and must not silently keep that behaviour.
     "mark_stale_ns",
-    // BIN15 P3 (F6): the coverage entry's price bound. Optional; absent
-    // = the STATED default 20000 (2 c). An artifact written before this
-    // key existed drove an arm that paid ANY ask, so the default has to
-    // be the bound and not "off".
-    "e_entry_1e6",
-    // BIN15 R0 (2026-09-19): the coverage entry's price FLOOR. Optional;
-    // absent = 0 = no floor, which is the 2026-09-13 law bit for bit.
-    "entry_min_px_1e6",
-    // BIN15 S5 (2026-09-24): the coverage entry's PERSISTENCE — how many
-    // consecutive distinct book snapshots of the preferred leg its price
-    // test must hold on before it fires. Optional; absent = 1 = the first
-    // snapshot that passes fires, which is the pre-S5 law bit for bit.
-    "entry_persist_polls",
-    // BIN15 S5: the entry's ELAPSED CEILING — the latest, after the
-    // instance's start (expiry − the tenor), that a run of passing
-    // snapshots may begin, ns. Optional; absent = 0 = no ceiling.
-    "entry_elapsed_max_ns",
     // BIN15 H90 (2026-10-13, rulings O-H90-1..8): the LATE-WINDOW entry.
     // Every key optional; absent `late_enabled` = 0 = the member exactly
     // as it was. `late_enabled = 1` requires `late_phi_lut`.
@@ -141,6 +112,27 @@ const BIN15_KEYS: [&str; 36] = [
     "late_phi_lut",
 ];
 
+/// BIN15 H90 G3 (2026-10-16, ruling O-GL-2): the keys of the retired arms
+/// — the coverage entry, Arm A's takes and closes, the Arm B maker and its
+/// null arm. An artifact that still states one is refused by NAME (not as
+/// an unknown key), so the operator reads why: the arm it configured is
+/// gone, and the line goes too. Vault doc 38 records the removed law.
+const BIN15_RETIRED_KEYS: [&str; 13] = [
+    "e_take_1e6",
+    "h_quote_1e6",
+    "tau_min_take_ns",
+    "tau_min_quote_ns",
+    "requote_thr_1e6",
+    "clip_qty_1e6",
+    "maker_enabled",
+    "null_arm",
+    "entry_usd_1e6",
+    "e_entry_1e6",
+    "entry_min_px_1e6",
+    "entry_persist_polls",
+    "entry_elapsed_max_ns",
+];
+
 /// `bin15.toml` as parsed. The strings stay descriptors: resolving them
 /// against the universe is `bin15_boot`'s job, because only the cli
 /// knows the manifest.
@@ -152,31 +144,14 @@ pub struct Bin15File {
     pub underlying: Vec<String>,
     /// The `core-vol` tenor of the 15 m families.
     pub tau_ns: u64,
-    /// Arm A edge ×1e6.
-    pub e_take_1e6: i64,
-    /// Arm B half-spread ×1e6.
-    pub h_quote_1e6: i64,
-    /// τ floor for a take, ns — judged on the TIME TO EXPIRY, not the
-    /// pricer's horizon (BIN15 S3).
-    pub tau_min_take_ns: u64,
-    /// τ floor for a quote, ns — the time to expiry, as the take's.
-    pub tau_min_quote_ns: u64,
     /// The last window before expiry in which nothing is taken, ns.
     pub tail_refuse_ns: u64,
     /// Order TTL, ns.
     pub requote_ttl_ns: u64,
-    /// Arm B re-quote threshold ×1e6.
-    pub requote_thr_1e6: i64,
-    /// Per-order clip ×1e6 contracts.
-    pub clip_qty_1e6: i64,
     /// Notional cap per instance ×1e6.
     pub cap_instance_usd_1e6: i64,
     /// Notional cap per UTC day ×1e6.
     pub cap_day_usd_1e6: i64,
-    /// `1` = Arm B on.
-    pub maker_enabled: u8,
-    /// `1` = alternate model / null arm by instance parity.
-    pub null_arm: u8,
     /// `Φ(d) ×1e6`.
     pub phi_lut: Vec<u32>,
     /// `p' ×1e6` per phase (early, mid, late).
@@ -185,24 +160,9 @@ pub struct Bin15File {
     pub hour_ln_off_1e9: [i64; HOURS],
     /// Variance-ratio scale on σ̂ ×1e9; `1e9` when absent.
     pub scale_1e9: i64,
-    /// BIN15 O9: coverage-entry notional ×1e6 USD; `0` = off.
-    pub entry_usd_1e6: i64,
     /// BIN15 P0 (F4): the oldest an underlying mark may be and still
     /// price a binary, ns. Absent = [`MARK_STALE_NS_DEFAULT`].
     pub mark_stale_ns: u64,
-    /// BIN15 P3 (F6): the coverage entry's margin over its own belief
-    /// ×1e6. Absent = [`E_ENTRY_1E6_DEFAULT`].
-    pub e_entry_1e6: i64,
-    /// BIN15 R0 (2026-09-19): the lowest preferred-side ask the coverage
-    /// entry will pay ×1e6. Absent = 0 = no floor.
-    pub entry_min_px_1e6: i64,
-    /// BIN15 S5: consecutive distinct preferred-leg book snapshots the
-    /// coverage entry's price test must hold on before it fires, in
-    /// `[1, ENTRY_PERSIST_POLLS_MAX]`. Absent = 1 = the pre-S5 law.
-    pub entry_persist_polls: u8,
-    /// BIN15 S5: the latest a run of passing snapshots may begin, ns after
-    /// the instance's start; `0` or under `tau_ns`. Absent = 0 = no ceiling.
-    pub entry_elapsed_max_ns: u64,
     /// BIN15 H90: `1` = the late-window entry is on. Absent = 0.
     pub late_enabled: u8,
     /// BIN15 H90: consecutive distinct snapshots of the favoured leg the
@@ -254,7 +214,7 @@ pub fn default_seed_dir() -> Result<String, super::ConfigError> {
     super::expand_tilde("~/multivenue")
 }
 
-fn ints(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<i64>, Bin15Error> {
+pub(crate) fn ints(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<i64>, Bin15Error> {
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Ints(v), _)) => Ok(v.clone()),
         Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be an integer array"))),
@@ -262,7 +222,7 @@ fn ints(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<i64>, Bin15Error
     }
 }
 
-fn strs(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<String>, Bin15Error> {
+pub(crate) fn strs(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<String>, Bin15Error> {
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Strs(v), _)) => Ok(v.clone()),
         Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be a string array"))),
@@ -270,7 +230,7 @@ fn strs(kv: &[(String, Value, usize)], key: &str) -> Result<Vec<String>, Bin15Er
     }
 }
 
-fn int(kv: &[(String, Value, usize)], key: &str) -> Result<i64, Bin15Error> {
+pub(crate) fn int(kv: &[(String, Value, usize)], key: &str) -> Result<i64, Bin15Error> {
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Int(v), _)) => Ok(*v),
         Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be an integer"))),
@@ -278,7 +238,7 @@ fn int(kv: &[(String, Value, usize)], key: &str) -> Result<i64, Bin15Error> {
     }
 }
 
-fn opt_int(kv: &[(String, Value, usize)], key: &str, default: i64) -> Result<i64, Bin15Error> {
+pub(crate) fn opt_int(kv: &[(String, Value, usize)], key: &str, default: i64) -> Result<i64, Bin15Error> {
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Int(v), _)) => Ok(*v),
         Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be an integer"))),
@@ -294,14 +254,6 @@ pub const MARK_STALE_NS_DEFAULT: u64 = 5_000_000_000;
 /// The floor `mark_stale_ns` may be configured at, ns: one mark
 /// interval. Below it the gate fires between two healthy prints.
 pub const MARK_STALE_NS_MIN: u64 = 1_000_000_000;
-
-/// BIN15 P3 (F6): the stated margin the coverage entry demands over its
-/// own belief before paying an ask ×1e6 — 2 cents.
-///
-/// The entry's bar is `p > a` (buying at ask `a` with belief `p` has an
-/// EV per dollar of premium of `p/a − 1`). This is the cushion on top:
-/// model error plus the exit-leg fee at the operator tier.
-pub const E_ENTRY_1E6_DEFAULT: i64 = 20_000;
 
 /// BIN15 S5: the most consecutive snapshots the persistence law may ask
 /// for. The outcome legs' two-sided touch is the `l2Book` push, ~5.3 s
@@ -448,20 +400,6 @@ fn late_keys(kv: &[(String, Value, usize)], file: &mut Bin15File) -> Result<(), 
     Ok(())
 }
 
-/// BIN15 S5: `entry_persist_polls`, absent = 1, bounded to
-/// `[1, ENTRY_PERSIST_POLLS_MAX]`. Zero is refused rather than read as
-/// "off": a law that needs no passing snapshot would fire on a failing one.
-fn persist_polls(kv: &[(String, Value, usize)]) -> Result<u8, Bin15Error> {
-    let v = opt_int(kv, "entry_persist_polls", 1)?;
-    match u8::try_from(v) {
-        Ok(p) if (1..=ENTRY_PERSIST_POLLS_MAX).contains(&p) => Ok(p),
-        _ => Err(err(format!(
-            "`entry_persist_polls` must be in [1, {ENTRY_PERSIST_POLLS_MAX}] (got {v}); \
-             absent means 1 = the entry fires on the first snapshot that passes"
-        ))),
-    }
-}
-
 fn opt_pos_u64(
     kv: &[(String, Value, usize)],
     key: &str,
@@ -476,19 +414,9 @@ fn opt_pos_u64(
     }
 }
 
-fn pos_u64(kv: &[(String, Value, usize)], key: &str) -> Result<u64, Bin15Error> {
+pub(crate) fn pos_u64(kv: &[(String, Value, usize)], key: &str) -> Result<u64, Bin15Error> {
     let v = int(kv, key)?;
     u64::try_from(v).map_err(|_| err(format!("`{key}` must be positive (got {v})")))
-}
-
-/// One 0/1 flag. A value that is neither is a refusal: "2" in a boolean
-/// field means the operator believed something the grammar does not say.
-fn flag(kv: &[(String, Value, usize)], key: &str) -> Result<u8, Bin15Error> {
-    match int(kv, key)? {
-        0 => Ok(0),
-        1 => Ok(1),
-        v => Err(err(format!("`{key}` must be 0 or 1 (got {v})"))),
-    }
 }
 
 /// A monotone non-decreasing `u32` table of exactly `n` points, with
@@ -496,7 +424,7 @@ fn flag(kv: &[(String, Value, usize)], key: &str) -> Result<u8, Bin15Error> {
 /// interpolation rests on: a table that dips makes `p̂` non-monotone in
 /// the mark, and a non-monotone fair value is an arbitrage the member
 /// would trade against itself.
-fn table(
+pub(crate) fn table(
     kv: &[(String, Value, usize)],
     key: &str,
     n: usize,
@@ -574,8 +502,25 @@ fn table(
     Ok(out)
 }
 
+/// Refuse an artifact that still states a retired key, naming the key.
+fn retired_keys(src: &str) -> Result<(), Bin15Error> {
+    for (n, line) in src.lines().enumerate() {
+        let t = line.trim_start();
+        let key = t.split(|c: char| c == '=' || c.is_whitespace()).next().unwrap_or("");
+        if BIN15_RETIRED_KEYS.contains(&key) && t[key.len()..].trim_start().starts_with('=') {
+            return Err(err(format!(
+                "line {}: `{key}` was retired with the old arms (BIN15 H90 G3, 2026-10-16) \
+                 — the member trades the late-window law only; delete the line",
+                n + 1
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Parse the artifact text.
 pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
+    retired_keys(src)?;
     let kv = parse_single_section(src, "bin15", &BIN15_KEYS)
         .map_err(|e| err(e.0))?;
 
@@ -605,18 +550,10 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         families,
         underlying,
         tau_ns: pos_u64(&kv, "tau_ns")?,
-        e_take_1e6: int(&kv, "e_take_1e6")?,
-        h_quote_1e6: int(&kv, "h_quote_1e6")?,
-        tau_min_take_ns: pos_u64(&kv, "tau_min_take_ns")?,
-        tau_min_quote_ns: pos_u64(&kv, "tau_min_quote_ns")?,
         tail_refuse_ns: pos_u64(&kv, "tail_refuse_ns")?,
         requote_ttl_ns: pos_u64(&kv, "requote_ttl_ns")?,
-        requote_thr_1e6: int(&kv, "requote_thr_1e6")?,
-        clip_qty_1e6: int(&kv, "clip_qty_1e6")?,
         cap_instance_usd_1e6: int(&kv, "cap_instance_usd_1e6")?,
         cap_day_usd_1e6: int(&kv, "cap_day_usd_1e6")?,
-        maker_enabled: flag(&kv, "maker_enabled")?,
-        null_arm: flag(&kv, "null_arm")?,
         phi_lut: table(&kv, "phi_lut", PHI_POINTS, Some(500_000), Some(PHI_LAST_MIN_1E6), false)?,
         recal: [
             table(&kv, "recal_early", RECAL_POINTS, Some(0), Some(1_000_000), true)?,
@@ -625,12 +562,7 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         ],
         hour_ln_off_1e9: hour,
         scale_1e9: opt_int(&kv, "scale_1e9", 1_000_000_000)?,
-        entry_usd_1e6: opt_int(&kv, "entry_usd_1e6", 0)?,
         mark_stale_ns: opt_pos_u64(&kv, "mark_stale_ns", MARK_STALE_NS_DEFAULT)?,
-        e_entry_1e6: opt_int(&kv, "e_entry_1e6", E_ENTRY_1E6_DEFAULT)?,
-        entry_min_px_1e6: opt_int(&kv, "entry_min_px_1e6", 0)?,
-        entry_persist_polls: persist_polls(&kv)?,
-        entry_elapsed_max_ns: opt_pos_u64(&kv, "entry_elapsed_max_ns", 0)?,
         late_enabled: 0,
         late_persist_polls: LATE_PERSIST_POLLS_DEFAULT,
         late_tau_min_ns: LATE_TAU_MIN_NS_DEFAULT,
@@ -664,62 +596,18 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
     }
     // One tick. An edge under the venue's own price granularity is an
     // edge the venue cannot express, so every touch would look wrong.
-    if file.e_take_1e6 < 100 {
+    if file.tail_refuse_ns >= file.tau_ns {
         return Err(err(format!(
-            "`e_take_1e6` must be at least 100 (one 1e-4 tick); got {}",
-            file.e_take_1e6
+            "`tail_refuse_ns` {} must be under `tau_ns` {} — otherwise the tail \
+             swallows the whole instance and the pricer never prices",
+            file.tail_refuse_ns, file.tau_ns
         )));
     }
-    if file.h_quote_1e6 < 100 {
-        return Err(err(format!(
-            "`h_quote_1e6` must be at least 100 (one tick); got {}",
-            file.h_quote_1e6
-        )));
-    }
-    if file.tau_min_take_ns >= file.tau_ns || file.tau_min_quote_ns >= file.tau_ns {
-        return Err(err(format!(
-            "`tau_min_take_ns` {} and `tau_min_quote_ns` {} must both be under \
-             `tau_ns` {} — a floor at or above the tenor means the arm never fires",
-            file.tau_min_take_ns, file.tau_min_quote_ns, file.tau_ns
-        )));
-    }
-    if file.tail_refuse_ns >= file.tau_min_take_ns {
-        return Err(err(format!(
-            "`tail_refuse_ns` {} must be under `tau_min_take_ns` {} — otherwise \
-             the tail swallows the whole take window and the counter that says \
-             so would be `skipped_tail` for every tick of every instance",
-            file.tail_refuse_ns, file.tau_min_take_ns
-        )));
-    }
-    if file.requote_thr_1e6 <= 0 {
-        return Err(err(format!(
-            "`requote_thr_1e6` must be positive (got {}) — a zero threshold \
-             re-quotes on every tick and pays the spread for nothing",
-            file.requote_thr_1e6
-        )));
-    }
-    if file.clip_qty_1e6 <= 0
-        || file.cap_instance_usd_1e6 <= 0
-        || file.cap_day_usd_1e6 <= 0
-    {
+    if file.cap_instance_usd_1e6 <= 0 || file.cap_day_usd_1e6 <= 0 {
         return Err(err(
-            "`clip_qty_1e6`, `cap_instance_usd_1e6` and `cap_day_usd_1e6` must all \
-             be positive — a zero cap is a member that cannot trade, spelled as if \
-             it could",
+            "`cap_instance_usd_1e6` and `cap_day_usd_1e6` must both be positive — a \
+             zero cap is a member that cannot trade, spelled as if it could",
         ));
-    }
-    if file.entry_usd_1e6 < 0 {
-        return Err(err(format!(
-            "`entry_usd_1e6` must not be negative (got {}); absent means 0 = off",
-            file.entry_usd_1e6
-        )));
-    }
-    if file.entry_usd_1e6 > file.cap_instance_usd_1e6 {
-        return Err(err(format!(
-            "`entry_usd_1e6` {} exceeds `cap_instance_usd_1e6` {} — every coverage \
-             entry would be clipped by the cap it is meant to sit under",
-            file.entry_usd_1e6, file.cap_instance_usd_1e6
-        )));
     }
     if file.cap_instance_usd_1e6 > file.cap_day_usd_1e6 {
         return Err(err(format!(
@@ -740,12 +628,12 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
             file.mark_stale_ns
         )));
     }
-    if file.mark_stale_ns >= file.tau_min_take_ns {
+    if file.mark_stale_ns >= file.tau_ns {
         return Err(err(format!(
-            "`mark_stale_ns` {} must be under `tau_min_take_ns` {} — a staleness \
-             gate wider than the take window can never hold a take, so it is a \
-             gate that does nothing and reads as if it did",
-            file.mark_stale_ns, file.tau_min_take_ns
+            "`mark_stale_ns` {} must be under `tau_ns` {} — a staleness gate wider \
+             than the instance can never hold a price, so it is a gate that does \
+             nothing and reads as if it did",
+            file.mark_stale_ns, file.tau_ns
         )));
     }
     // BIN15 P3 (F6). One venue tick, because a margin under the price
@@ -753,40 +641,11 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
     // the interval, because a bound of 0.5 or more can never be cleared
     // by any ask on the preferred side (`belief` is at most 1e6 and the
     // ask is at least one tick).
-    if file.e_entry_1e6 < 100 {
-        return Err(err(format!(
-            "`e_entry_1e6` must be at least 100 (one 1e-4 tick); got {}. Zero would \
-             make the coverage entry pay ANY ask, which is the market order this \
-             bound exists to stop",
-            file.e_entry_1e6
-        )));
-    }
-    if file.e_entry_1e6 >= 500_000 {
-        return Err(err(format!(
-            "`e_entry_1e6` {} is at or over half the interval — no ask on the \
-             preferred side can ever clear it, so the entry arm would never fire \
-             and every instance would read as a quiet book",
-            file.e_entry_1e6
-        )));
-    }
     // Inside the price interval, floor included: 0 is "no floor" and a
     // floor at or over 1.0 could never be cleared by any ask, so the
     // entry arm would be silently off.
-    if file.entry_min_px_1e6 < 0 || file.entry_min_px_1e6 >= 1_000_000 {
-        return Err(err(format!(
-            "`entry_min_px_1e6` must be in [0, 1000000) (got {}); absent means 0 = no floor",
-            file.entry_min_px_1e6
-        )));
-    }
     // BIN15 S5. A ceiling at or past the tenor is later than any instance
     // lives, so it would never close one: a gate spelled as if it worked.
-    if file.entry_elapsed_max_ns >= file.tau_ns {
-        return Err(err(format!(
-            "`entry_elapsed_max_ns` {} must be under `tau_ns` {} — a ceiling at or \
-             past the tenor never closes an instance; absent means 0 = no ceiling",
-            file.entry_elapsed_max_ns, file.tau_ns
-        )));
-    }
     if file.scale_1e9 <= 0 {
         return Err(err(format!(
             "`scale_1e9` must be positive (got {}); absent means 1000000000",
@@ -894,18 +753,10 @@ mod tests {
              families = [\"out:BTC:15m\"]\n\
              underlying = [\"hyperliquid:BTC\"]\n\
              tau_ns = 900000000000\n\
-             e_take_1e6 = 30000\n\
-             h_quote_1e6 = 25000\n\
-             tau_min_take_ns = 60000000000\n\
-             tau_min_quote_ns = 120000000000\n\
              tail_refuse_ns = 10000000000\n\
              requote_ttl_ns = 1000000000\n\
-             requote_thr_1e6 = 5000\n\
-             clip_qty_1e6 = 500000000\n\
              cap_instance_usd_1e6 = 1000000000\n\
              cap_day_usd_1e6 = 5000000000\n\
-             maker_enabled = 1\n\
-             null_arm = 1\n\
              phi_lut = [{}]\n\
              recal_early = [{}]\n\
              recal_mid = [{}]\n\
@@ -1027,76 +878,6 @@ mod tests {
         // ABSENT OPTIONALS ARE THE STATED DEFAULT, bit for bit.
         assert_eq!(f.hour_ln_off_1e9, [0i64; HOURS], "no hour table = no offset");
         assert_eq!(f.scale_1e9, 1_000_000_000, "no scale = no scaling");
-        assert_eq!(f.entry_min_px_1e6, 0, "no floor = the 2026-09-13 entry law");
-        assert_eq!(f.entry_persist_polls, 1, "no persistence key = the pre-S5 entry law");
-        assert_eq!(f.entry_elapsed_max_ns, 0, "no ceiling key = no ceiling");
-    }
-
-    /// BIN15 S5: the persistence entry's two keys are KNOWN optional keys
-    /// (O4b's lesson), round-trip, and are bounded: persistence in
-    /// `[1, 8]` (zero would fire on a failing snapshot), the ceiling `0`
-    /// (off) or under the tenor (at or past it no instance is ever closed).
-    #[test]
-    fn the_persistence_keys_are_known_round_trip_and_are_bounded() {
-        let src = format!(
-            "{}entry_persist_polls = 3\nentry_elapsed_max_ns = 240000000000\n",
-            artifact()
-        );
-        let f = parse(&src).expect("both keys are known");
-        assert_eq!(f.entry_persist_polls, 3);
-        assert_eq!(f.entry_elapsed_max_ns, 240_000_000_000);
-        let edges: [(&str, u8, u64); 3] = [
-            ("entry_persist_polls = 1\nentry_elapsed_max_ns = 0", 1, 0),
-            ("entry_persist_polls = 8\nentry_elapsed_max_ns = 1", 8, 1),
-            ("entry_elapsed_max_ns = 899999999999", 1, 899_999_999_999),
-        ];
-        let mut i = 0usize;
-        while i < edges.len() {
-            let (lines, persist, ceiling) = edges[i];
-            let f = parse(&format!("{}{lines}\n", artifact())).expect(lines);
-            assert_eq!(
-                (f.entry_persist_polls, f.entry_elapsed_max_ns),
-                (persist, ceiling),
-                "{lines}"
-            );
-            i += 1;
-        }
-        let bad: [(&str, &str); 6] = [
-            ("entry_persist_polls = 0", "[1, 8]"),
-            ("entry_persist_polls = 9", "[1, 8]"),
-            ("entry_persist_polls = -1", "[1, 8]"),
-            ("entry_elapsed_max_ns = 900000000000", "must be under `tau_ns`"),
-            ("entry_elapsed_max_ns = 900000000001", "must be under `tau_ns`"),
-            ("entry_elapsed_max_ns = -1", "must be positive"),
-        ];
-        let mut i = 0usize;
-        while i < bad.len() {
-            let (line, want) = bad[i];
-            let e = parse(&format!("{}{line}\n", artifact())).expect_err(line);
-            assert!(e.0.contains(want), "{line}: got {}", e.0);
-            i += 1;
-        }
-    }
-
-    /// BIN15 R0 (2026-09-19): the coverage entry's price floor is a
-    /// KNOWN optional key (O4b's lesson), it round-trips, and it is
-    /// bounded to the open interval below 1.0 — a floor of 1.0 could
-    /// never be cleared and would switch the entry arm off in silence.
-    #[test]
-    fn the_entry_floor_is_a_known_key_that_round_trips_and_is_bounded() {
-        let src = format!("{}entry_min_px_1e6 = 700000\n", artifact());
-        let f = parse(&src).expect("entry_min_px_1e6 is a known key");
-        assert_eq!(f.entry_min_px_1e6, 700_000);
-        let zero = format!("{}entry_min_px_1e6 = 0\n", artifact());
-        assert_eq!(parse(&zero).expect("an explicit 0").entry_min_px_1e6, 0);
-        let bad: [&str; 2] = ["entry_min_px_1e6 = 1000000", "entry_min_px_1e6 = -1"];
-        let mut i = 0usize;
-        while i < bad.len() {
-            let src = format!("{}{}\n", artifact(), bad[i]);
-            let e = parse(&src).expect_err(bad[i]);
-            assert!(e.0.contains("[0, 1000000)"), "{}: got {}", bad[i], e.0);
-            i += 1;
-        }
     }
 
     /// O4b: the ONE artifact `claude_worker.bin15_fit` writes carries
@@ -1116,9 +897,26 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_refused_rather_than_ignored() {
-        let src = artifact().replace("e_take_1e6 =", "e_take_bps =");
+        let src = artifact().replace("tail_refuse_ns =", "tail_refuse_s =");
         let e = parse(&src).expect_err("unknown key");
-        assert!(e.0.contains("e_take_bps"), "{}", e.0);
+        assert!(e.0.contains("tail_refuse_s"), "{}", e.0);
+    }
+
+    /// BIN15 H90 G3: a key of a retired arm is refused BY NAME, with the
+    /// line, so an old artifact says why it no longer boots.
+    #[test]
+    fn a_retired_arms_key_is_refused_by_name() {
+        let mut i = 0usize;
+        while i < BIN15_RETIRED_KEYS.len() {
+            let key = BIN15_RETIRED_KEYS[i];
+            let src = artifact().replace("[bin15]\n", &format!("[bin15]\n{key} = 1\n"));
+            let e = parse(&src).expect_err("retired");
+            assert!(e.0.contains(key) && e.0.contains("retired") && e.0.contains("line 2"), "{}", e.0);
+            i += 1;
+        }
+        // A comment that names one is not a key.
+        let src = artifact().replace("[bin15]\n", "[bin15]\n# e_take_1e6 = 30000 (retired)\n");
+        assert!(parse(&src).is_ok());
     }
 
     #[test]
@@ -1157,22 +955,14 @@ mod tests {
 
     #[test]
     fn every_numeric_bound_is_enforced() {
-        let cases: [(&str, &str, &str); 8] = [
+        let cases: [(&str, &str, &str); 4] = [
             ("tau_ns = 900000000000", "tau_ns = 1800000000000", "not a tenor"),
-            ("e_take_1e6 = 30000", "e_take_1e6 = 99", "one 1e-4 tick"),
-            ("h_quote_1e6 = 25000", "h_quote_1e6 = 0", "one tick"),
-            (
-                "tau_min_take_ns = 60000000000",
-                "tau_min_take_ns = 900000000000",
-                "must both be under",
-            ),
             (
                 "tail_refuse_ns = 10000000000",
-                "tail_refuse_ns = 60000000000",
-                "swallows the whole take window",
+                "tail_refuse_ns = 900000000000",
+                "swallows the whole instance",
             ),
-            ("requote_thr_1e6 = 5000", "requote_thr_1e6 = 0", "must be positive"),
-            ("clip_qty_1e6 = 500000000", "clip_qty_1e6 = 0", "must all"),
+            ("cap_day_usd_1e6 = 5000000000", "cap_day_usd_1e6 = 0", "must both be positive"),
             (
                 "cap_instance_usd_1e6 = 1000000000",
                 "cap_instance_usd_1e6 = 9000000000",
@@ -1190,13 +980,6 @@ mod tests {
             assert!(e.0.contains(want), "{to}: got {}", e.0);
             i += 1;
         }
-    }
-
-    #[test]
-    fn a_flag_that_is_not_zero_or_one_is_refused() {
-        let src = artifact().replace("maker_enabled = 1", "maker_enabled = 2");
-        let e = parse(&src).expect_err("flag");
-        assert!(e.0.contains("must be 0 or 1"), "{}", e.0);
     }
 
     #[test]

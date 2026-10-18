@@ -350,23 +350,17 @@ pub fn plan(
     }
 }
 
-/// Whether `px_1e8` is a price the venue's own book can carry: inside
-/// (0, 1) and at most 5 significant figures — Hyperliquid's general price
-/// law. Mainnet's late books quote 0.99909, 0.9928, 0.0072 and 0.00091
-/// (2026-10-13), finer than the 1e-4 tick and outside the [0.001, 0.999]
-/// range `OutcomeRules` holds from its testnet measurement; the probe buys
-/// the favourite's real ask and lets the venue judge it — a refusal is an
-/// answer and places nothing.
+/// Whether `px_1e8` is a price the venue's own book can carry: the outcome
+/// leg's law, `OutcomeRules` (five significant figures in [0.00001,
+/// 0.99999] since BIN15 H90 G2). Mainnet's late books quote 0.99909,
+/// 0.9928, 0.0072 and 0.00091 (2026-10-13); the probe buys the favourite's
+/// real ask and lets the venue judge it — a refusal is an answer and places
+/// nothing.
 #[must_use]
 pub const fn venue_price(px_1e8: i64) -> bool {
-    if px_1e8 <= 0 || px_1e8 >= E8 {
-        return false;
-    }
-    let mut n = px_1e8;
-    while n % 10 == 0 {
-        n /= 10;
-    }
-    n < 100_000
+    px_1e8 >= OutcomeRules::PX_MIN_1E8
+        && px_1e8 <= OutcomeRules::PX_MAX_1E8
+        && OutcomeRules::sig_figs_ok(px_1e8)
 }
 
 /// The probe's client id: [`PROBE_MAGIC`], the run's second-of-start, the

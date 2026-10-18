@@ -32,3 +32,4 @@ strategy-xmm         = { workspace = true }
 strategy-hcv         = { workspace = true }
 # PVM impl-08 T4: the slot-8 member (Pine scripts — PAPER ONLY, ruling 2026-10-16).
 strategy-pine        = { workspace = true }
+strategy-pm15        = { workspace = true }

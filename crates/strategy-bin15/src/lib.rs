@@ -9,64 +9,48 @@
 //! git-excluded research vault). A FAMILY is a stable pair of
 //! `SymbolId` slots — Yes and No — whose underlying venue instrument is
 //! rebound every time an instance settles and the next one is created;
-//! the BTC 15-minute family rolls 96 times a day. The member prices
-//! each live instance off a `core-vol` 15 m volatility forecast of the
-//! family's UNDERLYING, compares that fair value with the binary's own
-//! book, and acts when the book is wrong by more than the configured
-//! edge.
+//! the BTC 15-minute family rolls 96 times a day.
 //!
-//! The pricer, per re-price, is: the log-moneyness of the underlying
-//! mark against the strike to second order; divided by `σ_min·√τ` built
-//! from the once-a-minute `sigma_hat_1e9`; looked up in a Φ table on a
-//! 1e-3 grid; then recalibrated through one of three τ-phase tables.
-//! One `i128` mul-div, one integer square root, four table reads. No
-//! float anywhere, no transcendental on the decision path — the two
-//! expensive functions (`exp`, `ln`) run once per minute per underlying
-//! inside `core-vol`, which is the crate's standing doctrine.
+//! **BIN15 H90 (2026-10-16, ruling O-GL-2): the member trades ONE law,
+//! the late-window entry** (`late` module, vault docs 32–34): inside the
+//! settlement minute it prices the partially observed 60 s mark TWAP
+//! from a short horizon and the perp's book (P1b), and takes one IoC per
+//! instance in `[late_tau_min, late_tau_max)` when the favoured side's
+//! ask sits at least the late edge under its probability. It is OFF
+//! unless the artifact switches it on.
+//!
+//! The S-law pricer stays as the LOGGED counterfactual (the late first
+//! fires' `ctl_*` columns) and the calibration ledger; it never trades.
+//! Per re-price it is: the log-moneyness of the underlying mark against
+//! the strike to second order; divided by `σ_min·√τ` built from the
+//! once-a-minute `sigma_hat_1e9`; looked up in a Φ table on a 1e-3
+//! grid; then recalibrated through one of three τ-phase tables. One
+//! `i128` mul-div, one integer square root, four table reads. No float
+//! anywhere, no transcendental on the decision path.
+//!
+//! The coverage entry, Arm A's takes and closes, Arm B's maker and the
+//! null arm were REMOVED at H90 G3 (vault doc 38 records their law and
+//! the commit to recover them from).
 //!
 //! ## What this lane does NOT do
 //!
 //! * **It does not infer a position from a submit.** Positions come
-//!   from fills. Before the engine-side paper matcher (VRP P1) exists,
-//!   live paper produces no fills and this member is a PIPELINE PROOF:
-//!   it prices, it emits, it counts. The harness (`backtest --member
-//!   bin15`) is the P&L instrument. A member that booked its submits
-//!   is how the VRP member came to believe it held a hedged option for
-//!   two live campaigns while the harness held a naked perp.
-//! * **It never sells short.** A HIP-4 position cannot go negative: the
-//!   two sides of a binary are two separate instruments, and the way to
-//!   express "Yes is rich" is to BUY No, not to sell Yes. The only sell
-//!   this member ever emits is a CLOSING take against inventory it can
-//!   prove it holds from fills.
-//! * **It never takes in the last `tail_refuse_ns`** — the arms priced
-//!   by the S-law pricer. At the very end of a binary's life that
-//!   pricer's fair value is a step function of the next tick of the
-//!   underlying, and its own error is larger than any edge it can
-//!   measure. The venue also clears the book at expiry. **BIN15 H90's
-//!   late entry is the one exception, and it is its own law** (`late`
-//!   module, rulings O-H90-1..8): inside the settlement minute it prices
-//!   the partially observed TWAP from a short horizon and the perp's
-//!   book, takes one IoC per instance in `[late_tau_min, late_tau_max)`,
-//!   and is OFF unless the artifact switches it on.
-//! * **It never quotes inside `tau_min_quote_ns`.** A resting quote
-//!   near expiry is pure gamma to whoever crosses it.
+//!   from fills; an unfilled take is written off at its deadline and
+//!   gives its room back.
+//! * **It never sells.** A HIP-4 position cannot go negative: the two
+//!   sides of a binary are two separate instruments, and every order
+//!   this member emits is a BUY of the favoured side, held to
+//!   settlement.
+//! * **The S-law pricer stops in the last `tail_refuse_ns`.** Its fair
+//!   value there is a step function of the next tick of the underlying.
+//!   The late law's floor is its own (`late_tau_min`); the venue clears
+//!   the book at expiry.
 //! * **It does not consult the regime word.** The HORIZON law: the
 //!   regime lane is measured on 4 h–8 h horizons and a 15-minute binary
 //!   is not one of its cells. The gate is accepted and ignored, and
 //!   that is deliberate rather than an omission.
 //! * **It does not build a signer, a cancel or a dispatch path.** Those
-//!   are Stage-3.
-//!
-//! ## Arm B is a LOWER BOUND, and why
-//!
-//! An ask on the Yes book with no Yes inventory is a short, which the
-//! venue refuses and the paper model does not know. So Arm B quotes the
-//! ask side only up to `pos_yes`; the bid side is the primary maker
-//! quote and the No book mirrors it against `pos_no`. A real two-sided
-//! maker on a venue that allowed shorting would earn more than this
-//! member's paper P&L shows. The bound is in the conservative
-//! direction, which is the only direction a paper model may be wrong
-//! in.
+//!   belong to the execution lane (`exec-hyperliquid`).
 //!
 //! ## Doctrine
 //!
@@ -79,10 +63,10 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use core_fill::{Touch, ORDER_KIND_IOC, ORDER_KIND_MAKER};
+use core_fill::{Touch, ORDER_KIND_IOC};
 use core_time::{BarClock, NsTs};
 use core_types::{
-    AiCmdKind, CancelReq, Order, Price, Qty, Side, SymbolId, Tick, VenueId, SYMBOL_ID_NONE,
+    AiCmdKind, Order, Price, Qty, Side, SymbolId, Tick, VenueId, SYMBOL_ID_NONE,
 };
 use strategy_core::{
     Bin15Counters, Ctx, RegimeGate, Strategy, StrategyCounters, StrategyError, SubmitErr,
@@ -102,9 +86,6 @@ pub const BIN15_MAX_FAMILIES: usize = 8;
 /// daily on BTC — and then share its `MarkState`.
 pub const BIN15_MAX_UNDERLYINGS: usize = 4;
 
-/// Arm B quote sides per family: index 0 = bid, 1 = ask.
-pub const QUOTE_SIDES: usize = 2;
-
 /// The 15 m `core-vol` tenor, ns. The 15 m families' σ source.
 pub const TAU_15M_NS: u64 = 900_000_000_000;
 
@@ -121,17 +102,30 @@ const TAU_15M_MINUTES: i128 = 15;
 /// Minutes in the 8 h tenor.
 const TAU_8H_MINUTES: i128 = 480;
 
-/// HIP-4 price tick ×1e6: 1e-4 of a dollar of payout.
+/// The smallest edge a law may ask for ×1e6 (1e-4 of a dollar of payout).
+/// NOT the venue's price law: that is [`PX_SIG_FIGS`] (H90 G2).
 pub const GRID_TICK_1E6: i64 = 100;
+
+/// HIP-4 price law: at most this many significant figures. BIN15 H90 G2
+/// (2026-10-16): mainnet accepted and filled IoCs at 0.99909 and 0.99911
+/// (doc 33 §9 / §9b), so the 1e-4 tick the grid carried until then was
+/// stricter than the venue and skipped real asks. In ×1e6 units a price at
+/// or above 0.1 is a multiple of 10 (1e-5); below 0.1 every ×1e6 value
+/// already has at most five figures.
+pub const PX_SIG_FIGS: u32 = 5;
+
+/// The ×1e6 level at and above which a price has six digits, so its last
+/// one must be 0 to keep [`PX_SIG_FIGS`] figures.
+const PX_SIX_DIGITS_1E6: i64 = 100_000;
 
 /// HIP-4 lot ×1e6: one whole contract.
 pub const GRID_LOT_1E6: i64 = 1_000_000;
 
-/// Lowest quotable binary price ×1e6 (0.001).
-pub const GRID_PX_MIN_1E6: i64 = 1_000;
+/// Lowest binary price ×1e6 (0.00001).
+pub const GRID_PX_MIN_1E6: i64 = 10;
 
-/// Highest quotable binary price ×1e6 (0.999).
-pub const GRID_PX_MAX_1E6: i64 = 999_000;
+/// Highest binary price ×1e6 (0.99999).
+pub const GRID_PX_MAX_1E6: i64 = 999_990;
 
 /// Minimum order notional ×1e6 ($1). MEASURED, not read from a doc:
 /// the venue refuses `Order must have minimum value of 1 USDC.` (testnet,
@@ -143,18 +137,11 @@ pub const GRID_MIN_NOTIONAL_1E6: i128 = 1_000_000;
 /// One whole payout ×1e6 — a binary settles at 0 or at this.
 pub const ONE_1E6: i64 = 1_000_000;
 
-/// `arm` value of the model arm.
-pub const ARM_MODEL: u8 = 0;
-/// `arm` value of the null arm (the venue mid in place of `p̂`).
-pub const ARM_NULL: u8 = 1;
-
 /// Family kind: a 15-minute rolling binary (`out:<COIN>:15m`).
 pub const FAMILY_OUT_15M: u8 = 0;
 /// Family kind: a native recurring daily binary (`native:<COIN>:1d`).
 pub const FAMILY_NATIVE_DAILY: u8 = 1;
 
-/// `client_oid` bit 63: the arm (0 model, 1 null).
-const OID_ARM_SHIFT: u32 = 63;
 /// `client_oid` bit 48: the side (0 Yes, 1 No).
 const OID_SIDE_SHIFT: u32 = 48;
 /// `client_oid` bits 32..48: the family index.
@@ -233,8 +220,7 @@ pub struct PendingLeg {
     /// Quantity filled so far ×1e6.
     pub filled_1e6: i64,
     /// BIN15 P2 (F2): the notional this leg BOOKED against the caps at
-    /// submit ×1e6, or 0 for a leg that booked nothing (a closing take,
-    /// an ask quote).
+    /// submit ×1e6.
     ///
     /// Kept on the leg rather than recomputed from `px × qty`, because
     /// the credit has to return exactly what was taken: a re-derivation
@@ -246,24 +232,7 @@ pub struct PendingLeg {
     /// [`Side`] as a byte.
     pub side: u8,
     /// Explicit padding — always zero.
-    pub _pad: [u8; 6],
-    /// **E5: the client id this leg carried BEFORE its last modify**,
-    /// or 0 if it has never moved.
-    ///
-    /// ONE generation, deliberately. A reprice is a MODIFY that gives
-    /// the replacement a fresh cloid (ruling O-E5b), so a fill the
-    /// venue was already answering under the old id arrives after the
-    /// member has stopped listening for it — and lands in
-    /// `unknown_fills`, moving no position, leaving the member
-    /// believing it holds less than it does. That is the F7 shape
-    /// again: absence read as evidence.
-    ///
-    /// One generation and not a list, because the window is one
-    /// round trip: a second reprice means the first replacement was
-    /// itself acknowledged, so anything still outstanding under the
-    /// id before THAT is a venue that has lost two messages, which is
-    /// a reconciliation problem and not a bookkeeping one.
-    pub prev_oid: u64,
+    pub _pad: [u8; 14],
 }
 
 // One cache line, so the family's scan touches one line per leg.
@@ -292,10 +261,8 @@ pub struct FamilyState {
     pub underlying: u8,
     /// [`FAMILY_OUT_15M`] or [`FAMILY_NATIVE_DAILY`].
     pub kind: u8,
-    /// [`ARM_MODEL`] or [`ARM_NULL`] for this instance.
-    pub arm: u8,
     /// Explicit padding — always zero.
-    pub _pad: [u8; 1],
+    pub _pad: [u8; 2],
     /// The Yes book.
     pub touch_yes: TouchState,
     /// The No book.
@@ -314,12 +281,8 @@ pub struct FamilyState {
     pub pos_no_1e6: i64,
     /// The one in-flight take.
     pub pend_take: PendingLeg,
-    /// The in-flight Arm B quotes, indexed by [`QUOTE_SIDES`].
-    pub pend_quote: [PendingLeg; QUOTE_SIDES],
     /// Notional booked against `cap_instance_usd_1e6` ×1e6.
     pub notional_instance_1e6: i64,
-    /// The `p̂` the resting quotes were built from ×1e6, per side.
-    pub last_quote_p_1e6: [i64; QUOTE_SIDES],
     /// BIN15 O6: the standardised distance the last reprice priced at
     /// ×1e6 (the pricer's `d`, already clamped).
     pub d_1e6: i64,
@@ -332,12 +295,6 @@ pub struct FamilyState {
     /// `price::pricing_horizon_ns` — the variance-time left in the
     /// settlement TWAP, not the time to expiry).
     pub last_tau_ns: u64,
-    /// BIN15 O9: `1` once this instance's COVERAGE ENTRY has been
-    /// emitted. Its own flag rather than a test on
-    /// `notional_instance_1e6`, because the MAKER arm books notional
-    /// too — a resting quote would otherwise read as "already
-    /// entered" and the coverage entry would never fire.
-    pub covered: u8,
     /// BIN15 S3 (ruling O-2): `∫ mark du` over `[T − W, twap_last_ts]`
     /// (mark ×1e6 · wall ns) — the part of the venue's settlement average
     /// already behind, integrated from the underlying's marks with the
@@ -358,51 +315,12 @@ pub struct FamilyState {
     /// it is not the venue's, so the family HOLDS for the rest of the
     /// window.
     pub twap_gap: u8,
-    /// BIN15 S5: the persistence run — consecutive distinct snapshots of
-    /// the preferred leg on which the coverage entry's price test held,
-    /// saturating (see `Bin15Params::entry_persist_polls`).
-    pub entry_hits: u8,
-    /// BIN15 S5: the side that run is on, `1` Yes / `0` No.
-    pub entry_yes: u8,
-    /// BIN15 S5: `1` once the elapsed ceiling closed this instance's entry
-    /// — counted once in `skipped_entry_elapsed`, then silent.
-    pub entry_closed: u8,
-    /// BIN15 S5: the counterfactual's side, `1` Yes / `0` No (valid while
-    /// `entry_first_ok_ts != 0`).
-    pub entry_first_ok_yes: u8,
-    /// BIN15 S5b: the CONTROL counterfactual's side (valid while
-    /// `entry_ctl_ok_ts != 0`).
-    pub entry_ctl_ok_yes: u8,
-    /// BIN15 S5: the preferred-leg snapshot (`TouchState::ts_ns`) the run
-    /// last counted — a reprice on the same snapshot (a mark) is not a new
-    /// poll.
-    pub entry_last_touch_ts: u64,
-    /// BIN15 S5 (ruling O-4): the COUNTERFACTUAL — when the entry's price
-    /// test FIRST held on this instance, engine ns (the venue wall in the
-    /// harness), whatever the persistence law and the ceiling then did.
-    /// That instant and [`Self::entry_first_ok_px_1e6`] are the pre-S5
-    /// law's entry attempt (persist 1, no ceiling) at the artifact's own
-    /// price test: logged, never traded — a cap, grid or ring refusal there
-    /// would have moved the old law's real entry later. `0` = never held.
-    pub entry_first_ok_ts: u64,
-    /// BIN15 S5b (ruling 2026-09-24): the CONTROL — the same record under
-    /// TODAY'S law (the artifact's floor, `Bin15Params::entry_control_e_1e6`
-    /// as the bound, persist 1, no ceiling), from the same reprice stream.
-    /// What doc 27 §5's "over today's law on the same instances" is scored
-    /// on once an artifact moves `e_entry_1e6`. `0` = never held.
-    pub entry_ctl_ok_ts: u64,
-    /// BIN15 S5: the preferred-side ask at the counterfactual's reprice
-    /// ×1e6 — `i32`, because an ask that passed the test is at most 1e6.
-    pub entry_first_ok_px_1e6: i32,
-    /// BIN15 S5b: the preferred-side ask at the control's reprice ×1e6.
-    pub entry_ctl_ok_px_1e6: i32,
 }
 
-// Eight cache lines: the three S3 fields took the eighth (see
-// `twap_sum`) and S5's ten sit in its tail (bytes 473..512, the two
-// counterfactual prices narrowed to `i32` to fit). A field added here
-// that crosses into a ninth is a decision, not an accident.
-const _: () = assert!(::core::mem::size_of::<FamilyState>() == 512);
+// Six cache lines since BIN15 H90 G3 retired the old arms' fields (the Arm B
+// quotes, the coverage entry's S5 run and counterfactuals). A field added
+// here that crosses into a seventh is a decision, not an accident.
+const _: () = assert!(::core::mem::size_of::<FamilyState>() == 384);
 
 impl Default for FamilyState {
     fn default() -> Self {
@@ -412,8 +330,7 @@ impl Default for FamilyState {
             sym_no: SYMBOL_ID_NONE,
             underlying: 0,
             kind: FAMILY_OUT_15M,
-            arm: ARM_MODEL,
-            _pad: [0; 1],
+            _pad: [0; 2],
             touch_yes: TouchState::default(),
             touch_no: TouchState::default(),
             p_hat_1e6: 0,
@@ -422,27 +339,14 @@ impl Default for FamilyState {
             pos_yes_1e6: 0,
             pos_no_1e6: 0,
             pend_take: PendingLeg::default(),
-            pend_quote: [PendingLeg::default(); QUOTE_SIDES],
             notional_instance_1e6: 0,
-            last_quote_p_1e6: [0; QUOTE_SIDES],
             d_1e6: 0,
             den_1e9: 0,
             mark_1e6: 0,
             last_tau_ns: 0,
-            covered: 0,
             twap_sum: 0,
             twap_last_ts: 0,
             twap_gap: 0,
-            entry_hits: 0,
-            entry_yes: 0,
-            entry_closed: 0,
-            entry_first_ok_yes: 0,
-            entry_ctl_ok_yes: 0,
-            entry_last_touch_ts: 0,
-            entry_first_ok_ts: 0,
-            entry_ctl_ok_ts: 0,
-            entry_first_ok_px_1e6: 0,
-            entry_ctl_ok_px_1e6: 0,
         }
     }
 }
@@ -470,9 +374,7 @@ impl FamilyState {
         self.pos_yes_1e6 = 0;
         self.pos_no_1e6 = 0;
         self.pend_take = PendingLeg::default();
-        self.pend_quote = [PendingLeg::default(); QUOTE_SIDES];
         self.notional_instance_1e6 = 0;
-        self.last_quote_p_1e6 = [0; QUOTE_SIDES];
         // BIN15 O6: the diagnostics describe the instance that is
         // going away, so they go with it — a stale `d` read against
         // the successor's strike is worse than no reading at all.
@@ -480,24 +382,10 @@ impl FamilyState {
         self.den_1e9 = 0;
         self.mark_1e6 = 0;
         self.last_tau_ns = 0;
-        // BIN15 O9: the successor is its own instance and gets its own
-        // coverage entry.
-        self.covered = 0;
         // BIN15 S3: and its own settlement average.
         self.twap_sum = 0;
         self.twap_last_ts = 0;
         self.twap_gap = 0;
-        // BIN15 S5: and its own persistence run, ceiling and counterfactuals.
-        self.entry_hits = 0;
-        self.entry_yes = 0;
-        self.entry_closed = 0;
-        self.entry_first_ok_yes = 0;
-        self.entry_ctl_ok_yes = 0;
-        self.entry_last_touch_ts = 0;
-        self.entry_first_ok_ts = 0;
-        self.entry_ctl_ok_ts = 0;
-        self.entry_first_ok_px_1e6 = 0;
-        self.entry_ctl_ok_px_1e6 = 0;
     }
 }
 
@@ -564,97 +452,27 @@ pub struct Bin15Params {
     pub underlying_sym: [SymbolId; BIN15_MAX_UNDERLYINGS],
     /// Configured underlyings.
     pub n_underlyings: usize,
-    /// Arm A edge ×1e6.
-    pub e_take_1e6: i64,
-    /// Arm B half-spread ×1e6.
-    pub h_quote_1e6: i64,
-    /// τ floor for a take, ns (per family kind) — judged on the TIME TO
-    /// EXPIRY (BIN15 S3), not the pricer's horizon.
-    pub tau_min_take_ns: [u64; 2],
-    /// τ floor for a quote, ns (per family kind) — the time to expiry.
-    pub tau_min_quote_ns: [u64; 2],
-    /// The last window before expiry in which NOTHING is taken, ns.
+    /// The last window before expiry in which the S-law pricer does not
+    /// price, ns (the late law's floor is `late.tau_min_ns`).
     pub tail_refuse_ns: u64,
-    /// Order TTL, ns — Arm A's deadline and Arm B's quote life.
+    /// Order TTL, ns — the late take's deadline (an unfilled take is
+    /// written off when it passes).
     pub requote_ttl_ns: u64,
-    /// Re-emit an Arm B quote when `|Δp̂|` reaches this ×1e6.
-    pub requote_thr_1e6: i64,
-    /// Per-order clip ×1e6 contracts.
-    pub clip_qty_1e6: i64,
     /// Notional cap per instance ×1e6.
     pub cap_instance_usd_1e6: i64,
     /// Notional cap per UTC day ×1e6.
     pub cap_day_usd_1e6: i64,
-    /// BIN15 O9: the COVERAGE-ENTRY notional ×1e6 USD. `0` = off.
-    ///
-    /// When positive, a 15 m family takes a position on EVERY instance
-    /// at this notional, on whichever side `p̂` prefers, WITHOUT
-    /// requiring the touch to offer `e_take` of edge. See
-    /// [`Bin15Strategy::arm_take`]'s coverage block for why.
-    pub entry_usd_1e6: i64,
-    /// BIN15 P3 (F6): the margin the coverage entry demands over its
-    /// own belief before it will pay an ask ×1e6.
-    ///
-    /// The entry fires only when `ask ≤ belief − e_entry`, i.e. when
-    /// `p > a` by this much. Distinct from `e_take_1e6`: that is the
-    /// opportunistic taker's edge hunt, this is the profitability bar
-    /// of an arm that trades EVERY instance, so it carries only model
-    /// error and the exit-leg fee.
-    pub e_entry_1e6: i64,
-    /// BIN15 R0 (2026-09-19): the lowest preferred-side ask the coverage
-    /// entry will pay ×1e6. `0` = no floor, the 2026-09-13 law bit for
-    /// bit.
-    ///
-    /// The entry buys the side `p̂` prefers, so an ask far BELOW the
-    /// belief is not a bargain: it is the venue disagreeing with the
-    /// model, and on the 2026-09-13→18 paper tape the venue won those
-    /// (entries at an ask under 0.50 hit 39 % against a 47.6 c price;
-    /// at 0.70 and over, 85 % against 79.6 c). The floor keeps the
-    /// entry where model and market agree on a favourite. Measured on
-    /// 428 settled submitted entries, t ≈ 1.5 at 0.70 — a research
-    /// setting, not a proven edge.
-    pub entry_min_px_1e6: i64,
-    /// BIN15 S5b (ruling 2026-09-24): the bound of the CONTROL
-    /// counterfactual ×1e6 — TODAY'S entry law, which a research artifact's
-    /// own `e_entry_1e6` no longer is. The cli sets it from `core-config`'s
-    /// stated default; it prices nothing and emits nothing, it only names
-    /// the law `FamilyState::entry_ctl_ok_*` records.
-    pub entry_control_e_1e6: i64,
     /// BIN15 P0 (F4): the oldest an underlying mark may be and still
     /// price a binary, ns.
     ///
     /// Hyperliquid prints a mark every 1-3 s. Past this age the mark is
     /// not a price, it is a memory: the binary's own book keeps tracking
     /// reality while `p_hat` is pinned to a number the tape has left
-    /// behind, and every arm then trades the difference between the
+    /// behind, and the ledger then records the difference between the
     /// venue and our own lag. The gate holds the re-price
     /// ([`Hold::MarkStale`]) rather than widening an edge, because
     /// ABSENT DATA HOLDS.
     pub mark_stale_ns: u64,
-    /// BIN15 S5: the coverage entry's ELAPSED CEILING, ns after the
-    /// instance's start (expiry − the tenor). A run of passing snapshots
-    /// (see `entry_persist_polls`) must BEGIN by then; past it only a run
-    /// already under way may still fire, and an instance with none is
-    /// closed for good. `0` = no ceiling, the pre-S5 law.
-    pub entry_elapsed_max_ns: u64,
-    /// `1` = Arm B on.
-    pub maker_enabled: u8,
-    /// `1` = alternate model / null arm by instance parity.
-    pub null_arm: u8,
-    /// BIN15 S5: the coverage entry's PERSISTENCE — it fires only once its
-    /// price test (floor and bound) has held on this many consecutive
-    /// distinct book snapshots of the preferred leg, on the same side.
-    /// `1` = the first passing snapshot fires, the pre-S5 law bit for bit.
-    ///
-    /// A snapshot is one write of the leg's touch (`TouchState::ts_ns`):
-    /// the outcome legs' only two-sided touch is the venue's `l2Book` push,
-    /// ~5.3 s apart (BIN15 O8), so `n` polls is the price test surviving
-    /// `n − 1` of them. Should the venue start publishing a two-sided
-    /// `bbo`, snapshots arrive on every BBO change and this count means
-    /// something shorter.
-    pub entry_persist_polls: u8,
-    /// Explicit padding — always zero.
-    pub _pad: [u8; 5],
     /// `ln σ̂` offset per UTC hour ×1e9; all zero = no hour table.
     pub hour_ln_off_1e9: [i64; 24],
     /// Variance-ratio scale on σ̂ ×1e9; `1e9` = no scaling.
@@ -674,29 +492,14 @@ impl Default for Bin15Params {
             n_families: 0,
             underlying_sym: [SYMBOL_ID_NONE; BIN15_MAX_UNDERLYINGS],
             n_underlyings: 0,
-            e_take_1e6: 30_000,
-            h_quote_1e6: 25_000,
-            tau_min_take_ns: [60_000_000_000, 3_600_000_000_000],
-            tau_min_quote_ns: [120_000_000_000, 3_600_000_000_000],
             tail_refuse_ns: 10_000_000_000,
             requote_ttl_ns: 1_000_000_000,
-            requote_thr_1e6: 5_000,
-            clip_qty_1e6: 500_000_000,
             cap_instance_usd_1e6: 1_000_000_000,
             cap_day_usd_1e6: 5_000_000_000,
-            entry_usd_1e6: 0,
-            e_entry_1e6: 20_000,
-            entry_min_px_1e6: 0,
-            entry_control_e_1e6: 20_000,
             // 5 s = ~2-5 missed HL mark prints. Long enough that an
             // ordinary jitter does not hold the member, short enough
             // that a dead feed cannot price a 15-minute binary.
             mark_stale_ns: 5_000_000_000,
-            entry_elapsed_max_ns: 0,
-            maker_enabled: 1,
-            null_arm: 1,
-            entry_persist_polls: 1,
-            _pad: [0; 5],
             hour_ln_off_1e9: [0; 24],
             scale_1e9: 1_000_000_000,
             late: late::LateParams::default(),
@@ -782,9 +585,6 @@ pub struct Bin15Strategy {
     /// The regime label set the set stamps; carried, never consulted
     /// (the HORIZON law).
     regime_label: core_types::RegimeLabelSet,
-    /// XH4i-6 (Q1): what a gateway arm's late refusal restores (its own
-    /// cache lines).
-    undo: QuoteUndo,
     /// BIN15 H90: per-family late-entry state.
     late_fam: [LateState; BIN15_MAX_FAMILIES],
     /// BIN15 H90: per-underlying 1-s grids (≈ 9.4 KiB each), boxed at boot.
@@ -795,23 +595,6 @@ pub struct Bin15Strategy {
     late_lut_set: u8,
 }
 
-/// XH4i-6 (Q1) — what a gateway arm's late refusal restores. A gateway arm
-/// answers `Ok` when it has QUEUED a verb; its refusal comes later, as a
-/// `REJECTED` event. Its own 19 cache lines (the allocation review: an
-/// accepted reprice writes a leg here, and a leg never straddles two lines).
-#[repr(C, align(64))]
-struct QuoteUndo {
-    /// Each quote side's leg as it stood before its last reprice.
-    legs: [[PendingLeg; QUOTE_SIDES]; BIN15_MAX_FAMILIES],
-    /// That leg's centre.
-    centre_1e6: [[i64; QUOTE_SIDES]; BIN15_MAX_FAMILIES],
-    /// Each family's coverage entry in flight (its IoC's client id; 0:
-    /// none) — a late refusal of it lets the entry retry.
-    cover_oid: [u64; BIN15_MAX_FAMILIES],
-}
-
-const _: () = assert!(core::mem::size_of::<QuoteUndo>() == 1_216);
-const _: () = assert!(core::mem::offset_of!(Bin15Strategy, undo) % 64 == 0);
 
 impl Default for Bin15Strategy {
     fn default() -> Self {
@@ -839,11 +622,6 @@ impl Bin15Strategy {
             orders_dropped: 0,
             configured: 0,
             regime_label: core_types::RegimeLabelSet::default(),
-            undo: QuoteUndo {
-                legs: [[PendingLeg::default(); QUOTE_SIDES]; BIN15_MAX_FAMILIES],
-                centre_1e6: [[0; QUOTE_SIDES]; BIN15_MAX_FAMILIES],
-                cover_oid: [0; BIN15_MAX_FAMILIES],
-            },
             late_fam: [LateState::default(); BIN15_MAX_FAMILIES],
             late_grid: Box::new(core::array::from_fn(|_| late::LateGrid::new())),
             late_lut: Box::new(late::LateLut::flat()),
@@ -873,58 +651,12 @@ impl Bin15Strategy {
         if params.scale_1e9 <= 0 {
             return Err(StrategyError::Config("bin15: scale_1e9 must be positive"));
         }
-        if params.clip_qty_1e6 <= 0
-            || params.cap_instance_usd_1e6 <= 0
-            || params.cap_day_usd_1e6 <= 0
-        {
-            return Err(StrategyError::Config("bin15: a cap or clip is not positive"));
-        }
-        if params.entry_usd_1e6 < 0 {
-            return Err(StrategyError::Config("bin15: entry_usd_1e6 is negative"));
-        }
-        if params.entry_usd_1e6 > params.cap_instance_usd_1e6 {
-            return Err(StrategyError::Config(
-                "bin15: entry_usd_1e6 over the per-instance cap — every entry would be clipped",
-            ));
-        }
-        if params.e_take_1e6 < GRID_TICK_1E6 {
-            return Err(StrategyError::Config("bin15: e_take under one tick"));
-        }
-        // BIN15 S5b: the entry's own bound, held here as core-config holds
-        // it — a passing ask is then under 1e6, which the counterfactual
-        // prices' `i32` relies on.
-        if params.e_entry_1e6 < GRID_TICK_1E6 || params.e_entry_1e6 >= ONE_1E6 / 2 {
-            return Err(StrategyError::Config(
-                "bin15: e_entry_1e6 outside [one tick, 0.5) — core-config's own bounds",
-            ));
-        }
-        if params.entry_min_px_1e6 < 0 || params.entry_min_px_1e6 >= ONE_1E6 {
-            return Err(StrategyError::Config(
-                "bin15: entry_min_px_1e6 outside [0, 1e6) — a floor of 1.0 or more refuses every ask",
-            ));
-        }
-        if params.entry_control_e_1e6 < GRID_TICK_1E6
-            || params.entry_control_e_1e6 >= ONE_1E6 / 2
-        {
-            return Err(StrategyError::Config(
-                "bin15: entry_control_e_1e6 outside [one tick, 0.5) — no law to control against",
-            ));
-        }
-        if params.entry_persist_polls == 0 {
-            return Err(StrategyError::Config(
-                "bin15: entry_persist_polls is zero — a law needing no passing snapshot",
-            ));
-        }
-        if params.entry_elapsed_max_ns >= TAU_15M_NS {
-            return Err(StrategyError::Config(
-                "bin15: entry_elapsed_max_ns not under the 15 m tenor — it could never close",
-            ));
+        if params.cap_instance_usd_1e6 <= 0 || params.cap_day_usd_1e6 <= 0 {
+            return Err(StrategyError::Config("bin15: a cap is not positive"));
         }
         if params.requote_ttl_ns == 0 {
             return Err(StrategyError::Config("bin15: requote_ttl_ns is zero"));
         }
-        // BIN15 H90: core-config's own bounds, held here too — the member is
-        // configured by more than one caller.
         let lp = params.late;
         if lp.enabled > 1
             || lp.persist_polls == 0
@@ -963,12 +695,6 @@ impl Bin15Strategy {
             }
             if params.family_kind[f] > FAMILY_NATIVE_DAILY {
                 return Err(StrategyError::Config("bin15: unknown family kind"));
-            }
-            let k = params.family_kind[f] as usize;
-            if params.tau_min_take_ns[k] >= tau_of_kind(params.family_kind[f])
-                || params.tau_min_quote_ns[k] >= tau_of_kind(params.family_kind[f])
-            {
-                return Err(StrategyError::Config("bin15: tau_min not under the tenor"));
             }
             f += 1;
         }
@@ -1191,27 +917,12 @@ const fn tau_minutes_of_kind(kind: u8) -> i128 {
 // ---------------------------------------------------------------
 
 impl Bin15Strategy {
-    /// BIN15 P2 (F2): release the DAY room of every pending an
-    /// instance takes with it when it goes.
-    ///
-    /// `clear_instance` zeroes `notional_instance_1e6` — the instance
-    /// cap follows the instance — but the DAY cap outlives the roll,
-    /// and a leg discarded at a roll would leave its reservation
-    /// standing for the rest of the UTC day. Ninety-six rolls a day is
-    /// ninety-six chances to leak, which is exactly the odometer this
-    /// phase removed by the front door.
+    /// A roll or a settle drops the in-flight take: credit the cap room its
+    /// unfilled part had reserved.
     fn release_pendings(&mut self, idx: usize) {
         let take = self.fam[idx].pend_take;
         if take.live() {
             self.credit_unfilled(idx, &take);
-        }
-        let mut s = 0usize;
-        while s < QUOTE_SIDES {
-            let q = self.fam[idx].pend_quote[s];
-            if q.live() {
-                self.credit_unfilled(idx, &q);
-            }
-            s += 1;
         }
     }
 
@@ -1224,14 +935,6 @@ impl Bin15Strategy {
         // BIN15 H90: the successor gets its own late entry.
         self.late_fam[idx] = LateState::default();
         self.fam[idx].live = spec;
-        // The null arm alternates by instance parity, so a session's
-        // model and null samples are interleaved in time rather than
-        // split into two epochs the market itself could differ across.
-        self.fam[idx].arm = if self.params.null_arm == 1 {
-            (spec.outcome & 1) as u8
-        } else {
-            ARM_MODEL
-        };
         // Arm the forecast hold for THIS instance's horizon. 15 m only:
         // a daily family's 8 h engine is armed by its own 8 h grid, not
         // by a 24 h instance boundary, and arming it here would hand
@@ -1531,7 +1234,7 @@ impl Bin15Strategy {
 }
 
 // ---------------------------------------------------------------
-// the re-price and the two arms
+// the re-price and the late law
 // ---------------------------------------------------------------
 
 /// Why a re-price produced nothing.
@@ -1552,14 +1255,15 @@ enum Hold {
 }
 
 impl Bin15Strategy {
-    /// Re-price one family, then let the arms act on the result.
+    /// Re-price one family (the S-law counterfactual), then run the late
+    /// law.
     ///
     /// Called on every `Mark` of the family's underlying and on every
     /// touch change of either leg — the two things that can move the
     /// decision. Never on a timer: a re-price with no new evidence is
     /// the same number.
     fn reprice<C: Ctx>(&mut self, ctx: &mut C, idx: usize, now: NsTs) {
-        let res = self.try_reprice(ctx, idx, now);
+        let res = self.try_reprice(idx, now);
         // BIN15 H90: the late law has its own window and its own holds; it
         // runs whatever the S-law pricer did, after it, so a fresh p̂ (the
         // production counterfactual) is this reprice's.
@@ -1583,7 +1287,7 @@ impl Bin15Strategy {
     }
 
     /// The pricer proper. `Err` names the gate that held.
-    fn try_reprice<C: Ctx>(&mut self, ctx: &mut C, idx: usize, now: NsTs) -> Result<(), Hold> {
+    fn try_reprice(&mut self, idx: usize, now: NsTs) -> Result<(), Hold> {
         debug_assert!(idx < self.params.n_families);
         if !self.fam[idx].is_live() {
             return Err(Hold::Dormant);
@@ -1659,14 +1363,6 @@ impl Bin15Strategy {
         self.fam[idx].mark_1e6 = mark;
         self.fam[idx].last_tau_ns = fair.horizon_ns;
         self.counters.reprices = self.counters.reprices.wrapping_add(1);
-        // The arms' τ floors are judged on the TIME TO EXPIRY (BIN15 S3):
-        // "no take in the last `tau_min_take_ns`" is a clock statement,
-        // and the pricer's horizon is a variance-time that moves with the
-        // settlement law.
-        self.arm_take(ctx, idx, to_expiry, now);
-        if self.params.maker_enabled == 1 {
-            self.arm_quote(ctx, idx, to_expiry, now);
-        }
         Ok(())
     }
 
@@ -1679,8 +1375,7 @@ impl Bin15Strategy {
     /// belief clears `p_min` and the ask sits `e` under it on
     /// `persist_polls` consecutive snapshots of that leg (the S5 poll),
     /// sized at the whole resting ask up to `usd` and the caps. Not held
-    /// by `tail_refuse_ns` or `tau_min_take_ns`: the window floor is its
-    /// own. Everything else binds: one pending take, the grid, the caps.
+    /// by `tail_refuse_ns`: the window floor is its own. Everything else binds: one pending take, the grid, the caps.
     fn late_reprice<C: Ctx>(&mut self, ctx: &mut C, idx: usize, now: NsTs) {
         let lp = self.params.late;
         if self.fam[idx].kind != FAMILY_OUT_15M || !self.fam[idx].is_live() {
@@ -1793,7 +1488,7 @@ impl Bin15Strategy {
             return;
         }
         let before = self.counters.takes_submitted;
-        self.emit_take(ctx, idx, want_yes, Side::Bid, px, qty, now, false);
+        self.emit_take(ctx, idx, want_yes, px, qty, now);
         if self.counters.takes_submitted != before {
             let oid = self.fam[idx].pend_take.oid;
             let st = &mut self.late_fam[idx];
@@ -1809,28 +1504,11 @@ impl Bin15Strategy {
     /// Room left under both notional caps ×1e6, at `px_1e6` per
     /// contract. `0` = no room.
     fn cap_room_1e6(&self, idx: usize, px_1e6: i64) -> i64 {
-        self.cap_room_excluding_1e6(idx, px_1e6, 0)
-    }
-
-    /// The same room, with `exclude_1e6` of already-booked notional
-    /// treated as free.
-    ///
-    /// **E5.** A MODIFY replaces a resting quote whose reservation is
-    /// still standing, so sizing the replacement against the caps as
-    /// they are would refuse room the quote itself is holding — a
-    /// reprice would shrink every time until it hit zero. The
-    /// exclusion is only ever the leg being replaced, and the
-    /// booking is corrected (credit the old, book the new) after the
-    /// venue takes the modify, never before: crediting first and then
-    /// being refused would free room for an order that is still
-    /// resting.
-    fn cap_room_excluding_1e6(&self, idx: usize, px_1e6: i64, exclude_1e6: i64) -> i64 {
         if px_1e6 <= 0 {
             return 0;
         }
-        let inst = self.params.cap_instance_usd_1e6
-            - (self.fam[idx].notional_instance_1e6 - exclude_1e6).max(0);
-        let day = self.params.cap_day_usd_1e6 - (self.day_notional_1e6 - exclude_1e6).max(0);
+        let inst = self.params.cap_instance_usd_1e6 - self.fam[idx].notional_instance_1e6.max(0);
+        let day = self.params.cap_day_usd_1e6 - self.day_notional_1e6.max(0);
         let usd = inst.min(day);
         if usd <= 0 {
             return 0;
@@ -1842,51 +1520,8 @@ impl Bin15Strategy {
         qty - qty.rem_euclid(GRID_LOT_1E6)
     }
 
-    /// Yes contracts ×1e6 a resting ASK may offer.
-    ///
-    /// The short rule. BIN15 P4b (F3): the mirror of the closing
-    /// take's reservation — an in-flight closing SELL has already
-    /// committed part of the holding, so the resting ask may only
-    /// offer what is left. A HIP-4 position cannot go negative and
-    /// the venue refuses the sell outright, so an ask larger than
-    /// this is an order that cannot execute live while the paper
-    /// matcher fills it happily.
-    fn ask_free_1e6(&self, idx: usize) -> i64 {
-        let in_flight = if self.fam[idx].pend_take.live()
-            && self.fam[idx].pend_take.is_yes == 1
-            && self.fam[idx].pend_take.side == Side::Ask as u8
-        {
-            (self.fam[idx].pend_take.qty_1e6 - self.fam[idx].pend_take.filled_1e6).max(0)
-        } else {
-            0
-        };
-        (self.fam[idx].pos_yes_1e6 - in_flight).max(0)
-    }
-
-    /// **E5: is the resting ASK offering more than we can prove we
-    /// hold?**
-    ///
-    /// A closing take commits part of the holding the moment it is
-    /// sent, so an ask that was correctly sized when it was placed
-    /// becomes oversized without the fair value moving at all.
-    /// Before E5 it rested that way until its TTL — a window in which
-    /// the live venue refuses any fill past the free amount while the
-    /// paper matcher takes it, which is one of the few places the
-    /// model is OPTIMISTIC against live. A MODIFY down to the free
-    /// amount closes it.
-    ///
-    /// Bid side: always false. A bid is bounded by the caps, and the
-    /// caps only move when the member itself books something.
-    fn ask_is_oversized(&self, idx: usize, side_idx: usize) -> bool {
-        if side_idx == 0 {
-            return false;
-        }
-        let leg = self.fam[idx].pend_quote[side_idx];
-        leg.live() && leg.qty_1e6.saturating_sub(leg.filled_1e6) > self.ask_free_1e6(idx)
-    }
-
     /// Whether a price and size are on the venue's grid. The harness
-    /// refuses off-grid orders outright (O3), so an arm that emitted
+    /// refuses off-grid orders outright (O3), so a take that emitted
     /// one would be counted as a submit and never fill — a silent
     /// hole in the member's own accounting. Public for one reader: the
     /// cli holds it in agreement with the gateway arm's `OutcomeRules`
@@ -1894,436 +1529,20 @@ impl Bin15Strategy {
     #[inline]
     #[must_use]
     pub fn on_grid(px_1e6: i64, qty_1e6: i64) -> bool {
-        px_1e6 % GRID_TICK_1E6 == 0
+        (px_1e6 < PX_SIX_DIGITS_1E6 || px_1e6 % 10 == 0)
             && qty_1e6 % GRID_LOT_1E6 == 0
             && (GRID_PX_MIN_1E6..=GRID_PX_MAX_1E6).contains(&px_1e6)
             && (px_1e6 as i128 * qty_1e6 as i128) / 1_000_000 >= GRID_MIN_NOTIONAL_1E6
     }
 
-    /// BIN15 S5 — the coverage entry's GATE: whether this reprice may
-    /// emit, given the price test `ok` (floor and bound) read off the
-    /// preferred leg's snapshot `snap_ts`, and `ok_ctl`, the same test under
-    /// today's law (the control's bound). A refusal is counted on its own
-    /// reason and burns nothing — `covered` stays down and the next reprice
-    /// asks again — except past the elapsed ceiling, which closes the
-    /// instance for good.
-    ///
-    /// 1. **The counterfactuals** (ruling O-4, S5b): the first reprice whose
-    ///    test holds is recorded — the pre-S5 law's entry attempt at the
-    ///    artifact's own test — and so is the first whose CONTROL test
-    ///    holds (today's law), whatever the steps below then do. Logged,
-    ///    never traded.
-    /// 2. **The polls.** Under the pre-S5 law (`entry_persist_polls = 1`)
-    ///    every reprice is judged, so a mark may start a run on a snapshot
-    ///    that failed at its arrival and the gate is that law exactly.
-    ///    Above 1 a POLL is only the reprice the preferred leg's own new
-    ///    snapshot triggered (`now == snap_ts`: its `l2Book` arrival) — doc
-    ///    27 R2's poll instant, exactly. A poll extends the run on its side,
-    ///    starts one on the other, or breaks it when the test fails;
-    ///    reprices between polls (marks, the other leg's ticks) never change
-    ///    the run, and may fire only a run already long enough (a retry
-    ///    after a refused emit) while the test holds on its side. A snapshot
-    ///    whose arrival never reaches this gate (a stale or one-sided book,
-    ///    a take in flight) is not a poll at all.
-    /// 3. **The elapsed ceiling**, judged before the run moves: a run must
-    ///    BEGIN within `entry_elapsed_max_ns` of the instance's start (doc 27
-    ///    R2: "the first of them"). Past it a run under way continues; a poll
-    ///    that would begin or break a run closes the instance, and so does
-    ///    any reprice when no run is under way — counted ONCE in
-    ///    `skipped_entry_elapsed`, silent after.
-    /// 4. **The refusals**: the test (`skipped_entry_price` — not an attempt
-    ///    and not a spray; the calibration observation is written by the
-    ///    ledger regardless, P3.3, so refusing to pay costs the gate
-    ///    nothing), then the run's length (`skipped_entry_persist`).
-    ///
-    /// Branch-light: the run update is a few selects and a multiply.
-    #[inline(always)]
-    fn entry_gate(
-        &mut self,
-        idx: usize,
-        ok: bool,
-        ok_ctl: bool,
-        want_yes: bool,
-        px: i64,
-        snap_ts: u64,
-        to_expiry_ns: u64,
-        now: NsTs,
-    ) -> bool {
-        let yes = u8::from(want_yes);
-        let pass = u8::from(ok);
-        // An ask that passed either test is at most 1e6, so it fits.
-        debug_assert!(!(ok || ok_ctl) || (0..=ONE_1E6).contains(&px));
-        let fam = &mut self.fam[idx];
-        if ok && fam.entry_first_ok_ts == 0 {
-            fam.entry_first_ok_ts = now;
-            fam.entry_first_ok_px_1e6 = px as i32;
-            fam.entry_first_ok_yes = yes;
-        }
-        if ok_ctl && fam.entry_ctl_ok_ts == 0 {
-            fam.entry_ctl_ok_ts = now;
-            fam.entry_ctl_ok_px_1e6 = px as i32;
-            fam.entry_ctl_ok_yes = yes;
-        }
-        if fam.entry_closed != 0 {
-            return false;
-        }
-        let persist = self.params.entry_persist_polls;
-        let same_side = yes == fam.entry_yes;
-        let fresh = snap_ts != fam.entry_last_touch_ts || !same_side;
-        let run = if same_side { fam.entry_hits } else { 0 };
-        let poll = persist == 1 || (fresh && now == snap_ts);
-        let next = if !poll {
-            run
-        } else if fresh {
-            run.saturating_add(1) * pass
-        } else {
-            run.max(pass)
-        };
-        let max = self.params.entry_elapsed_max_ns;
-        let close = if poll { run == 0 || next == 0 } else { fam.entry_hits == 0 };
-        if max > 0 && close && TAU_15M_NS.saturating_sub(to_expiry_ns) > max {
-            fam.entry_closed = 1;
-            self.counters.skipped_entry_elapsed =
-                self.counters.skipped_entry_elapsed.wrapping_add(1);
-            return false;
-        }
-        if poll {
-            fam.entry_hits = next;
-            fam.entry_yes = yes;
-            fam.entry_last_touch_ts = snap_ts;
-        }
-        if !ok {
-            self.counters.skipped_entry_price = self.counters.skipped_entry_price.wrapping_add(1);
-            return false;
-        }
-        if next < persist {
-            self.counters.skipped_entry_persist =
-                self.counters.skipped_entry_persist.wrapping_add(1);
-            return false;
-        }
-        true
-    }
-
-    /// Arm A — the taker.
-    ///
-    /// Three shapes, and only three. BUY Yes when the Yes ask is below
-    /// fair by the edge; BUY No when the No ask is below `1 − p̂` by the
-    /// edge (never "sell Yes": a HIP-4 position cannot go short, and
-    /// the No side is the vehicle); and CLOSE inventory when the bid on
-    /// a side we hold is RICH by the edge. The close is the only sell
-    /// this member ever emits.
-    fn arm_take<C: Ctx>(&mut self, ctx: &mut C, idx: usize, to_expiry_ns: u64, now: NsTs) {
-        let kind = self.fam[idx].kind as usize;
-        if to_expiry_ns < self.params.tau_min_take_ns[kind] {
-            self.counters.skipped_tau = self.counters.skipped_tau.wrapping_add(1);
-            return;
-        }
-        // One pending take per family: a second would double the size
-        // the caps just approved.
-        if self.fam[idx].pend_take.live() {
-            return;
-        }
-        let p_hat = self.fam[idx].p_hat_1e6;
-        let e = self.params.e_take_1e6;
-        let yes = self.fam[idx].touch_yes;
-        let no = self.fam[idx].touch_no;
-        if !yes.actionable() || !no.actionable() {
-            self.counters.skipped_book = self.counters.skipped_book.wrapping_add(1);
-            return;
-        }
-        // A closing take first: reducing risk outranks adding it.
-        //
-        // BIN15 P4b (F3): the size is the position MINUS whatever a
-        // resting ask has already offered. Arm B's ask and this closing
-        // take are two sells of the same inventory, and each used to
-        // size against the full holding — so 500 contracts held could
-        // be offered as 500 resting plus 500 crossing, and if both
-        // filled the member had sold 1 000 of something the venue does
-        // not let it be short of. The venue would reject the second;
-        // the paper model filled it and booked a fabricated trade.
-        let reserved_yes = self.fam[idx].pend_quote[1].qty_1e6
-            - self.fam[idx].pend_quote[1].filled_1e6;
-        let free_yes = (self.fam[idx].pos_yes_1e6 - reserved_yes.max(0)).max(0);
-        if free_yes > 0 && yes.touch.bid_1e6 >= p_hat.saturating_add(e) {
-            let qty = free_yes.min(yes.touch.bid_qty_1e6);
-            self.emit_take(ctx, idx, true, Side::Ask, yes.touch.bid_1e6, qty, now, true);
-            return;
-        }
-        // The No leg carries no Arm B quote (the maker quotes Yes
-        // only), so its whole holding is free.
-        if self.fam[idx].pos_no_1e6 > 0
-            && no.touch.bid_1e6 >= (ONE_1E6 - p_hat).saturating_add(e)
-        {
-            let qty = self.fam[idx].pos_no_1e6.min(no.touch.bid_qty_1e6);
-            self.emit_take(ctx, idx, false, Side::Ask, no.touch.bid_1e6, qty, now, true);
-            return;
-        }
-        // BIN15 O9 — the COVERAGE ENTRY (operator ruling 2026-09-13).
-        //
-        // A 15 m family takes a position on EVERY instance, at a fixed
-        // `entry_usd_1e6` notional, on whichever side `p̂` prefers, and
-        // WITHOUT requiring the touch to offer `e_take` of edge. The
-        // point is evidence, not edge: of the 33 instances in the
-        // 2026-09-12 capture, 22 drew no order at all, so two thirds of
-        // the calibration ledger was never written and the G6.1 gate
-        // (200 settled instances per phase) could not accrue. P&L under
-        // this rule is a CALIBRATION DIAGNOSTIC, not a strategy result.
-        //
-        // `covered == 0` is the once-per-instance test: `clear_instance`
-        // zeroes it at every roll, so the entry fires on the first
-        // reprice of each instance that passes the price test and the
-        // S5 gate (`entry_gate`: persistence, elapsed ceiling) and never
-        // again. The caps still bind — an entry that cannot fit under
-        // them is counted `skipped_cap` like any other.
-        if self.params.entry_usd_1e6 > 0
-            && self.fam[idx].kind == FAMILY_OUT_15M
-            && self.fam[idx].covered == 0
-        {
-            let want_yes = p_hat >= ONE_1E6 / 2;
-            let touch = if want_yes { yes } else { no };
-            let px = touch.touch.ask_1e6;
-            // BIN15 P3 (F6) — THE PRICE BOUND. The entry is a POSITION,
-            // not an observation, and a position has an arithmetic bar:
-            // buying the preferred side at ask `a` wins `1 − a` with
-            // probability `p` and loses `a` otherwise, so its EV per
-            // dollar of premium is `p/a − 1` and it is profitable iff
-            // `p > a`. "Right most of the time" is NOT the bar — at a
-            // typical favourite ask of 0.60, a 55 % hit rate loses.
-            //
-            // `e_entry_1e6` is the margin over that bar: model error
-            // plus the exit-leg fee. It is DISTINCT from `e_take_1e6`,
-            // which is the opportunistic taker's edge and much wider —
-            // this arm exists to be filled on every instance, so its
-            // bar is the profitability bar and not an edge hunt.
-            //
-            // The belief is `p̂` on the side we are buying: `p̂` for Yes,
-            // `1 − p̂` for No.
-            let belief = if want_yes { p_hat } else { ONE_1E6 - p_hat };
-            // BIN15 R0 (2026-09-19) — THE PRICE FLOOR, beside the bound:
-            // one price test. An ask under the floor is refused on the
-            // same counter and with the same non-burn as a bound miss.
-            // `0` is no floor, which is the old law.
-            let ok = px >= self.params.entry_min_px_1e6
-                && px <= belief.saturating_sub(self.params.e_entry_1e6);
-            // BIN15 S5b: the same test under today's law — the control the
-            // counterfactual records; it gates nothing.
-            let ok_ctl = px >= self.params.entry_min_px_1e6
-                && px <= belief.saturating_sub(self.params.entry_control_e_1e6);
-            if !self.entry_gate(idx, ok, ok_ctl, want_yes, px, touch.ts_ns, to_expiry_ns, now) {
-                return;
-            }
-            // Contracts ×1e6 the entry notional buys at that ask, then
-            // bounded by the resting size and by the caps' own room.
-            let want = (self.params.entry_usd_1e6 as i128 * 1_000_000) / px as i128;
-            let want = i64::try_from(want).unwrap_or(i64::MAX);
-            let qty = want
-                .min(touch.touch.ask_qty_1e6)
-                .min(self.cap_room_1e6(idx, px));
-            // BIN15 P3 (F6) — RETRY ON REFUSAL. `covered` is set only
-            // after a SUBMITTED emit. The old law marked the attempt
-            // before emitting, so a cap, grid or ring refusal burned
-            // the instance's only entry and the lane silently lost it —
-            // which is the same censoring F2 found in the caps, one
-            // layer up. Anti-spray survives because the flag is set on
-            // success and the caps still bind; a price-bound miss above
-            // emits nothing at all.
-            let before = self.counters.takes_submitted;
-            self.emit_take(ctx, idx, want_yes, Side::Bid, px, qty, now, false);
-            if self.counters.takes_submitted != before {
-                self.fam[idx].covered = 1;
-                // XH4i-6 (Q1): which take is the coverage entry — a late
-                // venue refusal of it (a gateway's `REJECTED`) lets it retry.
-                self.undo.cover_oid[idx] = self.fam[idx].pend_take.oid;
-            }
-            return;
-        }
-        // Then the opening takes.
-        if yes.touch.ask_1e6.saturating_add(e) <= p_hat {
-            let room = self.cap_room_1e6(idx, yes.touch.ask_1e6);
-            let qty = yes.touch.ask_qty_1e6.min(self.params.clip_qty_1e6).min(room);
-            self.emit_take(ctx, idx, true, Side::Bid, yes.touch.ask_1e6, qty, now, false);
-            return;
-        }
-        if no.touch.ask_1e6.saturating_add(e) <= ONE_1E6 - p_hat {
-            let room = self.cap_room_1e6(idx, no.touch.ask_1e6);
-            let qty = no.touch.ask_qty_1e6.min(self.params.clip_qty_1e6).min(room);
-            self.emit_take(ctx, idx, false, Side::Bid, no.touch.ask_1e6, qty, now, false);
-        }
-    }
-
-    /// Arm B — the paper maker.
-    ///
-    /// The BID side is the primary quote. The ASK side quotes only up
-    /// to the inventory we can prove we hold, because an ask with no
-    /// inventory is a short the venue refuses and the paper model would
-    /// happily fill. That asymmetry is why Arm B's paper P&L is a LOWER
-    /// BOUND of a real two-sided maker's, and it is stated in the
-    /// module header for the same reason.
-    fn arm_quote<C: Ctx>(&mut self, ctx: &mut C, idx: usize, to_expiry_ns: u64, now: NsTs) {
-        let kind = self.fam[idx].kind as usize;
-        if to_expiry_ns < self.params.tau_min_quote_ns[kind] {
-            self.counters.skipped_tau = self.counters.skipped_tau.wrapping_add(1);
-            return;
-        }
-        let yes = self.fam[idx].touch_yes;
-        if !yes.actionable() {
-            self.counters.skipped_book = self.counters.skipped_book.wrapping_add(1);
-            return;
-        }
-        // The null arm quotes around the venue's OWN mid: if the venue
-        // mid earns the same as the model, the model is not the edge.
-        let centre = if self.fam[idx].arm == ARM_NULL {
-            (yes.touch.bid_1e6 + yes.touch.ask_1e6) >> 1
-        } else {
-            // Skew against inventory: one clip of Yes moves the quote
-            // by one half-spread, so a filled maker stops re-offering
-            // at the price that filled it.
-            let inv = self.fam[idx].pos_yes_1e6;
-            let skew = if self.params.clip_qty_1e6 == 0 {
-                0
-            } else {
-                (inv as i128 * self.params.h_quote_1e6 as i128
-                    / self.params.clip_qty_1e6 as i128) as i64
-            };
-            self.fam[idx].p_hat_1e6 - skew
-        };
-        let h = self.params.h_quote_1e6;
-        let mut side_idx = 0usize;
-        while side_idx < QUOTE_SIDES {
-            let is_bid = side_idx == 0;
-            // **E5 (LAW E-8), the member's half.** The venue has no
-            // server-side TTL on a Gtc/Alo order, so a quote nobody
-            // cancels rests forever. Before E5 this member simply
-            // forgot a lapsed leg — correct against a paper matcher
-            // that runs its own TTL law, and a stranded quote live.
-            // The 1 s timer sweep is the backstop; this is the pass
-            // that usually gets there first, because it runs on every
-            // mark and every touch.
-            if self.fam[idx].pend_quote[side_idx].live()
-                && now >= self.fam[idx].pend_quote[side_idx].deadline_ns
-            {
-                self.cancel_quote(ctx, idx, side_idx, now);
-            }
-            // ONE gate now, where there used to be two.
-            //
-            // The first used to be forced: with no cancel path a live
-            // quote could only be replaced by letting it expire, so
-            // `requote_ttl_ns` was the replace cadence rather than a
-            // nicety. **LAW E-7 lifts it** — a live quote moves with a
-            // MODIFY, one request, no round trip through nothing.
-            //
-            // The gate that remains is the one that stops a re-quote
-            // loop. A quote that reached its TTL unfilled has just
-            // told us that price does not fill in this book;
-            // re-offering the SAME price a second later adds no
-            // information and would emit once per TTL forever. So we
-            // quote — or move — only when the fair value has actually
-            // travelled `requote_thr_1e6` (or when we have never
-            // quoted this side, where `last_quote_p` is 0 and the test
-            // passes).
-            let last = self.fam[idx].last_quote_p_1e6[side_idx];
-            let moved = last == 0 || (centre - last).abs() >= self.params.requote_thr_1e6;
-            let live = self.fam[idx].pend_quote[side_idx].live();
-            if live && !moved && !self.ask_is_oversized(idx, side_idx) {
-                side_idx += 1;
-                continue;
-            }
-            if !live && !moved {
-                side_idx += 1;
-                continue;
-            }
-            // **An oversized ask is never left resting.** Now that
-            // the member has a cancel verb, an ask offering inventory
-            // we cannot prove we hold must not survive to its TTL:
-            // the live venue refuses any fill past the free amount
-            // while the paper matcher takes it, which is the one
-            // direction of modelling error that matters. Where the
-            // replacement cannot be emitted — nothing free to offer,
-            // a size under the venue's lot or minimum notional, or a
-            // partial fill that makes a safe resize impossible — the
-            // quote is PULLED instead.
-            let oversized = live && self.ask_is_oversized(idx, side_idx);
-            // **A partially-filled quote is otherwise left alone.** A
-            // modify replaces the venue's remaining size wholesale, so
-            // moving one means the member's `filled_1e6`/`qty_1e6`
-            // pair and the venue's remainder have to agree across a
-            // race. That is where double-count bugs live, and a quote
-            // that is already working does not need the help — its TTL
-            // will end it.
-            if live && self.fam[idx].pend_quote[side_idx].filled_1e6 != 0 {
-                if oversized {
-                    self.cancel_quote(ctx, idx, side_idx, now);
-                } else {
-                    self.counters.skipped_partial =
-                        self.counters.skipped_partial.wrapping_add(1);
-                }
-                side_idx += 1;
-                continue;
-            }
-            // E5: a MODIFY replaces a reservation that is still
-            // standing, so the replacement must be sized against the
-            // caps with that reservation excluded — otherwise every
-            // reprice shrinks until it reaches zero.
-            let held = if live {
-                self.fam[idx].pend_quote[side_idx].booked_notional_1e6
-            } else {
-                0
-            };
-            let px = if is_bid {
-                // Never cross the touch: a maker that crosses is a
-                // taker paying the spread it meant to earn.
-                price::floor_grid_1e6(centre - h, GRID_TICK_1E6).min(yes.touch.bid_1e6)
-            } else {
-                price::ceil_grid_1e6(centre + h, GRID_TICK_1E6).max(yes.touch.ask_1e6)
-            };
-            let qty = if is_bid {
-                let room = self.cap_room_excluding_1e6(idx, px, held);
-                self.params.clip_qty_1e6.min(room)
-            } else {
-                self.params.clip_qty_1e6.min(self.ask_free_1e6(idx))
-            };
-            if qty <= 0 {
-                if is_bid {
-                    self.counters.skipped_cap = self.counters.skipped_cap.wrapping_add(1);
-                } else {
-                    self.counters.skipped_inventory =
-                        self.counters.skipped_inventory.wrapping_add(1);
-                }
-                if oversized {
-                    self.cancel_quote(ctx, idx, side_idx, now);
-                }
-                side_idx += 1;
-                continue;
-            }
-            let side = if is_bid { Side::Bid } else { Side::Ask };
-            let prev_oid = if live {
-                self.fam[idx].pend_quote[side_idx].oid
-            } else {
-                0
-            };
-            if !self.emit_quote(ctx, idx, side_idx, side, px, qty, centre, now, prev_oid, held)
-                && oversized
-            {
-                // The replacement did not reach the venue — refused,
-                // or off the grid. The old ask is still there, still
-                // offering what we do not hold.
-                self.cancel_quote(ctx, idx, side_idx, now);
-            }
-            side_idx += 1;
-        }
-    }
-
-    /// The `client_oid` of one intent. Bit 63 = arm, bit 48 = side,
-    /// bits 32..48 = family, bits 0..32 = outcome. The sequence rides
-    /// in the unused bits 49..63 so two intents on the same leg of the
-    /// same instance are still distinct.
+    /// The member's order id: sequence, side, family and outcome. Bit 63
+    /// (the retired null-arm flag, BIN15 H90 G3) is always 0.
     fn next_oid(&mut self, idx: usize, is_yes: bool) -> u64 {
         self.oid_seq = self.oid_seq.wrapping_add(1);
-        let arm = u64::from(self.fam[idx].arm & 1) << OID_ARM_SHIFT;
         let side = u64::from(!is_yes) << OID_SIDE_SHIFT;
         let fam = (idx as u64 & 0xFFFF) << OID_FAMILY_SHIFT;
         let seq = (self.oid_seq & 0x3FFF) << 49;
-        arm | seq | side | fam | (u64::from(self.fam[idx].live.outcome) & OID_OUTCOME_MASK)
+        seq | side | fam | (u64::from(self.fam[idx].live.outcome) & OID_OUTCOME_MASK)
     }
 }
 
@@ -2383,26 +1602,19 @@ impl Bin15Strategy {
         }
     }
 
-    /// Emit one Arm A IoC.
-    #[allow(clippy::too_many_arguments)]
+    /// Emit one late-window IoC BUY (the only order this member sends since
+    /// BIN15 H90 G3).
     fn emit_take<C: Ctx>(
         &mut self,
         ctx: &mut C,
         idx: usize,
         is_yes: bool,
-        side: Side,
         px_1e6: i64,
         qty_1e6: i64,
         now: NsTs,
-        closing: bool,
     ) {
         if qty_1e6 <= 0 {
-            if closing {
-                self.counters.skipped_inventory =
-                    self.counters.skipped_inventory.wrapping_add(1);
-            } else {
-                self.counters.skipped_cap = self.counters.skipped_cap.wrapping_add(1);
-            }
+            self.counters.skipped_cap = self.counters.skipped_cap.wrapping_add(1);
             return;
         }
         let qty = qty_1e6 - qty_1e6.rem_euclid(GRID_LOT_1E6);
@@ -2416,270 +1628,34 @@ impl Bin15Strategy {
             self.fam[idx].sym_no
         };
         let oid = self.next_oid(idx, is_yes);
-        if !self.submit(ctx, sym, side, ORDER_KIND_IOC, px_1e6, qty, oid, now) {
+        if !self.submit(ctx, sym, Side::Bid, ORDER_KIND_IOC, px_1e6, qty, oid, now) {
             return;
         }
-        // An OPENING take books its notional against both caps at
-        // SUBMIT, not at fill. A cap that only counted fills would let
-        // a member with eight unfilled intents in flight commit eight
-        // times its limit, which is the one thing a cap exists to stop.
-        // BIN15 P2 (F2): the booking is now RECORDED on the leg and
-        // released when the leg dies unfilled — booked-at-submit is a
-        // reservation, not a spend.
-        let booked = if closing {
-            self.counters.closes_submitted = self.counters.closes_submitted.wrapping_add(1);
-            0
-        } else {
-            let notional = ((px_1e6 as i128 * qty as i128) / 1_000_000) as i64;
-            self.fam[idx].notional_instance_1e6 =
-                self.fam[idx].notional_instance_1e6.saturating_add(notional);
-            self.day_notional_1e6 = self.day_notional_1e6.saturating_add(notional);
-            self.counters.takes_submitted = self.counters.takes_submitted.wrapping_add(1);
-            notional
-        };
+        let notional = ((px_1e6 as i128 * qty as i128) / 1_000_000) as i64;
+        self.fam[idx].notional_instance_1e6 =
+            self.fam[idx].notional_instance_1e6.saturating_add(notional);
+        self.day_notional_1e6 = self.day_notional_1e6.saturating_add(notional);
+        self.counters.takes_submitted = self.counters.takes_submitted.wrapping_add(1);
         self.fam[idx].pend_take = PendingLeg {
-            // Arm A is an IoC and is never modified: it has no history.
-            prev_oid: 0,
             oid,
             deadline_ns: now.saturating_add(self.params.requote_ttl_ns),
             px_1e6,
             qty_1e6: qty,
             filled_1e6: 0,
-            booked_notional_1e6: booked,
+            booked_notional_1e6: notional,
             is_yes: u8::from(is_yes),
-            side: side as u8,
-            _pad: [0; 6],
+            side: Side::Bid as u8,
+            _pad: [0; 14],
         };
     }
 
-    /// Emit one Arm B resting quote — as a PLACE, or, when
-    /// `prev_oid != 0`, as the **MODIFY that moves one** (LAW E-7).
-    ///
-    /// `held` is the cap notional the order being replaced is still
-    /// reserving; it is credited back only after the venue takes the
-    /// modify, so a refusal leaves both the quote and its reservation
-    /// exactly where they were.
-    ///
-    /// **The deadline is NOT extended by a modify.** A reprice
-    /// inherits the original quote's `deadline_ns`, so an Arm B that
-    /// moved every 333 ms could not hold a quote past the TTL its
-    /// ruleset gave it. The dispatcher enforces the same rule on its
-    /// own open table; this is the member keeping its book agreeing
-    /// with it rather than trusting it.
-    ///
-    /// `true` iff the venue took it — the caller uses that to decide
-    /// whether an oversized ask it meant to shrink is still resting.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_quote<C: Ctx>(
-        &mut self,
-        ctx: &mut C,
-        idx: usize,
-        side_idx: usize,
-        side: Side,
-        px_1e6: i64,
-        qty_1e6: i64,
-        centre_1e6: i64,
-        now: NsTs,
-        prev_oid: u64,
-        held: i64,
-    ) -> bool {
-        let qty = qty_1e6 - qty_1e6.rem_euclid(GRID_LOT_1E6);
-        if !Self::on_grid(px_1e6, qty) {
-            self.counters.skipped_grid = self.counters.skipped_grid.wrapping_add(1);
-            return false;
-        }
-        let sym = self.fam[idx].sym_yes;
-        let oid = self.next_oid(idx, true);
-        let moving = prev_oid != 0;
-        let old = self.fam[idx].pend_quote[side_idx];
-        // The caller's partial gate is what makes `held` (which sized
-        // this replacement) and the credit below the same number: with
-        // nothing filled, `credit_unfilled` returns the whole booked
-        // notional. Modifying a partially-filled leg would make the
-        // two disagree, so the gate is an invariant here, not a
-        // preference there.
-        debug_assert!(!moving || old.filled_1e6 == 0);
-        debug_assert!(!moving || old.booked_notional_1e6 == held);
-        if !self.send_quote(ctx, sym, side, px_1e6, qty, oid, now, prev_oid) {
-            return false;
-        }
-        if moving {
-            // The venue took it. Only now does the old reservation go
-            // back — crediting before the attempt would free room for
-            // an order that is still resting if the modify is refused.
-            self.credit_unfilled(idx, &old);
-            // XH4i-6 (Q1): on a gateway arm "took it" means queued — the
-            // leg as it stood is what a late refusal restores.
-            // COPY: the 64 B leg into its undo slot, once per accepted
-            // reprice — rejected: saving fields one by one (the restore
-            // needs the whole leg).
-            self.undo.legs[idx][side_idx] = old;
-            self.undo.centre_1e6[idx][side_idx] = self.fam[idx].last_quote_p_1e6[side_idx];
-        }
-        // BIN15 P2 (F2): a resting BID reserves cap room; an ASK is
-        // sold against inventory already paid for and reserves nothing.
-        let booked = if side == Side::Bid {
-            let notional = ((px_1e6 as i128 * qty as i128) / 1_000_000) as i64;
-            self.fam[idx].notional_instance_1e6 =
-                self.fam[idx].notional_instance_1e6.saturating_add(notional);
-            self.day_notional_1e6 = self.day_notional_1e6.saturating_add(notional);
-            notional
-        } else {
-            0
-        };
-        self.fam[idx].pend_quote[side_idx] = PendingLeg {
-            oid,
-            // A reprice inherits the original deadline; a fresh quote
-            // starts its own.
-            deadline_ns: if moving {
-                old.deadline_ns
-            } else {
-                now.saturating_add(self.params.requote_ttl_ns)
-            },
-            px_1e6,
-            qty_1e6: qty,
-            filled_1e6: 0,
-            booked_notional_1e6: booked,
-            is_yes: 1,
-            side: side as u8,
-            _pad: [0; 6],
-            // ONE generation: a fill the venue was already answering
-            // under the old id still books. See the field's own doc.
-            prev_oid,
-        };
-        self.fam[idx].last_quote_p_1e6[side_idx] = centre_1e6;
-        if moving {
-            self.counters.quotes_modified = self.counters.quotes_modified.wrapping_add(1);
-        } else {
-            self.counters.quotes_submitted =
-                self.counters.quotes_submitted.wrapping_add(1);
-        }
-        true
-    }
-
-    /// Send one Arm B quote — `ctx.submit` for a fresh one,
-    /// `ctx.modify` for a reprice. `true` iff the dispatcher took it.
-    ///
-    /// The two verbs share this so the order is built once. `kind`
-    /// really is part of `OrderIdentity`, so a replacement that
-    /// disagreed about it would be refused by the dispatcher and the
-    /// failure would read as a venue problem. `ttl_ns` is NOT —
-    /// nothing reads it on a modify, since the modified leg inherits
-    /// the original's expiry on both books — but it is set here
-    /// anyway so the two verbs cannot drift into building different
-    /// orders.
-    #[allow(clippy::too_many_arguments)]
-    fn send_quote<C: Ctx>(
-        &mut self,
-        ctx: &mut C,
-        sym: SymbolId,
-        side: Side,
-        px_1e6: i64,
-        qty_1e6: i64,
-        oid: u64,
-        now: NsTs,
-        prev_oid: u64,
-    ) -> bool {
-        if prev_oid == 0 {
-            return self.submit(ctx, sym, side, ORDER_KIND_MAKER, px_1e6, qty_1e6, oid, now);
-        }
-        debug_assert!(px_1e6 > 0 && qty_1e6 > 0);
-        let order = Order::new(
-            now,
-            VenueId::Hyperliquid,
-            sym,
-            side,
-            ORDER_KIND_MAKER,
-            Price::from_raw(px_1e6),
-            Qty::from_raw(qty_1e6),
-            oid,
-        )
-        .with_ttl_ns(self.params.requote_ttl_ns);
-        match ctx.modify(prev_oid, order) {
-            Ok(()) => {
-                self.orders_emitted = self.orders_emitted.wrapping_add(1);
-                true
-            }
-            // Every refusal leaves the resting quote where it was, at
-            // its old price, still reserving its room. `NoSuchOrder`
-            // is the common one and is not a defect — a fill or a TTL
-            // beat the reprice, and the fill lane is what says which.
-            Err(
-                SubmitErr::RingFull
-                | SubmitErr::Unsupported
-                | SubmitErr::NoSuchOrder
-                | SubmitErr::Refused,
-            ) => {
-                self.counters.quotes_modify_refused =
-                    self.counters.quotes_modify_refused.wrapping_add(1);
-                self.orders_dropped = self.orders_dropped.wrapping_add(1);
-                false
-            }
-        }
-    }
-
-    /// **E5, LAW E-8's member half — take back one lapsed quote.**
-    ///
-    /// The venue has no server-side TTL on a Gtc/Alo order, so a
-    /// quote nobody cancels rests forever. Before E5 this member
-    /// simply forgot a lapsed leg, which was correct against a paper
-    /// matcher running its own TTL law and would have stranded a live
-    /// quote at the venue.
-    ///
-    /// **The leg is cleared and its room credited either way**, as it
-    /// always has been: the member's own deadline is what governs its
-    /// book, and keeping a pending alive because a cancel failed
-    /// would leak one forever. A refusal that is not `NoSuchOrder` is
-    /// counted instead — that is a quote the member has stopped
-    /// tracking and the venue may still hold, which is what E6's
-    /// reconciliation exists to find.
-    fn cancel_quote<C: Ctx>(&mut self, ctx: &mut C, idx: usize, side_idx: usize, now: NsTs) {
-        let leg = self.fam[idx].pend_quote[side_idx];
-        debug_assert!(leg.live());
-        let req = CancelReq::new(now, VenueId::Hyperliquid, self.fam[idx].sym_yes, leg.oid);
-        match ctx.cancel(req) {
-            Ok(()) => {
-                self.counters.quotes_cancelled =
-                    self.counters.quotes_cancelled.wrapping_add(1);
-            }
-            Err(SubmitErr::NoSuchOrder) => {
-                // Already gone — filled, or swept by a dispatcher that
-                // runs its own TTL. Exactly what was wanted.
-            }
-            Err(SubmitErr::RingFull | SubmitErr::Unsupported | SubmitErr::Refused) => {
-                self.counters.quotes_cancel_refused =
-                    self.counters.quotes_cancel_refused.wrapping_add(1);
-            }
-        }
-        self.fam[idx].pend_quote[side_idx] = PendingLeg::default();
-        self.credit_unfilled(idx, &leg);
-        if leg.filled_1e6 == 0 {
-            self.counters.quotes_expired = self.counters.quotes_expired.wrapping_add(1);
-        }
-    }
-
-    /// Book one fill against the pending it belongs to.
-    ///
-    /// POSITIONS COME FROM FILLS. A fill whose `order_id` matches no
-    /// pending is counted (`unknown_fills`) and changes nothing — it
-    /// means this member's book of intents disagrees with the
-    /// dispatcher's, which is a defect to surface, not a position to
-    /// invent.
+    /// Book one fill against the in-flight take. A settlement print is
+    /// counted apart; a fill no pending leg owns is counted unknown.
     fn book_fill(&mut self, fill: &core_types::Fill) {
         let qty = fill.qty.raw();
         if qty <= 0 {
             return;
         }
-        // A SETTLEMENT is the venue closing the instance, not a trade
-        // this member asked for. It carries the venue's own order id
-        // and matches no pending by construction, so the scan below
-        // would drop it into `unknown_fills` — a counter whose whole
-        // meaning is "my book of intents disagrees with the
-        // dispatcher's". Counted on its own instead.
-        //
-        // It moves NO position here: `clear_instance` on the roll is
-        // what flattens the family, and applying the payout as well
-        // would close the same position twice.
         if fill.is_settlement() {
             self.counters.settlement_fills = self.counters.settlement_fills.wrapping_add(1);
             return;
@@ -2688,34 +1664,15 @@ impl Bin15Strategy {
         while i < self.params.n_families {
             if self.fam[i].pend_take.oid == fill.order_id {
                 let is_yes = self.fam[i].pend_take.is_yes == 1;
-                let buy = self.fam[i].pend_take.side == Side::Bid as u8;
                 let first = self.fam[i].pend_take.filled_1e6 == 0;
-                self.apply_position(i, is_yes, buy, qty);
+                self.apply_position(i, is_yes, qty);
                 let filled = self.fam[i].pend_take.filled_1e6.saturating_add(qty);
                 self.fam[i].pend_take.filled_1e6 = filled;
-                // BIN15 P4c (F8): an IoC is judged once by the VENUE,
-                // but the venue may answer it with more than one print
-                // — a marketable IoC that sweeps two price levels fills
-                // twice. Closing the leg on the first print sent the
-                // second into `unknown_fills`, where it changed no
-                // position at all: the member then believed it held
-                // less than it did, and the closing take sized against
-                // a holding that was already larger. So the leg closes
-                // when it is FULL, or at the sweep deadline — and the
-                // TTL is 1 s, inside which the venue's own cancel has
-                // already arrived.
                 if filled >= self.fam[i].pend_take.qty_1e6 {
                     let leg = self.fam[i].pend_take;
                     self.fam[i].pend_take = PendingLeg::default();
-                    // BIN15 P2 (F2): fully filled, so nothing to credit
-                    // — the call is here for the partial-at-deadline
-                    // path's symmetry and costs one compare.
                     self.credit_unfilled(i, &leg);
                 }
-                // `takes_filled` counts LEGS that filled, not prints:
-                // its own doc says "IoCs that filled (any quantity)",
-                // and a two-print sweep is one IoC. Every print is in
-                // `fills`, so partials stay visible as the difference.
                 if first {
                     self.counters.takes_filled = self.counters.takes_filled.wrapping_add(1);
                     if self.late_fam[i].oid == fill.order_id {
@@ -2725,100 +1682,19 @@ impl Bin15Strategy {
                 self.counters.fills = self.counters.fills.wrapping_add(1);
                 return;
             }
-            let mut sidx = 0usize;
-            while sidx < QUOTE_SIDES {
-                // E5: the id the leg carries now, OR the one it
-                // carried before its last modify. A fill the venue
-                // was already answering under the old cloid arrives
-                // after the reprice and would otherwise land in
-                // `unknown_fills`, moving no position — the member
-                // would believe it held less than it does, which is
-                // the F7 shape: absence read as evidence.
-                let raced = self.fam[i].pend_quote[sidx].prev_oid != 0
-                    && self.fam[i].pend_quote[sidx].prev_oid == fill.order_id;
-                if raced {
-                    self.book_raced_fill(i, sidx, fill, qty);
-                    return;
-                }
-                if self.fam[i].pend_quote[sidx].oid == fill.order_id {
-                    let buy = self.fam[i].pend_quote[sidx].side == Side::Bid as u8;
-                    let first = self.fam[i].pend_quote[sidx].filled_1e6 == 0;
-                    self.apply_position(i, true, buy, qty);
-                    let filled = self.fam[i].pend_quote[sidx].filled_1e6.saturating_add(qty);
-                    self.fam[i].pend_quote[sidx].filled_1e6 = filled;
-                    // A maker fills PARTIALLY and keeps resting, so the
-                    // leg closes only when it is full.
-                    if filled >= self.fam[i].pend_quote[sidx].qty_1e6 {
-                        let leg = self.fam[i].pend_quote[sidx];
-                        self.fam[i].pend_quote[sidx] = PendingLeg::default();
-                        self.credit_unfilled(i, &leg);
-                    }
-                    if first {
-                        self.counters.quotes_filled =
-                            self.counters.quotes_filled.wrapping_add(1);
-                    }
-                    self.counters.fills = self.counters.fills.wrapping_add(1);
-                    return;
-                }
-                sidx += 1;
-            }
             i += 1;
         }
         self.counters.unknown_fills = self.counters.unknown_fills.wrapping_add(1);
-    }
-
-    /// **E5: book a fill that raced a reprice.**
-    ///
-    /// The fill belongs to the order that was REPLACED. The
-    /// replacement is a different order and is still resting at the
-    /// venue at its full size, so this must move the POSITION and
-    /// nothing else about the replacement's bookkeeping.
-    ///
-    /// **Why `filled_1e6` is not touched.** `(qty_1e6, filled_1e6)`
-    /// on a quote leg is the member's statement of what the venue is
-    /// resting, and it is the whole of the short rule: `arm_take`
-    /// sizes a closing take as `pos − (ask.qty − ask.filled)`, and
-    /// `ask_free_1e6` reads the same pair. Crediting a raced fill to
-    /// the replacement's `filled_1e6` moves BOTH sides of that
-    /// subtraction by the same amount, so the oversize it creates
-    /// becomes algebraically invisible — the resting ask and a
-    /// closing take would then size against the same inventory, which
-    /// is precisely the "two sells of the same holding" BIN15 P4b
-    /// (F3) exists to prevent.
-    ///
-    /// It is also how the replacement gets closed by someone else's
-    /// fill: a reprice may SHRINK a quote (the oversized-ask pull does
-    /// exactly that), so a raced quantity between the new size and the
-    /// old one would mark a still-resting order full, clear it, and
-    /// send every later fill of that order into `unknown_fills`.
-    ///
-    /// **The cap room, on the other hand, must come back.** The old
-    /// leg's whole reservation was credited when the modify was
-    /// taken, because nothing had filled at that moment. This fill
-    /// says part of it was in fact spent, so a BUY re-books what was
-    /// actually paid — the fill's own price, not the order's, because
-    /// that is the cash that left.
-    fn book_raced_fill(&mut self, idx: usize, sidx: usize, fill: &core_types::Fill, qty: i64) {
-        let buy = self.fam[idx].pend_quote[sidx].side == Side::Bid as u8;
-        self.apply_position(idx, true, buy, qty);
-        if buy {
-            let notional = ((fill.px.raw() as i128 * qty as i128) / 1_000_000) as i64;
-            self.fam[idx].notional_instance_1e6 =
-                self.fam[idx].notional_instance_1e6.saturating_add(notional);
-            self.day_notional_1e6 = self.day_notional_1e6.saturating_add(notional);
-        }
-        self.counters.quotes_raced = self.counters.quotes_raced.wrapping_add(1);
-        self.counters.fills = self.counters.fills.wrapping_add(1);
     }
 
     /// BIN15 P2 (F2): give back the cap room a leg no longer occupies.
     ///
     /// A cap is a limit on EXPOSURE. Booking at submit is right — eight
     /// intents in flight can all fill — but a booking that is never
-    /// released turns the cap into a SUBMISSIONS ODOMETER: with the
-    /// maker arm on, twenty unfilled 500-lot quotes at 0.50 exhaust
-    /// $5,000 of day room without the member ever holding a contract,
-    /// and every later instance is then refused. That refusal is what
+    /// released turns the cap into a SUBMISSIONS ODOMETER: twenty
+    /// unfilled takes would exhaust the day's room without the member
+    /// ever holding a contract, and every later instance is then
+    /// refused. That refusal is what
     /// censors the calibration ledger — the instances that never traded
     /// are exactly the ones the gate needed.
     ///
@@ -2843,20 +1719,9 @@ impl Bin15Strategy {
         self.day_notional_1e6 = (self.day_notional_1e6 - back).max(0);
     }
 
-    /// XH4i-6 (Q1) — a venue refusal a gateway arm reports late (its `Ok`
-    /// meant queued; the blocking arm's synchronous `Err` came at once),
-    /// handled as that `Err` was:
-    /// - a take is written off as an unfilled one (its room back), and a
-    ///   coverage entry's lets the entry retry;
-    /// - a refused reprice restores the leg as it stood — the old order
-    ///   still rests: its reservation, its price and its centre come back;
-    /// - a refused fresh quote frees its side (its room back), and a
-    ///   reprice that cannot be restored cancels the old order, never
-    ///   leaves it stranded.
-    ///
-    /// The blocking arm, paper and the replays send this member no event:
-    /// replay-neutral by construction.
-    fn on_rejected<C: Ctx>(&mut self, ctx: &mut C, oid: u64, now: NsTs) {
+    /// The venue (or the dispatcher) refused the take: release its cap room;
+    /// a refused LATE entry may try again inside its window.
+    fn on_rejected(&mut self, oid: u64) {
         let mut i = 0usize;
         while i < self.params.n_families {
             if self.fam[i].pend_take.live() && self.fam[i].pend_take.oid == oid {
@@ -2866,151 +1731,38 @@ impl Bin15Strategy {
                 if leg.filled_1e6 == 0 {
                     self.counters.takes_unfilled = self.counters.takes_unfilled.wrapping_add(1);
                 }
-                if self.undo.cover_oid[i] == oid {
-                    self.undo.cover_oid[i] = 0;
-                    self.fam[i].covered = 0;
-                }
-                // BIN15 H90: a refused late entry retries inside its window.
                 if self.late_fam[i].oid == oid {
                     self.late_fam[i].oid = 0;
                     self.late_fam[i].covered = 0;
                 }
                 return;
             }
-            let mut s = 0usize;
-            while s < QUOTE_SIDES {
-                if self.fam[i].pend_quote[s].live() && self.fam[i].pend_quote[s].oid == oid {
-                    // COPY: the refused 64 B leg and its undo, once a refusal
-                    // — the slot is rewritten before the leg's credit.
-                    let leg = self.fam[i].pend_quote[s];
-                    self.credit_unfilled(i, &leg);
-                    let undo = self.undo.legs[i][s];
-                    if leg.prev_oid != 0 && undo.oid == leg.prev_oid && leg.filled_1e6 == 0 {
-                        // The old order rests on, whole (a reprice needs an
-                        // unfilled leg): its reservation is booked again —
-                        // an ask's is 0.
-                        self.fam[i].notional_instance_1e6 = self.fam[i]
-                            .notional_instance_1e6
-                            .saturating_add(undo.booked_notional_1e6);
-                        self.day_notional_1e6 = self
-                            .day_notional_1e6
-                            .saturating_add(undo.booked_notional_1e6);
-                        self.fam[i].pend_quote[s] = undo;
-                        self.fam[i].last_quote_p_1e6[s] = self.undo.centre_1e6[i][s];
-                        self.undo.legs[i][s] = PendingLeg::default();
-                        self.counters.quotes_modify_refused =
-                            self.counters.quotes_modify_refused.wrapping_add(1);
-                    } else {
-                        self.fam[i].pend_quote[s] = PendingLeg::default();
-                        // The side quotes again at the next price, as after
-                        // the blocking arm's synchronous refusal (risk
-                        // review r1): no centre is left to wait out.
-                        self.fam[i].last_quote_p_1e6[s] = 0;
-                        self.orders_dropped = self.orders_dropped.wrapping_add(1);
-                        if leg.prev_oid != 0 {
-                            let req = CancelReq::new(
-                                now,
-                                VenueId::Hyperliquid,
-                                self.fam[i].sym_yes,
-                                leg.prev_oid,
-                            );
-                            let _ = ctx.cancel(req);
-                        }
-                    }
-                    return;
-                }
-                s += 1;
-            }
             i += 1;
         }
     }
 
-    /// XH4i-6 (risk review r1) — a quote leg the venue says is gone: the
-    /// arm's own cancel (a roll's E-8 sweep, a halt), or the original of a
-    /// refused reprice the venue dropped with it (no phantom restore). Its
-    /// side is freed as `cancel_quote` frees it, with no cancel to send; a
-    /// leg the member already let go matches nothing. A gateway arm's alone,
-    /// as `on_rejected`: replay-neutral.
-    fn on_canceled(&mut self, oid: u64) {
-        let mut i = 0usize;
-        while i < self.params.n_families {
-            let mut s = 0usize;
-            while s < QUOTE_SIDES {
-                if self.fam[i].pend_quote[s].live() && self.fam[i].pend_quote[s].oid == oid {
-                    // COPY: the gone 64 B leg, once — the slot is cleared
-                    // before the leg's credit.
-                    let leg = self.fam[i].pend_quote[s];
-                    self.fam[i].pend_quote[s] = PendingLeg::default();
-                    self.fam[i].last_quote_p_1e6[s] = 0;
-                    self.credit_unfilled(i, &leg);
-                    return;
-                }
-                s += 1;
-            }
-            i += 1;
-        }
-    }
-
-    /// Move one leg's position. A buy adds, a sell reduces, and a sell
-    /// can never take a side below zero — the venue has no short.
-    fn apply_position(&mut self, idx: usize, is_yes: bool, buy: bool, qty_1e6: i64) {
+    /// A take is a BUY: the member never sells (it holds to settlement).
+    fn apply_position(&mut self, idx: usize, is_yes: bool, qty_1e6: i64) {
         let pos = if is_yes {
             &mut self.fam[idx].pos_yes_1e6
         } else {
             &mut self.fam[idx].pos_no_1e6
         };
-        if buy {
-            *pos = pos.saturating_add(qty_1e6);
-            return;
-        }
-        // BIN15 P4b (F3): a sell larger than the holding is a SHORT the
-        // venue does not allow, so reaching this branch means the
-        // member's own book disagrees with the fills it is being handed
-        // — a defect to surface, not a number to quietly floor. Loud in
-        // debug (the house `debug_assert!` law), saturating in release
-        // so a live process keeps a non-negative position rather than
-        // wrapping into one that would size the next order absurdly.
-        debug_assert!(
-            *pos >= qty_1e6,
-            "bin15: sell of {qty_1e6} against a holding of {pos} — the venue has no short"
-        );
-        *pos = (*pos - qty_1e6).max(0);
+        *pos = pos.saturating_add(qty_1e6);
     }
 
-    /// Write off every pending whose deadline has passed.
-    ///
-    /// The clock is the only thing that says an unfilled order is a
-    /// decision. Without this the member would hold a pending forever
-    /// and never re-price that leg — which reads, from the outside,
-    /// exactly like a member that has stopped working.
-    fn sweep_pendings<C: Ctx>(&mut self, ctx: &mut C, now: NsTs) {
+    /// A take past its TTL is gone at the venue (an IoC): release its room.
+    fn sweep_pendings(&mut self, now: NsTs) {
         let mut i = 0usize;
         while i < self.params.n_families {
             if self.fam[i].pend_take.live() && now >= self.fam[i].pend_take.deadline_ns {
                 let leg = self.fam[i].pend_take;
                 self.fam[i].pend_take = PendingLeg::default();
-                // BIN15 P2 (F2): the room the leg reserved and did not
-                // use goes back BEFORE anything else can ask for it.
                 self.credit_unfilled(i, &leg);
                 if leg.filled_1e6 == 0 {
                     self.counters.takes_unfilled =
                         self.counters.takes_unfilled.wrapping_add(1);
                 }
-            }
-            let mut s = 0usize;
-            while s < QUOTE_SIDES {
-                if self.fam[i].pend_quote[s].live() && now >= self.fam[i].pend_quote[s].deadline_ns
-                {
-                    // **E5, LAW E-8's member half — the BACKSTOP.**
-                    // The requote pass cancels a lapsed quote too, and
-                    // usually gets there first because it runs on
-                    // every mark and every touch. This one runs on a
-                    // clock, so a family whose book has gone quiet —
-                    // which is exactly when a stale quote is most
-                    // dangerous — still has its quote taken back.
-                    self.cancel_quote(ctx, i, s, now);
-                }
-                s += 1;
             }
             i += 1;
         }
@@ -3129,7 +1881,7 @@ impl Strategy for Bin15Strategy {
             ts_ns: tick.ts_ns,
             // VT4: a stale tick is not evidence. It still updates the
             // prices (they are the last thing the venue said) but the
-            // flag keeps the arms off them.
+            // flag keeps the late law off them.
             stale: u8::from(tick.is_stale()),
             _pad: [0; 7],
         };
@@ -3151,20 +1903,15 @@ impl Strategy for Bin15Strategy {
     }
 
     /// XH4i-6 (Q1): a venue's verdict reported late — only a gateway arm
-    /// sends this member one; a `REJECTED` is the blocking arm's `Err`
-    /// (`on_rejected`), a `CANCELED` a quote gone without the member's
-    /// cancel (`on_canceled`, risk review r1). Every other kind changes
-    /// nothing here.
-    fn on_order_event<C: Ctx>(&mut self, event: &core_types::OrderEvent, ctx: &mut C) {
+    /// sends this member one. A `REJECTED` is the blocking arm's `Err`
+    /// (`on_rejected`): the take's room comes back. The member rests
+    /// nothing since H90 G3, so every other kind changes nothing here.
+    fn on_order_event<C: Ctx>(&mut self, event: &core_types::OrderEvent, _ctx: &mut C) {
         if self.configured == 0 {
             return;
         }
-        match event.kind {
-            core_types::ORDER_EVENT_REJECTED => {
-                self.on_rejected(ctx, event.client_oid, event.ts_ns);
-            }
-            core_types::ORDER_EVENT_CANCELED => self.on_canceled(event.client_oid),
-            _ => {}
+        if event.kind == core_types::ORDER_EVENT_REJECTED {
+            self.on_rejected(event.client_oid);
         }
     }
 
@@ -3185,7 +1932,15 @@ impl Strategy for Bin15Strategy {
             return;
         }
         match core_types::ChannelId::from_u8(event.channel) {
-            Some(core_types::ChannelId::InstrumentRoll) => self.on_roll(event),
+            // PM15: Polymarket's rolling families ride the same channel
+            // (venue byte Polymarket, `core_types::pm_roll`); this member's
+            // families are Hyperliquid's, and a roll of another venue
+            // names none of them — not even as a refusal to count.
+            Some(core_types::ChannelId::InstrumentRoll)
+                if event.venue == VenueId::Hyperliquid as u8 =>
+            {
+                self.on_roll(event)
+            }
             Some(core_types::ChannelId::Mark) => {
                 let Some(u) = self.underlying_of_sym(event.sym) else {
                     return;
@@ -3208,13 +1963,13 @@ impl Strategy for Bin15Strategy {
     /// The 1 s cadence: deadlines, the day-cap epoch, the dormant
     /// level. NOT a re-price — a re-price with no new evidence returns
     /// the same number.
-    fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C) {
+    fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, _ctx: &mut C) {
         if self.configured == 0 {
             return;
         }
         // E5: the sweep now SENDS — LAW E-8's member half needs a ctx
         // to cancel through, where it used to only forget.
-        self.sweep_pendings(ctx, now_ns);
+        self.sweep_pendings(now_ns);
         self.roll_day(self.bar.anchor.wall_of(now_ns));
         self.refresh_dormant();
     }
@@ -3354,10 +2109,6 @@ mod tests {
         p.n_families = 1;
         p.underlying_sym[0] = btc_sym();
         p.n_underlyings = 1;
-        // A daily family's floors are an hour, which no test window
-        // reaches; shrink them so one code path covers both kinds.
-        p.tau_min_take_ns = [60_000_000_000, 60_000_000_000];
-        p.tau_min_quote_ns = [120_000_000_000, 120_000_000_000];
         p
     }
 
@@ -3456,11 +2207,6 @@ mod tests {
         WALL0 + secs * 1_000_000_000
     }
 
-    /// The Yes leg family 0 quotes on.
-    fn first_sym(m: &Bin15Strategy) -> SymbolId {
-        m.family(0).expect("f").sym_yes
-    }
-
     /// Drive one family to a priced state: warm, bind, mark, book.
     fn live_family(m: &mut Bin15Strategy, c: &mut RecCtx, yes_bid: i64, yes_ask: i64) {
         warm(m, 0);
@@ -3500,27 +2246,10 @@ mod tests {
         bad.scale_1e9 = 0;
         assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
         let mut bad = params_1(FAMILY_OUT_15M);
-        bad.e_take_1e6 = GRID_TICK_1E6 - 1;
-        assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
-        let mut bad = params_1(FAMILY_OUT_15M);
-        bad.tau_min_take_ns[0] = TAU_15M_NS;
-        assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
-        let mut bad = params_1(FAMILY_OUT_15M);
         bad.cap_day_usd_1e6 = 0;
         assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
-        // BIN15 S5b: the entry's bound and the control's, each in
-        // [one tick, 0.5).
         let mut bad = params_1(FAMILY_OUT_15M);
-        bad.e_entry_1e6 = GRID_TICK_1E6 - 1;
-        assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
-        let mut bad = params_1(FAMILY_OUT_15M);
-        bad.e_entry_1e6 = ONE_1E6 / 2;
-        assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
-        let mut bad = params_1(FAMILY_OUT_15M);
-        bad.entry_control_e_1e6 = 0;
-        assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
-        let mut bad = params_1(FAMILY_OUT_15M);
-        bad.entry_control_e_1e6 = ONE_1E6 / 2;
+        bad.requote_ttl_ns = 0;
         assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
     }
 
@@ -3547,6 +2276,27 @@ mod tests {
         assert_eq!(m.counters().rolls_settled, 1);
         assert_eq!(m.counters().families_dormant, 1);
         assert!(!m.marks[0].vol[0].is_armed());
+    }
+
+    /// PM15: a Polymarket roll — the same channel, the same codec — never
+    /// binds, settles or counts against a Hyperliquid family, whatever its
+    /// family byte and strike say.
+    #[test]
+    fn a_polymarket_roll_is_not_this_members() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        warm(&mut m, 0);
+        m.on_venue_event(&roll_event(0, 2649, 60, 79_000_000_000, expiry(900), false), &mut c);
+        let mut pm = roll_event(0, 2650, 60, 79_000_000_000, expiry(900), false);
+        pm.venue = VenueId::Polymarket as u8;
+        m.on_venue_event(&pm, &mut c);
+        let mut pm_settled = roll_event(0, 2649, 60, 0, expiry(900), true);
+        pm_settled.venue = VenueId::Polymarket as u8;
+        m.on_venue_event(&pm_settled, &mut c);
+        assert_eq!(m.family(0).expect("f").live.outcome, 2649, "the HL instance stands");
+        assert_eq!(m.counters().rolls, 1);
+        assert_eq!(m.counters().rolls_settled, 0);
+        assert_eq!(m.counters().spec_refused, 0, "not even counted");
     }
 
     #[test]
@@ -3577,29 +2327,6 @@ mod tests {
         assert_eq!(m.orders_emitted(), 0);
     }
 
-    #[test]
-    fn a_take_fires_only_when_the_touch_is_wrong_by_e() {
-        // At the money with a ramp Φ, p̂ ≈ 0.5. An ask of 0.40 is 10 c
-        // cheap — well past the 3 c edge.
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 390_000, 400_000);
-        assert!(m.counters().reprices > 0, "the pricer ran");
-        assert_eq!(m.counters().takes_submitted, 1, "one IoC, not two");
-        let o = c.orders.iter().find(|o| o.kind == ORDER_KIND_IOC).expect("an IoC");
-        assert_eq!(o.sym, yes_sym(0), "the cheap side is Yes");
-        assert_eq!(o.side, Side::Bid, "and the member BUYS it");
-        assert_eq!(o.px.raw(), 400_000, "at the touch, not through it");
-        assert_eq!(o.venue, VenueId::Hyperliquid as u8);
-
-        // A touch inside the edge fires nothing.
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 480_000, 490_000);
-        assert_eq!(m.counters().takes_submitted, 0, "10 c away is not 1 c away");
-        assert!(c.orders.iter().all(|o| o.kind != ORDER_KIND_IOC));
-    }
-
     /// BIN15 P0 (F4). The book is FRESH and two-sided and the edge is
     /// 10 c wide — everything the taker needs — and the member still
     /// emits nothing, because the mark it would price off is nine
@@ -3624,13 +2351,11 @@ mod tests {
             priced_before,
             "the pricer never ran on the dead mark"
         );
-        assert_eq!(m.counters().takes_submitted, 0);
-        assert!(c.orders.is_empty(), "a 10 c edge off a dead mark is not an edge");
-        // The very same book, once the mark catches up, IS acted on —
-        // so the gate is the mark's age and nothing else.
+        assert!(c.orders.is_empty(), "nothing acts on a dead mark");
+        // The very same book, once the mark catches up, IS priced — so the
+        // gate is the mark's age and nothing else.
         m.on_venue_event(&mark_event(79_000_000_000, at(71)), &mut c);
         assert!(m.counters().reprices > priced_before, "a fresh mark re-prices");
-        assert_eq!(m.counters().takes_submitted, 1, "and the edge is taken");
         assert_eq!(m.counters().skipped_mark_stale, 2, "the counter does not move again");
     }
 
@@ -3652,7 +2377,7 @@ mod tests {
         m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(70), false), &mut c);
         m.on_tick(&tick(yes_sym(0), 390_000, 400_000, 1_000_000_000, at(70), false), &mut c);
         assert_eq!(m.counters().skipped_mark_stale, 0, "9 s is inside a 30 s shelf");
-        assert_eq!(m.counters().takes_submitted, 1);
+        assert_eq!(m.family(0).expect("f").p_ts_ns, at(70), "and the tick at 70 s priced");
     }
 
     #[test]
@@ -3665,753 +2390,12 @@ mod tests {
         m.on_venue_event(&mark_event(79_000_000_000, at(61)), &mut c);
         m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
         m.on_tick(&tick(yes_sym(0), 390_000, 400_000, 1_000_000_000, at(62), true), &mut c);
-        assert_eq!(m.counters().takes_submitted, 0, "VT4: stale is not evidence");
-        assert!(m.counters().skipped_book > 0);
+        assert_ne!(m.family(0).expect("f").p_ts_ns, at(62) + 1, "VT4: stale is not evidence");
         // The prices ARE recorded — they are the last thing the venue
-        // said — and the next FRESH tick acts on them.
+        // said — and the next FRESH tick prices on them.
         assert_eq!(m.family(0).expect("f").touch_yes.touch.ask_1e6, 400_000);
         m.on_tick(&tick(yes_sym(0), 390_000, 400_000, 1_000_000_000, at(63), false), &mut c);
-        assert_eq!(m.counters().takes_submitted, 1);
-    }
-
-    #[test]
-    fn no_take_inside_tail_refuse() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        warm(&mut m, 0);
-        // Expiry 5 s out, `tail_refuse_ns` is 10 s.
-        m.on_venue_event(&roll_event(0, 2649, 0, 79_000_000_000, expiry(5), false), &mut c);
-        m.on_mark(0, 79_000_000_000, at(0));
-        m.on_venue_event(&mark_event(79_000_000_000, at(61)), &mut c);
-        m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
-        m.on_tick(&tick(yes_sym(0), 100_000, 200_000, 1_000_000_000, at(62), false), &mut c);
-        assert_eq!(m.counters().takes_submitted, 0);
-        assert_eq!(m.counters().reprices, 0, "the pricer never even ran");
-        assert!(m.counters().skipped_tail > 0);
-    }
-
-    #[test]
-    fn no_quote_inside_tau_min() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        warm(&mut m, 0);
-        // The mark events must straddle a MINUTE boundary or
-        // `refresh_sigma` never runs and the pricer holds on Stale
-        // instead — which would make this test pass for the wrong
-        // reason.
-        m.on_venue_event(&roll_event(0, 2649, 0, 79_000_000_000, expiry(160), false), &mut c);
-        m.on_mark(0, 79_000_000_000, at(0));
-        m.on_venue_event(&mark_event(79_000_000_000, at(61)), &mut c);
-        // 98 s to expiry: past `tau_min_take` (60 s), inside
-        // `tau_min_quote` (120 s).
-        m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
-        m.on_tick(&tick(yes_sym(0), 490_000, 500_000, 1_000_000_000, at(62), false), &mut c);
-        assert!(m.counters().reprices > 0, "the pricer DID run");
-        assert_eq!(m.counters().quotes_submitted, 0, "no maker this close in");
-        assert!(m.counters().skipped_tau > 0);
-        assert!(c.orders.iter().all(|o| o.kind != ORDER_KIND_MAKER));
-    }
-
-    #[test]
-    fn arm_b_quotes_the_bid_and_asks_only_against_inventory() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let makers: Vec<&Order> = c.orders.iter().filter(|o| o.kind == ORDER_KIND_MAKER).collect();
-        assert_eq!(makers.len(), 1, "the bid alone: no Yes inventory to offer");
-        assert_eq!(makers[0].side, Side::Bid);
-        assert_eq!(makers[0].sym, yes_sym(0), "Arm B quotes the Yes book");
-        // XH4i-3a: no order of BIN15 carries a flag — the gateway arm rests
-        // a MAKER as ALO by its kind, and the replay's queue law reads the
-        // post-only flag (`core_fill::judged_by_queue`).
-        assert!(c.orders.iter().all(|o| o.flags == 0), "BIN15 sets no flag");
-        assert_eq!(makers[0].px.raw() % GRID_TICK_1E6, 0, "on the 1e-4 grid");
-        assert!(makers[0].px.raw() <= 490_000, "never crossing the touch");
-        assert!(m.counters().skipped_inventory > 0, "and the ask side says why");
-    }
-
-    // ---------------- E5: Arm B moves and pulls its own quotes ------
-
-    /// **LAW E-7, and the gate that was forced open.**
-    ///
-    /// Until E5 the first gate in `arm_quote` was "a live quote is
-    /// skipped", because this member had no cancel path: a resting
-    /// quote could only be replaced by letting its TTL run out, so
-    /// `requote_ttl_ns` was the replace cadence rather than a nicety.
-    /// A move of the fair value now becomes ONE modify — not a wait,
-    /// and not a cancel plus a place.
-    #[test]
-    fn a_fair_value_move_reprices_the_resting_bid_with_one_modify() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let first = m.family(0).expect("f").pend_quote[0];
-        assert!(first.live(), "a bid is resting");
-        // Arm A reprices on the same event and may fire its own IoC,
-        // so only MAKER intents are the claim here.
-        let makers_before = c.orders.iter().filter(|o| o.kind == ORDER_KIND_MAKER).count();
-
-        // The centre moves — and it is the BOOK that moves it here,
-        // because these families run the null arm, which quotes around
-        // the venue's own mid rather than the model's `p̂`. Inside the
-        // resting quote's TTL, so this is a reprice and not a lapse.
-        m.on_tick(
-            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 500_000_000, false),
-            &mut c,
-        );
-
-        assert_eq!(
-            c.orders.iter().filter(|o| o.kind == ORDER_KIND_MAKER).count(),
-            makers_before,
-            "a reprice is a MODIFY, never a second place"
-        );
-        assert_eq!(
-            c.modifies.len(),
-            1,
-            "DEBUG p_hat={} last_q={} reprices={} thr={} live={} skipped_partial={}",
-            m.family(0).expect("f").p_hat_1e6,
-            m.family(0).expect("f").last_quote_p_1e6[0],
-            m.counters().reprices,
-            5_000,
-            m.family(0).expect("f").pend_quote[0].live(),
-            m.counters().skipped_partial
-        );
-        assert_eq!(c.modifies[0].0, first.oid, "addressed by the resting id");
-        let repl = c.modifies[0].1;
-        assert_ne!(repl.client_oid, first.oid, "a FRESH cloid (ruling O-E5b)");
-        assert_eq!(repl.sym, first_sym(&m), "the same leg");
-        assert_eq!(repl.side, Side::Bid);
-        assert_eq!(repl.kind, ORDER_KIND_MAKER);
-
-        let now = m.family(0).expect("f").pend_quote[0];
-        assert_eq!(now.oid, repl.client_oid, "the member tracks the new id");
-        assert_eq!(now.prev_oid, first.oid, "and remembers the old one");
-        assert_eq!(now.px_1e6, repl.px.raw());
-        assert_eq!(m.counters().quotes_modified, 1);
-        assert_eq!(
-            m.counters().quotes_submitted,
-            1,
-            "a move is not a new quote"
-        );
-    }
-
-    /// **The raced fill, which is why one generation is remembered.**
-    ///
-    /// A reprice gives the replacement a fresh cloid, so a fill the
-    /// venue was already answering under the OLD id arrives after the
-    /// member has stopped listening for it. Without the memory it
-    /// lands in `unknown_fills`, moves no position, and the member
-    /// believes it holds less than it does — the F7 shape, absence
-    /// read as evidence.
-    #[test]
-    fn a_fill_that_raced_the_reprice_still_books_under_the_previous_id() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let old_oid = m.family(0).expect("f").pend_quote[0].oid;
-        m.on_tick(
-            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 500_000_000, false),
-            &mut c,
-        );
-        assert_eq!(m.counters().quotes_modified, 1);
-        let new_oid = m.family(0).expect("f").pend_quote[0].oid;
-        assert_ne!(old_oid, new_oid);
-
-        // The venue answers the OLD id.
-        m.on_fill(
-            &Fill::new(
-                at(62) + 700_000_000,
-                first_sym(&m),
-                Side::Bid,
-                Price::from_raw(480_000),
-                Qty::from_raw(10_000_000),
-                old_oid,
-            ),
-            &mut c,
-        );
-        assert_eq!(
-            m.family(0).expect("f").pos_yes_1e6,
-            10_000_000,
-            "the position moved — the whole point"
-        );
-        assert_eq!(m.counters().quotes_raced, 1);
-        assert_eq!(
-            m.counters().unknown_fills,
-            0,
-            "it is NOT a book disagreement"
-        );
-    }
-
-    /// A refused modify changes nothing: the old quote is still
-    /// resting at its old price and still reserving its room.
-    /// Crediting the reservation before the venue took the modify
-    /// would free cap room for an order that never moved.
-    #[test]
-    fn a_refused_modify_leaves_the_quote_and_its_reservation_alone() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let before = m.family(0).expect("f").pend_quote[0];
-        let reserved_before = m.family(0).expect("f").notional_instance_1e6;
-        let orders_before = c.orders.len();
-
-        c.lifecycle_err = Some(SubmitErr::NoSuchOrder);
-        m.on_tick(
-            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 500_000_000, false),
-            &mut c,
-        );
-
-        let after = m.family(0).expect("f").pend_quote[0];
-        assert_eq!(after.oid, before.oid, "still the same resting order");
-        assert_eq!(after.px_1e6, before.px_1e6, "at the same price");
-        assert_eq!(after.prev_oid, 0, "and it never moved");
-        assert_eq!(
-            after.booked_notional_1e6, before.booked_notional_1e6,
-            "the leg still holds the room it reserved"
-        );
-        // EXACT, not `>=`. Arm A reprices on the same event and may
-        // book an opening take, so its contribution is measured and
-        // subtracted rather than waved at — a `>=` would also pass if
-        // the code credited the reservation and Arm A happened to
-        // book at least as much on the same tick, which is the shape
-        // of assertion this lane keeps having to tighten.
-        let arm_a: i64 = c.orders[orders_before..]
-            .iter()
-            .filter(|o| o.kind != ORDER_KIND_MAKER && o.side == Side::Bid)
-            .map(|o| ((o.px.raw() as i128 * o.qty.raw() as i128) / 1_000_000) as i64)
-            .sum();
-        assert_eq!(
-            m.family(0).expect("f").notional_instance_1e6,
-            reserved_before + arm_a,
-            "a refused modify must credit nothing and book nothing"
-        );
-        assert_eq!(m.counters().quotes_modified, 0);
-        assert_eq!(m.counters().quotes_modify_refused, 1);
-    }
-
-    /// **The MODEL arm, where `p̂` really is the centre.**
-    ///
-    /// Every other reprice test here runs the NULL arm, which quotes
-    /// around the venue's own mid — so a mark move cannot move their
-    /// centre, and none of them shows that a FAIR-VALUE move produces
-    /// a modify. That is the arm the lane will run live, and its
-    /// centre also carries the inventory skew, so its reprice rate is
-    /// not the null arm's. Pinned separately for both reasons.
-    #[test]
-    fn a_mark_move_reprices_the_model_arms_quote() {
-        let mut p = params_1(FAMILY_OUT_15M);
-        p.null_arm = 0; // every instance is the model arm
-        let mut m = Bin15Strategy::new();
-        m.configure(p, ramp_luts(), core_time::WallAnchor::new(MONO0, WALL0))
-            .expect("configure");
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        assert_eq!(m.family(0).expect("f").arm, ARM_MODEL, "the model arm");
-        let before = m.family(0).expect("f").pend_quote[0];
-        assert!(before.live(), "a bid is resting");
-
-        // A mark move — the model arm's centre IS `p̂`, so this is
-        // what moves it. Inside the resting quote's TTL.
-        m.on_venue_event(
-            &mark_event(79_000_100_000, at(62) + 500_000_000),
-            &mut c,
-        );
-
-        assert_eq!(m.counters().quotes_modified, 1, "one modify, no new place");
-        assert_eq!(c.modifies.len(), 1);
-        assert_eq!(c.modifies[0].0, before.oid);
-        let after = m.family(0).expect("f").pend_quote[0];
-        assert_eq!(after.prev_oid, before.oid);
-        assert_ne!(after.px_1e6, before.px_1e6, "and it really moved the price");
-    }
-
-    /// **A reprice does not extend a quote's life.** The modified leg
-    /// inherits the ORIGINAL deadline, so an Arm B moving every
-    /// 333 ms cannot hold a quote past the TTL its ruleset gave it —
-    /// the TTL would stop being a bound. The dispatcher enforces the
-    /// same rule on its own open table; this is the member's book
-    /// agreeing with it rather than trusting it.
-    #[test]
-    fn a_reprice_inherits_the_original_deadline() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let before = m.family(0).expect("f").pend_quote[0];
-        m.on_tick(
-            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 500_000_000, false),
-            &mut c,
-        );
-        let after = m.family(0).expect("f").pend_quote[0];
-        assert_eq!(m.counters().quotes_modified, 1, "it really moved");
-        assert_ne!(after.oid, before.oid);
-        assert_eq!(
-            after.deadline_ns, before.deadline_ns,
-            "a reprice must not buy the quote more time"
-        );
-    }
-
-    /// **The oversized ask — one of the few places the paper model is
-    /// OPTIMISTIC against live.**
-    ///
-    /// Arm B's ask may only offer inventory we can prove we hold: a
-    /// HIP-4 position cannot go negative and the venue refuses the
-    /// sell outright. A resting ask bigger than the holding is an
-    /// order the live venue will not fill and the paper matcher
-    /// takes happily — the one direction of modelling error that
-    /// matters.
-    ///
-    /// **The reachable way in is a raced fill on the ASK.** A closing
-    /// take cannot do it (`arm_take` already subtracts the resting
-    /// ask's remaining before sizing) and a settlement cannot
-    /// (`clear_instance` zeroes the position and the quotes
-    /// together). What can is a sell the venue answered under the id
-    /// the ask carried BEFORE a reprice: the holding drops, the
-    /// replacement keeps its size, and the two no longer agree. That
-    /// is exactly the state this test builds, through `on_fill` and
-    /// nothing else.
-    ///
-    /// The pull fires with the centre standing still — the trigger is
-    /// the inventory, not the price.
-    #[test]
-    fn a_resting_ask_is_pulled_down_when_a_raced_fill_takes_the_inventory() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let bid = m.family(0).expect("f").pend_quote[0];
-
-        // Inventory, from a fill on our own resting bid.
-        m.on_fill(
-            &Fill::new(
-                at(62) + 100_000_000,
-                yes_sym(0),
-                Side::Bid,
-                Price::from_raw(bid.px_1e6),
-                Qty::from_raw(100_000_000),
-                bid.oid,
-            ),
-            &mut c,
-        );
-        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 100_000_000);
-
-        // One reprice: now there IS something to offer, so the ask
-        // quotes for the first time — sized at the whole holding.
-        m.on_tick(
-            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 200_000_000, false),
-            &mut c,
-        );
-        let ask1 = m.family(0).expect("f").pend_quote[1];
-        assert!(ask1.live(), "the ask is resting");
-        assert_eq!(ask1.qty_1e6, 100_000_000, "all of it is offered");
-
-        // The centre moves, so the ask is repriced — fresh cloid, old
-        // one remembered for one generation.
-        m.on_tick(
-            &tick(yes_sym(0), 430_000, 450_000, 1_000_000_000, at(62) + 300_000_000, false),
-            &mut c,
-        );
-        let ask2 = m.family(0).expect("f").pend_quote[1];
-        assert_eq!(ask2.prev_oid, ask1.oid, "the reprice happened");
-        assert_eq!(ask2.qty_1e6, 100_000_000, "still offering the whole holding");
-        let modifies_before = c.modifies.len();
-
-        // The venue answers the OLD ask id: 60 contracts sold. The
-        // holding drops; the replacement's size does not.
-        m.on_fill(
-            &Fill::new(
-                at(62) + 350_000_000,
-                yes_sym(0),
-                Side::Ask,
-                Price::from_raw(ask1.px_1e6),
-                Qty::from_raw(60_000_000),
-                ask1.oid,
-            ),
-            &mut c,
-        );
-        assert_eq!(m.counters().quotes_raced, 1);
-        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 40_000_000);
-        assert_eq!(
-            m.family(0).expect("f").pend_quote[1].filled_1e6,
-            0,
-            "the raced fill belongs to the RETIRED order, not this one"
-        );
-
-        // Same book, so the centre has not moved. The ask is pulled
-        // down anyway.
-        m.on_tick(
-            &tick(yes_sym(0), 430_000, 450_000, 1_000_000_000, at(62) + 400_000_000, false),
-            &mut c,
-        );
-        assert_eq!(
-            c.modifies.len(),
-            modifies_before + 1,
-            "the ask must be pulled down even though nothing repriced"
-        );
-        let (prev, repl) = c.modifies[modifies_before];
-        assert_eq!(prev, ask2.oid, "addressed by the resting ask");
-        assert_eq!(repl.side, Side::Ask);
-        assert_eq!(
-            repl.qty.raw(),
-            40_000_000,
-            "down to what we can prove we hold"
-        );
-        assert_eq!(m.family(0).expect("f").pend_quote[1].qty_1e6, 40_000_000);
-    }
-
-    /// **When there is nothing left to offer, the ask is PULLED.**
-    ///
-    /// The remedy for an oversized ask is normally a modify down to
-    /// the free amount — but at free = 0 there is no replacement to
-    /// send, and before the cancel verb the member's only option was
-    /// a counter and a shrug while the ask rested to its TTL. An ask
-    /// offering inventory we do not hold at all must not survive that
-    /// long: the live venue refuses every fill of it and the paper
-    /// matcher takes them.
-    #[test]
-    fn an_ask_with_nothing_left_behind_it_is_cancelled_not_counted() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let bid = m.family(0).expect("f").pend_quote[0];
-        m.on_fill(
-            &Fill::new(
-                at(62) + 100_000_000,
-                yes_sym(0),
-                Side::Bid,
-                Price::from_raw(bid.px_1e6),
-                Qty::from_raw(100_000_000),
-                bid.oid,
-            ),
-            &mut c,
-        );
-        m.on_tick(
-            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 200_000_000, false),
-            &mut c,
-        );
-        let ask1 = m.family(0).expect("f").pend_quote[1];
-        m.on_tick(
-            &tick(yes_sym(0), 430_000, 450_000, 1_000_000_000, at(62) + 300_000_000, false),
-            &mut c,
-        );
-        let ask2 = m.family(0).expect("f").pend_quote[1];
-        assert!(ask2.live());
-
-        // The raced fill takes the WHOLE holding.
-        m.on_fill(
-            &Fill::new(
-                at(62) + 350_000_000,
-                yes_sym(0),
-                Side::Ask,
-                Price::from_raw(ask1.px_1e6),
-                Qty::from_raw(100_000_000),
-                ask1.oid,
-            ),
-            &mut c,
-        );
-        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 0, "nothing left");
-
-        let cancels_before = c.cancels.len();
-        m.on_tick(
-            &tick(yes_sym(0), 430_000, 450_000, 1_000_000_000, at(62) + 400_000_000, false),
-            &mut c,
-        );
-        assert_eq!(
-            c.cancels.len(),
-            cancels_before + 1,
-            "the ask must be taken back, not merely counted"
-        );
-        assert_eq!(c.cancels[cancels_before], ask2.oid);
-        assert!(
-            !m.family(0).expect("f").pend_quote[1].live(),
-            "and the member stops tracking it"
-        );
-        assert_eq!(m.counters().quotes_cancelled, 1);
-    }
-
-    /// **`arm_take` and the resting ask must never size against the
-    /// same contracts** (BIN15 P4b, F3). A raced fill folded into the
-    /// replacement's `filled_1e6` would move BOTH sides of
-    /// `pos − (ask.qty − ask.filled)` by the same amount, making the
-    /// oversize algebraically invisible and letting a closing take be
-    /// sized past the holding. This pins the pair against the venue's
-    /// truth instead.
-    #[test]
-    fn a_raced_fill_does_not_make_the_resting_ask_look_smaller_than_it_is() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let bid = m.family(0).expect("f").pend_quote[0];
-        m.on_fill(
-            &Fill::new(
-                at(62) + 100_000_000,
-                yes_sym(0),
-                Side::Bid,
-                Price::from_raw(bid.px_1e6),
-                Qty::from_raw(100_000_000),
-                bid.oid,
-            ),
-            &mut c,
-        );
-        m.on_tick(
-            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 200_000_000, false),
-            &mut c,
-        );
-        let ask1 = m.family(0).expect("f").pend_quote[1];
-        m.on_tick(
-            &tick(yes_sym(0), 430_000, 450_000, 1_000_000_000, at(62) + 300_000_000, false),
-            &mut c,
-        );
-        let ask2 = m.family(0).expect("f").pend_quote[1];
-        m.on_fill(
-            &Fill::new(
-                at(62) + 350_000_000,
-                yes_sym(0),
-                Side::Ask,
-                Price::from_raw(ask1.px_1e6),
-                Qty::from_raw(60_000_000),
-                ask1.oid,
-            ),
-            &mut c,
-        );
-
-        let f = *m.family(0).expect("f");
-        let reserved = f.pend_quote[1].qty_1e6 - f.pend_quote[1].filled_1e6;
-        assert_eq!(reserved, ask2.qty_1e6, "the venue still rests all of it");
-        assert!(
-            reserved > f.pos_yes_1e6,
-            "and it now offers more than we hold — which must be VISIBLE"
-        );
-        assert_eq!(
-            f.pos_yes_1e6 - reserved,
-            -60_000_000,
-            "a closing take sized on this would be a second sell of the same 60"
-        );
-    }
-
-    /// **LAW E-8's member half.** The venue has no server-side TTL on    /// **LAW E-8's member half.** The venue has no server-side TTL on
-    /// a Gtc/Alo order, so a quote nobody cancels rests forever.
-    /// Before E5 the member simply forgot a lapsed leg — correct
-    /// against a paper matcher running its own TTL law, and a
-    /// stranded quote live.
-    #[test]
-    fn a_lapsed_quote_is_cancelled_and_not_merely_forgotten() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let leg = m.family(0).expect("f").pend_quote[0];
-        assert!(leg.live());
-
-        // The 1 s timer, well past the quote's TTL.
-        m.on_timer(leg.deadline_ns + 1, &mut c);
-
-        assert_eq!(c.cancels, vec![leg.oid], "the venue was told");
-        assert!(!m.family(0).expect("f").pend_quote[0].live());
-        assert_eq!(m.counters().quotes_cancelled, 1);
-        assert_eq!(m.counters().quotes_expired, 1);
-    }
-
-    /// The member's own deadline governs its book either way — a
-    /// pending kept alive because a cancel failed would leak forever.
-    /// A refusal that is NOT `NoSuchOrder` is a quote the member has
-    /// stopped tracking and the venue may still hold, so it gets its
-    /// own counter rather than being lost in the expiry count.
-    #[test]
-    fn a_refused_cancel_still_clears_the_book_and_is_counted_apart() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let leg = m.family(0).expect("f").pend_quote[0];
-        c.lifecycle_err = Some(SubmitErr::Refused);
-        m.on_timer(leg.deadline_ns + 1, &mut c);
-
-        assert!(!m.family(0).expect("f").pend_quote[0].live(), "book cleared");
-        assert_eq!(m.counters().quotes_cancel_refused, 1);
-        assert_eq!(m.counters().quotes_cancelled, 0);
-
-        // `NoSuchOrder` is NOT counted there: the order really is
-        // gone, which is what the member wanted.
-        let mut m2 = member(FAMILY_OUT_15M);
-        let mut c2 = ctx();
-        live_family(&mut m2, &mut c2, 490_000, 510_000);
-        let leg2 = m2.family(0).expect("f").pend_quote[0];
-        c2.lifecycle_err = Some(SubmitErr::NoSuchOrder);
-        m2.on_timer(leg2.deadline_ns + 1, &mut c2);
-        assert_eq!(m2.counters().quotes_cancel_refused, 0);
-    }
-
-    /// **A settlement is not "a fill the engine did not order".**
-    ///
-    /// The venue places the settling order itself, so it carries the
-    /// venue's oid and matches no pending by construction — the scan
-    /// would drop it into `unknown_fills`, whose whole meaning is "my
-    /// book of intents disagrees with the dispatcher's". It gets its
-    /// own counter, and it moves NO position: `clear_instance` on the
-    /// roll is what flattens the family, and applying the payout too
-    /// would close the same position twice.
-    #[test]
-    fn a_settlement_is_counted_apart_from_unknown_fills() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 390_000, 400_000);
-        let oid = m.family(0).expect("f").pend_take.oid;
-        m.on_fill(
-            &Fill::new(at(63), yes_sym(0), Side::Bid, Price::from_raw(400_000), Qty::from_raw(25_000_000), oid),
-            &mut c,
-        );
-        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 25_000_000);
-
-        // The venue settles: its OWN oid, at 1.0, sold back.
-        let settle = Fill::new(
-            at(900),
-            yes_sym(0),
-            Side::Ask,
-            Price::from_raw(1_000_000),
-            Qty::from_raw(25_000_000),
-            0xDEAD_BEEF,
-        )
-        .with_flags(core_types::FILL_FLAG_SETTLEMENT);
-        m.on_fill(&settle, &mut c);
-
-        assert_eq!(m.counters().settlement_fills, 1, "counted as what it is");
-        assert_eq!(
-            m.counters().unknown_fills,
-            0,
-            "and NOT as a disagreement with the dispatcher"
-        );
-        assert_eq!(
-            m.family(0).expect("f").pos_yes_1e6,
-            25_000_000,
-            "the roll flattens the family; the payout must not close it twice"
-        );
-
-        // An unflagged fill with the same unmatched oid IS unknown —
-        // the flag is what distinguishes them, not the oid.
-        let stranger = Fill::new(
-            at(901),
-            yes_sym(0),
-            Side::Ask,
-            Price::from_raw(1_000_000),
-            Qty::from_raw(25_000_000),
-            0xDEAD_BEEF,
-        );
-        m.on_fill(&stranger, &mut c);
-        assert_eq!(m.counters().unknown_fills, 1);
-        assert_eq!(m.counters().settlement_fills, 1, "unchanged");
-    }
-
-    #[test]
-    fn positions_move_only_on_fills() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 390_000, 400_000);
-        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 0, "a submit is an intent");
-        let oid = m.family(0).expect("f").pend_take.oid;
-        assert_ne!(oid, 0);
-        m.on_fill(
-            &Fill::new(at(63), yes_sym(0), Side::Bid, Price::from_raw(400_000), Qty::from_raw(25_000_000), oid),
-            &mut c,
-        );
-        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 25_000_000, "NOW it moves");
-        assert_eq!(m.counters().fills, 1);
-        assert_eq!(m.counters().takes_filled, 1);
-        assert_eq!(m.counters().unknown_fills, 0);
-        // BIN15 P4c (F8): 25 M of a 500 M clip is a PARTIAL, and the leg
-        // stays open for the rest of the venue's answer. It closes when
-        // it is full or at the sweep deadline — never on the first
-        // print, which used to send the second one to `unknown_fills`
-        // where it moved no position at all.
-        assert_eq!(
-            m.family(0).expect("f").pend_take.oid,
-            oid,
-            "a partially filled IoC is still in flight"
-        );
-        assert_eq!(m.family(0).expect("f").pend_take.filled_1e6, 25_000_000);
-        m.on_timer(at(300), &mut c);
-        assert_eq!(m.family(0).expect("f").pend_take.oid, 0, "the deadline judges it");
-
-        // A fill for an order this member never sent changes nothing.
-        m.on_fill(
-            &Fill::new(at(64), yes_sym(0), Side::Bid, Price::from_raw(400_000), Qty::from_raw(1_000_000), 0xDEAD),
-            &mut c,
-        );
-        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 25_000_000);
-        assert_eq!(m.counters().unknown_fills, 1);
-    }
-
-    /// BIN15 P4b (F3): loud in debug, saturating in release.
-    ///
-    /// A sell larger than the holding means the member's book of
-    /// intents disagrees with the fills it is handed. In a test build
-    /// that is a `debug_assert!` and it must FIRE — a silent `.max(0)`
-    /// is how the disagreement stayed invisible. In release the process
-    /// keeps a non-negative position instead of wrapping, which is the
-    /// house law for a hot path.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "the venue has no short"))]
-    fn a_sell_can_never_take_a_side_below_zero() {
-        // The venue has no short, so a sell fill larger than the
-        // position must floor at zero rather than wrap negative.
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 390_000, 400_000);
-        let oid = m.family(0).expect("f").pend_take.oid;
-        m.on_fill(
-            &Fill::new(at(63), yes_sym(0), Side::Bid, Price::from_raw(400_000), Qty::from_raw(5_000_000), oid),
-            &mut c,
-        );
-        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 5_000_000);
-        m.apply_position(0, true, false, 9_000_000);
-        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 0, "floored, not negative");
-    }
-
-    #[test]
-    fn an_unfilled_take_is_counted_and_cleared() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 390_000, 400_000);
-        assert!(m.family(0).expect("f").pend_take.live());
-        // Before the deadline: still pending.
-        m.on_timer(at(62), &mut c);
-        assert!(m.family(0).expect("f").pend_take.live());
-        assert_eq!(m.counters().takes_unfilled, 0);
-        // After: written off.
-        m.on_timer(at(70), &mut c);
-        assert!(!m.family(0).expect("f").pend_take.live());
-        assert_eq!(m.counters().takes_unfilled, 1);
-        assert_eq!(m.counters().quotes_expired, 1, "the resting bid expired too");
-    }
-
-    #[test]
-    fn null_arm_alternates_by_outcome_parity() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        warm(&mut m, 0);
-        m.on_venue_event(&roll_event(0, 2648, 60, 79_000_000_000, expiry(900), false), &mut c);
-        assert_eq!(m.family(0).expect("f").arm, ARM_MODEL, "even outcome ⇒ model");
-        m.on_venue_event(&roll_event(0, 2648, 60, 79_000_000_000, expiry(900), true), &mut c);
-        m.on_venue_event(&roll_event(0, 2649, 60, 79_000_000_000, expiry(900), false), &mut c);
-        assert_eq!(m.family(0).expect("f").arm, ARM_NULL, "odd outcome ⇒ null");
-
-        // With `null_arm` off, every instance is the model arm.
-        let mut p = params_1(FAMILY_OUT_15M);
-        p.null_arm = 0;
-        let mut m2 = Bin15Strategy::new();
-        m2.configure(p, ramp_luts(), core_time::WallAnchor::new(MONO0, WALL0)).expect("cfg");
-        warm(&mut m2, 0);
-        m2.on_venue_event(&roll_event(0, 2649, 60, 79_000_000_000, expiry(900), false), &mut c);
-        assert_eq!(m2.family(0).expect("f").arm, ARM_MODEL);
-    }
-
-    #[test]
-    fn the_oid_carries_arm_family_side_and_outcome() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 390_000, 400_000);
-        let oid = m.family(0).expect("f").pend_take.oid;
-        assert_eq!(oid & OID_OUTCOME_MASK, 2649, "outcome in bits 0..32");
-        assert_eq!((oid >> OID_FAMILY_SHIFT) & 0xFFFF, 0, "family in 32..48");
-        assert_eq!((oid >> OID_SIDE_SHIFT) & 1, 0, "Yes leg");
-        assert_eq!(oid >> OID_ARM_SHIFT, 1, "outcome 2649 is odd ⇒ null arm");
-        assert_ne!(oid, 0, "and an oid is never zero, which is what marks a slot free");
+        assert_eq!(m.family(0).expect("f").p_ts_ns, at(63), "the fresh tick priced");
     }
 
     #[test]
@@ -4463,232 +2447,6 @@ mod tests {
         m.on_ai(&clear, &mut c);
         assert_eq!(m.family(0).expect("f").live.outcome, 0);
         assert_eq!(m.counters().spec_overrides, 2);
-    }
-
-    /// BIN15 P2 (F2), THE REGRESSION. Twenty unfilled 500-lot maker
-    /// quotes at ~0.50 book $5,000 at submit — the whole day cap — and
-    /// under the pre-fix law that room was never released, so the
-    /// twenty-first instance and every one after it was refused for the
-    /// rest of the UTC day. The member had not held a single contract.
-    ///
-    /// This test fails on HEAD before P2 and passes after it: the cap
-    /// is a limit on EXPOSURE, so an expired reservation goes back.
-    #[test]
-    fn unfilled_quotes_give_their_cap_room_back() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        warm(&mut m, 0);
-        // An ODD outcome selects the NULL arm, whose quote centre is
-        // the venue's own mid — so the book drift below actually moves
-        // the quote and the re-quote threshold lets each cycle emit.
-        m.on_venue_event(&roll_event(0, 2651, 60, 79_000_000_000, expiry(900), false), &mut c);
-        m.on_mark(0, 79_000_000_000, at(0));
-        m.on_venue_event(&mark_event(79_000_000_000, at(61)), &mut c);
-        m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
-        let mut t = 62u64;
-        let mut cycles = 0usize;
-        let mut peak = 0i64;
-        // 25 quotes of 500 contracts near $0.48 book about $5,900 in
-        // total — over the $5,000 day cap, which is the number the
-        // pre-fix law would have been stuck at.
-        while cycles < 25 {
-            // A book that moves each cycle, so the re-quote threshold
-            // passes and a NEW quote is emitted every time.
-            let drift = (cycles as i64 % 5) * 10_000;
-            m.on_venue_event(&mark_event(79_000_000_000, at(t)), &mut c);
-            m.on_tick(
-                &tick(yes_sym(0), 480_000 + drift, 520_000 + drift, 500_000_000, at(t), false),
-                &mut c,
-            );
-            peak = peak.max(m.day_notional_1e6());
-            // Every quote reaches its TTL unfilled.
-            t += 3;
-            m.on_timer(at(t), &mut c);
-            cycles += 1;
-        }
-        assert!(m.counters().quotes_submitted >= 21, "the tape must actually quote");
-        assert!(m.counters().quotes_expired >= 21, "and every quote must expire");
-        assert_eq!(m.counters().quotes_filled, 0, "none of them filled");
-        assert!(peak > 0, "and each one did reserve room while it rested");
-        assert!(
-            peak <= m.params().cap_day_usd_1e6,
-            "no single moment may exceed the cap either"
-        );
-        // THE INVARIANT. Nothing filled, so nothing is held, so nothing
-        // is booked — the cap reads the member's exposure, which is
-        // zero, not the number of orders it has ever sent.
-        assert_eq!(
-            m.day_notional_1e6(),
-            0,
-            "unfilled reservations must be released; the pre-fix law left ${} booked",
-            m.day_notional_1e6() / 1_000_000
-        );
-        assert_eq!(m.family(0).expect("f").notional_instance_1e6, 0);
-        // And the room really is usable: a fresh instance still trades.
-        m.on_venue_event(&roll_event(0, 2651, 60, 79_000_000_000, expiry(1800), false), &mut c);
-        m.on_venue_event(&mark_event(79_000_000_000, at(t + 1)), &mut c);
-        m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(t + 1), false), &mut c);
-        let before = m.counters().takes_submitted;
-        m.on_tick(&tick(yes_sym(0), 390_000, 400_000, 1_000_000_000, at(t + 1), false), &mut c);
-        assert!(
-            m.counters().takes_submitted > before,
-            "the day cap must not have been exhausted by orders that never filled"
-        );
-    }
-
-    /// BIN15 P2 (F2): a FILLED leg keeps its booking. The credit is for
-    /// the part that never became a position, and no more.
-    #[test]
-    fn a_filled_leg_keeps_the_room_it_actually_used() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 390_000, 400_000);
-        let leg = m.family(0).expect("f").pend_take;
-        assert!(leg.live(), "an IoC is in flight");
-        assert!(leg.booked_notional_1e6 > 0, "and it booked its notional");
-        let booked = leg.booked_notional_1e6;
-        // Fill HALF of it, then let the deadline pass.
-        m.on_fill(
-            &Fill::new(at(63), yes_sym(0), Side::Bid, Price::from_raw(400_000), Qty::from_raw(leg.qty_1e6 / 2), leg.oid),
-            &mut c,
-        );
-        m.on_timer(at(200), &mut c);
-        assert_eq!(
-            m.day_notional_1e6(),
-            booked / 2,
-            "half filled ⇒ half the room stays booked"
-        );
-        assert_eq!(m.counters().fills, 1);
-        assert_eq!(m.counters().takes_filled, 1);
-    }
-
-    /// BIN15 P4c (F8): a two-print IoC books BOTH prints.
-    ///
-    /// A marketable IoC that sweeps two price levels answers with two
-    /// fills. Closing the leg on the first sent the second into
-    /// `unknown_fills`, where it moved no position — the member then
-    /// believed it held half of what it held, and the closing take
-    /// sized against the wrong number.
-    #[test]
-    fn both_prints_of_a_two_print_ioc_are_booked() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 390_000, 400_000);
-        let leg = m.family(0).expect("f").pend_take;
-        let half = leg.qty_1e6 / 2;
-        m.on_fill(
-            &Fill::new(at(63), yes_sym(0), Side::Bid, Price::from_raw(400_000), Qty::from_raw(half), leg.oid),
-            &mut c,
-        );
-        m.on_fill(
-            &Fill::new(at(64), yes_sym(0), Side::Bid, Price::from_raw(400_000), Qty::from_raw(leg.qty_1e6 - half), leg.oid),
-            &mut c,
-        );
-        assert_eq!(m.counters().unknown_fills, 0, "the second print is not a stranger");
-        assert_eq!(m.counters().fills, 2, "both prints counted");
-        assert_eq!(m.counters().takes_filled, 1, "and they are ONE IoC");
-        assert_eq!(
-            m.family(0).expect("f").pos_yes_1e6,
-            leg.qty_1e6,
-            "the position is the whole IoC, not half of it"
-        );
-        assert!(!m.family(0).expect("f").pend_take.live(), "a full leg closes");
-    }
-
-    #[test]
-    fn caps_hold_per_instance_and_per_day() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        // $1 k per instance at 0.40 is 2 500 contracts; the clip is
-        // 500, so five FILLED takes exhaust the instance cap.
-        //
-        // BIN15 P2 (F2) changed what fills this cap. An unfilled take
-        // now gives its reservation back, so a loop of expiring IoCs
-        // never reaches the cap at all — which is the whole point of
-        // the phase. To measure the CAP the takes have to actually
-        // fill, so each one is answered with a fill for its full size.
-        warm(&mut m, 0);
-        m.on_venue_event(&roll_event(0, 2648, 60, 79_000_000_000, expiry(600), false), &mut c);
-        m.on_mark(0, 79_000_000_000, at(0));
-        m.on_venue_event(&mark_event(79_000_000_000, at(61)), &mut c);
-        m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
-        let mut t = 62u64;
-        let mut submitted_before = 0u64;
-        let mut i = 0usize;
-        while i < 12 {
-            // Each take is written off by its deadline, so the next
-            // tick can submit again — the caps, not the pendings, are
-            // what eventually stops it.
-            m.on_timer(at(t + 2), &mut c);
-            // BIN15 P0 (F4): the tape runs 36 s and the mark's shelf
-            // life is 5 s, so the underlying has to keep printing —
-            // which is what it does live (every 1-3 s). Without this
-            // the loop measures the staleness gate, not the caps.
-            m.on_venue_event(&mark_event(79_000_000_000, at(t + 2)), &mut c);
-            m.on_tick(&tick(yes_sym(0), 390_000, 400_000, 500_000_000, at(t + 3), false), &mut c);
-            let leg = m.family(0).expect("f").pend_take;
-            if leg.live() && leg.side == Side::Bid as u8 {
-                m.on_fill(
-                    &Fill::new(
-                        at(t + 3),
-                        if leg.is_yes == 1 { yes_sym(0) } else { no_sym(0) },
-                        Side::Bid,
-                        Price::from_raw(leg.px_1e6),
-                        Qty::from_raw(leg.qty_1e6),
-                        leg.oid,
-                    ),
-                    &mut c,
-                );
-            }
-            submitted_before = m.counters().takes_submitted;
-            t += 3;
-            i += 1;
-        }
-        assert!(submitted_before >= 2, "it did trade");
-        // THE INVARIANT: the booked notional never exceeds the cap, no
-        // matter how many ticks arrive.
-        let f = m.family(0).expect("f");
-        assert!(
-            f.notional_instance_1e6 <= m.params().cap_instance_usd_1e6,
-            "instance notional {} over cap",
-            f.notional_instance_1e6
-        );
-        // AND the interaction worth knowing: the last sliver of cap
-        // room does not produce a tiny order, it produces NO order.
-        // Either guard may be the proximate refusal — the CAP when the
-        // room reaches zero, the GRID when the residual buys fewer
-        // contracts than the venue's $1 minimum (the interaction O3
-        // documented in the harness). What must never happen is a
-        // rounded-up order.
-        //
-        // BIN15 P2 (F2) moved WHICH of the two speaks first: an unfilled
-        // reservation now returns, so the cap is consumed only by real
-        // exposure and lands on it squarely rather than leaving a
-        // sub-minimum crumb. The assertion is on the property, not on
-        // which counter carries it.
-        assert!(
-            m.counters().skipped_cap + m.counters().skipped_grid > 0,
-            "the residual cap room must be refused, not rounded up"
-        );
-        let left = m.params().cap_instance_usd_1e6 - f.notional_instance_1e6;
-        assert!(
-            left < GRID_MIN_NOTIONAL_1E6 as i64,
-            "and what is left must be under the venue minimum: {left} left"
-        );
-        // Exposure, not submissions: every dollar booked is a contract
-        // the member can prove it holds.
-        let held = f.pos_yes_1e6 + f.pos_no_1e6;
-        assert!(held > 0, "the tape must have filled something");
-        // The day cap survives a roll; the instance cap does not.
-        let day_before = m.day_notional_1e6;
-        assert!(day_before > 0);
-        m.on_venue_event(&roll_event(0, 2648, 60, 79_000_000_000, expiry(600), true), &mut c);
-        m.on_venue_event(&roll_event(0, 2650, 60, 79_000_000_000, expiry(1200), false), &mut c);
-        assert_eq!(m.family(0).expect("f").notional_instance_1e6, 0, "per instance");
-        assert_eq!(m.day_notional_1e6, day_before, "per day, across the roll");
-        // And it rolls at 00:00Z.
-        m.on_timer(at(86_400 * 2), &mut c);
-        assert_eq!(m.day_notional_1e6, 0);
     }
 
     #[test]
@@ -4960,705 +2718,6 @@ mod tests {
         assert_eq!(fam.p_ts_ns, priced_at, "nothing priced on half an average");
     }
 
-    /// BIN15 S3: the arms' τ floors are CLOCK statements — "no take in
-    /// the last minute" — so they are judged on the time to expiry, not
-    /// on the pricer's horizon (a variance-time: `τ − 2W/3` for a
-    /// TWAP-settled family, which would close the take arm 40 s early).
-    #[test]
-    fn the_take_floor_is_the_time_to_expiry_not_the_pricing_horizon() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        warm(&mut m, 0);
-        // 70 s to expiry at 62 s: past the 60 s take floor on the clock,
-        // while the horizon (70 − 40 = 30 s) is under it.
-        m.on_venue_event(&roll_event(0, 2654, 60, 79_000_000_000, expiry(132), false), &mut c);
-        m.on_mark(0, 79_000_000_000, at(0));
-        m.on_venue_event(&mark_event(79_000_000_000, at(61)), &mut c);
-        m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
-        m.on_tick(&tick(yes_sym(0), 390_000, 400_000, 1_000_000_000, at(62), false), &mut c);
-        assert_eq!(m.family(0).expect("f").last_tau_ns, 30_000_000_000, "the horizon");
-        assert_eq!(m.counters().takes_submitted, 1, "the clock says 70 s: the arm is open");
-    }
-
-    /// BIN15 S3: the other side of the same law. 50 s to expiry is inside
-    /// the 60 s take floor on the clock, although the old horizon
-    /// (`τ + W/3` = 70 s) cleared it — and the window's evidence is whole,
-    /// so the member DID price there: the hold is the floor's.
-    #[test]
-    fn inside_the_take_floor_on_the_clock_nothing_is_taken() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        warm(&mut m, 0);
-        let k = 79_000_000_000i64;
-        // Window [52 s, 112 s]; marks at most 6 s apart across its open.
-        m.on_venue_event(&roll_event(0, 2656, 60, k, expiry(112), false), &mut c);
-        m.on_mark(0, k, at(0));
-        let mut s = 45u64;
-        while s <= 55 {
-            m.on_venue_event(&mark_event(k, at(s)), &mut c);
-            s += 5;
-        }
-        m.on_venue_event(&mark_event(k, at(61)), &mut c);
-        let tau_held = m.counters().skipped_tau;
-        m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
-        m.on_tick(&tick(yes_sym(0), 390_000, 400_000, 1_000_000_000, at(62), false), &mut c);
-        let fam = m.family(0).expect("f");
-        assert_eq!(fam.twap_gap, 0, "whole evidence");
-        assert_eq!(fam.p_ts_ns, at(62), "it priced, inside the window");
-        assert_eq!(m.counters().takes_submitted, 0, "50 s on the clock is inside the floor");
-        assert!(m.counters().skipped_tau > tau_held);
-    }
-
-    /// BIN15 S3: the quote floor is on the clock too — 110 s to expiry is
-    /// inside the 120 s floor (the old horizon read 130 s and quoted),
-    /// and 121 s is outside it.
-    #[test]
-    fn the_quote_floor_is_the_time_to_expiry() {
-        for (expiry_s, quotes) in [(172u64, false), (183u64, true)] {
-            let mut m = member(FAMILY_OUT_15M);
-            let mut c = ctx();
-            warm(&mut m, 0);
-            m.on_venue_event(
-                &roll_event(0, 2657, 60, 79_000_000_000, expiry(expiry_s), false),
-                &mut c,
-            );
-            m.on_mark(0, 79_000_000_000, at(0));
-            m.on_venue_event(&mark_event(79_000_000_000, at(61)), &mut c);
-            m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
-            m.on_tick(&tick(yes_sym(0), 490_000, 510_000, 1_000_000_000, at(62), false), &mut c);
-            assert!(m.counters().reprices > 0, "the pricer ran");
-            assert_eq!(
-                m.counters().quotes_submitted > 0,
-                quotes,
-                "{} s to expiry",
-                expiry_s - 62
-            );
-        }
-    }
-
-    /// BIN15 O9: the coverage entry takes EVERY 15 m instance at the
-    /// fixed notional, on the side `p̂` prefers, with no edge required
-    /// — and exactly once per instance.
-    ///
-    /// Why it exists: 22 of the 33 instances in the 2026-09-12 capture
-    /// drew no order at all, so two thirds of the calibration ledger
-    /// was never written.
-    #[test]
-    fn the_coverage_entry_takes_every_instance_once_at_the_fixed_size() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        m.params.entry_usd_1e6 = 50_000_000; // $50
-        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
-        // A mark well ABOVE the strike ⇒ p̂ > 0.5 ⇒ the YES side.
-        m.on_venue_event(
-            &roll_event(0, 2650, 0, 79_000_000_000, expiry(600), false),
-            &mut c,
-        );
-        m.on_venue_event(&mark_event(79_197_500_000, at(62)), &mut c);
-        // p̂ ≈ 0.697 and a YES ask of 0.65: BIN15 P3 (F6) requires the
-        // ask to clear `p̂ − e_entry` = 0.677, and 0.65 does. The
-        // coverage block runs before the opening takes, and the SIZE
-        // tells the two apart — $50 of premium is 76 contracts, the
-        // edge arm's clip is 500.
-        m.on_tick(&tick(yes_sym(0), 640_000, 650_000, 1_000_000_000, at(63), false), &mut c);
-        m.on_tick(&tick(no_sym(0), 290_000, 300_000, 1_000_000_000, at(63), false), &mut c);
-        m.on_venue_event(&mark_event(79_197_500_000, at(64)), &mut c);
-
-        // The MAKER arm also quotes here; the coverage entry is the
-        // taker, so count those.
-        let takes = |c: &RecCtx| -> Vec<core_types::Order> {
-            c.orders
-                .iter()
-                .filter(|o| o.kind == ORDER_KIND_IOC)
-                .copied()
-                .collect()
-        };
-        let t = takes(&c);
-        assert_eq!(t.len(), 1, "one coverage entry, not one per reprice");
-        let o = t[0];
-        assert_eq!(o.sym, yes_sym(0), "p̂ > 0.5 takes the YES leg");
-        assert_eq!(o.side, Side::Bid);
-        assert_eq!(o.px.raw(), 650_000, "lifts the ask");
-        // $50 / 0.65 = 76.92 contracts, floored to the venue's lot.
-        assert_eq!(o.qty.raw(), 76_000_000, "$50 at 0.65 is 76 contracts");
-
-        // A second reprice must NOT enter again: the instance is taken.
-        m.on_venue_event(&mark_event(79_198_000_000, at(70)), &mut c);
-        assert_eq!(takes(&c).len(), 1, "once per instance");
-
-        // The NEXT instance is entered afresh.
-        m.on_venue_event(&roll_event(0, 2650, 0, 0, 0, true), &mut c);
-        m.on_venue_event(
-            &roll_event(0, 2651, 0, 79_000_000_000, expiry(1500), false),
-            &mut c,
-        );
-        // The settle feeds the realised vol back into the forecast,
-        // which drops the hand-set σ̂ this test stands on — put it back,
-        // exactly as at the top, or the successor never prices.
-        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
-        m.on_venue_event(&mark_event(79_197_500_000, at(962)), &mut c);
-        m.on_tick(&tick(yes_sym(0), 640_000, 650_000, 1_000_000_000, at(963), false), &mut c);
-        m.on_tick(&tick(no_sym(0), 290_000, 300_000, 1_000_000_000, at(963), false), &mut c);
-        // Immediately before the reprice: the settle fed realised vol
-        // back into the forecast and a mark can refresh σ̂ from it, so
-        // the hand-set value has to be the last word.
-        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
-        m.on_venue_event(&mark_event(79_197_500_000, at(964)), &mut c);
-        assert_eq!(takes(&c).len(), 2, "the successor is its own instance");
-    }
-
-    /// BIN15 P3 (F6) — THE PRICE BOUND, which is §0's whole argument in
-    /// one test.
-    ///
-    /// Buying the preferred side at ask `a` with belief `p` has an EV
-    /// per dollar of premium of `p/a − 1`, so the bar is `p > a`.
-    /// "Right most of the time" is not the bar: a 0.98 belief bought at
-    /// 0.999 is a losing trade even when it is right 98 times out of a
-    /// hundred, because the hundredth costs 0.999 and the other 99 win
-    /// 0.001 each. The old law paid that ask; this one does not, and
-    /// says so on its own counter.
-    #[test]
-    fn the_entry_refuses_an_ask_that_beats_its_own_belief() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        m.params.entry_usd_1e6 = 50_000_000; // $50
-        m.params.maker_enabled = 0; // the taker alone, so IoCs are its own
-        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
-        m.on_venue_event(&roll_event(0, 2650, 0, 79_000_000_000, expiry(600), false), &mut c);
-        m.on_venue_event(&mark_event(79_500_000_000, at(62)), &mut c);
-        // A deep YES belief against an ask of 0.999.
-        m.on_tick(&tick(yes_sym(0), 995_000, 999_000, 1_000_000_000, at(63), false), &mut c);
-        m.on_tick(&tick(no_sym(0), 1_000, 5_000, 1_000_000_000, at(63), false), &mut c);
-        m.on_venue_event(&mark_event(79_500_000_000, at(64)), &mut c);
-        let p_hat = m.family(0).expect("f").p_hat_1e6;
-        assert!(p_hat > 900_000, "the fixture must be a deep belief: {p_hat}");
-        assert!(p_hat < 999_000, "and cheaper than the ask, which is the point");
-        assert!(c.orders.is_empty(), "nothing is bought at an ask over the belief");
-        assert_eq!(m.counters().takes_submitted, 0);
-        assert!(m.counters().skipped_entry_price > 0, "and the refusal is counted");
-        // NOT burned: the flag stays down, so a book that comes back
-        // inside the bound is still this instance's entry.
-        assert_eq!(m.family(0).expect("f").covered, 0);
-
-        // The same instance, one tick later, offered at 0.90: now the
-        // ask clears `p̂ − 2 c` and the entry fires at the size $50 buys.
-        m.on_tick(&tick(yes_sym(0), 890_000, 900_000, 1_000_000_000, at(65), false), &mut c);
-        m.on_venue_event(&mark_event(79_500_000_000, at(66)), &mut c);
-        let t: Vec<core_types::Order> =
-            c.orders.iter().filter(|o| o.kind == ORDER_KIND_IOC).copied().collect();
-        assert_eq!(t.len(), 1, "one entry, once the price is lawful");
-        assert_eq!(t[0].px.raw(), 900_000);
-        // $50 / 0.90 = 55.55 contracts, floored to the venue's lot.
-        assert_eq!(t[0].qty.raw(), 55_000_000, "$50 at 0.90 is 55 contracts");
-        assert_eq!(m.family(0).expect("f").covered, 1, "and NOW it is taken");
-    }
-
-    /// BIN15 R0 (2026-09-19) — THE PRICE FLOOR. A preferred-side ask
-    /// far under the belief clears the bound (`ask ≤ p̂ − 2 c`) with
-    /// room to spare and is exactly the trade the tape says loses: the
-    /// venue disagreeing with the model. With `entry_min_px_1e6` set
-    /// the entry refuses it on the price counter, keeps the flag down,
-    /// and fires the moment the book comes back over the floor. With
-    /// the floor at 0 the branch is dead and every other test in this
-    /// module is the proof that the old law is untouched.
-    #[test]
-    fn the_entry_refuses_an_ask_under_its_floor_and_keeps_the_instance() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        m.params.entry_usd_1e6 = 50_000_000; // $50
-        m.params.entry_min_px_1e6 = 700_000; // no entry under 0.70
-        m.params.maker_enabled = 0; // the taker alone, so IoCs are its own
-        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
-        m.on_venue_event(&roll_event(0, 2650, 0, 79_000_000_000, expiry(600), false), &mut c);
-        m.on_venue_event(&mark_event(79_500_000_000, at(62)), &mut c);
-        // A deep YES belief against a Yes ask of 0.60: the bound is
-        // cleared by a mile, the floor is not.
-        m.on_tick(&tick(yes_sym(0), 590_000, 600_000, 1_000_000_000, at(63), false), &mut c);
-        m.on_tick(&tick(no_sym(0), 400_000, 410_000, 1_000_000_000, at(63), false), &mut c);
-        m.on_venue_event(&mark_event(79_500_000_000, at(64)), &mut c);
-        let p_hat = m.family(0).expect("f").p_hat_1e6;
-        assert!(p_hat > 700_000, "the fixture must be a belief over the floor: {p_hat}");
-        assert!(c.orders.is_empty(), "nothing is bought under the floor");
-        assert_eq!(m.counters().takes_submitted, 0);
-        assert!(m.counters().skipped_entry_price > 0, "and the refusal is counted");
-        assert_eq!(m.family(0).expect("f").covered, 0, "the instance is NOT burned");
-
-        // The same instance, one tick later, offered at 0.75: over the
-        // floor and still under the belief, so the entry fires.
-        m.on_tick(&tick(yes_sym(0), 740_000, 750_000, 1_000_000_000, at(65), false), &mut c);
-        m.on_venue_event(&mark_event(79_500_000_000, at(66)), &mut c);
-        let t: Vec<core_types::Order> =
-            c.orders.iter().filter(|o| o.kind == ORDER_KIND_IOC).copied().collect();
-        assert_eq!(t.len(), 1, "one coverage entry over the floor");
-        assert_eq!(t[0].px.raw(), 750_000);
-        assert_eq!(m.family(0).expect("f").covered, 1);
-    }
-    /// BIN15 P3 (F6) — RETRY ON REFUSAL.
-    ///
-    /// A cap, grid or ring refusal used to burn the instance's only
-    /// entry: `covered` was set before the emit, so an order that was
-    /// never sent still counted as the attempt and the instance was
-    /// silently lost to the lane. The flag now follows a SUBMITTED
-    /// emit, so the next reprice tries again.
-    #[test]
-    fn a_refused_entry_is_retried_not_burned() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        m.params.entry_usd_1e6 = 50_000_000;
-        m.params.maker_enabled = 0;
-        // No day room at all: the caps refuse the entry outright.
-        m.params.cap_day_usd_1e6 = 0;
-        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
-        m.on_venue_event(&roll_event(0, 2650, 0, 79_000_000_000, expiry(600), false), &mut c);
-        m.on_venue_event(&mark_event(79_197_500_000, at(62)), &mut c);
-        m.on_tick(&tick(yes_sym(0), 640_000, 650_000, 1_000_000_000, at(63), false), &mut c);
-        m.on_tick(&tick(no_sym(0), 290_000, 300_000, 1_000_000_000, at(63), false), &mut c);
-        m.on_venue_event(&mark_event(79_197_500_000, at(64)), &mut c);
-        assert_eq!(m.counters().takes_submitted, 0, "the cap refused it");
-        assert!(m.counters().skipped_cap > 0, "and said so");
-        assert_eq!(m.family(0).expect("f").covered, 0, "the attempt is NOT burned");
-
-        // Give the day its room back — the operator raising the cap, or
-        // 00:00Z arriving — and the very next reprice enters.
-        m.params.cap_day_usd_1e6 = 5_000_000_000;
-        m.on_venue_event(&mark_event(79_197_500_000, at(66)), &mut c);
-        assert_eq!(m.counters().takes_submitted, 1, "the retry lands");
-        assert_eq!(m.family(0).expect("f").covered, 1);
-        // And it is still ONCE per instance.
-        m.on_venue_event(&mark_event(79_197_500_000, at(68)), &mut c);
-        assert_eq!(m.counters().takes_submitted, 1, "once per instance, still");
-    }
-
-    /// BIN15 O9: `entry_usd_1e6 = 0` is the pre-2026-09-13 law bit for
-    /// bit — no coverage entry, the edge arm alone decides.
-    #[test]
-    fn a_zero_entry_notional_is_the_edge_law_unchanged() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        assert_eq!(m.params.entry_usd_1e6, 0, "off by default");
-        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
-        m.on_venue_event(
-            &roll_event(0, 2650, 0, 79_000_000_000, expiry(600), false),
-            &mut c,
-        );
-        m.on_venue_event(&mark_event(79_197_500_000, at(62)), &mut c);
-        // The same no-edge book the coverage test uses.
-        m.on_tick(&tick(yes_sym(0), 680_000, 690_000, 1_000_000_000, at(63), false), &mut c);
-        m.on_tick(&tick(no_sym(0), 290_000, 300_000, 1_000_000_000, at(63), false), &mut c);
-        m.on_venue_event(&mark_event(79_197_500_000, at(64)), &mut c);
-        assert!(
-            c.orders.iter().all(|o| o.kind != ORDER_KIND_IOC),
-            "no taker order without edge when the coverage entry is off"
-        );
-    }
-
-    /// BIN15 S5: a member with the coverage entry on, the taker alone
-    /// (so every IoC is the entry), a hand-set σ̂, and a 15 m instance
-    /// bound. `p̂ ≈ 0.697` at the mark `S5_UP`, `≈ 0.303` at `S5_DOWN`.
-    fn s5_member(persist: u8, ceiling_ns: u64, expiry_s: u64) -> (Bin15Strategy, RecCtx) {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        m.params.entry_usd_1e6 = 50_000_000;
-        m.params.maker_enabled = 0;
-        m.params.entry_persist_polls = persist;
-        m.params.entry_elapsed_max_ns = ceiling_ns;
-        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
-        m.on_venue_event(
-            &roll_event(0, 2650, 0, 79_000_000_000, expiry(expiry_s), false),
-            &mut c,
-        );
-        (m, c)
-    }
-
-    /// The mark that makes YES the preferred side.
-    const S5_UP: i64 = 79_197_500_000;
-    /// The mark that makes NO the preferred side.
-    const S5_DOWN: i64 = 78_802_500_000;
-
-    fn iocs(c: &RecCtx) -> usize {
-        c.orders.iter().filter(|o| o.kind == ORDER_KIND_IOC).count()
-    }
-
-    /// One book snapshot of `sym` whose ask clears either belief's bound
-    /// (0.65 against `0.697 − 2 c`), preceded by a mark so it is fresh.
-    fn s5_snapshot(m: &mut Bin15Strategy, c: &mut RecCtx, mark: i64, sym: SymbolId, s: u64) {
-        m.on_venue_event(&mark_event(mark, at(s - 1)), c);
-        m.on_tick(&tick(sym, 640_000, 650_000, 1_000_000_000, at(s), false), c);
-    }
-
-    /// BIN15 S5 — PERSISTENCE. With `entry_persist_polls = 3` the entry
-    /// does not fire on the first or the second passing snapshot of the
-    /// preferred leg and fires on the third DISTINCT one; the reprices in
-    /// between (marks on the same snapshot) never count twice. The
-    /// counterfactual is the FIRST passing reprice — the pre-S5 law's
-    /// entry — and it is recorded whatever the persistence law did.
-    #[test]
-    fn the_entry_waits_for_its_persistence_and_counts_each_snapshot_once() {
-        let (mut m, mut c) = s5_member(3, 0, 600);
-        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
-        let f = *m.family(0).expect("f");
-        assert_eq!((f.entry_hits, f.entry_yes), (1, 1), "one passing YES snapshot");
-        assert_eq!(f.entry_first_ok_ts, at(63), "the counterfactual: the old law fired here");
-        assert_eq!((f.entry_first_ok_px_1e6, f.entry_first_ok_yes), (650_000, 1));
-        assert_eq!(iocs(&c), 0, "one snapshot is not three");
-        assert!(m.counters().skipped_entry_persist > 0, "and the wait is counted");
-        // Marks on the SAME snapshot re-price; they are not polls.
-        m.on_venue_event(&mark_event(S5_UP, at(64)), &mut c);
-        m.on_venue_event(&mark_event(S5_UP, at(65)), &mut c);
-        assert_eq!(m.family(0).expect("f").entry_hits, 1, "a mark never counts twice");
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 68);
-        assert_eq!(m.family(0).expect("f").entry_hits, 2);
-        assert_eq!(iocs(&c), 0, "two is not three");
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 73);
-        assert_eq!(iocs(&c), 1, "the third distinct passing snapshot fires");
-        let o = c.orders[0];
-        assert_eq!((o.sym, o.px.raw()), (yes_sym(0), 650_000), "at that snapshot's ask");
-        let f = *m.family(0).expect("f");
-        assert_eq!(f.covered, 1);
-        assert_eq!(f.entry_first_ok_ts, at(63), "the counterfactual is not overwritten");
-        // The successor starts from nothing.
-        m.on_venue_event(&roll_event(0, 2650, 0, 0, 0, true), &mut c);
-        let f = *m.family(0).expect("f");
-        assert_eq!((f.entry_hits, f.entry_last_touch_ts, f.entry_first_ok_ts), (0, 0, 0));
-    }
-
-    /// BIN15 S5b: above one poll the run is judged at POLLS only — the
-    /// reprice a new snapshot of the preferred leg triggers (doc 27 R2's
-    /// poll instant). A failing poll breaks the run; a mark failing the test
-    /// between polls does not; and a mark passing it cannot start a run on a
-    /// snapshot that failed at its arrival (the pre-S5 law's rescue, kept for
-    /// `entry_persist_polls = 1` only).
-    #[test]
-    fn above_one_poll_only_a_poll_moves_the_run() {
-        let (mut m, mut c) = s5_member(3, 0, 600);
-        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 66);
-        assert_eq!(m.family(0).expect("f").entry_hits, 2);
-        // A new snapshot whose ask no longer clears the bound breaks it.
-        m.on_venue_event(&mark_event(S5_UP, at(68)), &mut c);
-        m.on_tick(&tick(yes_sym(0), 690_000, 700_000, 1_000_000_000, at(69), false), &mut c);
-        assert_eq!(m.family(0).expect("f").entry_hits, 0, "a failing poll breaks the run");
-        assert!(m.counters().skipped_entry_price > 0, "on the price counter, as before S5");
-        // A mark lifting p̂ over that ask is not a poll: no run starts.
-        m.on_venue_event(&mark_event(79_300_000_000, at(70)), &mut c);
-        assert_eq!(m.family(0).expect("f").entry_hits, 0, "no rescue above one poll");
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 73);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 76);
-        assert_eq!(m.family(0).expect("f").entry_hits, 2);
-        // A mark failing the test between polls neither breaks nor extends.
-        m.on_venue_event(&mark_event(79_050_000_000, at(77)), &mut c);
-        assert_eq!(m.family(0).expect("f").entry_hits, 2, "a mark never breaks a run");
-        assert_eq!(iocs(&c), 0, "no run of three yet");
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 79);
-        assert_eq!(iocs(&c), 1, "the third passing poll fires");
-    }
-
-    /// BIN15 S5: under the pre-S5 law a mark that passes the test on a
-    /// snapshot which failed at its arrival fires — every reprice is judged,
-    /// which is what makes `entry_persist_polls = 1` the old law exactly.
-    #[test]
-    fn under_the_pre_s5_law_a_mark_can_fire_on_a_snapshot_that_failed() {
-        let (mut m, mut c) = s5_member(1, 0, 600);
-        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
-        m.on_venue_event(&mark_event(S5_UP, at(62)), &mut c);
-        m.on_tick(&tick(yes_sym(0), 690_000, 700_000, 1_000_000_000, at(63), false), &mut c);
-        assert_eq!(iocs(&c), 0, "0.70 does not clear p̂ − 2 c at the arrival");
-        m.on_venue_event(&mark_event(79_300_000_000, at(64)), &mut c);
-        assert_eq!(iocs(&c), 1, "the mark lifts p̂ and the old law fires");
-    }
-
-    /// BIN15 S5: the run is on ONE side, and a side is judged at a poll. A
-    /// flip that a mark shows and a mark takes back before the next poll is
-    /// invisible (R2 never saw it); a flip seen at a poll of the other leg
-    /// starts a run there, and the way back starts afresh.
-    #[test]
-    fn a_preferred_side_flip_seen_at_a_poll_resets_the_run() {
-        let (mut m, mut c) = s5_member(3, 0, 600);
-        m.on_tick(&tick(no_sym(0), 640_000, 650_000, 1_000_000_000, at(61), false), &mut c);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 66);
-        // Down and back between two polls: nothing moved.
-        m.on_venue_event(&mark_event(S5_DOWN, at(67)), &mut c);
-        m.on_venue_event(&mark_event(S5_UP, at(68)), &mut c);
-        let f = *m.family(0).expect("f");
-        assert_eq!((f.entry_hits, f.entry_yes), (2, 1), "a flip between polls is invisible");
-        // Down, and the No book polls: a run on NO.
-        m.on_venue_event(&mark_event(S5_DOWN, at(69)), &mut c);
-        m.on_tick(&tick(no_sym(0), 640_000, 650_000, 1_000_000_000, at(70), false), &mut c);
-        let f = *m.family(0).expect("f");
-        assert_eq!((f.entry_hits, f.entry_yes), (1, 0), "a flip seen at a poll: a run on NO");
-        // Back up: the YES run starts again from its next poll.
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 72);
-        let f = *m.family(0).expect("f");
-        assert_eq!((f.entry_hits, f.entry_yes), (1, 1), "and back: a new run on YES");
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 75);
-        assert_eq!(iocs(&c), 0, "two on the new run");
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 78);
-        assert_eq!(iocs(&c), 1, "three on the new run fire");
-        assert_eq!(c.orders[0].sym, yes_sym(0));
-    }
-
-    /// BIN15 S5 — THE ELAPSED CEILING. An instance with no run begun by
-    /// the ceiling is closed for good, counted ONCE however often it
-    /// re-prices after; the counterfactual — the old law has no ceiling
-    /// — is still recorded.
-    #[test]
-    fn past_the_ceiling_an_instance_with_no_run_is_closed_and_counted_once() {
-        // expiry 600 s after the anchor: at(63) is 363 s into the
-        // instance, past a 240 s ceiling.
-        let (mut m, mut c) = s5_member(1, 240_000_000_000, 600);
-        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 66);
-        m.on_venue_event(&mark_event(S5_UP, at(67)), &mut c);
-        assert_eq!(iocs(&c), 0, "nothing is bought past the ceiling");
-        assert_eq!(m.counters().skipped_entry_elapsed, 1, "once per instance, not per reprice");
-        let f = *m.family(0).expect("f");
-        assert_eq!((f.entry_closed, f.covered), (1, 0));
-        assert_eq!(f.entry_first_ok_ts, at(63), "the old law would have bought it");
-        assert_eq!(m.counters().skipped_entry_price, 0, "closed is not a price refusal");
-    }
-
-    /// BIN15 S5: the ceiling judges where a run BEGINS (doc 27 R2: "the
-    /// first of them"). A run begun inside it completes past it — a failing
-    /// mark on the way does not stop it; a run broken past it (a failing
-    /// snapshot) cannot begin again.
-    #[test]
-    fn a_run_begun_inside_the_ceiling_may_complete_past_it() {
-        // expiry 725 s after the anchor: at(63) is 238 s into the
-        // instance, inside a 240 s ceiling; at(66) is past it.
-        let (mut m, mut c) = s5_member(3, 240_000_000_000, 725);
-        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 66);
-        // Past the ceiling, a mark failing the test on the same snapshot
-        // neither breaks the run nor closes the instance.
-        m.on_venue_event(&mark_event(79_050_000_000, at(67)), &mut c);
-        assert_eq!(m.family(0).expect("f").entry_hits, 2);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 69);
-        assert_eq!(iocs(&c), 1, "begun at 238 s, completed at 244 s");
-        assert_eq!(m.counters().skipped_entry_elapsed, 0);
-
-        let (mut m, mut c) = s5_member(3, 240_000_000_000, 725);
-        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
-        m.on_venue_event(&mark_event(S5_UP, at(65)), &mut c);
-        m.on_tick(&tick(yes_sym(0), 690_000, 700_000, 1_000_000_000, at(66), false), &mut c);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 69);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 72);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 75);
-        assert_eq!(iocs(&c), 0, "broken at 241 s: no new run may begin");
-        assert_eq!(m.counters().skipped_entry_elapsed, 1);
-        assert_eq!(m.family(0).expect("f").entry_closed, 1);
-    }
-
-    /// BIN15 S5b: past the ceiling, BETWEEN polls, a reprice with no run
-    /// under way closes the instance — as the next poll would have, one
-    /// snapshot sooner. Here the Yes snapshot's own arrival never reached
-    /// the gate (no mark yet to price it), so the first gated reprice is
-    /// the mark's, and it is not a poll.
-    #[test]
-    fn past_the_ceiling_a_reprice_between_polls_with_no_run_closes_the_instance() {
-        // expiry 600 s after the anchor: at(64) is 364 s in, past 240 s.
-        let (mut m, mut c) = s5_member(3, 240_000_000_000, 600);
-        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
-        m.on_tick(&tick(yes_sym(0), 640_000, 650_000, 1_000_000_000, at(62), false), &mut c);
-        assert_eq!(m.family(0).expect("f").entry_first_ok_ts, 0, "unpriced: never gated");
-        m.on_venue_event(&mark_event(S5_UP, at(64)), &mut c);
-        let f = *m.family(0).expect("f");
-        assert_eq!((f.entry_closed, f.entry_hits, f.covered), (1, 0, 0));
-        assert_eq!(m.counters().skipped_entry_elapsed, 1);
-        assert_eq!(f.entry_first_ok_ts, at(64), "the counterfactual still records it");
-        assert_eq!(iocs(&c), 0);
-    }
-
-    /// XH4i-6 (Q1): a reprice the venue refused late — a gateway's
-    /// `REJECTED` — restores the quote as it stood (the old order rests on):
-    /// its price, its reservation, its centre; and once the venue says that
-    /// order is gone too (`CANCELED`), its side is freed (risk review r1).
-    #[test]
-    fn a_refused_reprice_reported_late_restores_the_resting_quote() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        live_family(&mut m, &mut c, 490_000, 510_000);
-        let first = m.family(0).expect("f").pend_quote[0];
-        assert!(first.live(), "a bid is resting");
-        m.on_tick(
-            &tick(
-                yes_sym(0),
-                460_000,
-                480_000,
-                1_000_000_000,
-                at(62) + 500_000_000,
-                false,
-            ),
-            &mut c,
-        );
-        assert_eq!(c.modifies.len(), 1, "a reprice went out");
-        let repl = c.modifies[0].1;
-        let after = *m.family(0).expect("f");
-        let mut refused = core_types::OrderEvent::ZERO;
-        refused.client_oid = repl.client_oid;
-        refused.kind = core_types::ORDER_EVENT_REJECTED;
-        refused.reason = core_types::ORDER_EVENT_REASON_BAD_ALO_PX;
-        m.on_order_event(&refused, &mut c);
-        let f = *m.family(0).expect("f");
-        assert_eq!(
-            (
-                f.pend_quote[0].oid,
-                f.pend_quote[0].px_1e6,
-                f.pend_quote[0].booked_notional_1e6
-            ),
-            (first.oid, first.px_1e6, first.booked_notional_1e6),
-            "the old quote rests on"
-        );
-        assert_eq!(
-            f.notional_instance_1e6,
-            after.notional_instance_1e6 - after.pend_quote[0].booked_notional_1e6
-                + first.booked_notional_1e6,
-            "its reservation is back, the refused one's gone"
-        );
-        assert_eq!(m.counters().quotes_modify_refused, 1);
-        // The venue drops the old order too: its side is freed and its
-        // reservation is back — no phantom quote.
-        let mut gone = core_types::OrderEvent::ZERO;
-        gone.client_oid = first.oid;
-        gone.kind = core_types::ORDER_EVENT_CANCELED;
-        m.on_order_event(&gone, &mut c);
-        let g = *m.family(0).expect("f");
-        assert!(!g.pend_quote[0].live(), "freed");
-        assert_eq!(
-            g.notional_instance_1e6,
-            f.notional_instance_1e6 - first.booked_notional_1e6
-        );
-    }
-
-    /// XH4i-6 (Q1): a coverage entry the venue refused late — an IoC that
-    /// found nothing, a gateway's `REJECTED` — is written off and retried,
-    /// as the blocking arm's synchronous `Err` let it.
-    #[test]
-    fn a_coverage_entry_the_venue_refused_late_retries() {
-        let (mut m, mut c) = s5_member(1, 0, 600);
-        m.on_tick(
-            &tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false),
-            &mut c,
-        );
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
-        assert_eq!((iocs(&c), m.family(0).expect("f").covered), (1, 1));
-        let entry = m.family(0).expect("f").pend_take.oid;
-        // The gateway's IoC miss (`exec_hyperliquid::event::REASON_IOC_MISS`).
-        let mut missed = core_types::OrderEvent::ZERO;
-        missed.client_oid = entry;
-        missed.kind = core_types::ORDER_EVENT_REJECTED;
-        missed.reason = 12;
-        m.on_order_event(&missed, &mut c);
-        let f = *m.family(0).expect("f");
-        assert_eq!(
-            (f.covered, f.pend_take.live()),
-            (0, false),
-            "written off, free to retry"
-        );
-        m.on_venue_event(&mark_event(S5_UP, at(64)), &mut c);
-        assert_eq!(
-            (iocs(&c), m.family(0).expect("f").covered),
-            (2, 1),
-            "the entry retried"
-        );
-    }
-
-    /// BIN15 S5b: a complete run whose emit was REFUSED (the ring full)
-    /// burns nothing — the next reprice, a mark between polls, retries it
-    /// while the test holds on the run's side, without waiting a poll.
-    #[test]
-    fn a_complete_run_whose_emit_was_refused_retries_between_polls() {
-        let (mut m, mut c) = s5_member(3, 0, 600);
-        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 66);
-        c.full = true;
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 69);
-        let f = *m.family(0).expect("f");
-        assert_eq!((f.entry_hits, f.covered, iocs(&c)), (3, 0, 0), "complete, refused, kept");
-        c.full = false;
-        m.on_venue_event(&mark_event(S5_UP, at(70)), &mut c);
-        assert_eq!(iocs(&c), 1, "the mark retries the complete run");
-        assert_eq!(m.family(0).expect("f").covered, 1);
-    }
-
-    /// BIN15 S5: under `entry_persist_polls = 1` and no ceiling — the
-    /// defaults, and every artifact before S5 — the counterfactual IS the
-    /// entry: same reprice, same ask, same side.
-    #[test]
-    fn under_the_pre_s5_law_the_counterfactual_is_the_entry_itself() {
-        let (mut m, mut c) = s5_member(1, 0, 600);
-        assert_eq!(Bin15Params::default().entry_persist_polls, 1);
-        assert_eq!(Bin15Params::default().entry_elapsed_max_ns, 0);
-        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
-        assert_eq!(iocs(&c), 1, "the first passing snapshot fires");
-        let f = *m.family(0).expect("f");
-        assert_eq!(f.entry_first_ok_ts, at(63));
-        assert_eq!(i64::from(f.entry_first_ok_px_1e6), c.orders[0].px.raw());
-        assert_eq!(f.entry_first_ok_yes, 1);
-        // BIN15 S5b: with the artifact AT today's bound the control is the
-        // same record.
-        assert_eq!(
-            (f.entry_ctl_ok_ts, f.entry_ctl_ok_px_1e6, f.entry_ctl_ok_yes),
-            (f.entry_first_ok_ts, f.entry_first_ok_px_1e6, f.entry_first_ok_yes)
-        );
-        assert_eq!(m.counters().skipped_entry_persist, 0, "never counted under persist 1");
-        assert_eq!(m.counters().skipped_entry_elapsed, 0, "never counted with no ceiling");
-    }
-
-    /// BIN15 S5b: the CONTROL counterfactual records today's law from the
-    /// same reprice stream, whatever the artifact's own bound. With the
-    /// artifact at 3 c and the control at the 2 c default, an ask of 0.67
-    /// against `p̂ ≈ 0.697` clears the control only: the control records it
-    /// there, and the artifact's own counterfactual waits for the 0.65 that
-    /// clears 3 c. Neither trades.
-    #[test]
-    fn the_control_records_todays_law_when_the_artifact_moves_its_bound() {
-        let (mut m, mut c) = s5_member(3, 0, 600);
-        m.params.e_entry_1e6 = 30_000;
-        assert_eq!(m.params.entry_control_e_1e6, 20_000, "today's law");
-        m.on_tick(&tick(no_sym(0), 320_000, 330_000, 1_000_000_000, at(61), false), &mut c);
-        m.on_venue_event(&mark_event(S5_UP, at(62)), &mut c);
-        m.on_tick(&tick(yes_sym(0), 660_000, 670_000, 1_000_000_000, at(63), false), &mut c);
-        let f = *m.family(0).expect("f");
-        assert_eq!(
-            (f.entry_ctl_ok_ts, f.entry_ctl_ok_px_1e6, f.entry_ctl_ok_yes),
-            (at(63), 670_000, 1),
-            "0.67 clears today's 2 c"
-        );
-        assert_eq!(f.entry_first_ok_ts, 0, "0.67 does not clear the artifact's 3 c");
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 66);
-        let f = *m.family(0).expect("f");
-        assert_eq!((f.entry_first_ok_ts, f.entry_first_ok_px_1e6), (at(66), 650_000));
-        assert_eq!(f.entry_ctl_ok_ts, at(63), "the control keeps its first fire");
-        assert_eq!(iocs(&c), 0, "neither counterfactual trades");
-    }
-
-    #[test]
-    fn a_full_order_ring_is_counted_and_books_nothing() {
-        let mut m = member(FAMILY_OUT_15M);
-        let mut c = ctx();
-        c.full = true;
-        live_family(&mut m, &mut c, 390_000, 400_000);
-        // TWO, not three: the take and the BID quote reach `submit`
-        // and are refused by the ring, while the ASK quote never gets
-        // that far — with no Yes inventory the short rule holds it
-        // before an order exists. A count of three would mean the
-        // member had tried to sell what it does not own.
-        assert_eq!(m.orders_dropped(), 2, "the take and the bid quote");
-        assert!(m.counters().skipped_inventory > 0, "and the ask said why");
-        assert_eq!(m.orders_emitted(), 0);
-        assert_eq!(m.counters().takes_submitted, 0, "a dropped order is not a submit");
-        assert!(!m.family(0).expect("f").pend_take.live(), "and books no pending");
-        assert_eq!(m.family(0).expect("f").notional_instance_1e6, 0, "nor any notional");
-    }
-
     #[test]
     fn the_regime_word_is_carried_and_never_consulted() {
         let mut m = member(FAMILY_OUT_15M);
@@ -5668,7 +2727,7 @@ mod tests {
         assert_eq!(m.regime_label(), labels);
         // A CLOSED gate changes nothing: the HORIZON law.
         live_family(&mut m, &mut c, 390_000, 400_000);
-        let before = m.counters().takes_submitted;
+        let before = m.counters().reprices;
         m.on_regime(
             RegimeGate::new(
                 [core_types::RegimeWord(0); 4],
@@ -5683,7 +2742,7 @@ mod tests {
         m.on_venue_event(&mark_event(79_000_000_000, at(70)), &mut c);
         m.on_tick(&tick(yes_sym(0), 390_000, 400_000, 1_000_000_000, at(71), false), &mut c);
         assert!(
-            m.counters().takes_submitted > before,
+            m.counters().reprices > before,
             "a 15-minute binary is not one of the regime lane's cells"
         );
     }
@@ -5843,6 +2902,120 @@ mod tests {
         // The successor instance starts clean.
         m.on_venue_event(&roll_event(0, 7002, 60, 79_000_000_000, expiry(1_500), false), &mut c);
         assert_eq!(*m.late_state(0).expect("f"), LateState::default());
+    }
+
+    /// One late entry on the decided Yes side at 0.85 (persist 1); its oid.
+    fn late_entry(m: &mut Bin15Strategy, c: &mut RecCtx) -> u64 {
+        late_bind(m, c);
+        late_feed(m, c, 0, 585);
+        late_poll(m, c, 585, 800_000, 850_000);
+        assert_eq!(c.orders.len(), 1, "one late entry");
+        c.orders[0].client_oid
+    }
+
+    #[test]
+    fn a_late_take_moves_the_position_only_on_its_fills_and_books_every_print() {
+        let mut m = late_member(1);
+        let mut c = ctx();
+        let oid = late_entry(&mut m, &mut c);
+        let q = c.orders[0].qty.raw();
+        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 0, "a submit is an intent");
+        let fill = |qty: i64, oid: u64| {
+            Fill::new(at(586), yes_sym(0), Side::Bid, Price::from_raw(850_000), Qty::from_raw(qty), oid)
+        };
+        // Two prints of one IoC: a partial stays in flight, the second closes it.
+        m.on_fill(&fill(17_000_000, oid), &mut c);
+        assert_eq!(m.family(0).expect("f").pend_take.filled_1e6, 17_000_000);
+        assert!(m.family(0).expect("f").pend_take.live(), "a partial is still in flight");
+        m.on_fill(&fill(q - 17_000_000, oid), &mut c);
+        assert_eq!(m.family(0).expect("f").pos_yes_1e6, q, "both prints booked");
+        assert!(!m.family(0).expect("f").pend_take.live(), "full: closed");
+        let k = m.counters();
+        assert_eq!((k.fills, k.takes_filled, k.late_filled, k.unknown_fills), (2, 1, 1, 0));
+        // A fill for an order this member never sent changes nothing.
+        m.on_fill(&fill(1_000_000, 0xDEAD), &mut c);
+        assert_eq!(m.family(0).expect("f").pos_yes_1e6, q);
+        assert_eq!(m.counters().unknown_fills, 1);
+        // The venue's settlement print is counted as what it is, never as
+        // a disagreement with the dispatcher, and closes nothing twice.
+        let settle = Fill::new(at(601), yes_sym(0), Side::Ask, Price::from_raw(1_000_000), Qty::from_raw(q), 0xDEAD_BEEF)
+            .with_flags(core_types::FILL_FLAG_SETTLEMENT);
+        m.on_fill(&settle, &mut c);
+        assert_eq!((m.counters().settlement_fills, m.counters().unknown_fills), (1, 1));
+        assert_eq!(m.family(0).expect("f").pos_yes_1e6, q);
+    }
+
+    #[test]
+    fn an_unfilled_late_take_is_written_off_at_its_deadline_and_gives_its_room_back() {
+        let mut m = late_member(1);
+        let mut c = ctx();
+        let _ = late_entry(&mut m, &mut c);
+        assert!(m.family(0).expect("f").notional_instance_1e6 > 0, "the take reserved its room");
+        m.on_timer(at(585) + 400_000_000, &mut c);
+        assert!(m.family(0).expect("f").pend_take.live(), "before its deadline: pending");
+        assert_eq!(m.counters().takes_unfilled, 0);
+        m.on_timer(at(590), &mut c);
+        assert!(!m.family(0).expect("f").pend_take.live(), "after it: written off");
+        assert_eq!(m.counters().takes_unfilled, 1);
+        assert_eq!(m.family(0).expect("f").notional_instance_1e6, 0, "the room came back");
+    }
+
+    #[test]
+    fn the_oid_carries_family_side_and_outcome() {
+        let mut m = late_member(1);
+        let mut c = ctx();
+        let oid = late_entry(&mut m, &mut c);
+        assert_eq!(oid & OID_OUTCOME_MASK, 7001, "outcome in bits 0..32");
+        assert_eq!((oid >> OID_FAMILY_SHIFT) & 0xFFFF, 0, "family in 32..48");
+        assert_eq!((oid >> OID_SIDE_SHIFT) & 1, 0, "Yes leg");
+        assert_eq!(oid >> 63, 0, "bit 63, the retired null-arm flag, is always 0");
+        assert_ne!(oid, 0, "and an oid is never zero, which is what marks a slot free");
+    }
+
+    #[test]
+    fn the_late_take_is_capped_by_the_instance_and_the_day() {
+        let configured = |instance: i64, day: i64| {
+            let mut p = params_1(FAMILY_OUT_15M);
+            p.late.enabled = 1;
+            p.late.persist_polls = 1;
+            p.late.usd_1e6 = instance;
+            p.cap_instance_usd_1e6 = instance;
+            p.cap_day_usd_1e6 = day;
+            let mut m = Bin15Strategy::new();
+            m.configure(p, ramp_luts(), core_time::WallAnchor::new(MONO0, WALL0))
+                .expect("configure");
+            m.configure_late(late_ramp());
+            m
+        };
+        // $10 at 0.85 is 11 whole contracts ($9.35).
+        let mut m = configured(10_000_000, 100_000_000);
+        let mut c = ctx();
+        let _ = late_entry(&mut m, &mut c);
+        assert_eq!(c.orders[0].qty.raw(), 11_000_000);
+        // A day with under one contract of room: counted, nothing sent.
+        let mut m = configured(10_000_000, 500_000);
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 585);
+        late_poll(&mut m, &mut c, 585, 800_000, 850_000);
+        assert!(c.orders.is_empty());
+        assert!(m.counters().late_skipped_cap > 0);
+    }
+
+    #[test]
+    fn a_full_order_ring_is_counted_and_books_nothing() {
+        let mut m = late_member(1);
+        let mut c = ctx();
+        c.full = true;
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 585);
+        late_poll(&mut m, &mut c, 585, 800_000, 850_000);
+        assert!(m.orders_dropped() >= 1, "each try is refused by the ring");
+        assert_eq!(m.orders_emitted(), 0);
+        assert_eq!(m.counters().takes_submitted, 0, "a dropped order is not a submit");
+        assert!(!m.family(0).expect("f").pend_take.live(), "and books no pending");
+        assert_eq!(m.family(0).expect("f").notional_instance_1e6, 0, "nor any notional");
+        assert_eq!(m.late_state(0).expect("f").covered, 0, "so the entry may retry");
     }
 
     #[test]

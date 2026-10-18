@@ -21,8 +21,14 @@ instances.
 instance: cut it into ≤ 2 h windows (the capture-window law, absolute),
 cut a POINT-IN-TIME seed for each from ``candles.db``, drive
 ``backtest --member bin15 --emit-detail`` through it, and merge the
-sidecar's ``bin15_ledger``, ``bin15_entries`` and ``bin15_first_fires``
-blocks into the stores.
+sidecar's ``bin15_ledger`` and late blocks into the stores.
+
+**BIN15 H90 G3 (2026-10-16):** the coverage entry and its counterfactuals
+were retired from the member, so the harness writes no ``bin15_entries`` /
+``bin15_first_fires`` block any more and the accrual merges the ledger and
+the LATE stores only; ``entries.tsv`` and ``first_fires.tsv`` are the
+retired law's closed record (09-13 -> 10-15), still reported and
+relabelled, never grown (vault doc 38).
 Idempotent: both merges dedupe, so re-running a day adds nothing -- on ONE
 clock law. A day accrued on the anchor clock, relabelled onto the venue's
 (BIN15 S4), and then re-accrued by a venue-clock binary is NOT deduped
@@ -77,7 +83,6 @@ import argparse
 import collections
 import dataclasses
 import datetime
-import json
 import math
 import os
 import pathlib
@@ -202,48 +207,6 @@ def entries_path(path: str | None = None) -> pathlib.Path:
     return pathlib.Path(os.path.expanduser(path or DEFAULT_ENTRIES))
 
 
-def entries_from_sidecar(text: str) -> list[Entry]:
-    """The `bin15_entries` block of one `--emit-detail` sidecar."""
-    obj = json.loads(text)
-    block = obj.get("bin15_entries")
-    if not block:
-        return []
-    venue = claude_worker.bin15_ledger.sidecar_on_venue(obj)
-    out: list[Entry] = []
-    for r in block:
-        y = r.get("y")
-        y_next = r.get("y_next_strike")
-        if "origin" not in r:
-            # The harness stamps it (`Bin15EntryRow::origin`). A sidecar
-            # without it came from a binary that predates §6.4, and
-            # defaulting it here is exactly the silent mislabelling the
-            # split exists to prevent — so this is an error, not a
-            # fallback. Rebuild the release binary.
-            raise ValueError(
-                "bin15_entries row has no `origin`: this sidecar predates the "
-                "PAPER/VENUE split (plan §6.4). Rebuild the harness."
-            )
-        out.append(
-            Entry(
-                ts_ns=int(r["ts_ns"]),
-                outcome=int(r["outcome"]),
-                family=int(r["family"]),
-                start_ns=int(r["start_ns"]),
-                expiry_ns=int(r["expiry_ns"]),
-                offset_s=int(r["offset_s"]),
-                is_yes=int(r["is_yes"]),
-                px_1e6=int(r["px_1e6"]),
-                qty_1e6=int(r["qty_1e6"]),
-                p_hat_1e6=int(r["p_hat_1e6"]),
-                y=Y_UNKNOWN if y is None else int(y),
-                origin=int(r["origin"]),
-                y_next_strike=Y_UNKNOWN if y_next is None else int(y_next),
-                venue=venue,
-            )
-        )
-    return out
-
-
 def read_entries(path: pathlib.Path) -> list[Entry]:
     """Every entry, oldest first. Empty when absent."""
     if not path.is_file():
@@ -271,46 +234,6 @@ def read_entries(path: pathlib.Path) -> list[Entry]:
                 f"(or {LEGACY_COLUMNS} pre-§6.4), got {len(f)}: {s!r}"
             )
     return out
-
-
-def merge_entries(
-    existing: typing.Sequence[Entry], incoming: typing.Sequence[Entry]
-) -> tuple[list[Entry], int]:
-    """``(merged oldest first, added)``, deduped by ``(OUTCOME, ORIGIN)``.
-
-    One instance is entered at most once **per accounting**, so the
-    outcome id alone is NOT the identity. The same instance can carry a
-    PAPER entry (what the model would have done, from a replay of that
-    day) and a VENUE entry (what the account actually did) — two
-    different facts about one market, and keying on the outcome alone
-    would let whichever arrived second silently overwrite the other.
-    That is how a mixed number gets built out of two honest halves
-    (plan §6.4).
-
-    A SETTLED row wins over an unsettled one whichever way round they
-    arrive: a window re-cut later can carry the same entry with its
-    payout now derivable, and that is an upgrade, not a duplicate.
-    Otherwise existing wins, so a re-cut can never un-settle the store.
-    Above both (BIN15 S4): a VENUE-law row beats an engine-label row,
-    settled or not — the law is corrected, never reverted.
-    """
-    by: dict[tuple[int, int], Entry] = {(e.outcome, e.origin): e for e in existing}
-    added = 0
-    for e in incoming:
-        key = (e.outcome, e.origin)
-        old = by.get(key)
-        if old is None:
-            by[key] = e
-            added += 1
-        elif e.venue != old.venue:
-            if e.venue:
-                by[key] = e
-        elif not old.settled and e.settled:
-            by[key] = e
-    return (
-        sorted(by.values(), key=lambda e: (e.ts_ns, e.outcome, e.origin)),
-        added,
-    )
 
 
 def write_entries(path: pathlib.Path, rows: typing.Sequence[Entry]) -> None:
@@ -364,16 +287,6 @@ FIRST_FIRE_COLUMNS_PRE_S5B: int = 13
 
 #: The entry law with neither S5 key set: the old law itself.
 OLD_LAW: tuple[int, int] = (1, 0)
-
-#: The sidecar keys of one counterfactual: (stamp, ask, side).
-_ENTRY_FIRE: tuple[str, str, str] = ("first_fire_ts_ns", "first_fire_px_1e6", "first_fire_is_yes")
-_ENTRY_CTL: tuple[str, str, str] = ("ctl_fire_ts_ns", "ctl_fire_px_1e6", "ctl_fire_is_yes")
-_BLOCK_FIRE: tuple[str, str, str] = ("ts_ns", "px_1e6", "is_yes")
-_BLOCK_CTL: tuple[str, str, str] = ("ctl_ts_ns", "ctl_px_1e6", "ctl_is_yes")
-
-#: One counterfactual that never held: (ts_ns, offset_s, is_yes, px_1e6).
-_NO_FIRE: tuple[int, int, int, int] = (0, 0, -1, 0)
-
 
 class FirstFire(typing.NamedTuple):
     """One instance's two counterfactuals: logged, never traded."""
@@ -446,83 +359,6 @@ def first_fires_path(path: str | None = None) -> pathlib.Path:
     return pathlib.Path(os.path.expanduser(path or DEFAULT_FIRST_FIRES))
 
 
-def _fire(r: dict, keys: tuple[str, str, str], start: int) -> tuple[int, int, int, int]:
-    """``(ts_ns, offset_s, is_yes, px_1e6)`` of one counterfactual on a
-    sidecar row -- :data:`_NO_FIRE` when its test never held (``null``) or
-    the harness predates it (absent)."""
-    ts_key, px_key, side_key = keys
-    ts = r.get(ts_key)
-    if ts is None:
-        return _NO_FIRE
-    ts = int(ts)
-    return (ts, max(ts - start, 0) // 1_000_000_000, int(r[side_key]), int(r[px_key]))
-
-
-def _first_fire(
-    r: dict,
-    keys: tuple[tuple[str, str, str], tuple[str, str, str]],
-    entered: int,
-    law: tuple[int, int],
-) -> FirstFire:
-    y = r.get("y")
-    y_next = r.get("y_next_strike")
-    start = int(r["start_ns"])
-    ts, offset, side, px = _fire(r, keys[0], start)
-    cts, coffset, cside, cpx = _fire(r, keys[1], start)
-    return FirstFire(
-        ts_ns=ts,
-        outcome=int(r["outcome"]),
-        family=int(r["family"]),
-        start_ns=start,
-        expiry_ns=int(r["expiry_ns"]),
-        offset_s=offset,
-        is_yes=side,
-        px_1e6=px,
-        y=Y_UNKNOWN if y is None else int(y),
-        y_next_strike=Y_UNKNOWN if y_next is None else int(y_next),
-        entered=entered,
-        persist_polls=law[0],
-        elapsed_max_ns=law[1],
-        ctl_ts_ns=cts,
-        ctl_offset_s=coffset,
-        ctl_is_yes=cside,
-        ctl_px_1e6=cpx,
-    )
-
-
-def entry_law_of(obj: dict) -> tuple[int, int]:
-    """The sidecar's ``bin15_entry_law`` -- the entry law its member ran
-    under; :data:`OLD_LAW` for a pre-S5 sidecar, which has none."""
-    law = obj.get("bin15_entry_law") or {}
-    return (int(law.get("persist_polls", 1)), int(law.get("elapsed_max_ns", 0)))
-
-
-def first_fires_from_sidecar(text: str) -> tuple[list[FirstFire], int]:
-    """``(first fires, dropped)`` of one `--emit-detail` sidecar: the
-    entries' own ``first_fire_*`` / ``ctl_fire_*`` columns (``entered`` 1)
-    and the ``bin15_first_fires`` block (``entered`` 0), each stamped with
-    the sidecar's ``bin15_entry_law``. A pre-S5 sidecar carries none and
-    yields nothing; a pre-S5b one yields rows without a control. One whose
-    runs are not on the venue clock yields nothing either and counts what it
-    dropped -- the store is on one clock, and a first fire on the anchor
-    clock is not a fact about it."""
-    obj = json.loads(text)
-    law = entry_law_of(obj)
-    rows = [(r, (_ENTRY_FIRE, _ENTRY_CTL), 1) for r in obj.get("bin15_entries") or []]
-    rows += [(r, (_BLOCK_FIRE, _BLOCK_CTL), 0) for r in obj.get("bin15_first_fires") or []]
-    out: list[FirstFire] = []
-    for r, keys, entered in rows:
-        f = _first_fire(r, keys, entered, law)
-        # Neither test recorded: a pre-S5 row, or an entry whose first fire
-        # the harness lost (the gate cannot pass without one) -- nothing to
-        # pair, and nothing is guessed.
-        if f.fired or f.ctl_fired:
-            out.append(f)
-    if out and not claude_worker.bin15_ledger.sidecar_on_venue(obj):
-        return [], len(out)
-    return out, 0
-
-
 def read_first_fires(path: pathlib.Path) -> list[FirstFire]:
     """Every first fire, oldest instance first. Empty when absent."""
     if not path.is_file():
@@ -540,73 +376,6 @@ def read_first_fires(path: pathlib.Path) -> list[FirstFire]:
             )
         out.append(FirstFire(*(int(v) for v in f)))
     return out
-
-
-def _earliest(a: FirstFire, b: FirstFire) -> FirstFire:
-    """``a`` with each counterfactual the EARLIER of the two rows' -- each on
-    its own, since the two tests fire apart; a test that never held (``0``)
-    is later than any that did, and a tie keeps ``a``'s."""
-    if b.fired and (not a.fired or b.ts_ns < a.ts_ns):
-        a = a._replace(ts_ns=b.ts_ns, offset_s=b.offset_s, is_yes=b.is_yes, px_1e6=b.px_1e6)
-    if b.ctl_fired and (not a.ctl_fired or b.ctl_ts_ns < a.ctl_ts_ns):
-        a = a._replace(
-            ctl_ts_ns=b.ctl_ts_ns,
-            ctl_offset_s=b.ctl_offset_s,
-            ctl_is_yes=b.ctl_is_yes,
-            ctl_px_1e6=b.ctl_px_1e6,
-        )
-    return a
-
-
-def merge_first_fires(
-    existing: typing.Sequence[FirstFire], incoming: typing.Sequence[FirstFire]
-) -> tuple[list[FirstFire], int]:
-    """``(merged oldest instance first, added)``, one row per OUTCOME.
-
-    An instance that straddles a window cut is replayed twice, and each
-    window's member records its own counterfactuals. The EARLIEST of each
-    is the law's -- a later one is a re-bound member firing again -- so its
-    stamp, price and side are kept, each counterfactual on its own; the
-    label is taken from whichever row has it (settled beats unsettled, a
-    known venue label beats -1); and ``entered`` from either, because the
-    member entering the instance in any window is what makes it a
-    same-instance pair.
-
-    A row accrued under ANOTHER entry law (a day re-accrued after the
-    artifact changed) is a different fact: the stored row keeps its fires,
-    law and ``entered`` -- existing wins, as in the entries' merge -- and
-    only takes a label it lacked. With :func:`same_law_entries` on the
-    entries' side, a stored pair never mixes two laws.
-    """
-    by: dict[int, FirstFire] = {f.outcome: f for f in existing}
-    added = 0
-    for f in incoming:
-        old = by.get(f.outcome)
-        if old is None:
-            by[f.outcome] = f
-            added += 1
-            continue
-        same_law = old.law == f.law
-        lab = old if old.settled or not f.settled else f
-        by[f.outcome] = (_earliest(old, f) if same_law else old)._replace(
-            y=lab.y,
-            y_next_strike=(
-                old.y_next_strike if old.y_next_strike != Y_UNKNOWN else f.y_next_strike
-            ),
-            entered=max(old.entered, f.entered) if same_law else old.entered,
-        )
-    return sorted(by.values(), key=lambda f: (f.start_ns, f.outcome)), added
-
-
-def same_law_entries(
-    incoming: typing.Sequence[tuple[Entry, tuple[int, int]]],
-    stored: typing.Sequence[FirstFire],
-) -> list[Entry]:
-    """The incoming entries (each with its sidecar's entry law) that may
-    merge: an instance whose first fire is stored under ANOTHER law keeps
-    its stored entry, because the pair is scored under that law."""
-    law_of = {f.outcome: f.law for f in stored}
-    return [e for e, law in incoming if law_of.get(e.outcome, law) == law]
 
 
 def write_first_fires(path: pathlib.Path, rows: typing.Sequence[FirstFire]) -> None:
@@ -1034,23 +803,18 @@ def accrue(
     bin15: pathlib.Path,
     day: str | None,
     ledger: pathlib.Path,
-    entries: pathlib.Path,
-    first_fires: pathlib.Path,
     fee_flag: str,
     report: typing.Callable[[str], None] = lambda s: None,
     late: tuple[pathlib.Path, pathlib.Path] | None = None,
-) -> tuple[int, int, int, int]:
-    """``(windows driven, ledger rows added, entries added, first fires
-    added)``. BIN15 H90: with ``late = (entries, fires)`` the sidecars'
-    late blocks merge into those stores too (what they added is reported)."""
+) -> tuple[int, int]:
+    """``(windows driven, ledger rows added)``. BIN15 H90: with
+    ``late = (entries, fires)`` the sidecars' late blocks merge into those
+    stores too (what they added is reported)."""
     runs = hip4_runs(replay_dir, day)
     if not runs:
         report(f"bin15-accrue: no HIP-4 run for {day or 'any day'}")
-        return (0, 0, 0, 0)
+        return (0, 0)
     new_ledger: list = []
-    new_entries: list[tuple[Entry, tuple[int, int]]] = []
-    new_fires: list[FirstFire] = []
-    dropped_fires = 0
     new_late_e: list = []
     new_late_f: list = []
     dropped_late = 0
@@ -1083,11 +847,6 @@ def accrue(
                     new_ledger.extend(
                         claude_worker.bin15_ledger.rows_from_sidecar(text)
                     )
-                    law = entry_law_of(json.loads(text))
-                    new_entries.extend((e, law) for e in entries_from_sidecar(text))
-                    fires, dropped = first_fires_from_sidecar(text)
-                    new_fires.extend(fires)
-                    dropped_fires += dropped
                     if late is not None:
                         le, lf, ld = claude_worker.bin15_late.late_from_sidecar(text)
                         new_late_e.extend(le)
@@ -1099,28 +858,9 @@ def accrue(
         claude_worker.bin15_ledger.read_ledger(ledger), new_ledger
     )
     claude_worker.bin15_ledger.write_ledger(ledger, merged_l)
-    # BIN15 S5: an instance whose first fire is stored under another entry
-    # law (a day re-accrued after the artifact changed) keeps its stored
-    # entry -- merging this law's would pair two laws in one number.
-    kept = same_law_entries(new_entries, read_first_fires(first_fires))
-    if len(kept) < len(new_entries):
-        report(
-            f"bin15-accrue: {len(new_entries) - len(kept)} entr(ies) of instances accrued "
-            "under another entry law — not merged (never accrue one day under two laws)"
-        )
-    merged_e, added_e = merge_entries(read_entries(entries), kept)
-    write_entries(entries, merged_e)
-    if dropped_fires:
-        report(
-            f"bin15-accrue: {dropped_fires} first fire(s) dropped — their run has no "
-            "venue clock (the counterfactual store is on the venue's law only)"
-        )
-    merged_f, added_f = merge_first_fires(read_first_fires(first_fires), new_fires)
-    if merged_f:
-        write_first_fires(first_fires, merged_f)
     if late is not None:
         _merge_late(late, new_late_e, new_late_f, dropped_late, report)
-    return (units, added_l, added_e, added_f)
+    return (units, added_l)
 
 
 def _merge_late(
@@ -1489,8 +1229,6 @@ def main(argv: list[str] | None = None) -> int:
     ac.add_argument("--replay-dir", default=None)
     ac.add_argument("--bin15", default=None)
     ac.add_argument("--ledger", default=None)
-    ac.add_argument("--entries", default=None)
-    ac.add_argument("--first-fires", default=None)
     ac.add_argument("--fee-bps", default="hl.prediction:0:0")
     ac.add_argument("--late-entries", default=None, help="BIN15 H90: the late entry store")
     ac.add_argument("--late-fires", default=None, help="BIN15 H90: the late first-fire store")
@@ -1558,16 +1296,12 @@ def main(argv: list[str] | None = None) -> int:
             now = datetime.datetime.now(datetime.UTC)
             day = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         led = claude_worker.bin15_ledger.ledger_path(args.ledger)
-        ent = entries_path(args.entries)
-        ff = first_fires_path(args.first_fires)
-        units, dl, de, df = accrue(
-            replay, bin15, day, led, ent, ff, args.fee_bps, lambda s: print(s, file=sys.stderr),
-            late=late,
+        units, dl = accrue(
+            replay, bin15, day, led, args.fee_bps, lambda s: print(s, file=sys.stderr), late=late
         )
         print(
             f"bin15-accrue: day {day}: {units} window(s) <= 2 h driven; "
-            f"+{dl} ledger row(s) -> {led}; +{de} entry(ies) -> {ent}; "
-            f"+{df} first fire(s) -> {ff}"
+            f"+{dl} ledger row(s) -> {led}"
         )
         return 0
 

@@ -1,20 +1,28 @@
 ---
-description: Run the zero-allocation assertions in release mode and fail on any non-zero byte count
-allowed-tools: Bash(cargo test*), Bash(make *)
+description: Run the zero-allocation assertions (release, one thread) and fail on any non-zero byte count
+allowed-tools: Bash(make alloc-assert*), Bash(cargo test -p bench*), Bash(cargo clean -p bench*)
 ---
 
-Run the zero-allocation assertions. This is the **most important** gate in
-the repo — a failure here means a regression that must be fixed before merge.
+Run the zero-allocation gate — a failure here is a hot-path regression that
+must be fixed before merge.
 
 ## What to run
 
 ```sh
-cargo test -p bench --test alloc_assertions --release -- --nocapture
+make alloc-assert
+# = cargo test -p bench --test alloc_assertions --release -- --nocapture --test-threads=1
 ```
+
+`--test-threads=1` is REQUIRED: the CountingAllocator is process-global, so
+parallel test threads pollute each other's counts.
+
+## Stale-binary guard
+
+The log must show a fresh `Compiling bench`. If it does not, the run is a
+false green: `cargo clean -p bench --release` and run again.
 
 ## Output format
 
-If all pass, print a one-line "PASS — 0 B/op across N assertions". If any
-fail, print the failing assertion, the byte count it observed, and the
-git diff line that most likely caused the regression (use `git log -p` on
-the relevant file). Do not try to auto-fix.
+All pass: `PASS — 0 B/op across N assertions (fresh Compiling bench)`.
+Any fail: the failing assertion, the byte count it observed, and the most
+likely cause (`git log -p` on the file it exercises). Do not try to auto-fix.

@@ -37,29 +37,6 @@ def _e(outcome: int, ts: int = 1_000, px: int = 600_000, y: int = 1_000_000,
     )
 
 
-def test_an_instance_is_entered_once_so_a_redrive_adds_nothing() -> None:
-    rows = [_e(7), _e(9, ts=2_000)]
-    merged, added = claude_worker.bin15_accrue.merge_entries([], rows)
-    assert added == 2 and len(merged) == 2
-    again, added2 = claude_worker.bin15_accrue.merge_entries(merged, rows)
-    assert added2 == 0, "re-driving a day must add nothing"
-    assert len(again) == 2
-
-
-def test_a_settled_row_upgrades_an_unsettled_one_but_never_the_reverse() -> None:
-    """A window re-cut later can carry the same entry with its payout now
-    derivable. That is an upgrade. The reverse — a later cut that has
-    LOST the settlement because its expiry now falls outside — must not
-    un-settle the store."""
-    unk = _e(7, y=claude_worker.bin15_accrue.Y_UNKNOWN)
-    known = _e(7, y=0)
-    merged, _ = claude_worker.bin15_accrue.merge_entries([unk], [known])
-    assert merged[0].y == 0, "unsettled -> settled is an upgrade"
-    back, added = claude_worker.bin15_accrue.merge_entries([known], [unk])
-    assert added == 0
-    assert back[0].y == 0, "settled -> unsettled must never happen"
-
-
 def test_won_reads_the_side_the_member_bought_not_the_yes_side() -> None:
     assert _e(1, is_yes=1, y=1_000_000).won
     assert not _e(1, is_yes=1, y=0).won
@@ -116,28 +93,6 @@ def test_a_pre_split_row_reads_as_paper_and_a_split_row_keeps_its_origin(
     assert claude_worker.bin15_accrue.read_entries(out) == rows
 
 
-def test_one_instance_can_carry_both_accountings_without_either_winning() -> None:
-    """THE reason the identity is (outcome, origin) and not outcome.
-
-    The same market gets a PAPER entry — what the model would have done,
-    from a replay of that day — and a VENUE entry, what the account
-    actually did. Two different facts. Keyed on the outcome alone,
-    whichever merged second would silently replace the other, and the
-    store would then hold one number built out of two honest halves."""
-    paper = _e(outcome=7, origin=claude_worker.bin15_accrue.ORIGIN_PAPER)
-    venue = _e(outcome=7, origin=claude_worker.bin15_accrue.ORIGIN_VENUE)
-
-    merged, added = claude_worker.bin15_accrue.merge_entries([paper], [venue])
-    assert added == 1, "a different accounting is a new row, not a duplicate"
-    assert len(merged) == 2
-    assert {e.origin for e in merged} == {0, 1}
-
-    # Idempotent within one accounting, exactly as before.
-    again, added2 = claude_worker.bin15_accrue.merge_entries(merged, [venue])
-    assert added2 == 0
-    assert len(again) == 2
-
-
 def test_a_mixed_set_is_refused_rather_than_averaged() -> None:
     """§6.4's law, enforced in the function rather than asked of the
     caller. Every figure `render` produces is a sum over what it was
@@ -171,65 +126,6 @@ def test_by_origin_puts_the_account_first_and_omits_what_has_none() -> None:
         claude_worker.bin15_accrue.ORIGIN_VENUE,
         claude_worker.bin15_accrue.ORIGIN_PAPER,
     ]
-
-
-def test_the_sidecar_block_is_read_and_a_null_payout_is_unknown() -> None:
-    text = json.dumps(
-        {
-            "bin15_entries": [
-                {
-                    "ts_ns": 1,
-                    "outcome": 7,
-                    "family": 0,
-                    "start_ns": 0,
-                    "expiry_ns": 900_000_000_000,
-                    "offset_s": 12,
-                    "is_yes": 1,
-                    "px_1e6": 640_000,
-                    "qty_1e6": 78_000_000,
-                    "p_hat_1e6": 700_000,
-                    "origin": 1,
-                    "y": None,
-                },
-            ]
-        }
-    )
-    rows = claude_worker.bin15_accrue.entries_from_sidecar(text)
-    assert len(rows) == 1
-    assert rows[0].y == claude_worker.bin15_accrue.Y_UNKNOWN
-    assert not rows[0].settled
-    assert rows[0].origin == claude_worker.bin15_accrue.ORIGIN_PAPER
-    # A sidecar from any other member carries no block at all.
-    assert claude_worker.bin15_accrue.entries_from_sidecar("{}") == []
-
-
-def test_a_sidecar_without_an_origin_is_refused_not_defaulted() -> None:
-    """The harness stamps `origin` (`Bin15EntryRow::origin`). A sidecar
-    without it came from a binary predating §6.4 — and defaulting it
-    here would make the FIRST live day inherit "paper" in silence,
-    which is precisely the failure the split exists to prevent. The
-    answer is to rebuild the harness, not to guess."""
-    text = json.dumps(
-        {
-            "bin15_entries": [
-                {
-                    "ts_ns": 1,
-                    "outcome": 7,
-                    "family": 0,
-                    "start_ns": 0,
-                    "expiry_ns": 900_000_000_000,
-                    "offset_s": 12,
-                    "is_yes": 1,
-                    "px_1e6": 640_000,
-                    "qty_1e6": 78_000_000,
-                    "p_hat_1e6": 700_000,
-                    "y": None,
-                },
-            ]
-        }
-    )
-    with pytest.raises(ValueError, match="predates"):
-        claude_worker.bin15_accrue.entries_from_sidecar(text)
 
 
 def test_the_wilson_interval_is_honest_at_the_sample_sizes_this_lane_has() -> None:
@@ -293,15 +189,6 @@ def test_a_venue_entry_round_trips_fourteen_wide_beside_an_engine_one(tmp_path) 
     ]
     assert widths == [14, 12]
     assert claude_worker.bin15_accrue.read_entries(p) == rows
-
-
-def test_a_venue_entry_beats_an_engine_one_settled_or_not() -> None:
-    engine = _e(7, y=1_000_000)
-    venue_unknown = _e(7, y=claude_worker.bin15_accrue.Y_UNKNOWN)._replace(venue=True)
-    merged, added = claude_worker.bin15_accrue.merge_entries([engine], [venue_unknown])
-    assert added == 0 and merged == [venue_unknown], "the law is corrected"
-    merged, _ = claude_worker.bin15_accrue.merge_entries([venue_unknown], [engine])
-    assert merged == [venue_unknown], "and never reverted to the engine's label"
 
 
 def test_the_report_puts_the_venues_label_first_and_never_mixes_the_two() -> None:
@@ -539,162 +426,6 @@ def _ff(
     return f if fired else f._replace(ts_ns=0, offset_s=0, is_yes=-1, px_1e6=0)
 
 
-def test_first_fires_come_from_the_entry_columns_and_the_block() -> None:
-    """Every instance either test held on, once: an entered one from its
-    entry row's `first_fire_*` / `ctl_fire_*` columns, the rest from the
-    `bin15_first_fires` block (a null test is one that never held), all
-    stamped with the sidecar's entry law. A pre-S5 sidecar yields nothing, a
-    pre-S5b one rows without a control; one off the venue clock yields
-    nothing and counts what it dropped."""
-    entry = {
-        "ts_ns": 130 * _S,
-        "outcome": 7,
-        "family": 0,
-        "start_ns": 0,
-        "expiry_ns": 900 * _S,
-        "offset_s": 130,
-        "is_yes": 1,
-        "px_1e6": 650_000,
-        "qty_1e6": 76_000_000,
-        "p_hat_1e6": 700_000,
-        "origin": 1,
-        "y": 1_000_000,
-        "y_next_strike": 1_000_000,
-        "settle_px_1e6": 77_000_000_000,
-        "first_fire_ts_ns": 95 * _S,
-        "first_fire_px_1e6": 640_000,
-        "first_fire_is_yes": 1,
-        "ctl_fire_ts_ns": 60 * _S,
-        "ctl_fire_px_1e6": 660_000,
-        "ctl_fire_is_yes": 1,
-    }
-    declined = {
-        "ts_ns": 40 * _S,
-        "family": 1,
-        "outcome": 9,
-        "start_ns": 0,
-        "expiry_ns": 900 * _S,
-        "offset_s": 40,
-        "is_yes": 0,
-        "px_1e6": 410_000,
-        "ctl_ts_ns": 30 * _S,
-        "ctl_offset_s": 30,
-        "ctl_is_yes": 0,
-        "ctl_px_1e6": 430_000,
-        "y": None,
-        "y_next_strike": -1,
-        "settle_px_1e6": None,
-    }
-    control_only = {
-        "ts_ns": None,
-        "family": 2,
-        "outcome": 10,
-        "start_ns": 0,
-        "expiry_ns": 900 * _S,
-        "offset_s": None,
-        "is_yes": None,
-        "px_1e6": None,
-        "ctl_ts_ns": 70 * _S,
-        "ctl_offset_s": 70,
-        "ctl_is_yes": 1,
-        "ctl_px_1e6": 450_000,
-        "y": 1_000_000,
-        "y_next_strike": 1_000_000,
-        "settle_px_1e6": 77_000_000_000,
-    }
-    blocks = {
-        "bin15_entries": [entry],
-        "bin15_first_fires": [declined, control_only],
-        "bin15_entry_law": dict(_LAW, control_e_entry_1e6=20_000),
-    }
-    fires, dropped = claude_worker.bin15_accrue.first_fires_from_sidecar(
-        json.dumps({"stale": _VENUE, **blocks})
-    )
-    assert dropped == 0
-    assert [(f.outcome, f.ts_ns, f.px_1e6, f.is_yes, f.offset_s, f.entered) for f in fires] == [
-        (7, 95 * _S, 640_000, 1, 95, 1),
-        (9, 40 * _S, 410_000, 0, 40, 0),
-        (10, 0, 0, -1, 0, 0),
-    ]
-    assert [(f.ctl_ts_ns, f.ctl_px_1e6, f.ctl_is_yes, f.ctl_offset_s) for f in fires] == [
-        (60 * _S, 660_000, 1, 60),
-        (30 * _S, 430_000, 0, 30),
-        (70 * _S, 450_000, 1, 70),
-    ]
-    assert {f.law for f in fires} == {(3, 240 * _S)}
-    assert fires[0].won and not fires[1].settled
-    assert fires[2].ctl_fired and not fires[2].fired and fires[2].control().won
-    lost = dict(
-        entry,
-        first_fire_ts_ns=None,
-        first_fire_px_1e6=None,
-        first_fire_is_yes=None,
-        ctl_fire_ts_ns=None,
-        ctl_fire_px_1e6=None,
-        ctl_fire_is_yes=None,
-    )
-    assert claude_worker.bin15_accrue.first_fires_from_sidecar(
-        json.dumps({"stale": _VENUE, "bin15_entries": [lost]})
-    ) == ([], 0), "a lost first fire is not guessed"
-    pre_s5 = {k: v for k, v in entry.items() if not k.startswith(("first_fire_", "ctl_fire_"))}
-    assert claude_worker.bin15_accrue.first_fires_from_sidecar(
-        json.dumps({"stale": _VENUE, "bin15_entries": [pre_s5]})
-    ) == ([], 0)
-    pre_s5b = {k: v for k, v in entry.items() if not k.startswith("ctl_fire_")}
-    (old,), _ = claude_worker.bin15_accrue.first_fires_from_sidecar(
-        json.dumps({"stale": _VENUE, "bin15_entries": [pre_s5b]})
-    )
-    assert old.fired and not old.ctl_fired and old.ctl_is_yes == -1
-    anchor = {"runs": [{"epoch_ns": 1, "lanes": {}, "wall": "anchor"}]}
-    assert claude_worker.bin15_accrue.first_fires_from_sidecar(
-        json.dumps({"stale": anchor, **blocks})
-    ) == ([], 3)
-
-
-def test_the_first_fire_store_keeps_the_earliest_fire_and_never_mixes_two_laws(
-    tmp_path,
-) -> None:
-    """A window cut replays a straddling instance twice: the EARLIEST of
-    each counterfactual is the law's -- each on its own -- the label comes
-    from whichever row has it, `entered` from either. A row accrued under
-    another entry law only lends the label. A second merge changes nothing;
-    the file round-trips, and a pre-S5b row (13 columns) reads with no
-    control."""
-    unknown = claude_worker.bin15_accrue.Y_UNKNOWN
-    early = _ff(7, ts=10 * _S, px=600_000, y=unknown)
-    late = _ff(7, ts=20 * _S, px=700_000, y=0, entered=1)
-    merged, added = claude_worker.bin15_accrue.merge_first_fires([early], [late])
-    assert added == 0 and len(merged) == 1
-    m = merged[0]
-    assert (m.ts_ns, m.px_1e6, m.y, m.y_next_strike, m.entered) == (10 * _S, 600_000, 0, 0, 1)
-    again, added = claude_worker.bin15_accrue.merge_first_fires(merged, [late, early])
-    assert added == 0 and again == merged
-    other_law = _ff(8, ts=5 * _S, y=0, entered=1, law=claude_worker.bin15_accrue.OLD_LAW)
-    stored = _ff(8, ts=30 * _S, px=650_000, y=unknown)
-    (mix,), _ = claude_worker.bin15_accrue.merge_first_fires([stored], [other_law])
-    assert (mix.ts_ns, mix.px_1e6, mix.entered, mix.law) == (30 * _S, 650_000, 0, (3, 240 * _S))
-    assert mix.y == 0, "the label is a fact about the instance, whatever the law"
-    # S5b: the control can come from one window and the artifact's test
-    # from the other; a test that never held is later than any that did.
-    a = _ff(30, ts=40 * _S, ctl=(35 * _S, 610_000, 1))
-    b = _ff(30, ts=30 * _S, ctl=(50 * _S, 620_000, 0))
-    (m2,), _ = claude_worker.bin15_accrue.merge_first_fires([a], [b])
-    assert (m2.ts_ns, m2.ctl_ts_ns, m2.ctl_px_1e6, m2.ctl_is_yes) == (30 * _S, 35 * _S, 610_000, 1)
-    only_ctl = _ff(31, ts=30 * _S, fired=False, ctl=(20 * _S, 600_000, 1))
-    (m3,), _ = claude_worker.bin15_accrue.merge_first_fires([only_ctl], [_ff(31, ts=45 * _S)])
-    assert (m3.ts_ns, m3.ctl_ts_ns) == (45 * _S, 20 * _S)
-    p = tmp_path / "first_fires.tsv"
-    rows = [*again, _ff(9, ts=30 * _S), m2, m3]
-    claude_worker.bin15_accrue.write_first_fires(p, rows)
-    assert claude_worker.bin15_accrue.read_first_fires(p) == rows
-    legacy = tmp_path / "legacy.tsv"
-    legacy.write_text("\t".join(str(v) for v in tuple(_ff(40))[:13]) + "\n", encoding="utf-8")
-    assert claude_worker.bin15_accrue.read_first_fires(legacy) == [_ff(40)]
-    p.write_text("1\t2\t3\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="want 17 columns"):
-        claude_worker.bin15_accrue.read_first_fires(p)
-
-
 def test_the_counterfactuals_are_scored_per_law_on_the_same_instances_and_the_declined() -> None:
     """Doc 27 §5's "over today's law on the SAME instances": each
     counterfactual paired with the entries by outcome, each side at an equal
@@ -784,18 +515,6 @@ def test_the_control_is_counted_where_it_is_the_artifacts_own_test_or_was_never_
         "   IoC fills (doc 27 §5's fill bar): not measurable in the paper model -- the "
         "harness models every fill; gated at the first live step (ruling 2026-09-24)",
     ]
-
-
-def test_an_entry_of_an_instance_stored_under_another_law_is_not_merged() -> None:
-    """A day re-accrued after the artifact changed: an instance whose first
-    fire is stored under another entry law keeps its stored entry; one with
-    none stored (or under the same law) merges."""
-    other = claude_worker.bin15_accrue.OLD_LAW
-    law = (3, 240 * _S)
-    stored = [_ff(7, law=other), _ff(8, law=law)]
-    incoming = [(_e(7), law), (_e(8), law), (_e(9), law)]
-    kept = claude_worker.bin15_accrue.same_law_entries(incoming, stored)
-    assert [e.outcome for e in kept] == [8, 9]
 
 
 def test_relabel_fills_an_unknown_first_fire_label_and_nothing_else(tmp_path) -> None:

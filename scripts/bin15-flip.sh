@@ -3,7 +3,9 @@
 # Copyright 2026 Anton (darkcite)
 #
 # BIN15 S7-L1 — flip slot 3 between PAPER and LIVE on Hyperliquid mainnet
-# (docs/risk-policy.md, "S7-L1 — slot 3 LIVE on Hyperliquid mainnet").
+# (docs/risk-policy.md, "S7-L1 — slot 3 LIVE on Hyperliquid mainnet"; the
+# frame since BIN15 H90 G4: "BIN15 H90 G4 — slot 3 LIVE at the $2 / $5
+# frame", operator ruling O-GL-3).
 #
 #   bin15-flip.sh status                 # what the next boot runs, and what runs now
 #   bin15-flip.sh live  [--gateway] [--switch-only]  # preflight, then switch + restart + verify
@@ -18,8 +20,8 @@
 # blocking arm's on every flip); its top-ups draw on exec-topup.state's day.
 #
 # PARITY BY CONSTRUCTION. LIVE boots the paper artifact itself with only
-# the four LIVE_SIZING lines changed: the entry law, both arms, the
-# families and every other line are paper's, byte for byte. `live`
+# the three LIVE_SIZING lines changed: the late law, the families and
+# every other line are paper's, byte for byte. `live`
 # keeps the paper artifact as bin15.paper-s7.toml (the nightly accrual
 # reads that copy while it exists) and writes the live cut to
 # bin15.toml; `paper` puts it back. exec.toml's [exec.slot.3] becomes
@@ -40,10 +42,10 @@
 # `--switch-only` skips the restart and its waits: the next restart,
 # possibly an unattended scheduled drain, applies the files.
 #
-# `live` refuses unless the COMMITTED docs/risk-policy.md holds the S7-L1
+# `live` refuses unless the COMMITTED docs/risk-policy.md holds the H90 G4
 # entry, the state is a clean PAPER one with slot 3 not running live,
-# exec.HALT does not name slot 3, the paper artifact carries no price
-# floor and no sizing key outside LIVE_SIZING, and scripts/exec-smoke.sh
+# exec.HALT does not name slot 3, the paper artifact carries no sizing key
+# outside LIVE_SIZING, and scripts/exec-smoke.sh
 # passes on the binary launchd boots (checked unchanged before the
 # switch). The
 # session anchor is archived: every `live` starts a new session. `paper`
@@ -85,8 +87,9 @@ ENGINE_PAT='venue-engin[e] run'
 # LAW E-9: the cloid encodes the slot; slot 3's cloids start with this.
 CLOID_PREFIX="0x4d5603"
 
-# The S7-L1 frame (risk-policy.md): the member's sizing lines, key=value.
-LIVE_SIZING="entry_usd_1e6=2000000 cap_day_usd_1e6=50000000 clip_qty_1e6=4000000 cap_instance_usd_1e6=10000000"
+# The H90 G4 frame (risk-policy.md, ruling O-GL-3): the member's sizing
+# lines, key=value — the late take's stake and both caps.
+LIVE_SIZING="late_usd_1e6=2000000 cap_instance_usd_1e6=2000000 cap_day_usd_1e6=5000000"
 
 say() {
   print -r -- "bin15-flip: $*" >&2
@@ -181,29 +184,29 @@ exec_shape_ok() {
     END { exit !(on && !odd) }' "$1"
 }
 
-# The live section: exec.toml.example's keys at the S7-L1 frame.
+# The live section: exec.toml.example's keys at the H90 G4 frame.
 slot3_section() {
   cat <<EOF
 [exec.slot.3]
-# bin15 LIVE (S7-L1), written by scripts/bin15-flip.sh $TS.
-# docs/risk-policy.md "S7-L1" holds the why of every number.
+# bin15 LIVE (H90 G4, ruling O-GL-3), written by scripts/bin15-flip.sh $TS.
+# docs/risk-policy.md "BIN15 H90 G4" holds the why of every number.
 mode = "live"
 name = "bin15"
 venues = ["hyperliquid"]
-max_order_usd_1e6 = 10000000
-max_open_orders = 24
-cap_day_usd_1e6 = 50000000
-cap_instance_usd_1e6 = 200000000
+max_order_usd_1e6 = 2000000
+max_open_orders = 8
+cap_day_usd_1e6 = 5000000
+cap_instance_usd_1e6 = 2000000
 request_budget_floor = 2000
-request_topup_weight = 5000
+request_topup_weight = 1000
 request_topup_day_max = 30000
 halt_on_reject_streak = 5
-halt_on_recon_drift_usd_1e6 = 2000000
+halt_on_recon_drift_usd_1e6 = 1000000
 halt_on_ws_gap_ms = 30000
 halt_on_asset_refusal_streak = 3
 halt_on_recon_stale_ms = 300000
 halt_on_gain_usd_1e6 = 0
-halt_on_loss_usd_1e6 = 54000000
+halt_on_loss_usd_1e6 = 4000000
 EOF
   [ "$GATEWAY" = 1 ] || return 0
   cat <<EOF
@@ -244,15 +247,14 @@ is_live_cut() { [ -f "$1" ] && [ "$(head -1 "$1")" = "$CUT_MARK" ]; }
 
 sha() { shasum -a 256 "$1" | cut -c1-16; }
 
-# PAPER: refuse a price floor (the ruling is "none") and any sizing key
-# outside LIVE_SIZING (it would go live unsized).
+# PAPER: refuse any sizing key outside LIVE_SIZING (it would go live
+# unsized).
 paper_guard() {
   awk -v sizing="$LIVE_SIZING" '
     BEGIN { n = split(sizing, kv, " "); for (i = 1; i <= n; i++) { split(kv[i], p, "="); want[p[1]] = 1 } }
     match($0, /^[a-z0-9_]+[ \t]*=/) {
       k = substr($0, 1, RLENGTH - 1); sub(/[ \t]+$/, "", k)
       if ((k ~ /_usd_1e6$/ || k ~ /_qty_1e6$/) && !(k in want)) { print "sizing key `" k "` is not in LIVE_SIZING" > "/dev/stderr"; bad = 1 }
-      if (k == "entry_min_px_1e6") { v = substr($0, RLENGTH + 1); gsub(/[ \t"]/, "", v); if (v + 0 != 0) { print "a price floor is set (entry_min_px_1e6)" > "/dev/stderr"; bad = 1 } }
     }
     END { exit bad }' "$1"
 }
@@ -576,8 +578,8 @@ live_checks() {
   [ "$cur" = LIVE ] && { status; say "already LIVE at the next boot — nothing to do"; exit 0; }
   [ "$cur" = PAPER ] || die "the state is MIXED — run: bin15-flip.sh paper"
   slot3_running_live && die "slot 3 runs LIVE in the running engine — run: bin15-flip.sh paper"
-  git -C "$REPO_DIR" show HEAD:docs/risk-policy.md 2>/dev/null | grep -q '^### S7-L1 — slot 3 LIVE' \
-    || die "no S7-L1 entry in the committed docs/risk-policy.md (phased loosening: no arming without it)"
+  git -C "$REPO_DIR" show HEAD:docs/risk-policy.md 2>/dev/null | grep -q '^### BIN15 H90 G4 — slot 3 LIVE' \
+    || die "no BIN15 H90 G4 entry in the committed docs/risk-policy.md (phased loosening: no arming without it)"
   case "+$(kv_get STRATEGY)+" in *+bin15+*) ;; *) die "STRATEGY=$(kv_get STRATEGY) does not run bin15" ;; esac
   arm_ok || die "ARM_LIVE=$(kv_get ARM_LIVE) is not a comma list of built slots 0-7 (8-15 are reserved) — fix it by hand"
   check_exec_toml

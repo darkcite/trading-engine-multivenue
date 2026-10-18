@@ -1421,7 +1421,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // MX2's MEXC at lane 6 and WS9's Bybit at lane 5; four opt lanes
     // since HC1; five fill lanes since BX3 gave Binance lane 4); break
     // the build loudly if that drifts.
-    const _: () = assert!(NUM_TICK_LANES == 8 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
+    const _: () = assert!(NUM_TICK_LANES == 9 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
 
     struct NoopStrat;
     impl StrategyCounters for NoopStrat {}
@@ -1456,6 +1456,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t6p, t6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t7p, t7) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // PM15: lane 8, the rolling families.
+    let (_t8p, t8) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     // WS10-A: eight venue-event lanes ride in every engine. Lane 2
     // (OKX) gets a live producer — the measured window below pushes
     // one funding ChannelEvent per iteration and the engine drains
@@ -1476,6 +1478,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_e6p, e6) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e7p, e7) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e8p, e8) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     // WS10-B: two depth lanes; lane 0 (OKX) live — the measured
     // window pushes one DepthTopK per iteration and the engine
@@ -1516,8 +1520,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let mut eng = Engine::new(
         NoopStrat,
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5, t6, t7],
-        [e0, e1, e2, e3, e4, e5, e6, e7],
+        [t0, t1, t2, t3, t4, t5, t6, t7, t8],
+        [e0, e1, e2, e3, e4, e5, e6, e7, e8],
         [d0, d1],
         [o0, o1, o2, o3],
         sc,
@@ -7319,11 +7323,13 @@ fn vrp_member_p4_decision_paths_are_zero_alloc() {
     assert_eq!(bytes, 0, "P4 decision-path hot bytes should be zero: saw {bytes}");
 }
 
-/// Gate 52 (BIN15 O4b, spec §6.4): the bin15 member's live callbacks at
-/// full width — eight families over four underlyings, 100 rolls, 10 000
-/// `Mark` events with their per-minute forecast refresh, both binary
-/// legs ticking, both arms armed, the 1 s timer sweeping pendings, and
-/// every order it emits coming straight back as a fill.
+/// Gate 52 (BIN15 O4b, spec §6.4; narrowed at H90 G3): the bin15
+/// member's live callbacks at full width — eight families over four
+/// underlyings, 100 rolls, 10 000 `Mark` events with their per-minute
+/// forecast refresh, both binary legs ticking and the 1 s timer — with
+/// the late law OFF, so what runs is the S-law pricer, the member's
+/// logged counterfactual, which never trades (the arms it once fed were
+/// retired at H90 G3; gate 52b measures the late law's takes).
 ///
 /// The boot box is not measured: the lookup tables are 17 KiB on the
 /// heap by design (`Box<Bin15Luts>`), the two `VolEngine`s per
@@ -7336,11 +7342,10 @@ fn vrp_member_p4_decision_paths_are_zero_alloc() {
 /// EVERY underlying (one mark moves every binary struck against it), so
 /// a member with eight families on four coins re-prices twenty thousand
 /// times over this tape. An allocation anywhere on that path — a `Vec`
-/// for the arms' candidate list, a `format!` in a counter's name, a
-/// `Box` for a pending — would be invisible at the call site and fatal
-/// at 4 marks a second per coin.
+/// of candidates, a `format!` in a counter's name — would be invisible
+/// at the call site and fatal at 4 marks a second per coin.
 #[test]
-fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
+fn bin15_member_roll_tick_reprice_is_zero_alloc() {
     use core_types::{make_symbol_id, ChannelEvent, ChannelId, Order};
     use strategy_bin15::{
         price, Bin15Params, Bin15Strategy, FAMILY_NATIVE_DAILY, FAMILY_OUT_15M,
@@ -7356,13 +7361,11 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
 
     struct SinkCtx {
         n: u64,
-        last: Option<Order>,
         now: u64,
     }
     impl Ctx for SinkCtx {
-        fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+        fn submit(&mut self, _order: Order) -> Result<(), SubmitErr> {
             self.n += 1;
-            self.last = Some(order);
             Ok(())
         }
         fn now_ns(&self) -> u64 {
@@ -7397,22 +7400,10 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
         u += 1;
     }
     params.n_underlyings = BIN15_MAX_UNDERLYINGS;
-    // A daily family's floors are an hour, which no gate window reaches;
-    // shrink them so one tape exercises both kinds' arms.
-    params.tau_min_take_ns = [60_000_000_000, 60_000_000_000];
-    params.tau_min_quote_ns = [120_000_000_000, 120_000_000_000];
-    params.maker_enabled = 1;
-    params.null_arm = 1;
+    // The late law stays OFF (the default): every order would be its, and
+    // gate 52b measures it.
     params.cap_instance_usd_1e6 = 1_000_000_000;
     params.cap_day_usd_1e6 = 1_000_000_000_000;
-    // BIN15 S5: the coverage entry ON, with its persistence gate and its
-    // elapsed ceiling, so the run, the counterfactual, a price refusal and
-    // (in the S3 phase below) the ceiling's close are all under the guard.
-    // The legs tick every 10 s and a failing Yes book lands at 5 s, so
-    // each 15 m instance enters on its third passing snapshot, 30 s in.
-    params.entry_usd_1e6 = 50_000_000;
-    params.entry_persist_polls = 3;
-    params.entry_elapsed_max_ns = 240_000_000_000;
 
     // A real CDF shape, boxed before the guard.
     let mut luts = Box::new(price::Bin15Luts::identity());
@@ -7492,11 +7483,7 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
         )
     };
 
-    let mut ctx = SinkCtx {
-        n: 0,
-        last: None,
-        now: at(0),
-    };
+    let mut ctx = SinkCtx { n: 0, now: at(0) };
     // One mark per underlying before the guard, so the first measured
     // mark is a minute ROLL and not a cold first sighting.
     let mut u = 0usize;
@@ -7531,8 +7518,7 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
             );
         }
         // A strike 10 % below the mark: the Yes leg is a certainty, so
-        // a resident ask at 0.40 is always takeable and the arms run
-        // every time rather than only when the walk happens to cross.
+        // the pricer's φ table is read at its far end on every reprice.
         m.on_venue_event(
             &roll_ev(
                 fam,
@@ -7552,45 +7538,12 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
                 .max(60_000_000_000);
             m.on_venue_event(&mark_ev(ui, mark_px[ui], ts), &mut ctx);
             marks_seen += 1;
-            // Both legs tick every tenth second; both must be
-            // actionable before either arm fires.
+            // Both legs tick every tenth second (a touch change re-prices),
+            // and the 1 s timer sweeps.
             if k % 10 == 0 {
                 m.on_tick(&leg_tick(yes_sym(fam) + 1, ts, 390_000, 600_000), &mut ctx);
                 m.on_tick(&leg_tick(yes_sym(fam), ts, 300_000, 400_000), &mut ctx);
-                // Every order comes straight back as a full fill, so
-                // `book_fill` — which moves the position and clears the
-                // pending — is inside the guard too.
-                if let Some(o) = ctx.last.take() {
-                    if k == 20 {
-                        // XH4i-6: once an instance a gateway's late refusal
-                        // instead of the fill (`on_rejected`: a take written
-                        // off, or a quote's side freed) …
-                        let mut ev = core_types::OrderEvent::ZERO;
-                        ev.client_oid = o.client_oid;
-                        ev.kind = core_types::ORDER_EVENT_REJECTED;
-                        m.on_order_event(&ev, &mut ctx);
-                    } else {
-                        let fill =
-                            core_types::Fill::new(ts, o.sym, o.side, o.px, o.qty, o.client_oid);
-                        m.on_fill(&fill, &mut ctx);
-                    }
-                }
-                // … and the venue's end of a resting quote (`on_canceled`).
-                if k == 30 {
-                    if let Some(q) = m.family(fam).map(|f| f.pend_quote[0].oid) {
-                        let mut ev = core_types::OrderEvent::ZERO;
-                        ev.client_oid = q;
-                        ev.kind = core_types::ORDER_EVENT_CANCELED;
-                        m.on_order_event(&ev, &mut ctx);
-                    }
-                }
                 m.on_timer(ts, &mut ctx);
-            }
-            // BIN15 S5: once per instance a Yes ask the entry's bound
-            // refuses — a failing snapshot — so the gate's price refusal
-            // and a broken run are under the guard too.
-            if k == 5 {
-                m.on_tick(&leg_tick(yes_sym(fam), ts, 980_000, 990_000), &mut ctx);
             }
             k += 1;
         }
@@ -7618,8 +7571,6 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
         let px = 79_000_000_000 + (next() % 20_000_001) as i64 - 10_000_000;
         m.on_venue_event(&mark_ev(0, px, ts), &mut ctx);
         if k == 0 {
-            // BIN15 S5: this instance is bound 830 s into its life, past
-            // the ceiling, so its first coverage reprice CLOSES it.
             m.on_tick(&leg_tick(yes_sym(0) + 1, ts, 390_000, 600_000), &mut ctx);
             m.on_tick(&leg_tick(yes_sym(0), ts, 300_000, 400_000), &mut ctx);
         }
@@ -7646,25 +7597,8 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
         "one mark re-prices every family on its underlying: saw {}",
         counters.reprices
     );
-    assert!(counters.takes_submitted > 0, "the gate must measure real takes");
-    assert!(counters.takes_filled > 0, "and real fills");
-    assert!(counters.quotes_submitted > 0, "and Arm B");
-    assert!(counters.skipped_entry_persist > 0, "and the S5 persistence gate");
-    assert!(counters.skipped_entry_price > 0, "and its price refusal");
-    assert_eq!(counters.skipped_entry_elapsed, 1, "and the S5 ceiling's close, once");
-    // BIN15 S5b: both counterfactuals were stamped under the guard. The last
-    // roll's instance (family 3 — the S3 phase rebinds family 0 only) passed
-    // both tests on its first Yes snapshot, at its own bind second.
-    let last = ROLLS - 1;
-    assert_ne!(last % BIN15_MAX_FAMILIES, 0, "the S3 phase rebinds family 0");
-    let f_last = *m.family(last % BIN15_MAX_FAMILIES).expect("the last roll's family");
-    let t_last = at(1 + last as u64 * MARKS_PER_ROLL);
-    assert_eq!(
-        (f_last.entry_first_ok_ts, f_last.entry_ctl_ok_ts),
-        (t_last, t_last),
-        "the artifact's first fire and the control"
-    );
-    assert!(ctx.n > 0, "the gate must measure real submits");
+    assert_eq!(ctx.n, 0, "late off: the S-law pricer is a counterfactual and never trades");
+    assert_eq!(counters.takes_submitted, 0, "and counted none");
     assert_eq!(
         allocs, 0,
         "strategy-bin15 callbacks allocated {allocs} times ({bytes} B)"
@@ -7690,9 +7624,8 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
 /// σ-cold holds of the first 300 s, the take, its fill or refusal, and the
 /// settle that resets the family's `LateState`.
 ///
-/// The S-law's own arms are held off (a 200 s take floor on two-minute
-/// instances, no maker) so every order in the window is the late law's —
-/// gate 52 measures those arms. Not measured: `configure`, the two boxed
+/// The late law is the member's only trading law since H90 G3, so every
+/// order on the tape is its. Not measured: `configure`, the two boxed
 /// Φ tables (`Box<Bin15Luts>`, `Box<LateLut>`: 16 KiB each, built once at
 /// boot) and the HAR seeds.
 #[test]
@@ -7776,8 +7709,6 @@ fn bin15_late_window_entry_is_zero_alloc() {
     }
     params.n_families = FAMS;
     params.n_underlyings = FAMS;
-    params.tau_min_take_ns = [200_000_000_000, 3_600_000_000_000];
-    params.maker_enabled = 0;
     params.cap_instance_usd_1e6 = 1_000_000_000;
     params.cap_day_usd_1e6 = 1_000_000_000_000;
     // The ruled law (O-H90-5..7): [2, 30) s, p ≥ 0.90, 2 c, two polls, $100.
@@ -7971,7 +7902,7 @@ fn bin15_late_window_entry_is_zero_alloc() {
         "every late order was answered once"
     );
     assert_eq!(ctx.n, counters.late_submitted, "every order on the tape was the late law's");
-    assert_eq!(counters.takes_submitted, counters.late_submitted, "the S-law arms stayed off");
+    assert_eq!(counters.takes_submitted, counters.late_submitted, "every take is a late take");
     assert!(
         ctx.n_yes > 0 && ctx.n_yes < ctx.n,
         "Yes AND No entries: {} of {}",
@@ -16302,7 +16233,7 @@ fn hl_gateway_outcome_arm_is_zero_alloc() {
                 .is_err(),
         ) << 3;
         *acc ^= u64::from(
-            arm.submit(&leg(seq + 3, k, LEG_YES, ORDER_KIND_MAKER, 300_050))
+            arm.submit(&leg(seq + 3, k, LEG_YES, ORDER_KIND_MAKER, 300_055))
                 .is_err(),
         ) << 4;
         answer(gw, n);
@@ -22477,3 +22408,596 @@ fn pine_ignored_callbacks_are_zero_alloc() {
         "gate PVM-12"
     );
 }
+
+/// PM15 gate 114: the rolling 15m ingress driver's frame paths and slot 9's
+/// member, in steady state — `book` snapshots, `price_change` events (the
+/// ladder, the venue touch, the change-gated tick), Chainlink reports
+/// (marks), the roll clock; and the member's report grid, nowcast, pricer,
+/// persistence, take, fill and settlement. Zero bytes per operation.
+#[test]
+fn pm15_ingress_driver_and_member_are_zero_alloc() {
+    use core_ring::Ring;
+    use core_twaplock::late::LateLut;
+    use core_types::pm_roll::{
+        pm_instance_id, pm_mark_sym, pm_pair_of_window, pm_roll_family, pm_rolling_sym,
+        pm_window_end_ns, pm_window_of_open, PM_LEG_DOWN, PM_LEG_UP, PM_SETTLED_UP, PM_TWAP_S,
+    };
+    use core_types::{ChannelEvent, ChannelId, Fill, NullCapture, Order, Price, Qty, Side, Tick, VenueId};
+    use ingress_polymarket::gamma15::PmWindowSpec;
+    use ingress_polymarket::pm15_loop::{Pm15Counters, Pm15Driver, Pm15Out, Pm15Wire, PM15_EVENT_MASK};
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+
+    /// A wire that counts what it would send.
+    struct CountWire(usize);
+    impl Pm15Wire for CountWire {
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn queue(&mut self, parts: &[&[u8]]) -> bool {
+            let mut i = 0usize;
+            while i < parts.len() {
+                self.0 += parts[i].len();
+                i += 1;
+            }
+            true
+        }
+    }
+    /// A ctx that counts orders and keeps the last one.
+    struct CountCtx {
+        now: u64,
+        n: u64,
+        last: Option<Order>,
+    }
+    impl Ctx for CountCtx {
+        fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+            self.n += 1;
+            self.last = Some(order);
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    const S: u64 = 1_000_000_000;
+    const OPEN: u64 = 1_792_216_800;
+    let w = pm_window_of_open(OPEN).unwrap();
+    let up = b"74913418352376030655968323928940542465856871160803692353977404305259528321778";
+    let down = b"108416957532714595532891587985594213692071846013834323276407586325741402897137";
+
+    // ---- the ingress driver (boot: tables, rings, frames) ----
+    let mut spec = PmWindowSpec::EMPTY;
+    spec.window = w;
+    spec.tick_1e6 = 10_000;
+    spec.min_size_1e6 = 5_000_000;
+    spec.up.b[..up.len()].copy_from_slice(up);
+    spec.up.len = up.len() as u8;
+    spec.down.b[..down.len()].copy_from_slice(down);
+    spec.down.len = down.len() as u8;
+    let (mut tick_tx, mut tick_rx) = Ring::<Tick, { ingress_polymarket::DEFAULT_TICK_RING_CAP }>::new().split();
+    let (mut ev_tx, mut ev_rx) = Ring::<ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let status = core_metrics::IngressStatus::new();
+    let counters = Pm15Counters::new();
+    let mut cap = NullCapture;
+    let mut wire = CountWire(0);
+    let mut d = Pm15Driver::new(&[b"btc"], 5_000);
+    let wall0 = (OPEN + 100) * S;
+    {
+        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
+        d.offer(&spec, wall0, wall0, &mut out, &mut wire);
+    }
+    let us = std::str::from_utf8(up).unwrap();
+    let ds = std::str::from_utf8(down).unwrap();
+    let book = format!(
+        "[{{\"market\":\"0x70\",\"asset_id\":\"{us}\",\"timestamp\":\"1792216900000\",\"hash\":\"h\",\"bids\":[{{\"price\":\"0.40\",\"size\":\"10\"}},{{\"price\":\"0.50\",\"size\":\"10\"}}],\"asks\":[{{\"price\":\"0.60\",\"size\":\"7\"}},{{\"price\":\"0.52\",\"size\":\"7\"}}],\"event_type\":\"book\"}}, {{\"market\":\"0x70\",\"asset_id\":\"{ds}\",\"timestamp\":\"1792216900000\",\"hash\":\"h\",\"bids\":[{{\"price\":\"0.48\",\"size\":\"7\"}}],\"asks\":[{{\"price\":\"0.50\",\"size\":\"10\"}}],\"event_type\":\"book\"}}]"
+    );
+    let mut changes: Vec<String> = Vec::with_capacity(64);
+    let mut k = 0u32;
+    while k < 64 {
+        let sz = 10 + k % 7;
+        changes.push(format!(
+            "{{\"market\":\"0x70\", \"price_changes\":[{{\"asset_id\":\"{us}\", \"price\":\"0.50\", \"size\":\"{sz}\", \"side\":\"BUY\", \"hash\":\"a\", \"best_bid\":\"0.5\", \"best_ask\":\"0.52\"}}, {{\"asset_id\":\"{ds}\", \"price\":\"0.50\", \"size\":\"{sz}\", \"side\":\"SELL\", \"hash\":\"b\", \"best_bid\":\"0.48\", \"best_ask\":\"0.5\"}}], \"timestamp\":\"{}\", \"event_type\":\"price_change\"}}",
+            1_792_216_900_000u64 + u64::from(k)
+        ));
+        k += 1;
+    }
+    let mut marks: Vec<String> = Vec::with_capacity(64);
+    let mut k = 0u64;
+    while k < 64 {
+        marks.push(format!(
+            "{{\"connection_id\":\"x\",\"payload\":{{\"full_accuracy_value\":\"{}\",\"symbol\":\"btc/usd\",\"timestamp\":{},\"value\":1.0}},\"timestamp\":1,\"topic\":\"crypto_prices_chainlink\",\"type\":\"update\"}}",
+            81_000_000_000_000_000_000_000u128 + u128::from(k) * 1_000_000_000_000_000,
+            (OPEN + 200 + k) * 1_000
+        ));
+        k += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut i = 0usize;
+    while i < 2_000 {
+        let now = wall0 + i as u64 * 1_000_000;
+        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
+        if i % 256 == 0 {
+            d.on_market_text(book.as_bytes(), now, now, &mut out);
+        }
+        d.on_market_text(changes[i % 64].as_bytes(), now, now, &mut out);
+        if i % 32 == 0 {
+            d.on_rtds_text(marks[(i / 32) % 64].as_bytes(), now, &mut out);
+            d.on_clock(now, now, &mut out, &mut wire);
+        }
+        d.perform(now, &mut out, &mut wire);
+        while tick_rx.try_pop_ref().is_some() {}
+        while ev_rx.try_pop_ref().is_some() {}
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    assert!(counters.of(ingress_polymarket::pm15_loop::Pm15Counter::Marks) > 0, "gate 114: marks flowed");
+    assert!(status.ticks_total() > 0, "gate 114: ticks flowed");
+    assert_eq!(allocs, 0, "gate 114: the PM15 ingress driver allocated {allocs} times ({bytes} B)");
+
+    // ---- slot 9's member (boot: configure, the grids) ----
+    let mut lut = Box::new(LateLut::flat());
+    let mut z = 0usize;
+    while z < core_twaplock::late::LATE_PHI_POINTS {
+        lut.phi[z] = (500_000 + ((z as i64 * 2_000).min(4_000_000) / 8)) as u32;
+        z += 1;
+    }
+    let perp = core_types::make_symbol_id(VenueId::Hyperliquid, 1);
+    let mut perp_sym = [core_types::SYMBOL_ID_NONE; strategy_pm15::PM15_MAX_FAMILIES];
+    perp_sym[0] = perp;
+    let p = strategy_pm15::Pm15Params { n_families: 1, perp_sym, ..strategy_pm15::Pm15Params::default() };
+    let mut m = strategy_pm15::Pm15Strategy::new();
+    m.configure(p, lut, core_time::WallAnchor::new(0, 0)).expect("gate 114: configure");
+    let roll = |wc: u32, settled: bool, v0: i64| {
+        let pair = pm_pair_of_window(wc);
+        let inst = pm_instance_id(wc, 0).unwrap();
+        ChannelEvent::new(0, VenueId::Polymarket, ChannelId::InstrumentRoll, pm_rolling_sym(0, pair, PM_LEG_UP), core_types::pack_roll_seq(inst, PM_TWAP_S, pm_roll_family(0, pair), settled), 0, v0, pm_window_end_ns(wc) as i64)
+    };
+    let law = |wc: u32| {
+        let inst = pm_instance_id(wc, 0).unwrap();
+        ChannelEvent::new(0, VenueId::Polymarket, ChannelId::OutcomeMeta, pm_rolling_sym(0, pm_pair_of_window(wc), PM_LEG_UP), u64::from(inst), 0, 10_000, 5_000_000)
+    };
+    let mut c = CountCtx { now: 0, n: 0, last: None };
+    let base: i64 = 81_000_000_000;
+    let g = AllocGuard::new();
+    let mut cycle = 0u32;
+    // Four windows two apart (one slot pair), each with the 20 minutes of
+    // tape before it (the overlap is older than the newest report: ignored).
+    while cycle < 4 {
+        let wc = w + 2 * cycle;
+        let open = OPEN + u64::from(cycle) * 1_800;
+        let end = open + 900;
+        let pair = pm_pair_of_window(wc);
+        let mut s = open - 1_200;
+        while s < end - 2 {
+            if s == open {
+                c.now = open * S;
+                m.on_venue_event(&roll(wc, false, 0), &mut c);
+                m.on_venue_event(&law(wc), &mut c);
+            }
+            let px = if s >= open { base + 400_000_000 } else { base } + if s % 2 == 0 { 2_000_000 } else { -2_000_000 };
+            c.now = s * S - 200_000_000;
+            m.on_tick(&Tick::new(c.now, VenueId::Hyperliquid, perp, 1, Price::from_raw(px - 500_000), Qty::from_raw(1), Price::from_raw(px + 500_000), Qty::from_raw(1)), &mut c);
+            c.now = s * S + 1_300_000_000;
+            m.on_venue_event(&ChannelEvent::new(c.now, VenueId::Polymarket, ChannelId::Mark, pm_mark_sym(0), s, s * 1_000, px, px * 1_000_000), &mut c);
+            m.on_tick(&Tick::new(c.now, VenueId::Polymarket, pm_rolling_sym(0, pair, PM_LEG_UP), 1, Price::from_raw(920_000), Qty::from_raw(500_000_000), Price::from_raw(930_000), Qty::from_raw(500_000_000)), &mut c);
+            m.on_tick(&Tick::new(c.now, VenueId::Polymarket, pm_rolling_sym(0, pair, PM_LEG_DOWN), 1, Price::from_raw(70_000), Qty::from_raw(500_000_000), Price::from_raw(80_000), Qty::from_raw(500_000_000)), &mut c);
+            if let Some(o) = c.last.take() {
+                m.on_fill(&Fill::new(c.now, o.sym, Side::Bid, Price::from_raw(930_000), o.qty, o.client_oid), &mut c);
+            }
+            m.on_timer(c.now, &mut c);
+            s += 1;
+        }
+        m.on_venue_event(&roll(wc, true, PM_SETTLED_UP), &mut c);
+        cycle += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    let ct = m.counters();
+    assert!(c.n >= 4 && ct.settled_won == 4, "gate 114: the member took and settled every cycle ({} orders, {:?})", c.n, ct);
+    assert_eq!(allocs, 0, "gate 114: slot 9's member allocated {allocs} times ({bytes} B)");
+    std::hint::black_box((wire.0, ct));
+}
+
+/// PM15-6a gate 115: the slot-9 arm's order path without a socket — the
+/// FAK amounts, the struct hash and signature (EOA and the Deposit
+/// Wallet's wrapper), the per-order tail, the L2 MAC over the request's
+/// spans, the answer's read and a user-channel frame's scan. Zero bytes
+/// per order. (PM15-6b: the head is `HttpsReq`'s, gate 77b's.)
+#[test]
+fn pm15_exec_order_path_is_zero_alloc() {
+    use exec_polymarket::amounts::fak_buy;
+    use exec_polymarket::l2::L2Secret;
+    use exec_polymarket::render::{render_order_tail, render_token_prefix, render_ts, PREFIX_MAX, TAIL_MAX};
+    use exec_polymarket::response::{read_order_answer, Verdict};
+    use exec_polymarket::sign::{sign_order, SIG_MAX};
+    use exec_polymarket::userws::{scan_user_frame, UserEvt, KIND_TRADE};
+    use signer_eip712::pmv2::{
+        eip55, exchange_separator, u256_from_decimal, OrderV2, CHAIN_POLYGON, EXCHANGE_V2, SIDE_BUY, SIG_EOA,
+        SIG_POLY_1271,
+    };
+
+    const N: u64 = 256;
+    let key = [0x42u8; 32];
+    let sk = signer_eip712::parse_secret_key(&key).unwrap();
+    let me = signer_eip712::address_from_private_key(&key).unwrap();
+    let me_text = eip55(&me);
+    let tok_dec: &[u8] = b"74913418352376030655968323928940542465856871160803692353977404305259528321778";
+    let tok = u256_from_decimal(tok_dec).unwrap();
+    let sep = exchange_separator(b"2", CHAIN_POLYGON, EXCHANGE_V2);
+    let secret = L2Secret::from_base64(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+    let api_key: &[u8] = b"00000000-0000-0000-0000-000000000000";
+    let mut prefix = [0u8; PREFIX_MAX];
+    let mut tail = [0u8; TAIL_MAX];
+    let mut sig = [0u8; SIG_MAX];
+    let mut ts = [0u8; 20];
+    let mut evts = [UserEvt::BLANK; 4];
+    let p = render_token_prefix(&me_text, &me_text, tok_dec, SIG_EOA, &mut prefix);
+    let answer: &[u8] = br#"{"success":true,"errorMsg":"","orderID":"0x72e7378745dcfb7f03ad3bb1663fc00a91332015d6000399d131536361deaf9a","status":"matched","makingAmount":"2.5","takingAmount":"4.5454","tradeIDs":["t1"]}"#;
+    let frame: &[u8] = br#"{"event_type":"trade","type":"TRADE","id":"28c4d2eb-bbea-40e7-a9f0-b2fdb56b2c2e","taker_order_id":"0x72e7378745dcfb7f03ad3bb1663fc00a91332015d6000399d131536361deaf9a","asset_id":"74913418352376030655968323928940542465856871160803692353977404305259528321778","side":"BUY","size":"4.5454","price":"0.55","status":"MATCHED","trader_side":"TAKER","maker_orders":[{"order_id":"0xab","price":"0.45","side":"BUY"}],"timestamp":"1792217690300"}"#;
+
+    let mut bytes_out = 0usize;
+    let mut accepted = 0u64;
+    let mut fills = 0u64;
+    // Warm-up: the first signature builds the process's secp256k1 signing
+    // context (a boot cost, 208 B once) — taken before the count.
+    let warm = OrderV2 {
+        salt: 1,
+        maker: me,
+        signer: me,
+        token_id: tok,
+        maker_amount: 1,
+        taker_amount: 1,
+        timestamp_ms: 1,
+        metadata: [0; 32],
+        builder: [0; 32],
+        side: SIDE_BUY,
+        signature_type: SIG_EOA,
+        _pad: [0; 6],
+    };
+    sign_order(&sk, &sep, CHAIN_POLYGON, &warm, &mut sig).unwrap();
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < N {
+        let a = fak_buy(250_000_000 - i * 10_000, 950_000, 10_000).unwrap();
+        let sig_type = if i % 2 == 0 { SIG_EOA } else { SIG_POLY_1271 };
+        let o = OrderV2 {
+            salt: 479_249_096_354 + i,
+            maker: me,
+            signer: me,
+            token_id: tok,
+            maker_amount: a.maker,
+            taker_amount: a.taker,
+            timestamp_ms: 1_792_217_690_123 + i,
+            metadata: [0; 32],
+            builder: [0; 32],
+            side: SIDE_BUY,
+            signature_type: sig_type,
+            _pad: [0; 6],
+        };
+        let s = sign_order(&sk, &sep, CHAIN_POLYGON, &o, &mut sig).unwrap();
+        let t = render_order_tail(o.salt, &a, o.timestamp_ms, &sig[..s.sig_len], api_key, &mut tail);
+        let tn = render_ts(1_792_217_690 + i, &mut ts);
+        let mac = secret.sign(&[&ts[..tn], b"POST", b"/order", &prefix[..p], &tail[..t]]);
+        bytes_out += mac.len() + t;
+        if read_order_answer(200, answer).verdict == Verdict::Accepted {
+            accepted += 1;
+        }
+        let r = scan_user_frame(frame, &mut evts).unwrap();
+        if r.events == 1 && evts[0].kind == KIND_TRADE {
+            fills += 1;
+        }
+        i += 1;
+    }
+    let (allocs, nbytes, _) = g.delta();
+    std::hint::black_box((bytes_out, &tail));
+    assert_eq!((accepted, fills), (N, N), "gate 115: every answer accepted and every frame a fill");
+    assert_eq!(allocs, 0, "gate 115: the Polymarket order path allocated {allocs} times ({nbytes} B)");
+}
+
+/// PM15-6b gate 130: the slot-9 arm's two halves on one thread, at 0 B per
+/// order. pm-gw end to end on a fixed CLOB rig — the window from the spec
+/// ring, the amounts, the signature, the body in place, the MAC, SENT, the
+/// request and its answer (the venue's zero-fill FAK refusal) — and the
+/// arm admitting, draining SENT and REFUSED and retiring; then the arm
+/// alone against a scripted duplex: SENT, ACK, a channel trade booked
+/// once, a repeat, the retirement.
+#[test]
+fn pm15_exec_arm_and_gateway_are_zero_alloc() {
+    use clob_dispatcher::OrderDispatch;
+    use core_types::pm_roll::{pm_instance_id, pm_pair_of_window, pm_rolling_sym, pm_window_of_open};
+    use core_types::{ChannelEvent, ChannelId, Order, Price, Qty, Side, VenueId};
+    use exec_polymarket::account::PmAccount;
+    use exec_polymarket::arm::{PmArm, PmArmCfg};
+    use exec_polymarket::clob::PmClob;
+    use exec_polymarket::cmd::{PmCmd, PmEvt, EVT_ACK, EVT_SENT, PM_CMD_RING, PM_EVT_RING, PM_USER_RING};
+    use exec_polymarket::gw::{PmGateway, BODY_MIN};
+    use exec_polymarket::userws::TS_MATCHED;
+    use ingress_polymarket::gamma15::{PmTokenId, PmWindowSpec};
+    use ingress_polymarket::pm15_loop::PM15_SPEC_RING;
+
+    struct FixedClob {
+        body: Box<[u8; BODY_MIN]>,
+        resp: &'static [u8],
+        posts: u64,
+    }
+    impl PmClob for FixedClob {
+        fn body_mut(&mut self) -> &mut [u8] {
+            &mut self.body[..]
+        }
+        fn request(
+            &mut self,
+            _m: core_net::Method,
+            _t: &[u8],
+            extra: &[core_net::Header<'_>],
+            body_len: usize,
+        ) -> Result<(u16, core::ops::Range<usize>), core_net::PostErr> {
+            self.posts += (extra.len() == 5 && body_len > 0) as u64;
+            Ok((400, 0..self.resp.len()))
+        }
+        fn resp(&self) -> &[u8] {
+            self.resp
+        }
+    }
+
+    const N: u64 = 64;
+    let key = [0x42u8; 32];
+    let me = signer_eip712::address_from_private_key(&key).unwrap();
+    let acct = |k: &[u8; 32]| {
+        PmAccount::new(
+            0,
+            me,
+            None,
+            b"00000000-0000-0000-0000-000000000000",
+            b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            b"pass",
+            signer_eip712::parse_secret_key(k).unwrap(),
+        )
+        .unwrap()
+    };
+    let w = pm_window_of_open(1_792_216_800).unwrap();
+    let inst = pm_instance_id(w, 0).unwrap();
+    let pair = pm_pair_of_window(w);
+    let up = pm_rolling_sym(0, pair, 0);
+    let mut spec = PmWindowSpec::EMPTY;
+    spec.window = w;
+    spec.tick_1e6 = 10_000;
+    spec.min_size_1e6 = 5_000_000;
+    let tok = |d: &[u8]| {
+        let mut t = PmTokenId::NONE;
+        t.b[..d.len()].copy_from_slice(d);
+        t.len = d.len() as u8;
+        t
+    };
+    spec.up = tok(b"74913418352376030655968323928940542465856871160803692353977404305259528321778");
+    spec.down = tok(b"1234");
+    spec.condition_id_len = 66;
+    spec.condition_id.copy_from_slice(b"0x53efa9a4a5bddfd12a4d154653e337cedf2ec6667842dca165036ac21f6765b7");
+    let law = ChannelEvent::new(0, VenueId::Polymarket, ChannelId::OutcomeMeta, up, u64::from(inst), 0, 10_000, 5_000_000);
+    let order = |i: u64| {
+        let mut o = Order::new(
+            1,
+            VenueId::Polymarket,
+            up,
+            Side::Bid,
+            core_fill::ORDER_KIND_IOC,
+            Price::from_raw(930_000),
+            Qty::from_raw(268_810_000),
+            (i << 49) | u64::from(inst),
+        );
+        o.strategy_id = 9;
+        o
+    };
+
+    // Half one: the arm and pm-gw on one thread.
+    let (eng, end) = exec_gateway::duplex::<PmCmd, PmEvt, PM_CMD_RING, PM_EVT_RING>();
+    let (mut specs_tx, specs_rx) = core_ring::Ring::<PmWindowSpec, PM15_SPEC_RING>::new().split();
+    let (_user_tx, user_rx) = core_ring::Ring::<PmEvt, PM_USER_RING>::new().split();
+    let clob = FixedClob {
+        body: exec_gateway::boxed_array(0),
+        resp: br#"{"error":"no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found."}"#,
+        posts: 0,
+    };
+    let mut gw = PmGateway::new(acct(&key), clob, end, specs_rx, 7);
+    let mut arm = PmArm::new(PmArmCfg { slot: 9, live_families: 1 }, eng, user_rx);
+    arm.on_venue_event(&law);
+    assert!(specs_tx.try_push_ref(&spec));
+    gw.step(1, 1_792_217_690_000_000_000);
+    // Warm-up: the first signature builds the secp256k1 context (boot).
+    arm.submit(&order(0)).unwrap();
+    gw.step(2, 1_792_217_690_000_000_000);
+    arm.on_idle();
+    arm.on_idle();
+    let _ = arm.try_next_retired();
+    let g = AllocGuard::new();
+    let mut retired = 0u64;
+    let mut i = 1u64;
+    while i <= N {
+        arm.submit(&order(i)).unwrap();
+        gw.step(2 + i, 1_792_217_690_000_000_000 + i * 1_000_000);
+        arm.on_idle();
+        arm.on_idle();
+        while arm.try_next_retired().is_some() {
+            retired += 1;
+        }
+        i += 1;
+    }
+    let (allocs, nbytes, _) = g.delta();
+    assert_eq!(retired, N, "gate 130: every order refused and retired");
+    assert_eq!(gw.counters().refused, N + 1);
+    assert_eq!(allocs, 0, "gate 130: the arm and pm-gw allocated {allocs} times ({nbytes} B)");
+
+    // Half two: the arm against a scripted duplex and user ring.
+    let (eng, mut end) = exec_gateway::duplex::<PmCmd, PmEvt, PM_CMD_RING, PM_EVT_RING>();
+    let (mut user_tx, user_rx) = core_ring::Ring::<PmEvt, PM_USER_RING>::new().split();
+    let mut arm = PmArm::new(PmArmCfg { slot: 9, live_families: 1 }, eng, user_rx);
+    arm.on_venue_event(&law);
+    let g = AllocGuard::new();
+    let mut fills = 0u64;
+    let mut retired = 0u64;
+    let mut i = 1u64;
+    while i <= N {
+        let o = order(i);
+        arm.submit(&o).unwrap();
+        while end.cmd.pop().is_some() {}
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&i.to_le_bytes());
+        let mut e = PmEvt::about(EVT_SENT, o.client_oid);
+        e.order_id = id;
+        assert!(end.evt.emit(&e));
+        let mut e = PmEvt::about(EVT_ACK, o.client_oid);
+        e.order_id = id;
+        e.b = 1;
+        assert!(end.evt.emit(&e));
+        let t = PmEvt::fill(id, 1_000 + i, 930_000, 268_810_000, TS_MATCHED);
+        assert!(user_tx.try_push_ref(&t));
+        assert!(user_tx.try_push_ref(&t));
+        while arm.try_next_fill().is_some() {
+            fills += 1;
+        }
+        while arm.try_next_retired().is_some() {
+            retired += 1;
+        }
+        i += 1;
+    }
+    let (allocs, nbytes, _) = g.delta();
+    assert_eq!(
+        (fills, retired),
+        (N, N),
+        "gate 130: each trade booked once, each order retired"
+    );
+    assert_eq!(
+        allocs, 0,
+        "gate 130: the arm allocated {allocs} times ({nbytes} B)"
+    );
+}
+
+/// Gate 131 (PM15-6d): the relayer redemption — the wallet's nonce read,
+/// the batch (the boot's approval, then eight markets) hashed, signed and
+/// rendered in the client's window, the submit, the poll to its
+/// confirmation — at 0 B per batch.
+#[test]
+fn pm15_relayer_redemption_is_zero_alloc() {
+    use exec_polymarket::account::PmAccount;
+    use exec_polymarket::clob::PmClob;
+    use exec_polymarket::redeem::{
+        Redeemer, RelayerKey, POLL_GAP_NS, REDEEM_AFTER_NS, REDEEM_BATCH, RELAYER_BODY,
+    };
+
+    struct FixedRelayer {
+        body: Box<[u8; RELAYER_BODY]>,
+        resp: &'static [u8],
+        submits: u64,
+    }
+    impl PmClob for FixedRelayer {
+        fn body_mut(&mut self) -> &mut [u8] {
+            &mut self.body[..]
+        }
+        fn request(
+            &mut self,
+            m: core_net::Method,
+            t: &[u8],
+            _extra: &[core_net::Header<'_>],
+            body_len: usize,
+        ) -> Result<(u16, core::ops::Range<usize>), core_net::PostErr> {
+            self.resp = if t.starts_with(b"/v1/account/transactions/params") {
+                br#"{"address":"0x","nonce":"31"}"#
+            } else if m == core_net::Method::Post {
+                self.submits += u64::from(body_len > 4_000);
+                br#"{"transactionID":"0190b317-a1d3-7bec-9b91-eeb6dcd3a620","state":"STATE_NEW"}"#
+            } else {
+                br#"{"transaction_id":"x","state":"STATE_CONFIRMED"}"#
+            };
+            Ok((200, 0..self.resp.len()))
+        }
+        fn resp(&self) -> &[u8] {
+            self.resp
+        }
+    }
+
+    const N: u64 = 16;
+    let key = [0x42u8; 32];
+    let me = signer_eip712::address_from_private_key(&key).unwrap();
+    let acct = PmAccount::new(
+        3,
+        me,
+        Some([0x11; 20]),
+        b"00000000-0000-0000-0000-000000000000",
+        b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        b"pass",
+        signer_eip712::parse_secret_key(&key).unwrap(),
+    )
+    .unwrap();
+    let mut rly = FixedRelayer {
+        body: exec_gateway::boxed_array(0),
+        resp: b"",
+        submits: 0,
+    };
+    let mut r = Redeemer::new(RelayerKey::new(b"relayer-key").unwrap(), [0x11; 20], 137);
+    let mut now = 0u64;
+    let mut g = None;
+    let mut c = 0u64;
+    while c <= N {
+        if c == 1 {
+            // The warm-up batch (the approval; the secp256k1 context) is boot.
+            g = Some(AllocGuard::new());
+        }
+        let mut k = 0usize;
+        while k < REDEEM_BATCH {
+            let mut cond = [0u8; 32];
+            cond[0] = c as u8;
+            cond[1] = k as u8;
+            r.ask(&cond, now);
+            k += 1;
+        }
+        now += REDEEM_AFTER_NS;
+        while r.waiting() > 0 {
+            if r.due(now) {
+                r.step(&mut rly, &acct, now, 1_792_225_360);
+            } else {
+                now += POLL_GAP_NS;
+            }
+        }
+        c += 1;
+    }
+    let (allocs, nbytes, _) = g.unwrap().delta();
+    let k = r.counters();
+    assert_eq!(
+        (k.batches_done, k.redeemed),
+        (N + 1, (N + 1) * REDEEM_BATCH as u64)
+    );
+    assert_eq!(rly.submits, N + 1, "gate 131: every batch is a full one");
+    assert_eq!(
+        allocs, 0,
+        "gate 131: the redeemer allocated {allocs} times ({nbytes} B)"
+    );
+}
+
+/// Gate 132 (PM15-7, dormant): PolyBolt's frames — the auth and subscribe
+/// renders and the parse of a price and a TWAP report — at 0 B.
+#[test]
+fn pm15_polybolt_frames_are_zero_alloc() {
+    use ingress_polymarket::polybolt::{
+        parse_polybolt, render_auth, render_subscribe, PbFrame, PbReport, POLYBOLT_TWAP_S,
+    };
+    const PRICE: &[u8] = br#"{"v":1,"channel":"price.crypto","seq":5,"payload":{"timestamp":"2026-09-08T16:49:37Z","value":"78794.15450441","symbol":"btcusd"}}"#;
+    const TWAP: &[u8] = br#"{"v":1,"channel":"price.crypto.twap","seq":6,"payload":{"symbol":"ethusd","window_seconds":60,"full_accuracy_value":"4123456789012345678901","timestamp":1792238400250}}"#;
+    let mut buf = [0u8; 1024];
+    let mut r = PbReport::default();
+    let g = AllocGuard::new();
+    let mut n = 0u64;
+    let mut i = 0u64;
+    while i < 64 {
+        n += render_auth(&mut buf, b"key", b"c2VjcmV0", b"pass").unwrap() as u64;
+        n += render_subscribe(&mut buf, &[b"btc", b"eth"], POLYBOLT_TWAP_S).unwrap() as u64;
+        n += u64::from(parse_polybolt(PRICE, &mut r) == PbFrame::Price);
+        n += u64::from(parse_polybolt(TWAP, &mut r) == PbFrame::Twap);
+        i += 1;
+    }
+    let (allocs, nbytes, _) = g.delta();
+    assert!(n > 0 && r.px.px_1e6 == 4_123_456_789);
+    assert_eq!(
+        allocs, 0,
+        "gate 132: PolyBolt's frames allocated {allocs} times ({nbytes} B)"
+    );
+}
+

@@ -69,6 +69,10 @@ pub mod hl_outcome_probe;
 /// B'4 T27: `exec-smoke --perp-probe` — the Hyperliquid perp limits probe
 /// (TESTNET; writes `hl-perp-limits.tsv`, which the perp boot requires).
 pub mod hl_perp_probe;
+pub mod pm15_boot;
+pub mod pm15_live;
+pub mod pm15_polybolt;
+pub mod pm15_probe;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;
 pub mod hyparb_live;
@@ -133,12 +137,12 @@ pub use paper::{
     open_events_capture, open_fills_capture, open_orders_capture, parse_ai_hmac_key,
     parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai, spawn_binance,
     spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall, spawn_hyperevm,
-    spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_polymarket, spawn_rpc, split_host_port,
-    state_writer, AiIngressCounterIds, AiIngressStatus, BinanceConnSpec, BybitConnSpec,
-    CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters, EngineLoopResult,
-    EngineLoopStats, ExecObs, HcMetricIds, HypercallSpec, IngressCounterIds, IngressStatusSet,
-    LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability, RawTapConfig,
-    Rings, RunDirGuard, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
+    spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_pm15, spawn_polymarket, spawn_rpc,
+    split_host_port, state_writer, AiIngressCounterIds, AiIngressStatus, BinanceConnSpec,
+    BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters,
+    EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds, HypercallSpec, IngressCounterIds,
+    IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
+    Pm15MetricIds, RawTapConfig, Rings, RunDirGuard, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};
 pub use sigint::{install_sigint_handler, shutdown_requested, SHUTDOWN};

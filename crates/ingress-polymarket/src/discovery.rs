@@ -177,7 +177,7 @@ impl PmDiscovery {
             match body[i] {
                 b']' => break,
                 b'{' => {
-                    let (row, end) = parse_row(body, i)?;
+                    let (row, end) = parse_row(body, i, &mut PmRollLaw::default())?;
                     if self.rows.len() >= PM_DISCOVERY_ROWS_CAP {
                         return Err(PmDiscoveryErr::TooMany);
                     }
@@ -230,13 +230,137 @@ impl Default for PmDiscovery {
     }
 }
 
+/// PM15: the fields of a market object that only a ROLLING market's
+/// venue law reads (`crate::gamma15`). [`parse_row`] captures them beside
+/// the row; the static boot discovery passes a scratch and ignores them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PmRollLaw {
+    /// `outcomes` was exactly `["Up", "Down"]` (so `clobTokenIds[0]` is Up).
+    pub outcomes_up_down: bool,
+    /// A `feeSchedule` object was present.
+    pub fee_seen: bool,
+    /// `feeSchedule.rate` ×1e9.
+    pub fee_rate_1e9: i64,
+    /// `feeSchedule.exponent` ×1e9.
+    pub fee_exponent_1e9: i64,
+    /// `feeSchedule.takerOnly`.
+    pub fee_taker_only: bool,
+    /// A `cryptoMarketConfig` object was present.
+    pub cmc_seen: bool,
+    /// `cryptoMarketConfig.asset` (`cmc_asset_len` bytes valid).
+    pub cmc_asset: [u8; PM_LAW_NAME_MAX],
+    /// Valid prefix of `cmc_asset`.
+    pub cmc_asset_len: u8,
+    /// `cryptoMarketConfig.duration` was `"15m"`.
+    pub cmc_15m: bool,
+    /// `cryptoMarketConfig.twapEnabled`.
+    pub cmc_twap_enabled: bool,
+    /// `cryptoMarketConfig.twapLookbackSeconds` ×1e9.
+    pub cmc_twap_s_1e9: i64,
+    /// `slug` (`slug_len` bytes valid).
+    pub slug: [u8; PM_LAW_SLUG_MAX],
+    /// Valid prefix of `slug`.
+    pub slug_len: u8,
+}
+
+/// Longest `cryptoMarketConfig.asset` captured.
+pub const PM_LAW_NAME_MAX: usize = 16;
+/// Longest `slug` captured (`<asset ≤ 15>-updown-15m-<10 digits>` = 40).
+pub const PM_LAW_SLUG_MAX: usize = 48;
+
+impl Default for PmRollLaw {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl PmRollLaw {
+    /// Nothing captured.
+    pub const EMPTY: Self = Self {
+        outcomes_up_down: false,
+        fee_seen: false,
+        fee_rate_1e9: 0,
+        fee_exponent_1e9: 0,
+        fee_taker_only: false,
+        cmc_seen: false,
+        cmc_asset: [0; PM_LAW_NAME_MAX],
+        cmc_asset_len: 0,
+        cmc_15m: false,
+        cmc_twap_enabled: false,
+        cmc_twap_s_1e9: 0,
+        slug: [0; PM_LAW_SLUG_MAX],
+        slug_len: 0,
+    };
+
+    /// The captured `cryptoMarketConfig.asset`.
+    #[inline]
+    #[must_use]
+    pub fn cmc_asset(&self) -> &[u8] {
+        &self.cmc_asset[..self.cmc_asset_len as usize]
+    }
+
+    /// The captured `slug`.
+    #[inline]
+    #[must_use]
+    pub fn slug(&self) -> &[u8] {
+        &self.slug[..self.slug_len as usize]
+    }
+}
+
+/// The next member of the object being walked at `*i`: its key, with `*i`
+/// on the first byte of its value; `None` at the closing `}` (`*i` past
+/// it). The one object walker of this module — the market row and its
+/// nested `feeSchedule` / `cryptoMarketConfig` objects all go through it.
+pub(crate) fn next_member<'a>(
+    body: &'a [u8],
+    i: &mut usize,
+) -> Result<Option<&'a [u8]>, PmDiscoveryErr> {
+    loop {
+        *i = skip_ws(body, *i);
+        match body.get(*i) {
+            None => return Err(PmDiscoveryErr::Truncated),
+            Some(b'}') => {
+                *i += 1;
+                return Ok(None);
+            }
+            Some(b',') => *i += 1,
+            Some(b'"') => {
+                let key_start = *i + 1;
+                let key_end_q = skip_string(body, key_start).ok_or(PmDiscoveryErr::Truncated)?;
+                let key = &body[key_start..key_end_q - 1];
+                *i = skip_ws(body, key_end_q);
+                if body.get(*i) != Some(&b':') {
+                    return Err(PmDiscoveryErr::BadRow);
+                }
+                *i = skip_ws(body, *i + 1);
+                return Ok(Some(key));
+            }
+            Some(_) => return Err(PmDiscoveryErr::BadRow),
+        }
+    }
+}
+
+/// The value at `i` must open an object; returns the position after `{`.
+fn open_object(body: &[u8], i: usize) -> Result<usize, PmDiscoveryErr> {
+    if body.get(i) != Some(&b'{') {
+        return Err(PmDiscoveryErr::BadRow);
+    }
+    Ok(i + 1)
+}
+
 /// Parse one market object starting at `pos` (must point at `{`).
-/// Returns the row and the position after the closing `}`.
+/// Returns the row and the position after the closing `}`; the rolling
+/// venue-law fields land in `law`.
 // COPY: `Result<(PmMarketRow, usize), _>` ≥ 264 B by value, once per
-// row of the boot-time REST discovery (cold; the row is pushed into the
-// discovery table next) — rejected: an out-param into the table's next
-// slot, bookkeeping a boot-once path does not earn.
-fn parse_row(body: &[u8], pos: usize) -> Result<(PmMarketRow, usize), PmDiscoveryErr> {
+// row of the boot-time REST discovery and once per rolling window's
+// Gamma answer (cold; the row is pushed into the discovery table or
+// checked into a window spec next) — rejected: an out-param into the
+// table's next slot, bookkeeping a cold path does not earn.
+pub(crate) fn parse_row(
+    body: &[u8],
+    pos: usize,
+    law: &mut PmRollLaw,
+) -> Result<(PmMarketRow, usize), PmDiscoveryErr> {
     debug_assert_eq!(body[pos], b'{');
     let mut i = pos + 1;
 
@@ -250,96 +374,92 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(PmMarketRow, usize), PmDiscover
     let mut neg_risk = false; // optional — absent on some market states
     let mut order_price_min_tick_1e9: i64 = 0; // optional
     let mut order_min_size_1e6: i64 = 0; // optional
+    *law = PmRollLaw::default();
 
-    loop {
-        i = skip_ws(body, i);
-        if i >= body.len() {
-            return Err(PmDiscoveryErr::Truncated);
-        }
-        match body[i] {
-            b'}' => {
-                i += 1;
-                break;
+    while let Some(key) = next_member(body, &mut i)? {
+        match key {
+            b"clobTokenIds" => {
+                // Double-encoded: take the raw span WITH its escapes and
+                // extract the digit runs.
+                let (raw, end) = raw_quoted_span(body, i)?;
+                tokens = Some(extract_tokens(raw)?);
+                i = end;
             }
-            b',' => {
-                i += 1;
-                continue;
-            }
-            b'"' => {
-                // Key.
-                let key_start = i + 1;
-                let key_end_q = skip_string(body, key_start).ok_or(PmDiscoveryErr::Truncated)?;
-                let key = &body[key_start..key_end_q - 1];
-                i = skip_ws(body, key_end_q);
-                if i >= body.len() || body[i] != b':' {
+            b"conditionId" => {
+                let (s, end) = quoted_span(body, i)?;
+                if s.len() < 2 || s.len() > 66 || &s[..2] != b"0x" {
                     return Err(PmDiscoveryErr::BadRow);
                 }
-                i = skip_ws(body, i + 1);
-                match key {
-                    b"clobTokenIds" => {
-                        // Double-encoded: take the raw span WITH its
-                        // escapes and extract the digit runs.
-                        let (raw, end) = raw_quoted_span(body, i)?;
-                        tokens = Some(extract_tokens(raw)?);
-                        i = end;
-                    }
-                    b"conditionId" => {
-                        let (s, end) = quoted_span(body, i)?;
-                        if s.len() < 2 || s.len() > 66 || &s[..2] != b"0x" {
-                            return Err(PmDiscoveryErr::BadRow);
-                        }
-                        // COPY: ≤ 66 B `conditionId` into its discovery row, once per market row
-                        // at boot — the row outlives the Gamma REST body it was scanned from —
-                        // rejected: rows borrowing the body (the Gamma body pinned for the table's
-                        // life and a lifetime threaded through the boot, to save ≤ 66 B a row).
-                        condition_id[..s.len()].copy_from_slice(s);
-                        condition_id_len = s.len() as u8;
-                        i = end;
-                    }
-                    b"active" => {
-                        let (v, end) = bare_bool(body, i)?;
-                        active = Some(v);
-                        i = end;
-                    }
-                    b"closed" => {
-                        let (v, end) = bare_bool(body, i)?;
-                        closed = Some(v);
-                        i = end;
-                    }
-                    b"acceptingOrders" => {
-                        let (v, end) = bare_bool(body, i)?;
-                        accepting_orders = Some(v);
-                        i = end;
-                    }
-                    b"enableOrderBook" => {
-                        let (v, end) = bare_bool(body, i)?;
-                        enable_order_book = Some(v);
-                        i = end;
-                    }
-                    b"negRisk" => {
-                        let (v, end) = bare_bool(body, i)?;
-                        neg_risk = v;
-                        i = end;
-                    }
-                    b"orderPriceMinTickSize" => {
-                        // Bare number, ×1e9 metadata scale.
-                        let (v, end) =
-                            scan_number_sci_1e9(body, i).ok_or(PmDiscoveryErr::BadRow)?;
-                        order_price_min_tick_1e9 = v;
-                        i = end;
-                    }
-                    b"orderMinSize" => {
-                        // Bare number, trading Qty ×1e6 scale.
-                        let (v, end) = bare_1e6(body, i)?;
-                        order_min_size_1e6 = v;
-                        i = end;
-                    }
-                    _ => {
-                        i = skip_json_value(body, i).ok_or(PmDiscoveryErr::BadRow)?;
-                    }
-                }
+                // COPY: ≤ 66 B `conditionId` into its discovery row, once per market row
+                // at boot — the row outlives the Gamma REST body it was scanned from —
+                // rejected: rows borrowing the body (the Gamma body pinned for the table's
+                // life and a lifetime threaded through the boot, to save ≤ 66 B a row).
+                condition_id[..s.len()].copy_from_slice(s);
+                condition_id_len = s.len() as u8;
+                i = end;
             }
-            _ => return Err(PmDiscoveryErr::BadRow),
+            b"active" => {
+                let (v, end) = bare_bool(body, i)?;
+                active = Some(v);
+                i = end;
+            }
+            b"closed" => {
+                let (v, end) = bare_bool(body, i)?;
+                closed = Some(v);
+                i = end;
+            }
+            b"acceptingOrders" => {
+                let (v, end) = bare_bool(body, i)?;
+                accepting_orders = Some(v);
+                i = end;
+            }
+            b"enableOrderBook" => {
+                let (v, end) = bare_bool(body, i)?;
+                enable_order_book = Some(v);
+                i = end;
+            }
+            b"negRisk" => {
+                let (v, end) = bare_bool(body, i)?;
+                neg_risk = v;
+                i = end;
+            }
+            b"orderPriceMinTickSize" => {
+                // Bare number, ×1e9 metadata scale.
+                let (v, end) = scan_number_sci_1e9(body, i).ok_or(PmDiscoveryErr::BadRow)?;
+                order_price_min_tick_1e9 = v;
+                i = end;
+            }
+            b"orderMinSize" => {
+                // Bare number, trading Qty ×1e6 scale.
+                let (v, end) = bare_1e6(body, i)?;
+                order_min_size_1e6 = v;
+                i = end;
+            }
+            // PM15: the rolling venue law (`PmRollLaw`).
+            b"outcomes" => {
+                let (raw, end) = raw_quoted_span(body, i)?;
+                law.outcomes_up_down = is_up_down(raw);
+                i = end;
+            }
+            b"slug" => {
+                let (s, end) = quoted_span(body, i)?;
+                if s.len() <= PM_LAW_SLUG_MAX {
+                    // COPY: ≤ 48 B slug into the law capture, once per
+                    // rolling window's Gamma answer (cold).
+                    law.slug[..s.len()].copy_from_slice(s);
+                    law.slug_len = s.len() as u8;
+                }
+                i = end;
+            }
+            b"feeSchedule" => {
+                i = parse_fee_schedule(body, open_object(body, i)?, law)?;
+            }
+            b"cryptoMarketConfig" => {
+                i = parse_crypto_config(body, open_object(body, i)?, law)?;
+            }
+            _ => {
+                i = skip_json_value(body, i).ok_or(PmDiscoveryErr::BadRow)?;
+            }
         }
     }
 
@@ -361,6 +481,95 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(PmMarketRow, usize), PmDiscover
         order_min_size_1e6,
     };
     Ok((row, i))
+}
+
+/// `"[\"Up\", \"Down\"]"` as it arrives (escapes kept), spaces ignored.
+fn is_up_down(raw: &[u8]) -> bool {
+    const WANT: &[u8] = br#"[\"Up\",\"Down\"]"#;
+    let mut k = 0usize;
+    let mut j = 0usize;
+    while j < raw.len() {
+        let b = raw[j];
+        j += 1;
+        if b == b' ' {
+            continue;
+        }
+        if k >= WANT.len() || WANT[k] != b {
+            return false;
+        }
+        k += 1;
+    }
+    k == WANT.len()
+}
+
+/// The members of a `feeSchedule` object (after its `{`).
+fn parse_fee_schedule(
+    body: &[u8],
+    mut i: usize,
+    law: &mut PmRollLaw,
+) -> Result<usize, PmDiscoveryErr> {
+    law.fee_seen = true;
+    while let Some(key) = next_member(body, &mut i)? {
+        match key {
+            b"rate" => {
+                let (v, end) = scan_number_sci_1e9(body, i).ok_or(PmDiscoveryErr::BadRow)?;
+                law.fee_rate_1e9 = v;
+                i = end;
+            }
+            b"exponent" => {
+                let (v, end) = scan_number_sci_1e9(body, i).ok_or(PmDiscoveryErr::BadRow)?;
+                law.fee_exponent_1e9 = v;
+                i = end;
+            }
+            b"takerOnly" => {
+                let (v, end) = bare_bool(body, i)?;
+                law.fee_taker_only = v;
+                i = end;
+            }
+            _ => i = skip_json_value(body, i).ok_or(PmDiscoveryErr::BadRow)?,
+        }
+    }
+    Ok(i)
+}
+
+/// The members of a `cryptoMarketConfig` object (after its `{`).
+fn parse_crypto_config(
+    body: &[u8],
+    mut i: usize,
+    law: &mut PmRollLaw,
+) -> Result<usize, PmDiscoveryErr> {
+    law.cmc_seen = true;
+    while let Some(key) = next_member(body, &mut i)? {
+        match key {
+            b"asset" => {
+                let (s, end) = quoted_span(body, i)?;
+                if s.len() <= PM_LAW_NAME_MAX {
+                    // COPY: ≤ 16 B asset name into the law capture, once per
+                    // rolling window's Gamma answer (cold).
+                    law.cmc_asset[..s.len()].copy_from_slice(s);
+                    law.cmc_asset_len = s.len() as u8;
+                }
+                i = end;
+            }
+            b"duration" => {
+                let (s, end) = quoted_span(body, i)?;
+                law.cmc_15m = s == b"15m";
+                i = end;
+            }
+            b"twapEnabled" => {
+                let (v, end) = bare_bool(body, i)?;
+                law.cmc_twap_enabled = v;
+                i = end;
+            }
+            b"twapLookbackSeconds" => {
+                let (v, end) = scan_number_sci_1e9(body, i).ok_or(PmDiscoveryErr::BadRow)?;
+                law.cmc_twap_s_1e9 = v;
+                i = end;
+            }
+            _ => i = skip_json_value(body, i).ok_or(PmDiscoveryErr::BadRow)?,
+        }
+    }
+    Ok(i)
 }
 
 /// Extract token ids from the raw (still-escaped) in-quote span of
