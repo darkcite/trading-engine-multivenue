@@ -19,6 +19,31 @@ affected paragraph at each lane close; the superseded text goes to
   since 2026-10-17 09:22Z (risk-policy "PM15 — slot 9"; rulings R-PM-1..10).
   `BUILT_MASK` = 0x02FF; `ALL_MASK` (= `all`) = 0x00FF, so `all` does not
   include pm15. Slots 8 and 10–15 stay reserved.
+
+## Corrections found 2026-10-18 (they supersede the dated text below — verify on `/state`)
+
+- **Slot 11 (pmj, `strategy-pmj`) is built and runs PAPER in main's engine**
+  since 2026-10-18 13:06Z (`88f70509`; risk-policy "PMJ — slot 11", ### J1b–J4;
+  rulings R-PMJ-0..3, R-PMJ-S1..S14). It trades slot 9's H90 law on
+  Polymarket's **5-minute** up/down families only, addressed to Jupiter Predict
+  (`VenueId::Jupiter` = 10), judged by the paper held-quote law at submit +
+  2 s; a live slot 11 refuses the boot (no `PMJ-DUST-GATE` line yet), and
+  nothing of the Jupiter arm (`exec-jupiter`) is built at boot.
+  `BUILT_MASK` = **0x0AFF**; `ALL_MASK` stays 0x00FF. Slots 8, 10 and 12–15
+  stay reserved.
+- `~/multivenue/universe.toml` `[polymarket] rolling` gained the seven
+  `updown:<asset>:5m` families (btc eth sol xrp hype doge bnb), appended after
+  the 15-minute ones (R-PMJ-S12); `~/multivenue/pmj.toml` (sha256
+  `d82576a2…52e0`, the dust frame: $5 an order, $10 a market, −$50 a session;
+  the H90 values are pm15's, provisional) is read because `STRATEGY` names
+  `pmj` (`…+pm15+pmj`). `scripts/pmj-flip.sh status` shows what the next boot
+  runs for slot 11.
+- The boot at 13:06Z also shipped `a946a668` (SETUP docs). Rollback kit:
+  `~/multivenue/rollback-pmj-20261018/` (the pre-deploy `universe.toml`,
+  `strategy.conf`, the `eee660b` binary and its wrapper).
+- `exec.HALT` is present and slot 3 reads halted (`ws-gap`) on `/state` both
+  BEFORE and after this restart — not changed by the PMJ deploy; the
+  operator's to clear.
 - The binary, boot time, mask and `exec.configured` lines below predate both:
   read `/state` `boot.git_sha` and its `exec` block.
 

@@ -17339,6 +17339,9 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S9 | J4 shares 14 files with J1b + J3, which were not yet committed: **J2, then J1b + J3 + J4 as one commit.** |
 | R-PMJ-S10 | **Re-baseline** `strategy_set/on_tick_none` and `on_timer_all` for slot 11's row (J4-GATES below). |
 | R-PMJ-S11 | Deploy slot 11 PAPER once the commits are made (the restart law unchanged: a safe minute off the 15-minute grid, through the exec gate — slot 3 is LIVE). |
+| R-PMJ-S12 | Slot 11's 5-minute families: **all seven** (btc eth sol xrp hype doge bnb), appended to `universe.toml` `[polymarket] rolling` after the 15-minute ones. |
+| R-PMJ-S13 | Read-only git (log / status / show) is allowed to the session for the deploy; the operator asked the session to make the commits (J2 `9d9d9359`, J1b + J3 + J4 `88f70509`). |
+| R-PMJ-S14 | The restart immediately once the build and the offline checks pass — off the 15-minute grid, through the exec gate (deployed 2026-10-18 13:06Z). |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
