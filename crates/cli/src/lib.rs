@@ -64,6 +64,8 @@ pub mod har_writer;
 /// BIN15 H90 L4: the late window's live dust test (`hl-outcome-probe`) —
 /// MAINNET, the operator's to run (ruling O-H90-3).
 pub mod hl_outcome_probe;
+/// PMJ J4: `pmj.toml` → slot 11's member (paper).
+pub mod pmj_boot;
 pub mod pm15_boot;
 pub mod pm15_live;
 pub mod pm15_polybolt;
@@ -110,7 +112,7 @@ pub use paper::{
     new_capture_run_dir, open_events_capture, open_fills_capture, open_orders_capture,
     parse_ai_hmac_key, parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai,
     spawn_binance, spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall,
-    spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_pm15, spawn_polymarket,
+    spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_pm15, spawn_pm5, spawn_polymarket,
     spawn_rpc,
     split_host_port, state_writer, AiIngressCounterIds, AiIngressStatus, BinanceConnSpec,
     BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters,

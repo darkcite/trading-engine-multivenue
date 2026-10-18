@@ -32,7 +32,10 @@
 
 use std::path::Path;
 
-use core_types::pm_roll::{pm_slot_sym, PM_ROLLING_MAX, PM_ROLLING_STRIDE, PM_SLOT_TAGS};
+use core_types::pm_roll::{
+    pm5_slot_sym, pm_slot_sym, PM5_ROLLING_MAX, PM5_ROLLING_STRIDE, PM5_SLOT_TAGS, PM_ROLLING_MAX,
+    PM_ROLLING_STRIDE, PM_SLOT_TAGS,
+};
 use core_types::{make_symbol_id, SymbolId, VenueId};
 
 // ---------------------------------------------------------------
@@ -405,15 +408,17 @@ impl OptionsPolicy {
 pub struct Universe {
     /// `[polymarket] markets` — market entries in file order.
     pub pm_markets: Vec<PmMarket>,
-    /// PM15: `[polymarket] rolling` — ROLLING 15-minute up/down families
-    /// as `updown:<asset>:15m` (lowercase asset, the slug's own
-    /// spelling), in file order. Absent or empty is the pre-PM15 boot,
-    /// bit for bit.
+    /// PM15: `[polymarket] rolling` — ROLLING up/down families as
+    /// `updown:<asset>:15m` or (PMJ J1b) `updown:<asset>:5m` (lowercase
+    /// asset, the slug's own spelling), in file order. Absent or empty is
+    /// the pre-PM15 boot, bit for bit.
     ///
-    /// A family is not an instrument: it is three reserved `SymbolId`
-    /// slots — two token pairs by window parity and `[mark]`
-    /// (`core_types::pm_roll`) —
-    /// whose venue tokens are rebound every 15 minutes.
+    /// A family is not an instrument: it is reserved `SymbolId` slots —
+    /// token pairs and `[mark]` (`core_types::pm_roll`) — whose venue
+    /// tokens are rebound at every window. A family's index is its rank
+    /// among the keys OF ITS PERIOD ([`pm_rolling_15m`],
+    /// [`pm_rolling_5m`]): a 5-minute key, wherever it stands, moves no
+    /// 15-minute family.
     pub pm_rolling: Vec<String>,
     /// `[binance] spot` — lowercase stream symbols in file order.
     pub binance_spot: Vec<String>,
@@ -1148,8 +1153,9 @@ fn validate_pm_entry(s: &str, line_no: usize) -> Result<(), UniverseError> {
     }
 }
 
-/// PM15: the asset of a validated `[polymarket] rolling` key
-/// (`updown:<asset>:15m` → `<asset>`, the slug's spelling).
+/// PM15: the asset of a validated 15-minute `[polymarket] rolling` key
+/// (`updown:<asset>:15m` → `<asset>`, the slug's spelling); `None` for a
+/// 5-minute key ([`pm5_rolling_asset`]).
 #[must_use]
 pub fn pm_rolling_asset(key: &str) -> Option<&str> {
     let rest = key.strip_prefix("updown:")?;
@@ -1160,9 +1166,47 @@ pub fn pm_rolling_asset(key: &str) -> Option<&str> {
     Some(asset)
 }
 
+/// PMJ J1b: the asset of a validated 5-minute `[polymarket] rolling` key
+/// (`updown:<asset>:5m` → `<asset>`); `None` for a 15-minute key.
+#[must_use]
+pub fn pm5_rolling_asset(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix("updown:")?;
+    let asset = rest.strip_suffix(":5m")?;
+    if asset.is_empty() || asset.contains(':') {
+        return None;
+    }
+    Some(asset)
+}
+
+/// PMJ J1b: the 15-minute keys of `[polymarket] rolling`, in file order —
+/// what slot 9 and the 15-minute ingress index as families. Boot-only.
+#[must_use]
+pub fn pm_rolling_15m(keys: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(keys.len());
+    for k in keys {
+        if pm_rolling_asset(k).is_some() {
+            out.push(k.clone());
+        }
+    }
+    out
+}
+
+/// PMJ J1b: the 5-minute keys of `[polymarket] rolling`, in file order —
+/// the 5-minute ingress's families. Boot-only.
+#[must_use]
+pub fn pm_rolling_5m(keys: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(keys.len());
+    for k in keys {
+        if pm5_rolling_asset(k).is_some() {
+            out.push(k.clone());
+        }
+    }
+    out
+}
+
 /// PM15: `updown:<asset>:15m` — the slug's own spelling: `<asset>` is
-/// 1..=15 bytes of `[a-z0-9]` (`btc-updown-15m-<open epoch>`). Only the
-/// 15-minute period exists; the 5-minute family is a later lane.
+/// 1..=15 bytes of `[a-z0-9]` (`btc-updown-15m-<open epoch>`). PMJ J1b:
+/// `updown:<asset>:5m` too (`btc-updown-5m-<open epoch>`).
 fn validate_pm_rolling(s: &str, line_no: usize) -> Result<(), UniverseError> {
     let mut it = s.split(':');
     let kind = it.next().unwrap_or("");
@@ -1171,13 +1215,13 @@ fn validate_pm_rolling(s: &str, line_no: usize) -> Result<(), UniverseError> {
     if it.next().is_some() || kind != "updown" {
         return Err(err(
             line_no,
-            format!("rolling family `{s}`: want updown:<asset>:15m"),
+            format!("rolling family `{s}`: want updown:<asset>:<15m|5m>"),
         ));
     }
-    if period != "15m" {
+    if period != "15m" && period != "5m" {
         return Err(err(
             line_no,
-            format!("rolling family `{s}`: only the 15m period exists"),
+            format!("rolling family `{s}`: only the 15m and 5m periods exist"),
         ));
     }
     if asset.is_empty()
@@ -1705,9 +1749,14 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     // Caps.
     check_cap(pm_markets.len(), PM_MARKETS_MAX, "PM markets")?;
     check_cap(
-        pm_rolling.len(),
+        pm_rolling_15m(&pm_rolling).len(),
         PM_ROLLING_MAX,
         "Polymarket rolling families",
+    )?;
+    check_cap(
+        pm_rolling_5m(&pm_rolling).len(),
+        PM5_ROLLING_MAX,
+        "Polymarket 5m rolling families",
     )?;
     check_cap(binance_spot.len(), VENUE_LIST_MAX, "Binance spot symbols")?;
     check_cap(binance_usdm.len(), VENUE_LIST_MAX, "Binance usdm symbols")?;
@@ -2055,19 +2104,35 @@ pub fn allocate_with_anchors(
         }
     }
 
-    // PM15: five rows per ROLLING family — the two Up/Down pairs (window
-    // parity) and the mark (`core_types::pm_roll::PM_SLOT_TAGS`).
-    // slots. Which window a slot means at a time is a
+    // PM15: five rows per 15-minute ROLLING family — the two Up/Down
+    // pairs (window parity) and the mark (`core_types::pm_roll::PM_SLOT_TAGS`);
+    // PMJ J1b: seven per 5-minute family — three pairs and the mark
+    // (`PM5_SLOT_TAGS`). A family's index is its rank among its period's
+    // keys. Which window a slot means at a time is a
     // `ChannelId::InstrumentRoll` event, never a manifest column.
-    for f in 0..u.pm_rolling.len() {
-        let key = &u.pm_rolling[f];
-        for off in 0..PM_ROLLING_STRIDE {
-            let name = format!("{key}[{}]", PM_SLOT_TAGS[off as usize]);
-            out.pm_rolling.push(Instrument {
-                sym: pm_slot_sym(f, off),
-                descriptor: format!("polymarket-rolling:{name}"),
-                name,
-            });
+    let mut f15 = 0usize;
+    let mut f5 = 0usize;
+    for key in &u.pm_rolling {
+        if pm5_rolling_asset(key).is_some() {
+            for off in 0..PM5_ROLLING_STRIDE {
+                let name = format!("{key}[{}]", PM5_SLOT_TAGS[off as usize]);
+                out.pm_rolling.push(Instrument {
+                    sym: pm5_slot_sym(f5, off),
+                    descriptor: format!("polymarket-rolling:{name}"),
+                    name,
+                });
+            }
+            f5 += 1;
+        } else {
+            for off in 0..PM_ROLLING_STRIDE {
+                let name = format!("{key}[{}]", PM_SLOT_TAGS[off as usize]);
+                out.pm_rolling.push(Instrument {
+                    sym: pm_slot_sym(f15, off),
+                    descriptor: format!("polymarket-rolling:{name}"),
+                    name,
+                });
+            }
+            f15 += 1;
         }
     }
 
@@ -2988,8 +3053,8 @@ map = ["0:0", "1:1"]
 
         for bad in [
             "rolling = [\"updown:BTC:15m\"]",
-            "rolling = [\"updown:btc:5m\"]",
             "rolling = [\"updown:btc:1h\"]",
+            "rolling = [\"updown:btc:5M\"]",
             "rolling = [\"updown:btc\"]",
             "rolling = [\"updown:btc:15m:x\"]",
             "rolling = [\"updown::15m\"]",
@@ -3009,10 +3074,109 @@ map = ["0:0", "1:1"]
         }
         many.push_str("]\n");
         assert!(parse(&many).is_err(), "over PM_ROLLING_MAX");
+        // Eight 15 m families and eight 5 m ones are each at their cap.
+        let mut both = String::from("[polymarket]\nrolling = [");
+        for i in 0..PM_ROLLING_MAX {
+            both.push_str(&format!("\"updown:a{i}:15m\",\"updown:a{i}:5m\","));
+        }
+        both.push_str("]\n");
+        assert!(parse(&both).is_ok(), "each period has its own cap");
+        let mut many5 = String::from("[polymarket]\nrolling = [");
+        for i in 0..=PM5_ROLLING_MAX {
+            many5.push_str(&format!("\"updown:a{i}:5m\","));
+        }
+        many5.push_str("]\n");
+        assert!(parse(&many5).is_err(), "over PM5_ROLLING_MAX");
         assert!(parse(
             "[polymarket]\nrolling = [\"updown:btc:15m\"]\nrolling = [\"updown:eth:15m\"]\n"
         )
         .is_err());
+    }
+
+    /// PMJ J1b: 5-minute families. Each period numbers its own families,
+    /// so a 5 m key anywhere in the list leaves every 15 m family's index,
+    /// syms and manifest rows as they were (R-PMJ-S1).
+    #[test]
+    fn pm_rolling_5m_families_allocate_their_own_pool_and_move_no_15m_family() {
+        let only15 = parse(&format!(
+            "[polymarket]\nmarkets = [\"{T1}\"]\nrolling = [\"updown:btc:15m\", \"updown:eth:15m\"]\n"
+        ))
+        .unwrap();
+        let mixed = parse(&format!(
+            "[polymarket]\nmarkets = [\"{T1}\"]\nrolling = [\"updown:btc:5m\", \"updown:btc:15m\", \"updown:eth:5m\", \"updown:eth:15m\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(pm5_rolling_asset("updown:btc:5m"), Some("btc"));
+        assert_eq!(pm5_rolling_asset("updown:btc:15m"), None);
+        assert_eq!(pm_rolling_asset("updown:btc:5m"), None);
+        assert_eq!(pm_rolling_15m(&mixed.pm_rolling), only15.pm_rolling);
+        assert_eq!(
+            pm_rolling_5m(&mixed.pm_rolling),
+            vec!["updown:btc:5m".to_string(), "updown:eth:5m".to_string()]
+        );
+        assert!(pm_rolling_5m(&only15.pm_rolling).is_empty());
+
+        let a15 = allocate(&only15).unwrap();
+        let am = allocate(&mixed).unwrap();
+        assert_eq!(am.pm_rolling.len(), 2 * 5 + 2 * 7, "five rows per 15 m, seven per 5 m");
+        // Every 15 m row of the mixed universe is the 15 m-only row, sym
+        // and descriptor alike.
+        let fifteen: Vec<&Instrument> = am
+            .pm_rolling
+            .iter()
+            .filter(|r| core_types::pm_roll::pm_rolling_of(r.sym).is_some())
+            .collect();
+        assert_eq!(fifteen.len(), a15.pm_rolling.len());
+        for (m, o) in fifteen.iter().zip(a15.pm_rolling.iter()) {
+            assert_eq!(m.sym, o.sym);
+            assert_eq!(m.descriptor, o.descriptor);
+            assert_eq!(m.name, o.name);
+        }
+        // The 5 m rows: their own pool, in their own order.
+        let mut k = 0usize;
+        for (g, key) in ["updown:btc:5m", "updown:eth:5m"].iter().enumerate() {
+            for (off, tag) in PM5_SLOT_TAGS.iter().enumerate() {
+                let row = am
+                    .pm_rolling
+                    .iter()
+                    .find(|r| r.descriptor == format!("polymarket-rolling:{key}[{tag}]"))
+                    .expect("the row exists");
+                assert_eq!(row.sym, pm5_slot_sym(g, off as u32));
+                assert_eq!(
+                    core_types::pm_roll::pm5_rolling_of(row.sym),
+                    Some((g, off as u32))
+                );
+                k += 1;
+            }
+        }
+        assert_eq!(k, 14);
+        // At both caps — eight 15 m and eight 5 m families — every slot of
+        // both pools is allocated and the universe-wide duplicate-id check
+        // passes: the pools never meet each other or a static token.
+        let mut full = format!("[polymarket]\nmarkets = [\"{T1}\"]\nrolling = [");
+        for i in 0..PM_ROLLING_MAX.max(PM5_ROLLING_MAX) {
+            if i < PM_ROLLING_MAX {
+                full.push_str(&format!("\"updown:a{i}:15m\","));
+            }
+            if i < PM5_ROLLING_MAX {
+                full.push_str(&format!("\"updown:a{i}:5m\","));
+            }
+        }
+        full.push_str("]\n");
+        let af = allocate(&parse(&full).unwrap()).expect("both pools at their caps");
+        assert_eq!(
+            af.pm_rolling.len(),
+            PM_ROLLING_MAX * PM_ROLLING_STRIDE as usize + PM5_ROLLING_MAX * PM5_ROLLING_STRIDE as usize
+        );
+        let mut syms: Vec<u32> = af.pm_rolling.iter().map(|r| r.sym).collect();
+        syms.extend(af.pm_tokens.iter().map(|t| t.sym));
+        let n = syms.len();
+        syms.sort_unstable();
+        syms.dedup();
+        assert_eq!(syms.len(), n, "a rolling sym collides");
+        // One asset in both periods is two families, not a duplicate.
+        assert!(parse("[polymarket]\nrolling = [\"updown:btc:15m\", \"updown:btc:5m\"]\n").is_ok());
+        assert!(parse("[polymarket]\nrolling = [\"updown:btc:5m\", \"updown:btc:5m\"]\n").is_err());
     }
 
     #[test]

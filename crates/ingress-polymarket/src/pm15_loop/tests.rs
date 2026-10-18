@@ -13,8 +13,8 @@ use crate::gamma15::parse_window_spec;
 use crate::rolling::PmSlotState;
 use core_ring::Ring;
 use core_types::pm_roll::{
-    pm_instance_id, pm_mark_sym, pm_pair_of_window, pm_roll_family, pm_window_of_open, PM_LEG_DOWN,
-    PM_SETTLED_UP,
+    pm_instance_id, pm_mark_sym, pm_pair_of_window, pm_roll_family, pm_rolling_sym,
+    pm_window_end_ns, pm_window_of_open, PM_LEG_DOWN, PM_SETTLED_UP,
 };
 use core_types::{roll_kind, unpack_roll_seq, ROLL_KIND_CREATED, ROLL_KIND_SETTLED};
 
@@ -28,6 +28,7 @@ const MS: u64 = 1_000_000;
 struct Rec {
     ticks: Vec<Tick>,
     events: Vec<ChannelEvent>,
+    depths: Vec<core_types::DepthTopK>,
     rejects: usize,
     raw: usize,
 }
@@ -38,6 +39,9 @@ impl Capture for Rec {
     }
     fn event(&mut self, e: &ChannelEvent) {
         self.events.push(*e);
+    }
+    fn depth(&mut self, d: &core_types::DepthTopK) {
+        self.depths.push(*d);
     }
     fn raw_frame(&mut self, _ts: NsTs, _p: &[u8]) {
         self.raw += 1;
@@ -457,3 +461,144 @@ fn a_session_lost_restarts_every_ladder_and_resubscribes_what_is_bound() {
     assert_eq!(rig.rec.ticks.len(), 5);
     assert!(!rig.rec.ticks[4].is_stale(), "a quiet book is not a stale one");
 }
+
+/// PMJ J1b: the 5-minute pipeline's driver. The same answer reshaped to a
+/// 5 m window binds on the 5 m pool: its roll names the 5 m leg sym, the
+/// family byte `16 + s`, the flagged instance and the 300 s window's end;
+/// a Chainlink report becomes a mark on the 5 m family's own mark slot;
+/// an unresolved window retires at 540 s.
+#[test]
+fn the_5m_driver_rolls_marks_and_retires_on_the_5m_pool() {
+    use crate::gamma15::parse_window_spec_for;
+    use core_types::pm_roll::{
+        pm5_instance_id, pm5_mark_sym, pm5_pair_of_window, pm5_roll_family, pm5_rolling_sym,
+        pm5_window_end_ns, pm5_window_of_open, PmPeriod, PM5_INSTANCE_FLAG,
+    };
+    const OPEN5: u64 = 1_792_308_000;
+    let body = String::from_utf8(fixture("gamma_btc_1792216800.json"))
+        .unwrap()
+        .replace("btc-updown-15m-1792216800", "btc-updown-5m-1792308000")
+        .replace(r#""duration":"15m""#, r#""duration":"5m""#);
+    let w = pm5_window_of_open(OPEN5).unwrap();
+    let mut spec = PmWindowSpec::EMPTY;
+    parse_window_spec_for(PmPeriod::M5, body.as_bytes(), 0, b"btc", w, &mut spec)
+        .expect("the 5 m answer passes the 5 m law");
+    let mut rig = Rig::new();
+    let mut wire = Wire::default();
+    let mut d = Pm15Driver::new_for(PmPeriod::M5, &[b"btc"], 5_000);
+    let t0 = OPEN5 * 1_000 * MS + 1;
+    d.offer(&spec, t0, t0, &mut rig.out(), &mut wire);
+    let ev = rig.lane_events();
+    assert_eq!(ev.len(), 3, "CREATED + the two legs' order law");
+    let pair = pm5_pair_of_window(w);
+    let inst = pm5_instance_id(w, 0).unwrap();
+    assert_ne!(inst & PM5_INSTANCE_FLAG, 0);
+    assert_eq!(ev[0].sym, pm5_rolling_sym(0, pair, PM_LEG_UP));
+    assert_eq!(
+        unpack_roll_seq(ev[0].venue_seq),
+        (inst, PM_TWAP_S, pm5_roll_family(0, pair), false)
+    );
+    assert_eq!(ev[0].v1, pm5_window_end_ns(w) as i64);
+    assert_eq!(ev[2].sym, pm5_rolling_sym(0, pair, PM_LEG_DOWN));
+    // A Chainlink report: the 5 m family's mark slot, not the 15 m one.
+    let rep = format!(
+        "{{\"connection_id\":\"x\",\"payload\":{{\"full_accuracy_value\":\"81474326921005000000000\",\"symbol\":\"btc/usd\",\"timestamp\":{},\"value\":1.0}},\"timestamp\":{},\"topic\":\"crypto_prices_chainlink\",\"type\":\"update\"}}",
+        OPEN5 * 1_000,
+        OPEN5 * 1_000 + 1_300
+    );
+    d.on_rtds_text(rep.as_bytes(), t0, &mut rig.out());
+    let ev = rig.lane_events();
+    assert_eq!(ev.len(), 1);
+    assert_eq!((ev[0].sym, ev[0].v0), (pm5_mark_sym(0), 81_474_326_921));
+    assert_ne!(ev[0].sym, pm_mark_sym(0));
+    // Unresolved: held at 539 s past the end, retired UNKNOWN at 540 s.
+    let end = pm5_window_end_ns(w);
+    d.on_clock(end + 539_000 * MS, end + 539_000 * MS, &mut rig.out(), &mut wire);
+    assert!(rig
+        .lane_events()
+        .iter()
+        .all(|e| roll_kind(e.venue_seq) != ROLL_KIND_SETTLED));
+    d.on_clock(end + 540_000 * MS, end + 540_000 * MS, &mut rig.out(), &mut wire);
+    let ev = rig.lane_events();
+    let settled: Vec<&ChannelEvent> = ev
+        .iter()
+        .filter(|e| {
+            e.channel == ChannelId::InstrumentRoll as u8 && roll_kind(e.venue_seq) == ROLL_KIND_SETTLED
+        })
+        .collect();
+    assert_eq!(settled.len(), 1);
+    assert_eq!(
+        unpack_roll_seq(settled[0].venue_seq),
+        (inst, PM_TWAP_S, pm5_roll_family(0, pair), true)
+    );
+    assert_eq!(settled[0].v0, 0, "retired unknown");
+    assert_eq!(rig.counters.of(Pm15Counter::RollsUnknown), 1);
+}
+
+/// PMJ J1b-3: the live window's book, replayed, fills the depth capture —
+/// the file that was empty in every run (month results, caveat 3). Every
+/// snapshot names a leg of the bound slot, is best-first on both sides,
+/// and differs from the leg's previous one (the change gate).
+#[test]
+fn the_live_window_fills_the_depth_capture_change_gated() {
+    let spec = btc_spec();
+    let w = spec.window;
+    let frames = fixture("market_btc_1792216800.frames");
+    let lines: Vec<(u64, &[u8])> = frames
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let tab = l.iter().position(|b| *b == b'\t').unwrap();
+            (
+                std::str::from_utf8(&l[..tab]).unwrap().parse::<u64>().unwrap(),
+                &l[tab + 1..],
+            )
+        })
+        .collect();
+    let mut rig = Rig::new();
+    let mut wire = Wire::default();
+    let mut d = Pm15Driver::new(&[b"btc"], 5_000);
+    let t0 = lines[0].0 * MS;
+    d.offer(&spec, t0, t0, &mut rig.out(), &mut wire);
+    wire.open = true;
+    assert!(d.on_market_open(&mut wire));
+    let mut events = 0usize;
+    for (ms, p) in &lines {
+        let now = ms * MS;
+        let mut out = rig.out();
+        d.on_clock(now, now, &mut out, &mut wire);
+        d.on_market_text(p, now, now, &mut out);
+        d.perform(now, &mut out, &mut wire);
+        events += usize::from(memchr::memmem::find(p, b"\"price_change\"").is_some());
+    }
+    let up = pm_rolling_sym(0, pm_pair_of_window(w), PM_LEG_UP);
+    let down = pm_rolling_sym(0, pm_pair_of_window(w), PM_LEG_DOWN);
+    let ds = &rig.rec.depths;
+    assert!(ds.len() > 100, "{} depth snapshots", ds.len());
+    assert!(ds.len() < 2 * events + 4, "change-gated, not one per row");
+    let mut last_up: Option<&core_types::DepthTopK> = None;
+    let mut last_down: Option<&core_types::DepthTopK> = None;
+    for x in ds {
+        assert!(x.sym == up || x.sym == down);
+        assert_eq!(x.venue, VenueId::Polymarket as u8);
+        let mut k = 1usize;
+        while k < core_types::DEPTH_K {
+            if x.bids[k].qty_1e6 > 0 {
+                assert!(x.bids[k].px_1e6 < x.bids[k - 1].px_1e6, "bids best first");
+            }
+            if x.asks[k].qty_1e6 > 0 {
+                assert!(x.asks[k].px_1e6 > x.asks[k - 1].px_1e6, "asks best first");
+            }
+            k += 1;
+        }
+        if x.bids[0].qty_1e6 > 0 && x.asks[0].qty_1e6 > 0 {
+            assert!(x.bids[0].px_1e6 < x.asks[0].px_1e6, "uncrossed");
+        }
+        let prev = if x.sym == up { &mut last_up } else { &mut last_down };
+        if let Some(p) = prev {
+            assert!(p.bids != x.bids || p.asks != x.asks, "a repeat passed the gate");
+        }
+        *prev = Some(x);
+    }
+}
+

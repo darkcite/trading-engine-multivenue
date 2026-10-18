@@ -910,6 +910,12 @@ impl Strategy for Pm15Strategy {
         if !self.configured || event.venue != VenueId::Polymarket as u8 {
             return;
         }
+        // PMJ J1b (ruling R-PMJ-3, the family split): a 5-minute family's
+        // records are slot 11's. They are not this member's to refuse, so
+        // nothing of slot 9's — orders, markets, counters — sees them.
+        if core_types::pm_roll::pm5_rolling_of(event.sym).is_some() {
+            return;
+        }
         match ChannelId::from_u8(event.channel) {
             Some(ChannelId::InstrumentRoll) => self.on_roll(event),
             Some(ChannelId::OutcomeMeta) => self.on_order_law(event),

@@ -153,6 +153,7 @@ dependencies = [
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
+ "exec-jupiter",
  "exec-polymarket",
  "exec-router",
  "ingress-ai",
@@ -183,6 +184,7 @@ dependencies = [
  "strategy-icdp",
  "strategy-latency-arb",
  "strategy-pm15",
+ "strategy-pmj",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -388,6 +390,7 @@ dependencies = [
  "strategy-hyparb",
  "strategy-icdp",
  "strategy-pm15",
+ "strategy-pmj",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -868,6 +871,24 @@ dependencies = [
  "rustls",
  "secp256k1",
  "signer-eip712",
+ "zeroize",
+]
+
+[[package]]
+name = "exec-jupiter"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-crypto",
+ "core-fill",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "exec-gateway",
+ "ingress-polymarket",
+ "signer-ed25519",
  "zeroize",
 ]
 
@@ -2149,6 +2170,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-pmj"
+version = "0.1.0"
+dependencies = [
+ "core-fill",
+ "core-time",
+ "core-twaplock",
+ "core-types",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-rule-tree"
 version = "0.1.0"
 dependencies = [
@@ -2175,6 +2207,7 @@ dependencies = [
  "strategy-hcv",
  "strategy-hyparb",
  "strategy-pm15",
+ "strategy-pmj",
  "strategy-vm",
  "strategy-vrp",
  "strategy-xmm",

@@ -636,7 +636,7 @@ fn slot_masks_encode_whole_and_the_slot_rows_carry_sixteen() {
         body.contains("{\"slot\":3,\"name\":\"bin15\",\"configured\":0,\"enabled\":0,\"gate\":0,")
     );
     assert!(body.contains(
-        "{\"slot\":11,\"name\":\"reserved\",\"configured\":1,\"enabled\":1,\"gate\":2,"
+        "{\"slot\":11,\"name\":\"pmj\",\"configured\":1,\"enabled\":1,\"gate\":2,"
     ));
     assert_eq!(body.matches("{\"slot\":").count(), SNAPSHOT_SLOTS);
     assert!(!body.contains("{\"slot\":16,"));
@@ -644,10 +644,12 @@ fn slot_masks_encode_whole_and_the_slot_rows_carry_sixteen() {
     let h = body.find("\"halted\":[\"").expect("exec.halted");
     let end = h + body[h..].find(']').unwrap();
     assert_eq!(body[h..end].matches(',').count() + 1, SNAPSHOT_SLOTS);
-    // Slots 8 and 10–15 are reserved; 0–7 and 9 (PM15) keep their members.
+    // Slots 8, 10 and 12–15 are reserved; 0–7, 9 (PM15) and 11 (PMJ) keep
+    // their members.
     assert_eq!(SLOT_NAMES[9], "pm15");
+    assert_eq!(SLOT_NAMES[11], "pmj");
     for (i, n) in SLOT_NAMES.iter().enumerate() {
-        let member = i < 8 || i == 9;
+        let member = i < 8 || i == 9 || i == 11;
         assert_eq!(*n != engine_snapshot::RESERVED_SLOT_NAME, member, "slot {i}");
     }
 }

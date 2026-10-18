@@ -33,23 +33,51 @@
 //! window that is over, older than the slot's, or already known changes
 //! nothing ([`PmOffer`]).
 //!
+//! ## PMJ J1b: one schedule per period
+//!
+//! A [`PmFamilies`] serves the families of ONE [`PmPeriod`] (one per
+//! pipeline). Slot `s` of family `f` is `f · pairs + pair` — `2·f + w & 1`
+//! for 15 m, exactly as before, and `3·f + w mod 3` for 5 m — and the
+//! roll's family byte is `period.roll_family_base() + s`. A 5-minute window
+//! the venue has not resolved is retired [`PM5_RETIRE_AFTER_END_NS`] after
+//! its end, before its pair is needed again (`w + 3` opens 600 s after `w`
+//! ends).
+//!
 //! Zero allocation: fixed arrays, while-index loops; the action queue is
 //! a fixed array the owner drains after every call.
 
 use crate::gamma15::{PmTokenId, PmWindowSpec, PM_ASSET_MAX};
 use core_types::pm_roll::{
-    pm_instance_id, pm_pair_of_window, pm_roll_family, pm_window_end_ns, pm_window_open_ns,
-    PM_LEG_DOWN, PM_LEG_UP, PM_PAIRS, PM_ROLLING_MAX, PM_SETTLED_DOWN, PM_SETTLED_UNKNOWN,
-    PM_SETTLED_UP,
+    PmPeriod, PM5_PAIRS, PM5_WINDOW_S, PM_FAMILIES_MAX, PM_LEG_DOWN, PM_LEG_UP, PM_PAIRS_MAX,
+    PM_SETTLED_DOWN, PM_SETTLED_UNKNOWN, PM_SETTLED_UP,
 };
 
-/// Slots: two per family.
-pub const PM_SLOTS: usize = PM_ROLLING_MAX * PM_PAIRS;
+/// Slots: the most pairs either period keeps, per family (15 m uses two,
+/// 5 m three).
+pub const PM_SLOTS: usize = PM_FAMILIES_MAX * PM_PAIRS_MAX;
 
 /// How long after its end an unresolved window is retired, ns (10 min:
 /// resolution measured at +116 s; the slot is needed again 15 min after
 /// the end).
 pub const PM_RETIRE_AFTER_END_NS: u64 = 600_000_000_000;
+
+/// PMJ J1b: how long after its end an unresolved 5-minute window is
+/// retired, ns (9 min, ruling R-PMJ-S1: resolution measured at +116…218 s
+/// on 15 m; the pair is needed again 10 min after the end).
+pub const PM5_RETIRE_AFTER_END_NS: u64 = 540_000_000_000;
+const _: () = assert!(
+    PM5_RETIRE_AFTER_END_NS < (PM5_PAIRS as u64 - 1) * PM5_WINDOW_S * 1_000_000_000
+);
+
+/// The retirement delay of a `period` window, ns.
+#[inline(always)]
+#[must_use]
+pub const fn retire_after_end_ns(period: PmPeriod) -> u64 {
+    match period {
+        PmPeriod::M15 => PM_RETIRE_AFTER_END_NS,
+        PmPeriod::M5 => PM5_RETIRE_AFTER_END_NS,
+    }
+}
 
 /// Capacity of one call's action queue: the worst call is a clock pass
 /// that retires and rebinds every slot (settle + unsubscribe + subscribe
@@ -240,9 +268,11 @@ pub fn token_key(id: &[u8]) -> u64 {
 
 /// The families and their slots (module docs).
 pub struct PmFamilies {
+    /// PMJ J1b: the families' period.
+    period: PmPeriod,
     n: usize,
-    asset: [[u8; PM_ASSET_MAX]; PM_ROLLING_MAX],
-    asset_len: [u8; PM_ROLLING_MAX],
+    asset: [[u8; PM_ASSET_MAX]; PM_FAMILIES_MAX],
+    asset_len: [u8; PM_FAMILIES_MAX],
     slot: [PmBinding; PM_SLOTS],
     pending: [PmWindowSpec; PM_SLOTS],
     has_pending: [bool; PM_SLOTS],
@@ -257,11 +287,21 @@ impl PmFamilies {
     /// or longer than `PM_ASSET_MAX` — the universe refuses both first.
     #[must_use]
     pub fn new(assets: &[&[u8]]) -> Self {
-        assert!(assets.len() <= PM_ROLLING_MAX, "pm15: too many families");
+        Self::with_period(PmPeriod::M15, assets)
+    }
+
+    /// PMJ J1b: [`Self::new`] for families of `period`. **Boot-only.**
+    ///
+    /// # Panics
+    /// As [`Self::new`], against the period's own family cap.
+    #[must_use]
+    pub fn with_period(period: PmPeriod, assets: &[&[u8]]) -> Self {
+        assert!(assets.len() <= period.max_families(), "pm15: too many families");
         let mut s = Self {
+            period,
             n: assets.len(),
-            asset: [[0; PM_ASSET_MAX]; PM_ROLLING_MAX],
-            asset_len: [0; PM_ROLLING_MAX],
+            asset: [[0; PM_ASSET_MAX]; PM_FAMILIES_MAX],
+            asset_len: [0; PM_FAMILIES_MAX],
             slot: [PmBinding::EMPTY; PM_SLOTS],
             pending: [PmWindowSpec::EMPTY; PM_SLOTS],
             has_pending: [false; PM_SLOTS],
@@ -295,11 +335,18 @@ impl PmFamilies {
         self.n == 0
     }
 
-    /// Slots in use by the configured families (`2 · len`).
+    /// Slots in use by the configured families (`pairs · len`).
     #[inline(always)]
     #[must_use]
     pub const fn n_slots(&self) -> usize {
-        self.n * PM_PAIRS
+        self.n * self.period.pairs()
+    }
+
+    /// The families' period.
+    #[inline(always)]
+    #[must_use]
+    pub const fn period(&self) -> PmPeriod {
+        self.period
     }
 
     /// Family `f`'s asset name.
@@ -370,10 +417,10 @@ impl PmFamilies {
         if f >= self.n {
             return PmOffer::Refused;
         }
-        if now_ns >= pm_window_end_ns(spec.window) {
+        if now_ns >= self.period.window_end_ns(spec.window) {
             return PmOffer::Stale;
         }
-        let s = pm_roll_family(f, pm_pair_of_window(spec.window));
+        let s = f * self.period.pairs() + self.period.pair_of_window(spec.window);
         let held = &self.slot[s];
         if held.state == PmSlotState::Empty {
             self.bind(s, spec, acts);
@@ -440,7 +487,7 @@ impl PmFamilies {
     /// Bind `spec` into the empty slot `s`.
     fn bind(&mut self, s: usize, spec: &PmWindowSpec, acts: &mut PmActions) {
         debug_assert!(self.slot[s].state == PmSlotState::Empty);
-        let Some(instance) = pm_instance_id(spec.window, spec.family as usize) else {
+        let Some(instance) = self.period.instance_id(spec.window, spec.family as usize) else {
             return;
         };
         self.slot[s] = PmBinding {
@@ -465,18 +512,23 @@ impl PmFamilies {
         match self.slot[s].state {
             PmSlotState::Empty => {}
             PmSlotState::Bound => {
-                if now_ns >= pm_window_open_ns(w) {
+                if now_ns >= self.period.window_open_ns(w) {
                     self.slot[s].state = PmSlotState::Live;
                     acts.push(PmAction::Created(s as u8));
                 }
             }
             PmSlotState::Live => {
-                if now_ns >= pm_window_end_ns(w) {
+                if now_ns >= self.period.window_end_ns(w) {
                     self.slot[s].state = PmSlotState::Ended;
                 }
             }
             PmSlotState::Ended => {
-                if now_ns >= pm_window_end_ns(w).saturating_add(PM_RETIRE_AFTER_END_NS) {
+                if now_ns
+                    >= self
+                        .period
+                        .window_end_ns(w)
+                        .saturating_add(retire_after_end_ns(self.period))
+                {
                     self.settle(s, PM_SETTLED_UNKNOWN, 0, now_ns, acts);
                 }
             }
@@ -502,7 +554,7 @@ impl PmFamilies {
         if self.has_pending[s] {
             self.has_pending[s] = false;
             let p = self.pending[s];
-            if now_ns < pm_window_end_ns(p.window) {
+            if now_ns < self.period.window_end_ns(p.window) {
                 self.bind(s, &p, acts);
                 self.clock_slot(s, now_ns, acts);
             }
@@ -513,7 +565,7 @@ impl PmFamilies {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::pm_roll::pm_window_of_open;
+    use core_types::pm_roll::{pm_instance_id, pm_pair_of_window, pm_roll_family, pm_window_of_open};
 
     const OPEN: u64 = 1_792_216_800;
     const S: u64 = 1_000_000_000;
@@ -730,5 +782,71 @@ mod tests {
         assert_eq!(token_key(&up), token_key(&twin));
         assert_eq!(f.find_token(&up), Some((s, PM_LEG_UP)));
         assert_eq!(f.find_token(&twin), None);
+    }
+
+    /// PMJ J1b: a 5-minute family keeps three pairs. Windows `w`, `w + 1`
+    /// and `w + 2` bind at once; `w + 3` waits on `w`'s pair until `w`
+    /// settles or is retired 540 s after its end — 60 s before `w + 3`
+    /// opens.
+    #[test]
+    fn five_minute_families_rotate_three_pairs_and_retire_before_the_reuse() {
+        use core_types::pm_roll::{pm5_instance_id, pm5_window_end_ns, pm5_window_open_ns};
+        const OPEN5: u64 = 1_792_308_000;
+        let w = core_types::pm_roll::pm5_window_of_open(OPEN5).unwrap();
+        let mut f = PmFamilies::with_period(PmPeriod::M5, &[b"btc", b"eth"]);
+        assert_eq!(f.period(), PmPeriod::M5);
+        assert_eq!(f.n_slots(), 6);
+        let mut a = PmActions::new();
+        let mut ids = [[0u8; 18]; 4];
+        let mut k = 0usize;
+        while k < 4 {
+            ids[k] = [b'1' + k as u8; 18];
+            k += 1;
+        }
+        let now = (OPEN5 - 60) * S;
+        let mut slots = [0usize; 3];
+        let mut d = 0u32;
+        while d < 3 {
+            let sp = spec(1, w + d, &ids[d as usize], b"999999999999999999");
+            assert_eq!(f.offer(&sp, now, &mut a), PmOffer::Bound, "window w+{d}");
+            slots[d as usize] = 3 + (((w + d) % 3) as usize);
+            assert_eq!(f.slot(slots[d as usize]).spec.window, w + d);
+            assert_eq!(
+                f.slot(slots[d as usize]).instance,
+                pm5_instance_id(w + d, 1).unwrap()
+            );
+            d += 1;
+        }
+        assert_ne!(slots[0], slots[1]);
+        assert_ne!(slots[1], slots[2]);
+        assert_ne!(slots[0], slots[2]);
+        let _ = take(&mut a);
+        // w + 3 shares w's pair: pending.
+        let sp3 = spec(1, w + 3, &ids[3], b"888888888888888888");
+        assert_eq!(f.offer(&sp3, now, &mut a), PmOffer::Pending);
+        // w opens and ends; unresolved, it is still held 539 s after.
+        f.on_clock(pm5_window_open_ns(w), &mut a);
+        assert_eq!(take(&mut a), vec![PmAction::Created(slots[0] as u8)]);
+        f.on_clock(pm5_window_end_ns(w), &mut a);
+        f.on_clock(pm5_window_end_ns(w) + 539 * S, &mut a);
+        assert_eq!(f.slot(slots[0]).spec.window, w, "not retired before 540 s");
+        // At 540 s: retired UNKNOWN, and w + 3 binds on the freed pair.
+        let _ = take(&mut a);
+        f.on_clock(pm5_window_end_ns(w) + 540 * S, &mut a);
+        let acts = take(&mut a);
+        assert!(acts.contains(&PmAction::Settled {
+            slot: slots[0] as u8,
+            instance: pm5_instance_id(w, 1).unwrap(),
+            window: w,
+            winner: PM_SETTLED_UNKNOWN,
+            venue_ms: 0,
+        }));
+        assert!(acts.contains(&PmAction::Subscribe(slots[0] as u8)));
+        assert_eq!(f.slot(slots[0]).spec.window, w + 3);
+        assert_eq!(f.slot(slots[0]).state, PmSlotState::Bound);
+        // ... and w + 3 opens 60 s later.
+        assert_eq!(pm5_window_open_ns(w + 3), pm5_window_end_ns(w) + 600 * S);
+        // A family past the configured two is refused.
+        assert_eq!(f.offer(&spec(2, w, &ids[0], b"777777777777777777"), now, &mut a), PmOffer::Refused);
     }
 }

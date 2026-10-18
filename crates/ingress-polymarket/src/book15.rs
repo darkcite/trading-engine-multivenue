@@ -36,10 +36,19 @@
 //! retired by its owner. `best_bid = "0"` and `best_ask = "1"` mean an
 //! empty side.
 //!
+//! ## PMJ J1b-3: the top of the book
+//!
+//! [`Ladder15::top_k`] reads the best [`DEPTH_K`] levels of each side,
+//! best first, from the venue's touch outward — what the owner writes into
+//! `<label>-depth.pmlr` (change-gated). A level whose size the ladder does
+//! not know (the venue's touch before any size row, 15 events in the tap)
+//! is not a level there: depth carries only sizes the ladder holds.
+//!
 //! Zero allocation: the ladder is a fixed POD, allocated at boot by its
 //! owner. No iterator on any path; while-index loops.
 
 use core_parse::{find_field, scan_price_1e6, skip_byte, skip_ws};
+use core_types::{DepthLevel, DEPTH_K};
 
 /// Price levels per side (power of two; `1..=999` are used).
 pub const PM_LADDER_LEVELS: usize = 1024;
@@ -177,6 +186,47 @@ impl Ladder15 {
             bid_sz: if b == 0 { 0 } else { self.bid[b] },
             ask_px: a as i64 * PM_LADDER_STEP_1E6,
             ask_sz: if a == 0 { 0 } else { self.ask[a] },
+        }
+    }
+
+    /// PMJ J1b-3: the best [`DEPTH_K`] levels of each side into `bids` /
+    /// `asks`, best first (bids descending from the venue's best bid,
+    /// asks ascending from its best ask); slots past the book's depth are
+    /// [`DepthLevel::EMPTY`]. Written element by element, in place.
+    pub fn top_k(&self, bids: &mut [DepthLevel; DEPTH_K], asks: &mut [DepthLevel; DEPTH_K]) {
+        let mut n = 0usize;
+        let mut i = self.best_bid as usize;
+        while n < DEPTH_K && i > 0 {
+            let sz = self.bid[i % PM_LADDER_LEVELS];
+            if sz > 0 {
+                bids[n] = DepthLevel {
+                    px_1e6: i as i64 * PM_LADDER_STEP_1E6,
+                    qty_1e6: sz,
+                };
+                n += 1;
+            }
+            i -= 1;
+        }
+        while n < DEPTH_K {
+            bids[n] = DepthLevel::EMPTY;
+            n += 1;
+        }
+        let mut n = 0usize;
+        let mut i = self.best_ask as usize;
+        while n < DEPTH_K && i > 0 && i <= IDX_MAX {
+            let sz = self.ask[i % PM_LADDER_LEVELS];
+            if sz > 0 {
+                asks[n] = DepthLevel {
+                    px_1e6: i as i64 * PM_LADDER_STEP_1E6,
+                    qty_1e6: sz,
+                };
+                n += 1;
+            }
+            i += 1;
+        }
+        while n < DEPTH_K {
+            asks[n] = DepthLevel::EMPTY;
+            n += 1;
         }
     }
 
@@ -379,6 +429,49 @@ mod tests {
             .expect("spaced shape");
         assert_eq!(r.touch().bid_px, 430_000);
         assert_eq!(r.touch().ask_px, 0, "an empty side");
+    }
+
+    /// PMJ J1b-3: the top of the book, best first from the venue's touch,
+    /// empty slots past the book's depth, an empty side all empty.
+    #[test]
+    fn the_top_k_reads_best_first_from_the_touch() {
+        let l = loaded();
+        let mut b = [DepthLevel { px_1e6: 7, qty_1e6: 7 }; DEPTH_K];
+        let mut a = b;
+        l.top_k(&mut b, &mut a);
+        let lv = |px: i64, q: i64| DepthLevel { px_1e6: px, qty_1e6: q };
+        assert_eq!(
+            b,
+            [
+                lv(430_000, 54_400_000),
+                lv(420_000, 10_000_000),
+                lv(10_000, 1_130_000_000),
+                DepthLevel::EMPTY,
+                DepthLevel::EMPTY
+            ]
+        );
+        assert_eq!(
+            a,
+            [
+                lv(450_000, 20_000_000),
+                lv(460_000, 18_000_000),
+                lv(990_000, 100_000_000),
+                DepthLevel::EMPTY,
+                DepthLevel::EMPTY
+            ]
+        );
+        // Six bid levels: the top five, the worst one left out.
+        let mut m = Box::new(Ladder15::EMPTY);
+        m.load_book(br#"{"bids":[{"price":"0.10","size":"1"},{"price":"0.11","size":"2"},{"price":"0.12","size":"3"},{"price":"0.13","size":"4"},{"price":"0.14","size":"5"},{"price":"0.15","size":"6"}],"asks":[],"event_type":"book"}"#)
+            .expect("shape");
+        m.top_k(&mut b, &mut a);
+        assert_eq!(b[0], lv(150_000, 6_000_000));
+        assert_eq!(b[DEPTH_K - 1], lv(110_000, 2_000_000));
+        assert_eq!(a, [DepthLevel::EMPTY; DEPTH_K], "an empty ask side");
+        // A cleared ladder reads all empty.
+        m.clear();
+        m.top_k(&mut b, &mut a);
+        assert_eq!(b, [DepthLevel::EMPTY; DEPTH_K]);
     }
 
     #[test]

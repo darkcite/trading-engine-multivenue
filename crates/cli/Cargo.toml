@@ -41,6 +41,8 @@ core-amm             = { workspace = true }
 strategy-ev          = { workspace = true }
 strategy-bin15       = { workspace = true }
 strategy-pm15        = { workspace = true }
+# PMJ J4: the slot-11 member (paper).
+strategy-pmj         = { workspace = true }
 core-twaplock        = { workspace = true }
 # HYPARB H5: the slot-0 member's params, built by `hyparb_boot`.
 strategy-hyparb      = { workspace = true }

@@ -444,6 +444,13 @@ pub trait StrategyCounters {
         Pm15Counters::default()
     }
 
+    /// PMJ: slot 11's observables (`engine_pmj_*`) — the same H90 tallies
+    /// and levels as slot 9's, its own family (`strategy-pmj`).
+    #[inline]
+    fn pmj_counters(&self) -> Pm15Counters {
+        Pm15Counters::default()
+    }
+
     /// BIN15 O4b: copy the per-family view into `out`, returning how
     /// many families are CONFIGURED (not how many are live — a dormant
     /// slot still has a row, because "no instance" is the observation).

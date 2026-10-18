@@ -22,6 +22,19 @@
 markets = [
   "57748138085022719760345772310040703848567377822400132842014290209986511882046",
 ]
+# PM15: ROLLING crypto up/down families, "updown:<asset>:15m" (slot 9)
+# and, PMJ J1b, "updown:<asset>:5m" — the slug's own lowercase asset
+# (`btc-updown-15m-<open>`, `btc-updown-5m-<open>`). Absent or empty is
+# the pre-PM15 boot, bit for bit. At most 8 families per period.
+#
+# A family is NOT an instrument: it owns reserved SymbolId slots whose
+# tokens are rebound at every window (`core_types::pm_roll`) — a 15 m
+# family five (two token pairs by window parity + [mark]) from the pool
+# at ordinal 4096, a 5 m family seven (three pairs + [mark]) from its own
+# pool at 4160. A family's index is its rank among its PERIOD's keys, so
+# a 5 m key anywhere in the list moves no 15 m family. Append, never
+# reorder, within a period.
+rolling = []
 
 [binance]
 # Lowercase stream symbols. spot[0] → SymbolId 7 (legacy anchor), then

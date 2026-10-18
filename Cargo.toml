@@ -64,6 +64,7 @@ members = [
     "crates/strategy-hcv",
     "crates/strategy-bin15",
     "crates/strategy-pm15",
+    "crates/strategy-pmj",
     "crates/strategy-rule-tree",
     "crates/strategy-set",
     "crates/strategy-vm",
@@ -91,6 +92,8 @@ members = [
     "crates/exec-binance",
     # PM15-6: the slot-9 Polymarket CLOB V2 arm (FAK taker; engine half + gateway thread)
     "crates/exec-polymarket",
+    # PMJ J3: the slot-11 Jupiter Predict order arm (paper only in this pass).
+    "crates/exec-jupiter",
 
     # --- engine + UI ---
     "crates/engine",
@@ -232,6 +235,7 @@ strategy-xmm          = { path = "crates/strategy-xmm" }
 strategy-hcv          = { path = "crates/strategy-hcv" }
 strategy-bin15        = { path = "crates/strategy-bin15" }
 strategy-pm15         = { path = "crates/strategy-pm15" }
+strategy-pmj          = { path = "crates/strategy-pmj" }
 strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
 strategy-set          = { path = "crates/strategy-set" }
 strategy-vm           = { path = "crates/strategy-vm" }
@@ -249,6 +253,7 @@ signer-ed25519  = { path = "crates/signer-ed25519" }
 exec-binance    = { path = "crates/exec-binance" }
 exec-hyperevm   = { path = "crates/exec-hyperevm" }
 exec-polymarket = { path = "crates/exec-polymarket" }
+exec-jupiter = { path = "crates/exec-jupiter" }
 
 engine          = { path = "crates/engine" }
 engine-snapshot = { path = "crates/engine-snapshot" }

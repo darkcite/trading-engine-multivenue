@@ -18,16 +18,19 @@ MacBook Pro M4 on free-tier APIs. Claude (the `claude-worker` process, and
 in-session) is an **offline strategy researcher** — never in the hot path.
 
 Slots (`crates/strategy-set`: one `member_table!` row and one `SlotMask`
-(u16) bit each; `BUILT_MASK` 0x02FF, `ALL_MASK` = `all` 0x00FF; timers per
+(u16) bit each; `BUILT_MASK` 0x0AFF, `ALL_MASK` = `all` 0x00FF; timers per
 slot): 0 hyparb (HyperEVM AMM ↔ HL Core arb; needs `~/multivenue/hyparb.toml`
 + the pool ingress; EVM writes TESTNET only, chain 998) · 1 vrp · 2 xsd ·
 3 bin15 (HIP-4 15-minute binaries, H90 late law only) · 4 ai-exec (AI door
 1, intents) · 5 vm (AI door 2, tables; `ai` = 4+5 = mask 48) · 6 xmm (HL
 post-only maker; needs `xmm.toml`) · 7 hcv (Hypercall options vs HAR σ̂;
 needs `hcv.toml`; a live slot 7 refuses the boot) · 9 pm15 (H90 on
-Polymarket 15-minute up/down; needs `pm15.toml`; not in `all`). Slots 8 and
-10–15 are RESERVED: arming one is refused; a member there needs its own
-ruling (S16-R5). `latency-arb` and `icdp` are unlinked and refuse the boot.
+Polymarket 15-minute up/down; needs `pm15.toml`; not in `all`) · 11 pmj
+(H90 on Polymarket 5-minute up/down through Jupiter Predict; needs
+`pmj.toml`; PAPER only — a live slot 11 refuses the boot; not in `all`).
+Slots 8, 10 and 12–15 are RESERVED: arming one is refused; a member there
+needs its own ruling (S16-R5). `latency-arb` and `icdp` are unlinked and
+refuse the boot.
 Paper/live, caps and boot tells per slot: `/state`, `docs/state.md`, the
 slot's risk-policy section.
 

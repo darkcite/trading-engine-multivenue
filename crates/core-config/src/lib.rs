@@ -43,6 +43,8 @@ pub mod icdp;
 pub mod instrument_class;
 /// PM15 (slot 9): the `pm15.toml` artifact.
 pub mod pm15;
+/// PMJ (slot 11): the `pmj.toml` artifact.
+pub mod pmj;
 /// RG2: the regime detector's parameter artifact (`regime.toml`) + seed file.
 pub mod regime;
 pub mod universe;

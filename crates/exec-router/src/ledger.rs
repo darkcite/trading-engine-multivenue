@@ -107,7 +107,23 @@ use core_types::{
 /// assets are 14 rows beside BIN15's eight Hyperliquid families, and the
 /// ledger binds every roll it sees — at 16 a PM boot would have left
 /// Hyperliquid's next instances refused.
-pub const LEDGER_ROWS: usize = 32;
+///
+/// PMJ J1b (2026-10-18, ruling R-PMJ-S1): 32 → 64. The 5-minute families
+/// take THREE rows each, on roll family bytes 16..40
+/// (`core_types::pm_roll::PM_ROLL_FAMILIES`): HL's 8 + PM 15 m's 16 + PM
+/// 5 m's 24 is 48 rows at the caps, and a family byte at or above the row
+/// count is refused outright, so 32 would refuse every 5 m family past
+/// the fifth row and, once the table filled, Hyperliquid's next
+/// instances on a live slot 3.
+pub const LEDGER_ROWS: usize = 64;
+// Every roll family byte the PM ingress writes is a bindable row key, and
+// all of them fit beside BIN15's eight HL families at once.
+const _: () = assert!(LEDGER_ROWS >= core_types::pm_roll::PM_ROLL_FAMILIES);
+const _: () = assert!(
+    LEDGER_ROWS
+        >= 8 + core_types::pm_roll::PM_ROLLING_MAX * core_types::pm_roll::PM_PAIRS
+            + core_types::pm_roll::PM5_ROLLING_MAX * core_types::pm_roll::PM5_PAIRS
+);
 
 /// Live-arm orders the resting table can hold at once.
 ///
@@ -851,8 +867,9 @@ const _: () = assert!(LEDGER_RESTING <= u16::MAX as usize);
 // (+2 KiB) and the per-slot arrays doubled. The S16-3 review's
 // `resting_hi` (u16) sits in the 2 B the u16 `seeded` and the u32 `inst_n`
 // left as padding: the size is unchanged. PM15-5 re-pin (146 048 →
-// 151 168 B): the family rows 16 → 32 (+16 × 320 B).
-const _: () = assert!(core::mem::size_of::<Ledger>() == 151_168);
+// 151 168 B): the family rows 16 → 32 (+16 × 320 B). PMJ J1b re-pin
+// (151 168 → 161 408 B): the family rows 32 → 64 (+32 × 320 B).
+const _: () = assert!(core::mem::size_of::<Ledger>() == 161_408);
 
 impl Ledger {
     /// An empty, UNSEEDED ledger: nothing bound, nothing held,

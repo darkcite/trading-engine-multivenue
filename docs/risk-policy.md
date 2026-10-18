@@ -473,6 +473,13 @@ HD3, below); the wrapper remains the control.
   (XNU), so the Mac fleet is likely unaffected — not verified. Until the
   question is ruled, BX6 keeps the seed's `SecretKeyBytes` alive for the
   life of the process. Nothing builds a signer from the environment yet.
+- **PMJ J3 adds the Solana wallet** (`PMJ_WALLET_KEY`, slot 11): a
+  wallet's 64-byte export (seed ‖ public key) loads through
+  `Ed25519Signer::from_solana_keypair` (J2) into BX4's locked page, as
+  `from_seed`; the local seed copy is wiped and a public half the seed does
+  not derive is refused, compared in constant time. The variable's decode
+  (base58, not constant-time, boot only) and its read are J5's wiring:
+  nothing reads it in this pass (slot 11 paper builds no arm).
 - The intermediate hex `String` the environment hands us is zeroized
   after parsing. Without that, the key sits in freed heap for the life
   of the process.
@@ -17303,3 +17310,392 @@ leg was never redeemed.
 - PolyBolt as the mark, after `polybolt-probe` has run on the account.
 - When the account exists: `pm15-exec.sh key-check`, then `miss-probe`,
   then P0's result or a ruling, then `pm15-flip.sh live`.
+
+## PMJ — slot 11 (paper only): H90 on Polymarket's 5-minute up/down markets through Jupiter Predict (2026-10-18)
+
+**Ask (Anton, 2026-10-18):** onboard the PM15 H90 law on Jupiter Predict
+(the same Polymarket books, reached through a Solana keeper) in a spare slot,
+plus research on the 5-minute markets. **Plan:** project docs
+`claude/pmj-plan-2026-10-18.md` (§3 architecture, §4 phases) and
+`claude/pm15-jupiter-review-2026-10-18.md`; the session prompt and the survey
+map are in the vault (`docs/research/pmj/`). This pass builds J1b–J4 on main
+and runs slot 11 in PAPER; nothing is armed.
+
+| id | ruling (operator, 2026-10-18) |
+|---|---|
+| R-PMJ-0 | Jupiter Predict and its API are allowed from the operator's location; the operator runs the J0 probe himself. |
+| R-PMJ-1 | **PMJ takes slot 11** (not 14 as the plan said). Slots 14 and 15 stay reserved; the plan's J1a (moving the unstamped-refusal buckets off 14 / 15) is dropped. |
+| R-PMJ-1b | **The TERM clash is recorded here, not resolved:** TERM's plan v2.1 (R-T1, plan only, `docs/terminal-plan.md`) proposes `term-bn` on slot 11. TERM's own session resolves it; the suggested remap is `term-bn` → 14. No TERM file is edited by this lane. |
+| R-PMJ-3 | **Family split:** slot 9 (`pm15`, direct CLOB) trades the 15-minute families only; slot 11 (`pmj`, Jupiter) the 5-minute families only. A member never binds the other family's windows. |
+| scope | J1b, J2, J3, J4. Slot 11 is built and runs PAPER; J5 onward (dust, live) is out of scope. |
+| R-PMJ-S1 | The 5-minute families get a pool of their own — three token pairs plus the mark per family, roll family bytes 16..40, instance ids flagged with bit 31, an unresolved window retired 540 s after its end; the 15-minute pool, oids and digests stay bit for bit. |
+| R-PMJ-S2 | Jupiter is `VenueId::Jupiter` = 10, an execution-route venue with no market data: slot 11's orders keep the Polymarket leg's sym. |
+| R-PMJ-S3 | Ed25519 stays in `signer-ed25519` (ring, O-BX5), extended with a raw signature and verification; base58 joins `core-crypto`. No new dependency. |
+| R-PMJ-S4 | J1b starts after the survey; each phase stops for the operator before its commit. |
+| R-PMJ-S5 | The operator commits each phase himself on the Mac, from the transfer files the session prepares (explicit paths). |
+| R-PMJ-S6 | A bench-check red is judged by an interleaved A/B against HEAD in a read-only worktree (J1b). |
+| R-PMJ-S7 | J2 commits first, then J1b + J3 as one commit (they share files). |
+| R-PMJ-S8 | J4 starts; no restart or deploy without the operator's word. |
+| R-PMJ-S9 | J4 shares 14 files with J1b + J3, which were not yet committed: **J2, then J1b + J3 + J4 as one commit.** |
+| R-PMJ-S10 | **Re-baseline** `strategy_set/on_tick_none` and `on_timer_all` for slot 11's row (J4-GATES below). |
+| R-PMJ-S11 | Deploy slot 11 PAPER once the commits are made (the restart law unchanged: a safe minute off the 15-minute grid, through the exec gate — slot 3 is LIVE). |
+
+### J1b — the 5-minute pool, its pipeline, the depth capture
+
+- **The pool** (`core_types::pm_roll`): ordinals 4160 + 7·g + offset
+  (`[up0][down0][up1][down1][up2][down2][mark]`), above the whole 15-minute
+  pool; window `w` on pair `w mod 3`, so a pair is needed again 600 s after
+  its window ends and the 540 s retirement frees it 60 s ahead. Instance ids
+  `0x8000_0000 | (window5 · 8 + g)`: a 5-minute id can never equal a
+  15-minute one. `PmPeriod` serves the shared code; its 15-minute answers are
+  the 15-minute free functions (a test pins each).
+- **The universe:** `updown:<asset>:5m`; a family's index is its rank among
+  its period's keys, so adding 5-minute keys moves no 15-minute family (a
+  test compares every 15-minute manifest row of a mixed universe with the
+  15-minute-only one). Each period has its own cap of 8.
+- **The pipeline:** a second instance of the rolling ingress, driven for
+  the 5-minute period: its own discovery (`pm5-discovery`, two windows
+  ahead, the `-updown-5m-` slug and the `5m` settlement law), its own market
+  and RTDS sockets (`ingress-pm5`; at most 42 tokens subscribed), tick and
+  event lane 9 (`engine::PM5_LANE`), the `pm5` capture, raw-tap label and
+  `/metrics` family. It spawns only when `[polymarket] rolling` names a
+  `:5m` key. No gateway tee: slot 9's arm never sees a 5-minute window.
+- **Slot 9 is untouched by the 5-minute records** (R-PMJ-3): `strategy-pm15`
+  returns on any 5-minute sym before its roll, order-law, mark and touch
+  paths — no order, no market, no counter changes (a test). Its boot and the
+  15-minute spawn read the `:15m` keys only.
+- **The router ledger: `LEDGER_ROWS` 32 → 64** (`Ledger` 161 408 B). It
+  binds every roll it sees, keyed (venue, family byte), and refuses a family
+  byte at or above its row count; the 5-minute bytes reach 39, and at the
+  caps the table holds HL's 8 + PM 15 m's 16 + PM 5 m's 24 rows. **This is
+  the live router of slot 3:** the risk checks scan the rows, so the
+  per-order cost grows by the 32 empty rows' bound test.
+- **The depth capture** (month results, caveat 3): the rolling ingress never
+  wrote `pm15-depth.pmlr`; it now writes a top-5 `DepthTopK` per leg,
+  best first from the venue's touch, change-gated through a `DepthPair` (the
+  spare row written in place, flipped on a change), whenever the leg's slot
+  ticks, for both periods. Capture only: no depth lane carries it. A level
+  whose size the ladder does not know is not written.
+- **The Gamma market id** joins `PmWindowSpec` (`market_id`): Jupiter names
+  its markets `POLY-<market id>-<0|1>`. A non-decimal id reads 0; it can
+  never refuse a static market row.
+- **Gates:** see the J1b gate line below.
+
+J1b-GATES (2026-10-18, on the Mac, detached): `make lint` rc 0, 0 warnings ·
+`cargo nextest run --workspace` 4 845 passed, 10 skipped · `make alloc-assert`
+133 passed at 0 B (a fresh `Compiling bench`; gate 133 new) · `make copy-audit`
+hits 27, baselined 27, new 0 · `make license-check` OK (748 files) · fuzz 60 s
+each, clean: `universe_toml` 23.4 M runs, `pm_gamma_markets` (now also the
+window law, both periods) 6.0 M, `pm_rolling_frame` (new: the rolling driver,
+both periods) 221 k · `make bench-check` RED, 8 samples past 15 %: on a re-run
+of the four groups `ledger/locate_*` came back within 15 % (+13 %, +6 %; the
+first run was noise), while `strategy_set/*` (+27…39 %) and `bin15/late_*`
+stayed out — no code of either is in this change (their baselines predate
+PM15-5's ninth member and PM15-4's move of the late grid into
+`core-twaplock`). **A/B against HEAD (ruling R-PMJ-S6;** a read-only
+worktree of `a946a668`, removed after; three interleaved runs, medians,
+bench-check's settings, the engine running): `strategy_set/on_tick_all`
+6.897 HEAD / 6.893 this tree, `on_tick_none` 3.132 / 3.130, `on_fill_routed`
+2.471 / 2.363, `on_timer_all` 3.709 / 3.306, `bin15/late_fair_in_window`
+487 / 397, `bin15/late_grid_mark_and_perp_1s` 14.27 / 12.89,
+`ledger/locate_miss` 3.80 / 3.92, `dispatcher/queued_submit` 0.837 / 0.850,
+`strategy/latency_arb_on_tick_no_fire` 3.128 / 3.140 ns — **HEAD is as red as
+this change; the regressions predate PMJ.** A re-baseline stays the
+operator's ruling.
+
+### J2 — base58, the raw Ed25519 signature, verification, the Solana keypair (R-PMJ-S3)
+
+- **No new dependency.** Ed25519 stays on `ring` in `signer-ed25519`
+  (O-BX5); `core-crypto` stays dependency-free.
+- `core_crypto::base58_decode` / `base58_encode`: the Bitcoin alphabet,
+  zero-alloc (the working number lives in the caller's buffer), boot and
+  cold paths only — **not constant-time**, so it may decode a secret only at
+  boot (the wallet key), never on a path an observer can time.
+- `Ed25519Signer::sign_raw`: the 64-byte signature written into the
+  caller's slot (the transaction's own buffer); `verify`: `ring`'s strict
+  RFC 8032 verification; `Ed25519Signer::from_solana_keypair`: a wallet's
+  64-byte export (seed ‖ public key) — the seed expanded into the locked
+  page as `from_seed`, the local seed copy wiped, and a public half the seed
+  does not derive refused (`KeypairMismatch`, compared in constant time).
+- The boot self-test (LAW BX-3) now also checks every RFC 8032 vector's raw
+  signature and its verification both ways; Binance's arm runs the same
+  self-test, so its boot checks more and accepts nothing new.
+- **Gates:** `make lint` rc 0 · nextest (core-crypto, signer-ed25519,
+  exec-binance, exec-polymarket) 457 passed · gate 86 at 0 B with `sign_raw`
+  + `verify` in its loop (the self-test's allocation count unchanged: one
+  page per vector) · copy-audit new 0 · license OK.
+
+
+### J3 — `exec-jupiter`: the guard, jup-gw, slot 11's arm (built and rig-tested; never armed)
+
+- **The venue (R-PMJ-S2): `VenueId::Jupiter` = 10, `VENUE_COUNT` 11.** An
+  execution route with no market data: no tick, depth, option or fill lane;
+  staleness 0 (never judged); the paper activation and the harness latency
+  0 — dead like `Ai`, and never tradeable in the harness
+  (`tradeable_venue_byte` is unchanged). `exec.toml` spells it `jupiter`.
+- **The router lists gain Jupiter** (`LIVE_ARM_VENUES`,
+  `PNL_JUDGING_VENUES`), **and refusals precede them:** a live slot 11
+  refuses the boot until a `PMJ-DUST-GATE` line here; a live slot naming
+  `jupiter` that is not slot 11 refuses ("whose only arm is slot 11's"); a
+  paper slot naming it arms nothing. The binary-contract risk law
+  (`px·qty/1e6`) is unchanged.
+- **LAW PMJ-G — never sign a server-built transaction blind.** Jupiter's
+  `POST /orders` answers an unsigned Solana transaction; jup-gw decodes it
+  into a fixed 1 232 B buffer and signs it only when every line holds:
+  the fee payer is our wallet and our wallet is a required signer; every
+  invoked program is in `pmj.toml`'s `guard_programs` and is a static key
+  (never loaded from a lookup table); every lookup table is in
+  `guard_alts`; **the transaction requires exactly one signature — ours** (a
+  co-signer could hold it; checked on the transaction, not only on the
+  answer's `requiredSigners`); **no System `AdvanceNonceAccount`, whatever
+  it names** (a durable-nonce transaction never expires, so the server
+  could land it whenever it liked); the SPL Token / Token-2022 `Transfer`
+  / `TransferChecked` our wallet authorises come **from the deposit
+  account** (`guard_deposit_account`, the wallet's USDC account — none configured
+  refuses every debit; one loaded through a lookup table is refused) and,
+  checked, **in the deposit mint**, and sum to at most the `depositAmount`
+  we asked (0 for a claim), with our wallet the authority and nothing
+  else; any other Token
+  instruction our wallet takes part in (`Approve`, `SetAuthority`,
+  `CloseAccount`, `Burn` …) is refused; System transfers and account funding from
+  our keys at most `guard_max_sol_lamports`; the compute-unit price at most
+  `guard_max_cu_price` (so a transaction's fees are bounded by 5 000 lamports
+  for the one signature plus `max_cu_price` × at most 1.4 M units — 0.07
+  mSOL at a 50 000 µlamport cap — plus `guard_max_sol_lamports`).
+  The answer must be the order we asked — `requiredSigners` exactly our
+  wallet, `order.marketId` the window's `POLY-<id>-<o>`, `isYes` and
+  `isBuy` true, `userPubkey` our wallet, `orderCostUsd` within the deposit
+  — and the server's price cap (`maxBuyPriceUsd`, the answer's word) at
+  most the member's limit (`p − 2c`); else the build is refused unsigned. **An empty allowlist
+  refuses everything**, and is the default until J0's decoded programs and
+  tables are reviewed into the `guard_*` keys. **The guard's limit: a CPI's debits
+  are invisible before signing** — an allowlisted program is trusted with
+  whatever the transaction's accounts let it reach; the program allowlist
+  is what bounds that. **Its consequence (risk review, 2026-10-18):**
+  Jupiter's own program most likely moves the deposit itself (a CPI,
+  not a top-level transfer); if so, the "≤ `depositAmount`" line binds
+  nothing, the per-order maximum and the session bound are not enforced
+  before signing, and the real bound is the wallet's USDC. **Before a
+  `PMJ-DUST-GATE` line, this section must require:** (a) the wallet holds
+  at most the slot's day cap in USDC; (b) J0 decodes Jupiter's
+  create-order instruction data so the guard checks its amount (and its
+  price) itself; (c) a halt when the wallet's USDC falls by more than the
+  deposit plus the fee after an order lands.
+- **jup-gw** (`exec_jupiter::gw`, socket-free; `core_net::HttpsReq` in
+  production): build → guard → sign (our signature written into its own
+  slot) → `POST /execute` with the build's `context` verbatim → LANDED /
+  REFUSED / IN DOUBT → `GET /orders/status/{pk}` every 250 ms until
+  terminal or the window's close + 30 s → recon (`GET /orders`, the order's
+  `filledContracts` and `avgFillPriceUsd`) → FILL (cumulative) and DONE.
+  **E-5 for this venue:** the execute's `Success` is the ACK; the order
+  record's fill numbers are the FILL. Fail closed: a build creates nothing
+  on chain, so any failure before the execute is a refusal; **every
+  execute answer but `Success` came after the signed transaction left the
+  host and is not believed** — `Failed`, a 4xx (a region or a key refusal
+  still halts), an unreadable or absent answer are in doubt, polled like
+  an unanswered one, and released (DONE, never landed) only once its
+  blockhash has surely expired (300 s after the execute; ~150 blocks live
+  60–90 s) AND recon read every page without finding it — pages left
+  unread are no evidence; a terminal record without its fill quantity (or
+  a filled one without its price) is not read, never booked unfilled; an
+  order — landed, or in doubt with pages left unread — that recon cannot
+  read for 30 tries is LOST and halts. **Recon reads 4 pages of 50**: if
+  `/orders` lists oldest first, an account past 200 orders would LOSE (and
+  halt on) every in-doubt order — J5 pages deeper or queries by time
+  before arming. **Execute-stage refusals count toward the reject-streak
+  halt** (`halt_on_reject_streak`): a `Failed` or a 4xx at the execute
+  raises the streak while its row stays in doubt; a landing resets it. The
+  build's `lastValidBlockHeight` is not used (no chain height is read in
+  this pass).
+- **Halts** (the duplex's halt word): a region refusal, an authentication
+  refusal, a lost order, a lost event, the arm's own (an event of no
+  order, a full queue or ledger, a fill price off the binary law: it halts
+  jup-gw too, so a queued intent is refused unbuilt), and the operator's —
+  **`exec.HALT`
+  on slot 11 reaches the arm's `cancel_slot`, which halts jup-gw's builds**;
+  a landed keeper order cannot be pulled, so it is still polled and
+  reconciled to its end (`cancel_slot_state` answers Working until then).
+- **The arm** (`exec_jupiter::arm`, an `OrderDispatch`): slot 11 only;
+  `Order.venue` = Jupiter; a 5-minute leg (R-PMJ-3) of a family allowed
+  live, on the window its order law is in force for; an IoC BUY at
+  `0 < px < 1`; a deposit `px·qty/1e6` of at least the venue's $5 and at
+  most the per-order maximum (`pmj.toml`); no cancel, no modify. Its worth
+  for the session bound: the wallet's USDC plus each unclaimed leg at cost,
+  a leg its roll settled as lost at 0; the anchor at the first balance read
+  (or the boot's).
+- **Claims are held, not sent:** jup-gw reads the positions, builds each
+  claimable one's claim, guards it (no token may leave our account) and
+  signs it — and stops: **the claim's submission route is unverified until
+  J0 records one** (and no claim is built while jup-gw is halted). A won
+  leg therefore stays in the worth at cost — until the positions read
+  shows it claimed (or settled by the venue on its own, `settlement:
+  auto`): then it leaves both ledgers, its payout in the USDC. Between a
+  balance read that already holds the payout and the positions read that
+  removes the leg (≤ 60 s), the worth is overstated by the leg's cost.
+  J5 wires the route before any arming.
+- **Wire facts to verify at J0 (before J5):** the market id
+  `POLY-<Gamma id>-<0|1>` with `isYes: true` for a buy of either outcome;
+  `requiredSigners` = our wallet alone on a keeper order; the `/orders`
+  record's `filledContracts` / `avgFillPriceUsd` spelling and units; the
+  `/positions` envelope; the balances read (`GET /ultra/v1/balances/{wallet}`,
+  `amount` in base units, `SOL` for the native coin); the claim route;
+  whether a venue-settled position reads `claimed`, and what the build's
+  `settlement: auto` means.
+- **HTTPS:** one keep-alive connection to `api.jup.ag` through
+  `core_net::HttpsReq` (HttpsConn's raw form) rather than HttpsConn
+  templates — a template's query form always renders `path?`, so the two
+  path-parameter requests fit none; the `x-api-key` header is fixed at boot
+  in the gateway's own buffer (wiped on drop). Two copies are not wiped:
+  the request buffer `HttpsReq` renders each head into, and the caller's
+  environment read (J5's wiring).
+- **Boot checks:** jup-gw refuses a guard for another wallet, a signer
+  that is not the wallet, an API key a header cannot carry, a short body
+  window; the arm refuses any slot but 11; both refuse a per-order maximum
+  under $5, and the boot (J5) builds both from one `pmj.toml` key. The
+  live-slot-11 refusal in `exec_boot` is unreachable until J4 gives slot
+  11 its `BUILT_MASK` bit (S16-R5 refuses it first): J4 pins it with a
+  test in the same commit.
+- **Secrets:** `JUP_API_KEY` and `PMJ_WALLET_KEY` reach the process only
+  through the wrapper sourcing `.env` (J5's wiring: slot 11 paper builds no
+  arm and reads neither). The wallet key loads through
+  `Ed25519Signer::from_solana_keypair` into the locked page.
+- **Gauges:** the arm's and jup-gw's `/metrics` words (`engine_pmj_arm_*`,
+  `engine_pmj_gw_*`: refusals by reason, the USDC and SOL gauges); the
+  latencies in the duplex's fixed series — `push_to_write` decision → build,
+  `post_rtt` the build, `rest_rtt` the land, `cancel_rtt` a status poll,
+  `fill_venue_to_local` execute → fill read.
+- **Risk review** (an Opus subagent at xhigh, read-only, three rounds):
+
+  | round | verdict | findings → resolution |
+  |---|---|---|
+  | 1 | BLOCK | MAJOR: recon running out of pages read as "never landed"; the signer count checked on the answer only (a durable nonce); a token debit's source and mint unchecked; a balance without USDC read as 0; a terminal record without its quantity booked 0; NEEDS-DOCS: the CPI-deposit consequence. MINOR: a 4xx execute freed its row; the 120 s blockhash rule; the build not cross-checked; the arm's halt not stopping jup-gw; claimed legs never leaving; the fee bound unstated. NITs: boot checks, claims while halted, key copies, the signing-key bullet | each fixed in code with a named test (`hostile_a_second_required_signer_is_refused`, `hostile_a_durable_nonce_advance_is_refused_whatever_it_names`, `hostile_a_debit_from_another_account_or_mint_is_refused`, `recon_that_runs_out_of_pages_never_releases_an_in_doubt_order`, `a_terminal_record_without_its_numbers_is_retried_never_booked_unfilled`, `a_balance_answer_without_usdc_is_a_failed_read`, `an_execute_refused_with_a_4xx_is_in_doubt_and_a_region_refusal_still_halts`, `a_build_for_another_order_is_refused_unsigned`, `the_arm_boots_only_for_slot_11_and_its_own_halt_stops_the_gateway`, `a_claimed_position_leaves_the_held_table_and_tells_the_arm`, `no_claim_is_built_while_halted`), or written above (the CPI consequence and its three pre-dust requirements, the fee bound, the key copies) |
+  | 2 | BLOCK | MAJOR (from the 4xx fix): execute-stage refusals never reached the reject streak. MINOR: `EVT_CLAIMED` could overflow the event ring; `on_claimed` left the worth stale; the recon depth. NITs: a missing `orderCostUsd`; the deposit config unchecked at boot; two J0 facts | `execute_stage_refusals_count_toward_the_reject_streak`; claimed events within the ring's room, a leg cleared after its event; the worth recomputed; the depth and its pre-arming requirement written above; `has_cost` (MISMATCH), `GwBootErr::Deposit`; the J0 list |
+  | 3 | APPROVE | residual NIT: a position listed twice would send one empty `EVT_CLAIMED` (matches no leg: 5-minute instances set bit 31) — harmless | — |
+
+J3-GATES (2026-10-18, on the Mac, detached; the release binary untouched,
+mtime 2026-10-17 13:45Z): `make lint` rc 0, 0 warnings · `cargo nextest run
+--workspace` 4 906 run, 10 skipped — 4 905 passed and one test whose boot the
+round-2 `GwBootErr::Deposit` correctly refused, its fixture fixed and
+re-run with `exec-jupiter` + `bench`: 190 passed · `make alloc-assert` 135
+passed at 0 B (a fresh `Compiling bench`; gate 134 the guard / sign /
+scanners, gate 135 jup-gw + the arm's steady state: 15 orders admitted,
+built, guarded, signed, executed, polled, reconciled, filled and retired, 12
+measured) · `make copy-audit` hits 27, baselined 27, new 0 (`exec-jupiter`
+in the set) · `make license-check` OK (it counts tracked files; the new
+crate's SPDX headers checked by hand) · fuzz `jup_wire` 60 s clean, 6.57 M
+runs (the transaction parse + guard and every scanner, the held file) ·
+`make bench-check` RED on `bin15/late_fair_in_window` alone (+16.3 %; red at
+HEAD too, J1b's A/B).
+
+### J4 — `strategy-pmj`, slot 11's member (PAPER)
+- **The member** (`crates/strategy-pmj`) trades slot 9's H90 law on the
+  5-minute pool only (the `pm5_*` syms; instance ids carry bit 31; a
+  15-minute record is ignored, R-PMJ-3). **The law is duplicated, not
+  shared:** the crate is `strategy-pm15` copied and adapted, so slot 9 —
+  armable — stays bit for bit; the cost is two copies to keep in step until
+  the 5-minute research (R5) freezes its own law, and a change to pm15's law
+  is NOT a change to pmj's. PMJ's own keys: the **price floor** (the
+  favourite's ask ≥ 0.90, else `skip_price`); the **keeper's lead** (`τ ≥
+  max(tau_min, min_tau)`, 3 s); the **$5 deposit** (sized up to $5 plus one
+  share step, never past the market's room — under $5 of room, no order);
+  the **paper fee** at twice Polymarket's taker fee (`2 × 0.07·p·(1 − p)`
+  per share: the keeper's and Jupiter's — MEASURED from the venue before
+  any arming, never read from a doc). Orders: an IoC BUY of the favourite,
+  `VenueId::Jupiter`, the Polymarket leg's sym.
+- **The paper law** (the plan's keeper-aware law): the held-quote book
+  (`core_fill::held`) carries the 5-minute legs after the 15-minute ones; a
+  5-minute IoC is judged against the touch held at its submit +
+  `paper_delay_ms` (2 s default, `pmj.toml`;
+  `PaperDispatcher::with_pm5_held_delay_ns`) — the keeper's latency, not the
+  CLOB's. The 15-minute legs keep pm15's delay. The delay is bounded by the
+  keeper's lead (`paper_delay_ms` < max(`tau_min`, `min_tau_s`), else the
+  parse refuses): an order decided at the window's floor is still judged
+  before the close, never against a book the venue has closed. The pending
+  IoCs have a share per class (`core_fill::held::HELD_PENDING_SHARES`: 16
+  options, 8 15-minute legs, 8 5-minute legs — one per family, a member
+  holding at most one IoC per family): a burst of slot 11's or slot 7's
+  never refuses slot 9's take (the book's 16 were shared before J4).
+- **A miss frees its market on the member's timer, not at the verdict:**
+  like slot 9's member, slot 11's keeps the trait's no-op for the
+  dispatcher's `CANCELED`/`EXPIRED` order event, so an IoC that does not
+  fill blocks its market until `2 × order_ttl` (10 s) — about 60 % of the
+  late window — and `max_orders_market` is rarely reached. The paper run
+  is that law's, conservatively; changing it for slot 11 alone would part
+  the two copies (above) and is a ruling, not a J4 fix.
+- **The artifact** `~/multivenue/pmj.toml` (`core_config::pmj`: one `[pmj]`
+  section, every bound at parse, the bytes hashed into the boot tell
+  `pmj: artifact configured (PAPER) …`). Read only when `--strategy` names
+  `pmj`; a request without it aborts the boot; `families` must equal the
+  universe's 5-minute `[polymarket] rolling` list in order; `pmj-check`
+  validates it offline. `PMJ_TOML=<path>` in `strategy.conf` names another
+  (`scripts/engine-wrapper.sh`, the `XMM_TOML` shape: a file, and `STRATEGY`
+  must carry `pmj`, else exit 78). A `pm15.toml` copied whole refuses (its section, its
+  `usd_order_1e6`, no deposit). Its H90 values are pm15's, provisional (R5).
+- **The frame (paper; the dust frame R-PMJ-5 names for J5):** the deposit
+  $5 per order; `usd_market` $10 per market; the session loss bound −$50
+  (at or below it the member enters nothing for the session: `skip_halt`,
+  `engine_pmj_halted`); `max_orders_market` 4; `order_ttl` 5 s (a pending
+  order written off at 2 × ttl). Parse bounds: deposit and market
+  $5..$10 000 (the market ≥ the deposit; a deposit within $0.01 of the
+  ceiling leaves `max_order` no room and refuses), session above $0 up to
+  $10 000, orders
+  1..16, ttl 1–30 s, `paper_delay_ms` 0–30 000 and under 2 × ttl and under
+  the keeper's lead, `min_tau_s` 0–59 and under `tau_max`, the price floor
+  0.50–0.999999. **The per-order maximum** (`max_order_usd_1e6`, the J3
+  arm's refusal line) defaults to the deposit + $0.01 and the parse refuses
+  less (`PMJ_SIZING_SLACK_1E6`): the member buys whole hundredths of a
+  share and one more when the rounding left the order under $5, so an order
+  costs at most the deposit + $0.01 — the arm would otherwise refuse the
+  default artifact's every order at J5 (risk review J4, round 1).
+- **Masks and names:** `BUILT_MASK` 0x02FF → 0x0AFF (bit 11); `ALL_MASK`
+  stays 0x00FF (`all` never names slot 11). `/state`'s slot 11 is `pmj`
+  (engine-snapshot's `SLOT_NAMES`, the dashboard's, `exec_boot`'s slot
+  list); slot 12 is now the first reserved slot the unbuilt-slot tests use.
+  **S16 amended:** the debug guard's probe slots (S16 above: "the debug
+  tests at slots 8, 11 and 15") are **8, 12 and 15** since J4 — slot 11 has
+  a member; the strategy-set and `exec_boot` probes moved with it, and a
+  `1u8 <<` at 12 panics in debug as it did at 11.
+- **Paper only, three ways:** the engine refuses a live slot 11 and a live
+  slot naming `jupiter` (J3c, `exec_boot`); `scripts/pmj-flip.sh` has
+  `status` and `paper` — `live` only refuses (`the_pmj_flip_has_no_live_path`);
+  a paper boot never builds the arm (`exec-jupiter` is not linked into the
+  loop). **Arming needs a later `PMJ-DUST-GATE` line here** (J5: R-PMJ-5's
+  dust battery, after J0); nothing in J4 is that line.
+- **Metrics:** `engine_pmj_<tally>_total` (31) and six level gauges,
+  registered at every boot (`the_pmj_member_family_is_31_counters_and_6_gauges_beside_pm15s`;
+  the worst-case boot still fits the fixed registry); `engine_pmj_arm_*` /
+  `engine_pmj_gw_*` stay unregistered until J5's live boot. The dashboard's
+  pmj panel reads `engine_pmj_*` and `engine_ingress_pm5_*`.
+- **Alloc:** gate 136 (`pmj_member_steady_state_is_zero_alloc`) — the
+  member over a real `PaperMatcher`'s 5-minute held branch: four windows
+  taken, held for the keeper's delay, judged, filled and settled at 0 B.
+- **Risk review** (an Opus subagent at xhigh, read-only, two rounds):
+
+  | round | verdict | findings → resolution |
+  |---|---|---|
+  | 1 | NEEDS-DOCS | NEEDS-DOCS: the frame (caps, halt, bounds) unwritten, and a J5 trap — `max_order` defaulted to the deposit while the member sizes up to the deposit + one share step, so the J3 arm would refuse the default artifact's every order. MINOR: `paper_delay` bounded by the ttl only, not by the keeper's lead; `pmj-flip.sh paper` with `ARM_LIVE=11` alone left `EXEC_TOML` set and `ARM_LIVE` empty (the wrapper refuses that boot); the held book's 16 pending shared by slots 7, 9 and 11 (a 5-minute burst could refuse slot 9's take). NITs: `[guard]` wording, the S16 probe slots, the miss's 10 s block, gate coverage of the matcher's 5-minute branch | `PMJ_SIZING_SLACK_1E6` (`max_order` ≥ the deposit + $0.01, the default; pinned) and "The frame" above; the lead bound (pinned); pm15-flip's `kv_off` of both keys, `status` names a half pair (smoke-tested, pinned); `HELD_PENDING_SHARES` 16 / 8 / 8 (`a_full_burst_of_one_class_never_refuses_another`); the wording; "S16 amended" above; the miss recorded above (a ruling, not a fix); gate 136 over the matcher |
+  | 2 | APPROVE | NITs: the session floor is any positive amount, not $1; a deposit within $0.01 of the $10 000 ceiling refuses | both written into "The frame" |
+
+J4-GATES (2026-10-18, on the Mac, detached; the release binary untouched,
+mtime 2026-10-17 13:45Z): `make lint` rc 0, 0 warnings · `cargo nextest run
+--workspace` 4 925 run, 4 925 passed, 10 skipped · `make alloc-assert` 136
+passed at 0 B (a fresh `Compiling bench`; gate 136 new) · `make copy-audit`
+hits 27, baselined 27, new 0 (`strategy-pmj` and `cli/src/pmj_boot.rs` in
+the set) · `make license-check` OK (748 files; it counts tracked files, the
+new files' SPDX headers checked by hand) · `uv run pytest` 1 784 passed, 3
+skipped (serialized behind a running `candles` verb) · `make py-lint` RED on
+two E501 lines in `tests/test_dashboard.py` (864, 867: PM15-8's, untouched by
+J4) · fuzz `jup_wire` 60 s clean, 6.83 M runs (no J4 parser has a target;
+`pmj.toml` is parse-tested) · `make bench-check` RED on
+`bin15/late_fair_in_window` (+16.3 %, red since J1b's A/B) and on
+`strategy_set/on_tick_none` (+21.9 %) / `strategy_set/on_timer_all` (+24.2 %):
+the set's fan-in tests one mask bit per BUILT row per event, and J4 adds a
+row — two J3 runs 2.81 / 2.84 ns and 2.55 / 2.56 ns, two J4 runs 3.06 / 3.06
+ns and 3.03 / 2.81 ns (+0.25 ns a record; HEAD's interleaved A/B, J1b: 3.13 /
+3.71 ns). **Re-baselined (R-PMJ-S10)**, each the median of three `make
+bench-check` runs on the final tree with the engine running (load 5.3–6.4):
+on_tick_none 2.51 → 3.06 ns (3.060 / 3.058 / 3.066), on_timer_all 2.26 →
+2.81 ns (2.808 / 2.810 / 2.808); `crates/bench/baselines/hot_path.json`
+records why. Against it the two pass (+0.2 %, −0.1 %); `bin15/late_fair_in_window`
+stays red as before. A set-bit fan-in (the cost by enabled members, not
+built rows) is a possible later lane.

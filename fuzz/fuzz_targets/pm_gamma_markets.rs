@@ -18,6 +18,10 @@
 //!    half and both halves are ingested sequentially into a fresh
 //!    table, re-checking the same invariant.
 //!
+//! 4. PM15 / PMJ J1b: the rolling window law (`gamma15`) over the same
+//!    bytes, for both periods — `out` is written only on `Ok`, and an
+//!    `Ok` spec names the family and window it was asked for.
+//!
 //! None of this may panic or read out of bounds on any input. (The
 //! module itself allocates by design — it runs at boot only.)
 
@@ -52,5 +56,22 @@ fuzz_target!(|data: &[u8]| {
         let key_len = data.len().min(80);
         let _ = d2.find_by_token(&data[..key_len]);
         let _ = d2.sibling_of(&data[..key_len]);
+    }
+
+    // PM15 / PMJ J1b: the rolling window law, both periods.
+    let periods = [
+        (core_types::pm_roll::PmPeriod::M15, 1_792_216_800u64),
+        (core_types::pm_roll::PmPeriod::M5, 1_792_308_000u64),
+    ];
+    let mut k = 0usize;
+    while k < periods.len() {
+        let (period, open) = periods[k];
+        k += 1;
+        let w = period.window_of_open(open).unwrap_or(0);
+        let mut spec = ingress_polymarket::gamma15::PmWindowSpec::EMPTY;
+        match ingress_polymarket::gamma15::parse_window_spec_for(period, data, 3, b"btc", w, &mut spec) {
+            Ok(()) => assert_eq!((spec.family, spec.window), (3, w)),
+            Err(_) => assert_eq!(spec, ingress_polymarket::gamma15::PmWindowSpec::EMPTY),
+        }
     }
 });

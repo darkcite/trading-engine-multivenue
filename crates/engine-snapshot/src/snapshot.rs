@@ -82,7 +82,9 @@ pub const RUN_DIR_MAX: usize = 160;
 /// **Slots 8–15 appeared in schema 3 (S16-5)** as
 /// [`RESERVED_SLOT_NAME`]; a member taking one later is additive in the
 /// same way. **Slot 9 is `strategy-pm15` since PM15-5 (2026-10-17)** —
-/// additive (`"reserved"` → `"pm15"`); 8 and 10–15 stay reserved. This is a copy of the `strategy-set` member table's names
+/// additive (`"reserved"` → `"pm15"`). **Slot 11 is `strategy-pmj` since
+/// PMJ J4 (2026-10-18)** — additive (`"reserved"` → `"pmj"`); 8, 10 and
+/// 12–15 stay reserved. This is a copy of the `strategy-set` member table's names
 /// (the snapshot crate does not link the members): the cli's
 /// `exec_boot` snapshot-parity test is the guard against drift.
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
@@ -97,7 +99,7 @@ pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
     RESERVED_SLOT_NAME,
     "pm15",
     RESERVED_SLOT_NAME,
-    RESERVED_SLOT_NAME,
+    "pmj",
     RESERVED_SLOT_NAME,
     RESERVED_SLOT_NAME,
     RESERVED_SLOT_NAME,

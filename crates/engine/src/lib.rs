@@ -90,7 +90,8 @@ pub const FILL_RING_SIZE: usize = 1_024;
 /// Number of tick lanes: 0 = Polymarket, 1 = Binance, 2 = OKX,
 /// 3 = Deribit, 4 = Hyperliquid, 5 = Bybit (WS9), 6 = MEXC (MX2),
 /// 7 = Hypercall (HC1), 8 = Polymarket's ROLLING 15-minute families
-/// (PM15, [`PM15_LANE`]).
+/// (PM15, [`PM15_LANE`]), 9 = its ROLLING 5-minute families (PMJ J1b,
+/// [`PM5_LANE`]).
 /// Lane indices are BOOT-WIRED and NO LONGER equal `VenueId as usize`
 /// past lane 4:
 /// `VenueId::Ai = 5` has no tick lane (AI commands ride their own
@@ -98,7 +99,7 @@ pub const FILL_RING_SIZE: usize = 1_024;
 /// `VenueId::Mexc = 7` lane 6; `VenueId::HyperEvm = 8` has none (pool
 /// events ride the signal lane), so `VenueId::Hypercall = 9` occupies
 /// lane 7 — see [`tick_lane_of`].
-pub const NUM_TICK_LANES: usize = 9;
+pub const NUM_TICK_LANES: usize = 10;
 
 /// PM15: the lane of Polymarket's ROLLING 15-minute families — ticks and
 /// events of their own ingress thread (`ingress_polymarket::pm15_loop`),
@@ -106,6 +107,13 @@ pub const NUM_TICK_LANES: usize = 9;
 /// byte Polymarket, so [`tick_lane_of`] does not name it: the boot wires
 /// it by index.
 pub const PM15_LANE: usize = 8;
+
+/// PMJ J1b: the lane of Polymarket's ROLLING 5-minute families — the
+/// 5-minute pipeline's own ingress thread (`ingress_polymarket::pm15_loop`
+/// driven for `PmPeriod::M5`), one writer per lane as for
+/// [`PM15_LANE`]. Venue byte Polymarket; wired by index at boot. Empty
+/// (the unspawned shape) without a `[polymarket] rolling` `:5m` key.
+pub const PM5_LANE: usize = 9;
 
 /// Tick-lane index for a market-data venue (WS9 — the lane↔venue
 /// identity broke when Bybit's discriminant landed past `Ai`).
@@ -124,7 +132,8 @@ pub const fn tick_lane_of(venue: VenueId) -> Option<usize> {
         // HC1: option BBO ticks off the indicative (quote-provider) feed.
         VenueId::Hypercall => Some(7),
         // HYPARB: HyperEVM pool events ride the signal lane — no ticks.
-        VenueId::Ai | VenueId::HyperEvm => None,
+        // PMJ J3: Jupiter is an execution route — no market data.
+        VenueId::Ai | VenueId::HyperEvm | VenueId::Jupiter => None,
     }
 }
 
@@ -161,7 +170,8 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
         | VenueId::HyperEvm
         // HC1: Hypercall's book is RFQ-provider indicative quotes — a
         // touch per instrument, no L2 depth to stream.
-        | VenueId::Hypercall => None,
+        | VenueId::Hypercall
+        | VenueId::Jupiter => None,
     }
 }
 
@@ -189,7 +199,8 @@ pub const fn opt_lane_of(venue: VenueId) -> Option<usize> {
         | VenueId::Ai
         | VenueId::Bybit
         | VenueId::Mexc
-        | VenueId::HyperEvm => None,
+        | VenueId::HyperEvm
+        | VenueId::Jupiter => None,
     }
 }
 
@@ -231,11 +242,14 @@ pub const fn fill_lane_of(venue: VenueId) -> Option<usize> {
         // O-H12 testnet sends are a shadow and never reach the book.
         // HC1: Hypercall is data-only by operator ruling O-HC1 — no exec
         // arm (HC9 waits for its own ruling), no fill lane.
+        // PMJ J3: Jupiter's fills come from its arm (`exec-jupiter`)
+        // through the dispatcher, never a fill lane.
         VenueId::Ai
         | VenueId::Bybit
         | VenueId::Mexc
         | VenueId::HyperEvm
-        | VenueId::Hypercall => None,
+        | VenueId::Hypercall
+        | VenueId::Jupiter => None,
     }
 }
 
@@ -2736,15 +2750,18 @@ mod tests {
         assert_eq!(tick_lane_of(VenueId::Bybit), Some(5));
         assert_eq!(tick_lane_of(VenueId::Mexc), Some(6));
         assert_eq!(tick_lane_of(VenueId::Hypercall), Some(7));
-        // PM15: the rolling families' lane is the last, and no venue maps
-        // to it (its records carry the Polymarket byte; boot wires it).
-        assert_eq!(PM15_LANE, NUM_TICK_LANES - 1);
+        // PM15: the rolling families' lanes are the last two, and no venue
+        // maps to either (their records carry the Polymarket byte; boot
+        // wires them): 15 m on 8, PMJ J1b's 5 m on 9.
+        assert_eq!(PM15_LANE, 8);
+        assert_eq!(PM5_LANE, NUM_TICK_LANES - 1);
         assert_ne!(tick_lane_of(VenueId::Polymarket), Some(PM15_LANE));
+        assert_ne!(tick_lane_of(VenueId::Polymarket), Some(PM5_LANE));
         assert_eq!(tick_lane_of(VenueId::Ai), None);
         assert_eq!(tick_lane_of(VenueId::HyperEvm), None);
         // The last market venue occupies lane 7, PM15's rolling families
-        // lane 8 (`PM15_LANE`) — no gaps.
-        assert_eq!(NUM_TICK_LANES, 9);
+        // lane 8 (`PM15_LANE`), the 5-minute ones lane 9 — no gaps.
+        assert_eq!(NUM_TICK_LANES, 10);
         assert_eq!(NUM_EVENT_LANES, NUM_TICK_LANES);
     }
 

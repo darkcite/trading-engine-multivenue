@@ -1421,7 +1421,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // MX2's MEXC at lane 6 and WS9's Bybit at lane 5; four opt lanes
     // since HC1; five fill lanes since BX3 gave Binance lane 4); break
     // the build loudly if that drifts.
-    const _: () = assert!(NUM_TICK_LANES == 9 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
+    const _: () = assert!(NUM_TICK_LANES == 10 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
 
     struct NoopStrat;
     impl StrategyCounters for NoopStrat {}
@@ -1458,6 +1458,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_t7p, t7) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     // PM15: lane 8, the rolling families.
     let (_t8p, t8) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // PMJ J1b: lane 9, the 5-minute families.
+    let (_t9p, t9) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     // WS10-A: eight venue-event lanes ride in every engine. Lane 2
     // (OKX) gets a live producer — the measured window below pushes
     // one funding ChannelEvent per iteration and the engine drains
@@ -1480,6 +1482,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_e7p, e7) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e8p, e8) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e9p, e9) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     // WS10-B: two depth lanes; lane 0 (OKX) live — the measured
     // window pushes one DepthTopK per iteration and the engine
@@ -1520,8 +1524,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let mut eng = Engine::new(
         NoopStrat,
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5, t6, t7, t8],
-        [e0, e1, e2, e3, e4, e5, e6, e7, e8],
+        [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9],
+        [e0, e1, e2, e3, e4, e5, e6, e7, e8, e9],
         [d0, d1],
         [o0, o1, o2, o3],
         sc,
@@ -12284,9 +12288,13 @@ fn hcv_member_and_the_held_quote_law_are_zero_alloc() {
 /// signer costs exactly one allocation (its page), and the self-test one
 /// per known answer — so a `ring` bump that starts allocating in
 /// `from_seed_unchecked`, or a keypair moved into a `Box`, fails here.
+///
+/// PMJ J2: the raw signature into a Solana transaction's slot
+/// (`sign_raw`) and its verification (`verify`) ride the same loop, and
+/// the self-test's raw and verify checks the same boot count.
 #[test]
 fn ed25519_sign_and_render_are_zero_alloc() {
-    use signer_ed25519::{Ed25519Signer, RFC8032, SIG_B64_LEN, SIG_B64_PCT_MAX};
+    use signer_ed25519::{Ed25519Signer, RFC8032, SIG_B64_LEN, SIG_B64_PCT_MAX, SIG_LEN};
     let g = AllocGuard::new();
     let signer = Ed25519Signer::from_seed(&[0x42; 32]).expect("gate 86 key");
     let (boot_allocs, boot_bytes, _) = g.delta();
@@ -12299,19 +12307,28 @@ fn ed25519_sign_and_render_are_zero_alloc() {
     let mut payload = [0x61u8; 200];
     let mut b64 = [0u8; SIG_B64_LEN];
     let mut pct = [0u8; SIG_B64_PCT_MAX];
+    let mut raw = [0u8; SIG_LEN];
+    let mut public = [0u8; 32];
+    public.copy_from_slice(signer.public_key());
     signer.sign_b64(&payload, &mut b64); // warm-up
+    signer.sign_raw(&payload, &mut raw);
+    assert!(signer_ed25519::verify(&public, &payload, &raw), "gate 86: warm-up verifies");
 
     let g = AllocGuard::new();
     let mut acc: u64 = 0;
+    let mut verified = 0u64;
     let mut n = 0u64;
     while n < 2_000 {
         payload[..8].copy_from_slice(&n.to_le_bytes());
         acc = acc.wrapping_add(signer.sign_b64(&payload, &mut b64) as u64);
         acc = acc.wrapping_add(signer.sign_b64_pct(&payload, &mut pct) as u64);
         acc = acc.wrapping_add(u64::from(b64[0]) + u64::from(pct[0]));
+        signer.sign_raw(&payload, &mut raw);
+        verified += u64::from(signer_ed25519::verify(&public, &payload, &raw));
         n += 1;
     }
     std::hint::black_box(acc);
+    assert_eq!(verified, 2_000, "gate 86: every raw signature verifies");
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert!(acc != 0, "the gate must measure real work");
@@ -20889,3 +20906,504 @@ fn pm15_polybolt_frames_are_zero_alloc() {
     );
 }
 
+/// PMJ J1b gate 133: the 5-minute pipeline's ingress driver
+/// (`Pm15Driver::new_for(PmPeriod::M5, ..)`) in steady state — `book`
+/// snapshots, `price_change` events (the ladder, the venue touch, the
+/// change-gated tick and the change-gated top-of-book), Chainlink reports
+/// on the 5 m mark slot, the roll clock across a window's end and its
+/// retirement. Zero bytes per operation.
+#[test]
+fn pm5_ingress_driver_is_zero_alloc() {
+    use core_ring::Ring;
+    use core_types::pm_roll::{pm5_window_of_open, PmPeriod};
+    use core_types::{ChannelEvent, NullCapture, Tick};
+    use ingress_polymarket::gamma15::PmWindowSpec;
+    use ingress_polymarket::pm15_loop::{Pm15Counters, Pm15Driver, Pm15Out, Pm15Wire, PM15_EVENT_MASK};
+
+    struct CountWire(usize);
+    impl Pm15Wire for CountWire {
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn queue(&mut self, parts: &[&[u8]]) -> bool {
+            let mut i = 0usize;
+            while i < parts.len() {
+                self.0 += parts[i].len();
+                i += 1;
+            }
+            true
+        }
+    }
+
+    const S: u64 = 1_000_000_000;
+    const OPEN5: u64 = 1_792_308_000;
+    let w = pm5_window_of_open(OPEN5).unwrap();
+    let up = b"74913418352376030655968323928940542465856871160803692353977404305259528321778";
+    let down = b"108416957532714595532891587985594213692071846013834323276407586325741402897137";
+    let mut spec = PmWindowSpec::EMPTY;
+    spec.window = w;
+    spec.tick_1e6 = 10_000;
+    spec.min_size_1e6 = 5_000_000;
+    spec.market_id = 5_768_386;
+    spec.up.b[..up.len()].copy_from_slice(up);
+    spec.up.len = up.len() as u8;
+    spec.down.b[..down.len()].copy_from_slice(down);
+    spec.down.len = down.len() as u8;
+    let (mut tick_tx, mut tick_rx) = Ring::<Tick, { ingress_polymarket::DEFAULT_TICK_RING_CAP }>::new().split();
+    let (mut ev_tx, mut ev_rx) = Ring::<ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let status = core_metrics::IngressStatus::new();
+    let counters = Pm15Counters::new();
+    let mut cap = NullCapture;
+    let mut wire = CountWire(0);
+    let mut d = Pm15Driver::new_for(PmPeriod::M5, &[b"btc"], 5_000);
+    let wall0 = (OPEN5 + 10) * S;
+    {
+        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
+        d.offer(&spec, wall0, wall0, &mut out, &mut wire);
+    }
+    let us = std::str::from_utf8(up).unwrap();
+    let ds = std::str::from_utf8(down).unwrap();
+    let book = format!(
+        "[{{\"market\":\"0x70\",\"asset_id\":\"{us}\",\"timestamp\":\"1792308010000\",\"hash\":\"h\",\"bids\":[{{\"price\":\"0.40\",\"size\":\"10\"}},{{\"price\":\"0.50\",\"size\":\"10\"}}],\"asks\":[{{\"price\":\"0.60\",\"size\":\"7\"}},{{\"price\":\"0.52\",\"size\":\"7\"}}],\"event_type\":\"book\"}}, {{\"market\":\"0x70\",\"asset_id\":\"{ds}\",\"timestamp\":\"1792308010000\",\"hash\":\"h\",\"bids\":[{{\"price\":\"0.48\",\"size\":\"7\"}}],\"asks\":[{{\"price\":\"0.50\",\"size\":\"10\"}}],\"event_type\":\"book\"}}]"
+    );
+    let mut changes: Vec<String> = Vec::with_capacity(64);
+    let mut k = 0u32;
+    while k < 64 {
+        let sz = 10 + k % 7;
+        changes.push(format!(
+            "{{\"market\":\"0x70\", \"price_changes\":[{{\"asset_id\":\"{us}\", \"price\":\"0.49\", \"size\":\"{sz}\", \"side\":\"BUY\", \"hash\":\"a\", \"best_bid\":\"0.5\", \"best_ask\":\"0.52\"}}, {{\"asset_id\":\"{ds}\", \"price\":\"0.51\", \"size\":\"{sz}\", \"side\":\"SELL\", \"hash\":\"b\", \"best_bid\":\"0.48\", \"best_ask\":\"0.5\"}}], \"timestamp\":\"{}\", \"event_type\":\"price_change\"}}",
+            1_792_308_010_000u64 + u64::from(k)
+        ));
+        k += 1;
+    }
+    let mut marks: Vec<String> = Vec::with_capacity(64);
+    let mut k = 0u64;
+    while k < 64 {
+        marks.push(format!(
+            "{{\"connection_id\":\"x\",\"payload\":{{\"full_accuracy_value\":\"{}\",\"symbol\":\"btc/usd\",\"timestamp\":{},\"value\":1.0}},\"timestamp\":1,\"topic\":\"crypto_prices_chainlink\",\"type\":\"update\"}}",
+            81_000_000_000_000_000_000_000u128 + u128::from(k) * 1_000_000_000_000_000,
+            (OPEN5 + 20 + k) * 1_000
+        ));
+        k += 1;
+    }
+    let g = AllocGuard::new();
+    let mut i = 0usize;
+    while i < 2_000 {
+        // 2 000 steps of 0.5 s: across the window's end (300 s) and its
+        // retirement 540 s later.
+        let now = wall0 + i as u64 * 500_000_000;
+        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
+        if i % 256 == 0 {
+            d.on_market_text(book.as_bytes(), now, now, &mut out);
+        }
+        d.on_market_text(changes[i % 64].as_bytes(), now, now, &mut out);
+        if i % 32 == 0 {
+            d.on_rtds_text(marks[(i / 32) % 64].as_bytes(), now, &mut out);
+        }
+        d.on_clock(now, now, &mut out, &mut wire);
+        d.perform(now, &mut out, &mut wire);
+        while tick_rx.try_pop_ref().is_some() {}
+        while ev_rx.try_pop_ref().is_some() {}
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    assert!(counters.of(ingress_polymarket::pm15_loop::Pm15Counter::Marks) > 0, "gate 133: marks flowed");
+    assert!(status.ticks_total() > 0, "gate 133: ticks flowed");
+    assert_eq!(
+        counters.of(ingress_polymarket::pm15_loop::Pm15Counter::RollsUnknown),
+        1,
+        "gate 133: the window ended and retired inside the measured run"
+    );
+    assert_eq!(allocs, 0, "gate 133: the 5 m ingress driver allocated {allocs} times ({bytes} B)");
+}
+
+/// PMJ J3 gate 134: the slot-11 arm's per-order work that is not I/O, at
+/// 0 B — the build answer scanned in place, the transaction base64-decoded
+/// into its fixed buffer, parsed, GUARDED, signed into its own slot, the
+/// execute body rendered (the signed transaction encoded straight into it,
+/// the context carried back), and the status and execute answers scanned.
+#[test]
+fn jupiter_guard_sign_and_scanners_are_zero_alloc() {
+    use exec_jupiter::json::{scan_build, scan_execute, scan_status, BuildAnswer, ExecuteAnswer, StatusAnswer};
+    use exec_jupiter::render::{execute_body, order_body, status_path, Outcome, EXECUTE_BODY_MAX, ORDER_BODY_MAX, PATH_MAX};
+    use exec_jupiter::tx::{guard, SolTx, TxGuard, TOKEN_PROGRAM, TX_MAX};
+
+    // Boot: the wallet (RFC 8032 TEST 1), a v0 order transaction it pays
+    // for with one TransferChecked of the deposit, its build answer.
+    let v = &signer_ed25519::RFC8032[0];
+    let signer = signer_ed25519::Ed25519Signer::from_seed(&v.seed).expect("gate 134 key");
+    let jup = [0x66u8; 32];
+    let mut msg = vec![0x80u8, 1, 0, 3, 6];
+    msg.extend_from_slice(&v.public);
+    msg.extend_from_slice(&[0x33; 32]);
+    msg.extend_from_slice(&[0x44; 32]);
+    msg.extend_from_slice(&[0x55; 32]);
+    msg.extend_from_slice(&jup);
+    msg.extend_from_slice(&TOKEN_PROGRAM);
+    msg.extend_from_slice(&[0xBB; 32]);
+    msg.push(2);
+    msg.extend_from_slice(&[4, 4, 0, 1, 2, 3, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
+    let mut data = vec![12u8];
+    data.extend_from_slice(&5_000_000u64.to_le_bytes());
+    data.push(6);
+    msg.extend_from_slice(&[5, 4, 1, 3, 2, 0, data.len() as u8]);
+    msg.extend_from_slice(&data);
+    msg.push(0);
+    let mut unsigned = vec![1u8];
+    unsigned.extend_from_slice(&[0u8; 64]);
+    unsigned.extend_from_slice(&msg);
+    let mut b64 = vec![0u8; core_crypto::base64_encoded_len(unsigned.len())];
+    let n = core_crypto::base64_encode(&unsigned, &mut b64);
+    let answer = format!(
+        r#"{{"transaction":"{}","txMeta":{{"blockhash":"x","lastValidBlockHeight":9}},"externalOrderId":null,"requiredSigners":["FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z"],"execution":{{"endpoint":"/execute","context":{{"type":"create_order","orderPubkey":"Ord1111"}}}},"order":{{"orderPubkey":"Ord1111","positionPubkey":"Pos2222","maxBuyPriceUsd":"960000","estimatedTotalFeeUsd":"35000","orderCostUsd":"5000000","contractsMicro":"5263157"}}}}"#,
+        std::str::from_utf8(&b64[..n]).unwrap()
+    );
+    let status = br#"{"orderPubkey":"Ord1111","status":"filled","latestEventType":"filled","latestSignature":"s","externalOrderId":"","orderId":"o","history":[]}"#;
+    let exec = br#"{"status":"Success","signature":"5h6xBEauJ3PK6SWCZ1PGjBvj8vDdWG3KpwATGy1ARAXFSDwt8GFXM7W5Ncn16wmqokgpiKRLuS83KUxyZyv2sUYv","error":null}"#;
+    let mut g = TxGuard::refuse_all(v.public);
+    assert!(g.allow_program(jup) && g.allow_program(TOKEN_PROGRAM));
+    g.deposit_account = [0x33; 32];
+    g.deposit_mint = [0x55; 32];
+    let mut txbuf = [0u8; TX_MAX];
+    let mut body = vec![0u8; EXECUTE_BODY_MAX];
+    let mut obody = [0u8; ORDER_BODY_MAX];
+    let mut path = [0u8; PATH_MAX];
+    let mut acc = 0u64;
+
+    let guard_ = AllocGuard::new();
+    let mut i = 0u64;
+    while i < 2_000 {
+        let on = order_body(&mut obody, b"FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z", 5_798_888 + i, Outcome::Up, 5_000_000, b"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").expect("order body");
+        let mut a = BuildAnswer::default();
+        scan_build(answer.as_bytes(), &mut a).expect("build answer");
+        let tn = core_crypto::base64_decode(a.transaction.of(answer.as_bytes()), &mut txbuf).expect("b64");
+        let t = SolTx::parse(&txbuf[..tn]).expect("tx");
+        let p = guard(&txbuf[..tn], &t, &g, 5_000_000).expect("guard passes");
+        t.sign_into(&mut txbuf[..tn], p.signer_idx, &signer).expect("sign");
+        let en = execute_body(&mut body, &txbuf[..tn], a.context.of(answer.as_bytes()), i).expect("execute body");
+        let pn = status_path(&mut path, a.order_pubkey.of(answer.as_bytes())).expect("path");
+        let mut e = ExecuteAnswer::default();
+        scan_execute(exec, &mut e).expect("execute answer");
+        let mut s = StatusAnswer::default();
+        scan_status(status, &mut s).expect("status answer");
+        acc = acc.wrapping_add((on + en + pn) as u64 + p.token_debit + u64::from(txbuf[1]));
+        i += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = guard_.delta();
+    assert!(acc != 0, "gate 134: real work");
+    assert_eq!(allocs, 0, "gate 134: the Jupiter arm's per-order path allocated {allocs} times ({bytes} B)");
+}
+
+
+/// PMJ J3 gate 135: slot 11's arm and jup-gw in their steady state, at 0 B
+/// — an order admitted by the arm (`OrderDispatch::submit`), its intent
+/// across the duplex, built, guarded, signed, executed, polled and
+/// reconciled by jup-gw against a scripted Jupiter answering from fixed
+/// buffers, its fill and its retirement back on the engine thread. The
+/// arm keeps a done row 120 s, so the run is 3 warm orders and 12 measured.
+#[test]
+fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
+    use clob_dispatcher::OrderDispatch;
+    use core_net::{Header, Method, PostErr};
+    use core_types::pm_roll::{pm5_instance_id, pm5_pair_of_window, pm5_rolling_sym, pm5_window_end_ns};
+    use core_types::{ChannelEvent, ChannelId, Order, Side};
+    use exec_jupiter::arm::{JupArm, JupArmCfg};
+    use exec_jupiter::client::JupClient;
+    use exec_jupiter::cmd::{JupEvent, JupIntent, JUP_CMD_RING, JUP_EVT_RING};
+    use exec_jupiter::gw::{JupGateway, JupGwCfg, BODY_MIN, MIN_LEAD_NS_DEFAULT, POLL_EVERY_NS};
+    use exec_jupiter::tx::{TxGuard, TOKEN_PROGRAM};
+    use ingress_polymarket::gamma15::PmWindowSpec;
+    use ingress_polymarket::pm15_loop::PM15_SPEC_RING;
+
+    struct FixedJup {
+        body: Vec<u8>,
+        resp: Vec<u8>,
+        build: Vec<u8>,
+        exec: Vec<u8>,
+        status: Vec<u8>,
+        page: Vec<u8>,
+    }
+    impl JupClient for FixedJup {
+        fn body_mut(&mut self) -> &mut [u8] {
+            &mut self.body
+        }
+        fn request(
+            &mut self,
+            _m: Method,
+            target: &[u8],
+            _x: &[Header<'_>],
+            _n: usize,
+        ) -> Result<(u16, core::ops::Range<usize>), PostErr> {
+            let src: &[u8] = if target == b"/prediction/v1/orders" {
+                &self.build
+            } else if target == b"/prediction/v1/execute" {
+                &self.exec
+            } else if target.starts_with(b"/prediction/v1/orders/status/") {
+                &self.status
+            } else {
+                &self.page
+            };
+            self.resp[..src.len()].copy_from_slice(src);
+            Ok((200, 0..src.len()))
+        }
+        fn resp(&self) -> &[u8] {
+            &self.resp
+        }
+    }
+
+    // Boot: the wallet (RFC 8032 TEST 1), gate 134's v0 order transaction,
+    // its build answer, the execute / status / recon answers.
+    let v = &signer_ed25519::RFC8032[0];
+    let signer = signer_ed25519::Ed25519Signer::from_seed(&v.seed).expect("gate 135 key");
+    let jup = [0x66u8; 32];
+    let mut msg = vec![0x80u8, 1, 0, 3, 6];
+    msg.extend_from_slice(&v.public);
+    msg.extend_from_slice(&[0x33; 32]);
+    msg.extend_from_slice(&[0x44; 32]);
+    msg.extend_from_slice(&[0x55; 32]);
+    msg.extend_from_slice(&jup);
+    msg.extend_from_slice(&TOKEN_PROGRAM);
+    msg.extend_from_slice(&[0xBB; 32]);
+    msg.push(2);
+    msg.extend_from_slice(&[4, 4, 0, 1, 2, 3, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
+    let mut data = vec![12u8];
+    data.extend_from_slice(&5_000_000u64.to_le_bytes());
+    data.push(6);
+    msg.extend_from_slice(&[5, 4, 1, 3, 2, 0, data.len() as u8]);
+    msg.extend_from_slice(&data);
+    msg.push(0);
+    let mut unsigned = vec![1u8];
+    unsigned.extend_from_slice(&[0u8; 64]);
+    unsigned.extend_from_slice(&msg);
+    let b58 = |k: &[u8; 32]| {
+        let mut o = [0u8; 44];
+        let n = core_crypto::base58_encode(k, &mut o).unwrap();
+        String::from_utf8(o[..n].to_vec()).unwrap()
+    };
+    let mut b64 = vec![0u8; core_crypto::base64_encoded_len(unsigned.len())];
+    let n = core_crypto::base64_encode(&unsigned, &mut b64);
+    let (wallet, order, position) = (b58(&v.public), b58(&[0x0A; 32]), b58(&[0x0B; 32]));
+    let build = format!(
+        r#"{{"transaction":"{}","txMeta":{{"blockhash":"x","lastValidBlockHeight":9}},"requiredSigners":["{wallet}"],"execution":{{"endpoint":"/execute","context":{{"type":"create_order","orderPubkey":"{order}"}}}},"order":{{"orderPubkey":"{order}","positionPubkey":"{position}","marketId":"POLY-5798888-1","isYes":true,"isBuy":true,"userPubkey":"{wallet}","maxBuyPriceUsd":"950000","estimatedTotalFeeUsd":"35000","orderCostUsd":"5000000","contractsMicro":"5263158"}}}}"#,
+        std::str::from_utf8(&b64[..n]).unwrap()
+    );
+    let status = format!(r#"{{"orderPubkey":"{order}","status":"filled","latestEventType":"filled","history":[]}}"#);
+    let page = format!(
+        r#"{{"data":[{{"pubkey":"{order}","status":"filled","filledContracts":"5.263158","avgFillPriceUsd":"950000","settled":false}}],"pagination":{{"hasNext":false}}}}"#
+    );
+    let client = FixedJup {
+        body: vec![0u8; BODY_MIN],
+        resp: vec![0u8; 8_192],
+        build: build.into_bytes(),
+        exec: br#"{"status":"Success","signature":"5h6x","error":null}"#.to_vec(),
+        status: status.into_bytes(),
+        page: page.into_bytes(),
+    };
+    let mut g = TxGuard::refuse_all(v.public);
+    assert!(g.allow_program(jup) && g.allow_program(TOKEN_PROGRAM));
+    g.deposit_account = [0x33; 32];
+    g.deposit_mint = [0x55; 32];
+    let (eng, gwe) = exec_gateway::duplex::<JupIntent, JupEvent, JUP_CMD_RING, JUP_EVT_RING>();
+    let (mut specs, specs_rx) = Ring::<PmWindowSpec, PM15_SPEC_RING>::new().split();
+    let cfg = JupGwCfg {
+        wallet: v.public,
+        usdc_mint: [0x55; 32],
+        guard: g,
+        max_order_micro: 50_000_000,
+        min_lead_ns: MIN_LEAD_NS_DEFAULT,
+    };
+    let mut gw = JupGateway::new(cfg, client, gwe, specs_rx, signer, b"gate-135-key").expect("jup-gw");
+    gw.set_idle_schedule(u64::MAX, u64::MAX);
+    let window = 5_974_360u32;
+    let inst = pm5_instance_id(window, 0).unwrap();
+    let mut spec = PmWindowSpec::EMPTY;
+    spec.window = window;
+    spec.market_id = 5_798_888;
+    assert!(specs.try_push_ref(&spec));
+    let mut arm = JupArm::new(
+        JupArmCfg {
+            slot: 11,
+            live_families: 1,
+            max_order_micro: 50_000_000,
+        },
+        eng,
+    )
+    .expect("the arm");
+    let leg = pm5_rolling_sym(0, pm5_pair_of_window(window), 1);
+    arm.on_venue_event(&ChannelEvent::new(0, VenueId::Polymarket, ChannelId::OutcomeMeta, leg, u64::from(inst), 0, 10_000, 5_000_000));
+    let wall = pm5_window_end_ns(window) - 10_000_000_000;
+    let mut now = 1_000_000_000u64;
+    let mut fills = 0u64;
+    let mut retired = 0u64;
+    let mut cycle = |seq: u64, now: &mut u64, fills: &mut u64, retired: &mut u64| {
+        let mut o = Order::new(
+            1,
+            VenueId::Jupiter,
+            leg,
+            Side::Bid,
+            core_fill::ORDER_KIND_IOC,
+            Price::from_raw(950_000),
+            Qty::from_raw(5_263_158),
+            (seq << 40) | (11 << 32) | u64::from(inst),
+        );
+        o.strategy_id = 11;
+        arm.submit(&o).expect("admitted");
+        gw.step(*now, wall);
+        gw.step(*now + POLL_EVERY_NS, wall);
+        gw.step(*now + POLL_EVERY_NS + 1, wall);
+        *now += 2 * POLL_EVERY_NS;
+        while let Some(f) = arm.try_next_fill() {
+            *fills += f.qty.raw() as u64;
+        }
+        while arm.try_next_retired().is_some() {
+            *retired += 1;
+        }
+        let _ = arm.on_idle();
+        while arm.try_next_retired().is_some() {
+            *retired += 1;
+        }
+    };
+    let mut seq = 1u64;
+    while seq <= 3 {
+        cycle(seq, &mut now, &mut fills, &mut retired);
+        seq += 1;
+    }
+    let guard_ = AllocGuard::new();
+    while seq <= 15 {
+        cycle(seq, &mut now, &mut fills, &mut retired);
+        seq += 1;
+    }
+    let (allocs, bytes, _) = guard_.delta();
+    let c = gw.counters();
+    assert_eq!((c.landed, c.fills, c.done, c.refused), (15, 15, 15, 0), "gate 135: every order landed, filled, done");
+    assert_eq!(fills, 15 * 5_263_158, "gate 135: every fill booked");
+    assert_eq!(retired, 15, "gate 135: every order retired");
+    assert_eq!(allocs, 0, "gate 135: jup-gw and the arm allocated {allocs} times ({bytes} B)");
+}
+
+/// PMJ J4 gate 136: slot 11's member on the 5-minute pool over the paper
+/// matcher's 5-minute held-quote branch, in steady state — the report grid,
+/// nowcast, pricer, persistence, the price floor, the $5 deposit sizing, the
+/// take, the IoC held for the keeper's delay and judged at the quote in
+/// force, its fill and the settlement. Zero bytes per operation.
+#[test]
+fn pmj_member_steady_state_is_zero_alloc() {
+    use clob_dispatcher::PaperMatcher;
+    use core_twaplock::late::LateLut;
+    use core_types::pm_roll::{
+        pm5_instance_id, pm5_mark_sym, pm5_pair_of_window, pm5_roll_family, pm5_rolling_sym,
+        pm5_window_end_ns, pm5_window_of_open, PM_LEG_DOWN, PM_LEG_UP, PM_SETTLED_UP, PM_TWAP_S,
+    };
+    use core_types::{ChannelEvent, ChannelId, Order, OrderEvent, Price, Qty, Tick, VenueId};
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+
+    /// The paper side: every order to the matcher, as slot 11's.
+    struct PaperCtx<'a> {
+        pm: &'a mut PaperMatcher,
+        now: u64,
+        n: &'a mut u64,
+    }
+    impl Ctx for PaperCtx<'_> {
+        fn submit(&mut self, mut order: Order) -> Result<(), SubmitErr> {
+            order.strategy_id = core_types::STRATEGY_SLOT_PMJ;
+            self.pm.submit(&order, self.now);
+            *self.n += 1;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    const S: u64 = 1_000_000_000;
+    const OPEN: u64 = 1_792_216_800;
+    let w = pm5_window_of_open(OPEN).unwrap();
+
+    // ---- boot: the member (configure, the grids) and the matcher ----
+    let mut lut = Box::new(LateLut::flat());
+    let mut z = 0usize;
+    while z < core_twaplock::late::LATE_PHI_POINTS {
+        lut.phi[z] = (500_000 + ((z as i64 * 2_000).min(4_000_000) / 8)) as u32;
+        z += 1;
+    }
+    let perp = core_types::make_symbol_id(VenueId::Hyperliquid, 1);
+    let mut perp_sym = [core_types::SYMBOL_ID_NONE; strategy_pmj::PMJ_MAX_FAMILIES];
+    perp_sym[0] = perp;
+    let p = strategy_pmj::PmjParams { n_families: 1, perp_sym, ..strategy_pmj::PmjParams::default() };
+    let mut m = strategy_pmj::PmjStrategy::new();
+    m.configure(p, lut, core_time::WallAnchor::new(0, 0)).expect("gate 136: configure");
+    let mut pm = Box::new(PaperMatcher::new());
+    pm.set_pm5_held_delay_ns(core_fill::held::PMJ_PAPER_DELAY_NS_DEFAULT);
+    let roll = |wc: u32, settled: bool, v0: i64| {
+        let pair = pm5_pair_of_window(wc);
+        let inst = pm5_instance_id(wc, 0).unwrap();
+        ChannelEvent::new(0, VenueId::Polymarket, ChannelId::InstrumentRoll, pm5_rolling_sym(0, pair, PM_LEG_UP), core_types::pack_roll_seq(inst, PM_TWAP_S, pm5_roll_family(0, pair), settled), 0, v0, pm5_window_end_ns(wc) as i64)
+    };
+    let law = |wc: u32, leg: u32| {
+        let inst = pm5_instance_id(wc, 0).unwrap();
+        ChannelEvent::new(0, VenueId::Polymarket, ChannelId::OutcomeMeta, pm5_rolling_sym(0, pm5_pair_of_window(wc), leg), u64::from(inst), 0, 10_000, 5_000_000)
+    };
+    let mut n = 0u64;
+    let (mut fills, mut events) = (0u64, 0u64);
+    let base: i64 = 81_000_000_000;
+    let g = AllocGuard::new();
+    let mut cycle = 0u32;
+    // Four 5-minute windows six apart (one slot pair, 30 minutes between
+    // opens), each with the 20 minutes of tape before it; the favourite's ask
+    // (0.93) clears the 0.90 floor and holds through the keeper's delay.
+    while cycle < 4 {
+        let wc = w + 6 * cycle;
+        let open = OPEN + u64::from(cycle) * 1_800;
+        let end = open + 300;
+        let pair = pm5_pair_of_window(wc);
+        let mut s = open - 1_200;
+        while s < end - 2 {
+            if s == open {
+                let mut c = PaperCtx { pm: &mut pm, now: open * S, n: &mut n };
+                m.on_venue_event(&roll(wc, false, 0), &mut c);
+                m.on_venue_event(&law(wc, PM_LEG_UP), &mut c);
+                m.on_venue_event(&law(wc, PM_LEG_DOWN), &mut c);
+            }
+            let px = if s >= open { base + 400_000_000 } else { base } + if s % 2 == 0 { 2_000_000 } else { -2_000_000 };
+            let t_perp = s * S - 200_000_000;
+            {
+                let mut c = PaperCtx { pm: &mut pm, now: t_perp, n: &mut n };
+                m.on_tick(&Tick::new(t_perp, VenueId::Hyperliquid, perp, 1, Price::from_raw(px - 500_000), Qty::from_raw(1), Price::from_raw(px + 500_000), Qty::from_raw(1)), &mut c);
+            }
+            let now = s * S + 1_300_000_000;
+            let up = Tick::new(now, VenueId::Polymarket, pm5_rolling_sym(0, pair, PM_LEG_UP), 1, Price::from_raw(920_000), Qty::from_raw(500_000_000), Price::from_raw(930_000), Qty::from_raw(500_000_000));
+            let down = Tick::new(now, VenueId::Polymarket, pm5_rolling_sym(0, pair, PM_LEG_DOWN), 1, Price::from_raw(70_000), Qty::from_raw(500_000_000), Price::from_raw(80_000), Qty::from_raw(500_000_000));
+            pm.observe_tick(&up, now);
+            pm.observe_tick(&down, now);
+            {
+                let mut c = PaperCtx { pm: &mut pm, now, n: &mut n };
+                m.on_venue_event(&ChannelEvent::new(now, VenueId::Polymarket, ChannelId::Mark, pm5_mark_sym(0), s, s * 1_000, px, px * 1_000_000), &mut c);
+                m.on_tick(&up, &mut c);
+                m.on_tick(&down, &mut c);
+                m.on_timer(now, &mut c);
+            }
+            while let Some(f) = pm.try_next_fill() {
+                fills += 1;
+                let mut c = PaperCtx { pm: &mut pm, now, n: &mut n };
+                m.on_fill(&f, &mut c);
+            }
+            let mut ev = OrderEvent::ZERO;
+            while pm.try_next_order_event(&mut ev) {
+                events += 1;
+                let mut c = PaperCtx { pm: &mut pm, now, n: &mut n };
+                m.on_order_event(&ev, &mut c);
+            }
+            s += 1;
+        }
+        let mut c = PaperCtx { pm: &mut pm, now: end * S, n: &mut n };
+        m.on_venue_event(&roll(wc, true, PM_SETTLED_UP), &mut c);
+        cycle += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    let ct = m.counters();
+    assert!(n >= 4 && fills >= 4 && ct.settled_won == 4, "gate 136: the member took, the held law filled and the member settled every cycle ({n} orders, {fills} fills, {events} events, {ct:?})");
+    assert_eq!(pm.held_pending(), 0, "gate 136: every held IoC judged");
+    assert_eq!(allocs, 0, "gate 136: slot 11's member and the 5-minute held law allocated {allocs} times ({bytes} B)");
+    std::hint::black_box(ct);
+}

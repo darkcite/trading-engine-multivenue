@@ -451,3 +451,84 @@ fn a_late_fill_books_by_its_client_id() {
     );
     assert_eq!(m.counters().unknown_fills, 1);
 }
+
+/// PMJ J1b (R-PMJ-3): the 5-minute families are slot 11's. Their rolls,
+/// order laws, marks and touches reach slot 9 on the same lane once the
+/// 5-minute ingress runs; none of them may change an order, a market or a
+/// counter of this member.
+#[test]
+fn five_minute_records_leave_slot_9_untouched() {
+    use core_types::pm_roll::{
+        pm5_instance_id, pm5_mark_sym, pm5_pair_of_window, pm5_roll_family, pm5_rolling_sym,
+        pm5_window_end_ns, pm5_window_of_open,
+    };
+    let w = pm_window_of_open(OPEN).unwrap();
+    let mut m = member();
+    let mut c = TestCtx {
+        now: OPEN * S,
+        orders: Vec::new(),
+    };
+    m.on_venue_event(&roll(w, false, 0), &mut c);
+    let before = m.counters();
+    let w5 = pm5_window_of_open(OPEN).unwrap();
+    let pair = pm5_pair_of_window(w5);
+    let inst = pm5_instance_id(w5, 0).unwrap();
+    let created = ChannelEvent::new(
+        0,
+        VenueId::Polymarket,
+        ChannelId::InstrumentRoll,
+        pm5_rolling_sym(0, pair, PM_LEG_UP),
+        pack_roll_seq(inst, PM_TWAP_S, pm5_roll_family(0, pair), false),
+        0,
+        0,
+        pm5_window_end_ns(w5) as i64,
+    );
+    let settled = ChannelEvent::new(
+        0,
+        VenueId::Polymarket,
+        ChannelId::InstrumentRoll,
+        pm5_rolling_sym(0, pair, PM_LEG_UP),
+        pack_roll_seq(inst, PM_TWAP_S, pm5_roll_family(0, pair), true),
+        0,
+        PM_SETTLED_DOWN,
+        pm5_window_end_ns(w5) as i64,
+    );
+    let law5 = ChannelEvent::new(
+        0,
+        VenueId::Polymarket,
+        ChannelId::OutcomeMeta,
+        pm5_rolling_sym(0, pair, PM_LEG_DOWN),
+        u64::from(inst),
+        0,
+        10_000,
+        5_000_000,
+    );
+    let mark5 = ChannelEvent::new(
+        OPEN * S,
+        VenueId::Polymarket,
+        ChannelId::Mark,
+        pm5_mark_sym(0),
+        OPEN,
+        OPEN * 1_000,
+        BASE,
+        BASE * 1_000_000,
+    );
+    m.on_venue_event(&created, &mut c);
+    m.on_venue_event(&law5, &mut c);
+    m.on_venue_event(&mark5, &mut c);
+    let t5 = Tick::new(
+        OPEN * S,
+        VenueId::Polymarket,
+        pm5_rolling_sym(0, pair, PM_LEG_UP),
+        1,
+        Price::from_raw(950_000),
+        Qty::from_raw(500_000_000),
+        Price::from_raw(960_000),
+        Qty::from_raw(500_000_000),
+    );
+    m.on_tick(&t5, &mut c);
+    m.on_venue_event(&settled, &mut c);
+    assert_eq!(m.counters(), before, "a 5 m record changed slot 9's counters");
+    assert!(c.orders.is_empty(), "a 5 m record made slot 9 order");
+    assert_eq!(m.market(0, pm_pair_of_window(w)).instance, pm_instance_id(w, 0).unwrap());
+}

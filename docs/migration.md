@@ -6,6 +6,100 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-18 — PMJ J4: slot 11 `pmj` (`BUILT_MASK` 0x0AFF), `pmj.toml`, the `engine_pmj_*` family, 5-minute held quotes
+
+**What changed** (rulings R-PMJ-1, R-PMJ-3; risk-policy "PMJ — slot 11", `### J4`)
+- `strategy-set`: the member row `pmj` at slot 11; **`BUILT_MASK` 0x02FF →
+  0x0AFF**. `ALL_MASK` (`all`) stays 0x00FF: slot 11 runs only when
+  `--strategy` names `pmj`. `/state`'s slot 11 reads **`pmj`** (it read
+  `reserved`), and so do the dashboard and the exec boot's slot list.
+- New artifact **`~/multivenue/pmj.toml`** (`core_config::pmj`, one `[pmj]`
+  section; `--pmj <path>` overrides the default, and the wrapper passes it
+  from `PMJ_TOML=<path>` in `strategy.conf`). A boot whose `--strategy`
+  names `pmj` without it aborts; `multivenue-engine pmj-check` validates it
+  offline. Its `families` must equal the universe's 5-minute
+  `[polymarket] rolling` list, in order. A `pm15.toml` copied whole refuses.
+- `/metrics`: **`engine_pmj_<tally>_total`** (31 counters, pm15's tally
+  names) and six gauges (`engine_pmj_pnl_usd_1e6`, `_fees_usd_1e6`,
+  `_bought_usd_1e6`, `_open_cost_usd_1e6`, `_markets_live`, `_halted`),
+  registered at every boot (zero while slot 11 idles).
+- Paper fills: the held-quote book (`core_fill::held`) carries the 5-minute
+  legs after the 15-minute ones; a 5-minute IoC is judged at submit +
+  `paper_delay_ms` (2 s default).
+- `scripts/pmj-flip.sh` (`status`, `paper`; `live` refuses); `scripts/engine-wrapper.sh`
+  `PMJ_TOML` (the `XMM_TOML` shape: a file, `STRATEGY` carrying `pmj`, else exit 78).
+
+**Readers:** a `/state` reader that maps slot 11 to `reserved` now sees
+`pmj`; a capture of a boot that names `pmj` carries orders with venue byte
+10 (Jupiter) on the 5-minute Polymarket syms. The schema-1 backtest output is
+unchanged. **Rollback:** the previous binary refuses a `--strategy` naming
+`pmj` (an unknown member) — remove the name with it; `pmj.toml` may stay
+(nothing else reads it).
+
+## 2026-10-18 — PMJ J3: `VenueId::Jupiter` = 10 (`VENUE_COUNT` 11), `exec.toml` venue `jupiter`, the `exec-jupiter` crate
+
+**What changed** (ruling R-PMJ-S2; risk-policy "PMJ — slot 11", `### J3`)
+- `core_types::VenueId` gains **`Jupiter = 10`**; `VENUE_COUNT` 10 → **11**.
+  It is an execution route with no market data: no tick, depth, option or
+  fill lane, staleness 0, paper activation 0, harness latency 0 (dead, like
+  `Ai`), never tradeable in the harness. Every `[_; VENUE_COUNT]` table
+  gained its eleventh column at the end; no existing index moved.
+- `exec.toml`: the venue name **`jupiter`** (byte 10) parses. A live slot
+  naming it refuses the boot (only slot 11 may, and a live slot 11 refuses
+  until a `PMJ-DUST-GATE` line); a paper slot naming it arms nothing.
+- `core_types::STRATEGY_SLOT_PMJ` = 11 (the member arrives with J4).
+- `cli::exec_boot::{LIVE_ARM_VENUES, PNL_JUDGING_VENUES}` gain Jupiter.
+- New crate `crates/exec-jupiter` (the slot-11 arm, built and rig-tested;
+  nothing links it into the engine in this pass). Its state file,
+  `pmj-held.state` (`pmj-held v1 owner=<base58>`, one `leg` line per held
+  position), has no writer until J5.
+
+**Readers:** an offline reader that decodes a venue byte must accept 10
+(`VenueId::from_u8(10)` is now `Some`); no capture written today carries it
+(no member stamps venue 10 before J4, and slot 11 runs paper). The harness's
+model tables index by the venue byte and grew by one; the schema-1 backtest
+output is unchanged. **Rollback:** the previous binary refuses an
+`exec.toml` that names `jupiter` (an unknown venue) — remove the name with
+it.
+
+## 2026-10-18 — PMJ J1b: the 5-minute rolling families (their own sym pool, tick/event lane 9, the `pm5` capture), `LEDGER_ROWS` 64, the rolling depth capture
+
+**What changed** (rulings R-PMJ-3, R-PMJ-S1 and R-PMJ-S2; risk-policy "PMJ — slot 11")
+- `universe.toml` `[polymarket] rolling` accepts `updown:<asset>:5m` beside
+  `updown:<asset>:15m`, at most 8 families per period. **A family's index
+  is its rank among its period's keys**: a `:5m` key anywhere in the list
+  moves no 15-minute family's index, syms or manifest rows (pinned by a
+  test). A 5-minute family allocates SEVEN manifest rows,
+  `polymarket-rolling:updown:<asset>:5m[up0|down0|up1|down1|up2|down2|mark]`.
+- `core_types::pm_roll`: the 5-minute pool — ordinals 4160 + 7·g + offset
+  on venue byte 0 (above the whole 15-minute pool, 4096..4136), three token
+  pairs by window mod 3, roll family bytes **16..40** (`16 + 3·g + pair`;
+  the 15-minute families keep 0..16), instance ids `0x8000_0000 |
+  (window5 · 8 + g)` (bit 31 = 5 m; a 15-minute id never has it), the 300 s
+  grid. `PmPeriod` serves code shared by both pools; every 15-minute
+  answer is the old free function's own.
+- `engine::NUM_TICK_LANES` (= `NUM_EVENT_LANES`) 9 → **10**; `PM5_LANE` = 9
+  carries the 5-minute pipeline's ticks and events (venue byte Polymarket,
+  wired by index). Empty, the unspawned shape, without a `:5m` key.
+- Capture: the 5-minute pipeline writes the `pm5-*.pmlr` files (label
+  `pm5`); `--raw-tap` accepts `pm5`; `/metrics` gains
+  `engine_ingress_pm5_state`, the `pm5` ingress counters and capture
+  gauges, and the `engine_ingress_pm5_*` family (the `pm15` family's
+  shape).
+- **`pm15-depth.pmlr` (and `pm5-depth.pmlr`) now carry data**: a top-5
+  `DepthTopK` per leg, change-gated, whenever the leg's slot ticks. The file
+  existed empty in every run before.
+- `exec_router::LEDGER_ROWS` 32 → **64** (`Ledger` 151 168 → 161 408 B):
+  the 5-minute families' roll family bytes reach 39.
+- `PmWindowSpec` gains `market_id` (the Gamma market id); the rolling
+  `PmFamilies` / driver arrays are sized for three pairs (24 slots, 48 legs).
+
+**Readers:** an offline reader of `InstrumentRoll` events must accept family
+bytes up to 39 and the flagged 5-minute instance ids; nothing in the worker
+reads the rolling families today. **Rollback:** the previous binary reads a
+`:5m` key as a refused universe (`only the 15m period exists`), so roll the
+universe back with it.
+
 ## 2026-10-16 — BIN15 trades the late-window law only: the old arms, their keys, counters and sidecar blocks are removed (BIN15 H90 G3)
 
 **What changed** (ruling O-GL-2; the removed law and its recovery commit,

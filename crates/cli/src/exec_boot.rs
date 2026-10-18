@@ -111,11 +111,19 @@ use tracing::info;
 /// only alone: its arm (`exec_polymarket`, `cli::pm15_live`) sends FAK
 /// BUYs on CLOB V2 from the slot's own account. The legacy Polymarket
 /// `--live` dispatcher is not this arm and never arms through it.
+///
+/// **PMJ J3 (R-PMJ-S2): `VenueId::Jupiter`**, for slot 11 only
+/// ([`PMJ_SLOT`]) and only alone: its arm (`exec_jupiter`) builds keeper
+/// orders on Jupiter Prediction, guards and signs their Solana
+/// transactions. Listed so the venue has its place in the law; a live
+/// slot 11 — or a live slot naming `jupiter` — still refuses the boot
+/// until the `PMJ-DUST-GATE` ruling (risk-policy "PMJ — slot 11").
 pub const LIVE_ARM_VENUES: &[u8] = &[
     core_types::VenueId::Hyperliquid as u8,
     core_types::VenueId::HyperEvm as u8,
     core_types::VenueId::Binance as u8,
     core_types::VenueId::Polymarket as u8,
+    core_types::VenueId::Jupiter as u8,
 ];
 
 /// **BX6 (obligation 5)** — the venues whose live arm judges the E7
@@ -127,10 +135,15 @@ pub const LIVE_ARM_VENUES: &[u8] = &[
 /// PM15-6c: Polymarket — slot 9's arm judges its account's pUSD with its
 /// unredeemed legs at cost (a settled loss at 0) against the session
 /// anchor (`exec_polymarket::arm`).
+///
+/// PMJ J3: Jupiter — slot 11's arm judges the wallet's USDC with its
+/// unclaimed legs at cost (a settled loss at 0) against the session
+/// anchor (`exec_jupiter::arm`), the same law as slot 9's.
 pub const PNL_JUDGING_VENUES: &[u8] = &[
     core_types::VenueId::Hyperliquid as u8,
     core_types::VenueId::Binance as u8,
     core_types::VenueId::Polymarket as u8,
+    core_types::VenueId::Jupiter as u8,
 ];
 
 /// PM15-6c: the one slot with a live Polymarket arm, `pm15` — live on
@@ -165,6 +178,12 @@ pub const BIN15_SLOT: usize = strategy_set::SLOT_BIN15 as usize;
 /// E6 ledger has no options row, and the member's HL hedges would need
 /// their own reconciled account.
 pub const HCV_SLOT: usize = strategy_set::SLOT_HCV as usize;
+
+/// PMJ J3 (R-PMJ-1, R-PMJ-S2): slot 11 (`pmj`) is paper only. A live slot
+/// 11 refuses the boot until the `PMJ-DUST-GATE` ruling, whatever venues
+/// it names, and `jupiter` is slot 11's venue alone: the arm is built
+/// and rig-tested (J3), never armed in this pass.
+pub const PMJ_SLOT: usize = core_types::STRATEGY_SLOT_PMJ as usize;
 
 /// Three crates name their own slot count and the dependency graph
 /// forbids them importing each other's. Assert all three agree at
@@ -594,7 +613,7 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
     let unbuilt = (artifact_mask | flag_mask) & !strategy_set::BUILT_MASK;
     if unbuilt != 0 {
         return Err(format!(
-            "exec: slots {} have no member in THIS binary (S16-R5: slots 8–15 are \
+            "exec: slots {} have no member in THIS binary (S16-R5: slots 8, 10 and 12–15 are \
              reserved) — refusing to arm a slot nothing trades from. ({} marks {} live, \
              --arm-live names {}.) A member there is its own lane and its own ruling.",
             render_slot_mask(unbuilt),
@@ -686,6 +705,24 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                  only by ruling O-HC18. Arming it is its own live-arming ruling, which must \
                  settle the E6 ledger's options row, its HL hedges' reconciled account and the \
                  two-venue composition. Refusing the boot."
+            ));
+        }
+
+        // PMJ J3: slot 11 is paper only until the PMJ-DUST-GATE ruling
+        // ([`PMJ_SLOT`]), and Jupiter is slot 11's alone.
+        if mode == ExecMode::Live && slot == PMJ_SLOT {
+            return Err(format!(
+                "exec: slot {slot} ({slot_name}) is marked live, but slot {slot} is paper only \
+                 until the PMJ-DUST-GATE ruling (risk-policy \"PMJ — slot 11\"): the Jupiter \
+                 arm is built and rig-tested, never armed — its transaction guard refuses \
+                 everything until J0's decoded programs and lookup tables are reviewed into \
+                 the pmj.toml `guard_*` keys, and a dust run must land first. Refusing the boot."
+            ));
+        }
+        if mode == ExecMode::Live && s.venues.contains(&(core_types::VenueId::Jupiter as u8)) {
+            return Err(format!(
+                "exec: slot {slot} ({slot_name}) is marked live for `jupiter`, whose only arm \
+                 is slot 11's (pmj) — refusing"
             ));
         }
 
@@ -1938,6 +1975,7 @@ mod tests {
                 core_types::VenueId::HyperEvm as u8,
                 core_types::VenueId::Binance as u8,
                 core_types::VenueId::Polymarket as u8,
+                core_types::VenueId::Jupiter as u8,
             ]
         );
         assert!(b.hl_arm_needed() && !b.hyparb_live() && !b.pm15_live());
@@ -2284,6 +2322,53 @@ mod tests {
         assert!(e.contains("NoneSym"), "{e}");
     }
 
+    /// PMJ J4 (R-PMJ-1): slot 11 is built and PAPER only — a live slot 11
+    /// refuses the boot whatever venues it names, agreed by `--arm-live`;
+    /// a paper slot 11 on `jupiter` is an ordinary artifact.
+    #[test]
+    fn a_live_slot_eleven_refuses_it_is_paper_only() {
+        let d = tmp();
+        let live = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.11]")
+            .replace("name = \"bin15\"", "name = \"pmj\"")
+            .replace("[\"hyperliquid\"]", "[\"jupiter\"]");
+        let p = write(&d, "exec.toml", &live);
+        let e = resolve(Some(&p), Some("11")).unwrap_err();
+        assert!(e.contains("slot 11 (pmj)") && e.contains("PMJ-DUST-GATE"), "{e}");
+        assert!(e.contains("Refusing the boot"), "{e}");
+        let on_hl = live.replace("[\"jupiter\"]", "[\"hyperliquid\"]");
+        let p = write(&d, "exec-hl.toml", &on_hl);
+        let e = resolve(Some(&p), Some("11")).unwrap_err();
+        assert!(e.contains("PMJ-DUST-GATE"), "whatever venues it names: {e}");
+        let paper = live.replacen("mode = \"live\"", "mode = \"paper\"", 1);
+        let p = write(&d, "exec-paper.toml", &paper);
+        let b = resolve(Some(&p), None).expect("a paper slot 11 is fine").expect("present");
+        assert_eq!(b.route.mode_at(PMJ_SLOT), Some(ExecMode::Paper));
+        assert_eq!(b.live_mask, 0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// PMJ J3: `jupiter` is in both router lists, and still nothing arms
+    /// it — a live slot naming it refuses (slot 11's own refusal is
+    /// pinned with the member, J4), while a paper one is an ordinary
+    /// artifact.
+    #[test]
+    fn a_live_jupiter_venue_refuses_and_a_paper_one_boots() {
+        assert!(LIVE_ARM_VENUES.contains(&(core_types::VenueId::Jupiter as u8)));
+        assert!(PNL_JUDGING_VENUES.contains(&(core_types::VenueId::Jupiter as u8)));
+        assert_eq!(PMJ_SLOT, 11);
+        let d = tmp();
+        let live = MINIMAL_LIVE.replace("[\"hyperliquid\"]", "[\"jupiter\"]");
+        let p = write(&d, "exec.toml", &live);
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("`jupiter`") && e.contains("slot 11's (pmj)"), "{e}");
+        let paper = live.replacen("mode = \"live\"", "mode = \"paper\"", 1);
+        let p = write(&d, "exec-paper.toml", &paper);
+        let boot = resolve(Some(&p), None).expect("a paper jupiter slot is fine").expect("present");
+        assert_eq!(boot.route.mode_at(BIN15_SLOT), Some(ExecMode::Paper));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     /// HC9: a live `hypercall` venue refuses the boot with its own
     /// reason — the arm exists, the engine does not arm it before slot
     /// 7's ruling — and the refusal names what that ruling settles.
@@ -2577,6 +2662,29 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// **PMJ J4** — `scripts/pmj-flip.sh` has no path to a live slot 11:
+    /// its `live` verb only refuses, it never writes a live `mode`, and the
+    /// one `ARM_LIVE` it writes is the list without 11.
+    #[test]
+    fn the_pmj_flip_has_no_live_path() {
+        const FLIP: &str = include_str!("../../../scripts/pmj-flip.sh");
+        let live = FLIP.find("\n  live)\n").expect("the live verb");
+        let body = &FLIP[live..live + FLIP[live..].find(";;").expect("its end")];
+        assert!(body.contains("die \"live is out of scope"), "live refuses");
+        assert!(body.lines().count() <= 4, "and does nothing else");
+        assert!(!FLIP.contains("mode = \\\"live\\\"") && !FLIP.contains("mode = \"live\""), "no live mode written");
+        assert_eq!(
+            FLIP.matches("kv_set ARM_LIVE").count(),
+            FLIP.matches("kv_set ARM_LIVE \"$(arm_without_11)\"").count(),
+            "ARM_LIVE is only ever written without 11"
+        );
+        assert!(FLIP.contains("$1 != \"11\""), "the list drops 11");
+        assert!(
+            FLIP.contains("kv_off ARM_LIVE \"$work_conf\"\n          kv_off EXEC_TOML \"$work_conf\""),
+            "slot 11 alone: both keys go together (the wrapper refuses one without the other)"
+        );
+    }
+
     /// The caps line is the last thing an operator reads before real
     /// money, so pin it exactly — including the two tokens that say
     /// nothing is enforced yet.
@@ -2696,7 +2804,8 @@ mod tests {
         assert_eq!(render_slot_mask((1 << 11) | (1 << 15)), "[11,15]");
         assert_eq!(render_slot_mask((1 << 3) | (1 << 11)), "[3,11]");
         assert_eq!(render_slot_mask(SlotMask::MAX), "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]");
-        assert_eq!(describe_slots((1 << 3) | (1 << 11)), "3 (bin15), 11 (reserved)");
+        assert_eq!(describe_slots((1 << 3) | (1 << 11)), "3 (bin15), 11 (pmj)");
+        assert_eq!(describe_slots((1 << 3) | (1 << 12)), "3 (bin15), 12 (reserved)");
         assert_eq!(describe_slots(1 << 15), "15 (reserved)");
         assert!(slot_in(1 << 11, 11) && !slot_in(1 << 11, 3));
         assert!(!slot_in(SlotMask::MAX, 16) && !slot_in(SlotMask::MAX, 255));
@@ -2707,12 +2816,12 @@ mod tests {
     #[test]
     fn an_unbuilt_slot_is_never_armed() {
         let d = tmp();
-        let live11 = MINIMAL_LIVE
-            .replace("[exec.slot.3]", "[exec.slot.11]")
+        let live12 = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.12]")
             .replace("name = \"bin15\"", "name = \"reserved\"");
-        let p = write(&d, "exec.toml", &live11);
-        let e = resolve(Some(&p), Some("11")).unwrap_err();
-        assert!(e.contains("no member") && e.contains("[11]"), "{e}");
+        let p = write(&d, "exec.toml", &live12);
+        let e = resolve(Some(&p), Some("12")).unwrap_err();
+        assert!(e.contains("no member") && e.contains("[12]"), "{e}");
         // The message renders on single spaces (its `\` continuations).
         assert!(e.contains("are reserved) ") && e.contains("live, --arm-live"), "{e}");
         assert!(!e.contains("  "), "{e}");
@@ -2721,14 +2830,14 @@ mod tests {
         let p3 = write(&d, "exec3.toml", MINIMAL_LIVE);
         let e = resolve(Some(&p3), Some("3,15")).unwrap_err();
         assert!(e.contains("no member") && e.contains("[15]"), "{e}");
-        let e = resolve(Some(&p3), Some("11")).unwrap_err();
-        assert!(e.contains("[11]"), "{e}");
+        let e = resolve(Some(&p3), Some("12")).unwrap_err();
+        assert!(e.contains("[12]"), "{e}");
         assert!(resolve(Some(&p3), Some("3")).unwrap().unwrap().slot_live(3));
         // A paper section for a reserved slot arms nothing and resolves.
-        let paper11 = write(&d, "exec11.toml", "[exec]\n[exec.slot.11]\nmode = \"paper\"\n");
-        let b = resolve(Some(&paper11), None).unwrap().unwrap();
+        let paper12 = write(&d, "exec12.toml", "[exec]\n[exec.slot.12]\nmode = \"paper\"\n");
+        let b = resolve(Some(&paper12), None).unwrap().unwrap();
         assert_eq!(b.live_mask, 0);
-        assert_eq!(b.route.mode_at(11), Some(ExecMode::Paper));
+        assert_eq!(b.route.mode_at(12), Some(ExecMode::Paper));
     }
 
     /// **S16-3** — `ExecBoot`'s live questions read bit `s` as slot `s`
@@ -2773,7 +2882,7 @@ mod tests {
         // Slot 3 on its gateway beside a live slot 11 on the blocking arm:
         // refused, naming 11.
         let e = check_bin15_gateway(&slots, (1 << 3) | (1 << 11)).unwrap_err();
-        assert!(e.contains("slot 11 (reserved)"), "{e}");
+        assert!(e.contains("slot 11 (pmj)"), "{e}");
         // A live 11 alone is not slot 3 on its gateway.
         assert!(check_bin15_gateway(&slots, 1 << 11).is_ok());
         // Slot 3 alone: slot 11's section is paper by the mask.

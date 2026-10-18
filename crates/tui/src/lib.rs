@@ -794,8 +794,9 @@ mod tests {
         let mut s = Box::new(EngineSnapshot::empty());
         let shown = |s: &EngineSnapshot| (0..SNAPSHOT_SLOTS).filter(|&i| slot_shown(s, i)).count();
         assert_eq!(SNAPSHOT_SLOTS, 16);
-        assert_eq!(shown(&s), 9, "an idle boot shows the nine members (pm15 at 9)");
+        assert_eq!(shown(&s), 10, "an idle boot shows the ten members (pm15 at 9, pmj at 11)");
         assert!(slot_shown(&s, 9), "pm15 is a member");
+        assert!(slot_shown(&s, 11), "pmj is a member");
         s.boot.configured_mask = 1 << 10;
         assert!(slot_shown(&s, 10));
         s.boot.configured_mask = 0;
@@ -807,7 +808,7 @@ mod tests {
         s.regime.gates[12] = 0;
         s.slots[8] = strategy_core::SlotCounters::new(0, 1, 0, 0);
         assert!(slot_shown(&s, 8));
-        assert_eq!(shown(&s), 10);
+        assert_eq!(shown(&s), 11);
     }
 
     #[test]

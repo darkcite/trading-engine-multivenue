@@ -31,3 +31,5 @@ strategy-xmm         = { workspace = true }
 # HC11: the slot-7 member (Hypercall S1 — DARK, paper only).
 strategy-hcv         = { workspace = true }
 strategy-pm15        = { workspace = true }
+# PMJ J4: the slot-11 member (H90 on the 5-minute families via Jupiter; paper).
+strategy-pmj         = { workspace = true }

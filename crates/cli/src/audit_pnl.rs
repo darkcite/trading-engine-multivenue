@@ -2167,8 +2167,9 @@ mod tests {
             assert_eq!(strategy_label(i as u8), *m);
         }
         assert_eq!(strategy_label(9), "pm15");
+        assert_eq!(strategy_label(11), "pmj");
         for id in 8..MAX_STRATEGY_SLOTS {
-            if id != 9 {
+            if id != 9 && id != 11 {
                 assert_eq!(strategy_label(id), "reserved", "slot {id}");
             }
         }

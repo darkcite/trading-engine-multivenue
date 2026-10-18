@@ -92,6 +92,13 @@ pub enum VenueId {
     /// (`ingress-hypercall`, public `indicative_market_data` WS + REST
     /// `/options-summary`). Data-only: no exec arm until its own ruling.
     Hypercall = 9,
+    /// PMJ J3 (R-PMJ-S2, 2026-10-18): Jupiter Prediction on Solana — an
+    /// EXECUTION-ROUTE venue with no market data of its own. Slot 11's
+    /// orders keep the Polymarket leg's sym (venue byte 0: the book they
+    /// are judged against) and carry `Order.venue` = 10, the venue that
+    /// executes them (`exec-jupiter`). No tick, depth, option or fill
+    /// lane; no staleness threshold (0, never judged, as `Ai`).
+    Jupiter = 10,
 }
 
 impl VenueId {
@@ -116,6 +123,7 @@ impl VenueId {
             7 => Some(Self::Mexc),
             8 => Some(Self::HyperEvm),
             9 => Some(Self::Hypercall),
+            10 => Some(Self::Jupiter),
             _ => None,
         }
     }
@@ -155,6 +163,8 @@ impl VenueId {
             // (n 10 159) — rounded up. (`published_at`, the wire leg
             // alone, is 217.9.) Override: `--stale-after-ms hypercall:<ms>`.
             Self::Hypercall => 500,
+            // PMJ J3: no market data — never judged, as `Ai`.
+            Self::Jupiter => 0,
         }
     }
 
@@ -173,6 +183,7 @@ impl VenueId {
             Self::Mexc.default_stale_after_ms(),
             Self::HyperEvm.default_stale_after_ms(),
             Self::Hypercall.default_stale_after_ms(),
+            Self::Jupiter.default_stale_after_ms(),
         ]
     }
 }
@@ -181,8 +192,9 @@ impl VenueId {
 /// the venue byte (stale thresholds, the fill model's fee / Δ / activation
 /// columns, the matcher's activation table). HYPARB (O-H11) introduced it
 /// when HyperEVM took byte 8: the next venue is ONE edit here plus its
-/// arms, not a sweep of literal `8`s. HC1: Hypercall took byte 9.
-pub const VENUE_COUNT: usize = 10;
+/// arms, not a sweep of literal `8`s. HC1: Hypercall took byte 9. PMJ J3:
+/// Jupiter took byte 10 (an execution route, no market data).
+pub const VENUE_COUNT: usize = 11;
 const _: () = assert!(
     VenueId::from_u8(VENUE_COUNT as u8 - 1).is_some()
         && VenueId::from_u8(VENUE_COUNT as u8).is_none()
@@ -2584,6 +2596,11 @@ pub const STRATEGY_SLOT_BIN15: u8 = 3;
 /// until then, so no capture carries another member's rows under it.
 pub const STRATEGY_SLOT_PM15: u8 = 9;
 
+/// Strategy-set slot of `strategy-pmj` (PMJ, R-PMJ-1, 2026-10-18): H90 on
+/// Polymarket's rolling 5-minute up/down markets, executed on Jupiter
+/// (`VenueId::Jupiter`). Paper only until a `PMJ-DUST-GATE` ruling.
+pub const STRATEGY_SLOT_PMJ: u8 = 11;
+
 /// `AiCmd::side` sentinel meaning "no side" (every kind except
 /// `OrderIntent`).
 pub const AI_SIDE_NONE: u8 = 0xFF;
@@ -3952,7 +3969,8 @@ pub const fn funding_period_s(venue: VenueId) -> u32 {
         | VenueId::Deribit
         | VenueId::Ai
         | VenueId::HyperEvm
-        | VenueId::Hypercall => 0,
+        | VenueId::Hypercall
+        | VenueId::Jupiter => 0,
     }
 }
 
@@ -4798,6 +4816,7 @@ mod tests {
             VenueId::Mexc,
             VenueId::HyperEvm,
             VenueId::Hypercall,
+            VenueId::Jupiter,
         ];
         assert_eq!(all.len(), VENUE_COUNT);
         let mut i = 0;
@@ -4813,8 +4832,10 @@ mod tests {
     #[test]
     fn venue_id_rejects_unknown_bytes() {
         // 6 became Bybit at WS9, 7 MEXC at MX2, 8 HyperEvm at HYPARB
-        // and 9 Hypercall at HC1 — the first unassigned byte is now 10.
-        assert_eq!(VenueId::from_u8(10), None);
+        // and 9 Hypercall at HC1, 10 Jupiter at PMJ J3 — the first
+        // unassigned byte is now 11.
+        assert_eq!(VenueId::from_u8(10), Some(VenueId::Jupiter));
+        assert_eq!(VenueId::from_u8(11), None);
         assert_eq!(VenueId::from_u8(254), None);
         // 255 is the venue byte of SYMBOL_ID_NONE — must never decode.
         assert_eq!(VenueId::from_u8(255), None);
@@ -5029,6 +5050,8 @@ mod tests {
         assert_eq!(VenueId::HyperEvm.default_stale_after_ms(), 2_500);
         // HC0: the quote-stamp feed-delay p99 447.6 ms rounded up.
         assert_eq!(VenueId::Hypercall.default_stale_after_ms(), 500);
+        // PMJ J3: an execution route, no feed to judge.
+        assert_eq!(VenueId::Jupiter.default_stale_after_ms(), 0);
     }
 
     #[test]

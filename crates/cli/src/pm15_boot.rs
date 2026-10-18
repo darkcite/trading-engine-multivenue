@@ -182,9 +182,11 @@ pub fn check(universe: Option<&Path>, artifact: Option<&Path>) -> Result<String,
         okx_depth: false,
         deribit_depth: false,
     })?;
-    if boot.pm_rolling.is_empty() {
+    // PMJ J1b: slot 9's families are the 15-minute keys only.
+    let rolling = core_config::universe::pm_rolling_15m(&boot.pm_rolling);
+    if rolling.is_empty() {
         return Err(String::from(
-            "universe: `[polymarket] rolling` is empty — slot 9 has no family",
+            "universe: `[polymarket] rolling` has no 15m family — slot 9 has no family",
         ));
     }
     let table = ingress_ai::DescriptorTable::from_entries(
@@ -201,11 +203,11 @@ pub fn check(universe: Option<&Path>, artifact: Option<&Path>) -> Result<String,
     match load_pm15_boot(
         artifact,
         &|d: &str| table.resolve(d.as_bytes()).map(|(sym, _)| sym),
-        &boot.pm_rolling,
+        &rolling,
     )? {
         Some(b) => Ok(format!(
             "rolling={} {}",
-            boot.pm_rolling.join(","),
+            rolling.join(","),
             render_boot_tell(&b)
         )),
         None => Err(String::from(

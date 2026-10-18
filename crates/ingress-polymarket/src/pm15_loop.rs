@@ -44,12 +44,10 @@ use core_metrics::{IngressState, IngressStatus};
 use core_net::{Backoff, WsConn, WsErr, WsNext, WsProgress};
 use core_ring::{Consumer, Producer};
 use core_time::{now_ns, FeedClock, WallAnchor};
-use core_types::pm_roll::{
-    pm_mark_sym, pm_rolling_sym, pm_window_end_ns, PM_LEG_UP, PM_PAIRS, PM_TWAP_S,
-};
+use core_types::pm_roll::{PmPeriod, PM_FAMILIES_MAX, PM_LEG_UP, PM_TWAP_S};
 use core_types::{
-    event_lane_bit, pack_roll_seq, ArrivalSeq, Capture, ChannelEvent, ChannelId, NsTs, Price, Qty,
-    Tick, VenueId, EVENT_RING_SIZE, TICK_FLAG_STALE,
+    event_lane_bit, pack_roll_seq, ArrivalSeq, Capture, ChannelEvent, ChannelId, DepthPair,
+    DepthTopK, NsTs, Price, Qty, SymbolId, Tick, VenueId, EVENT_RING_SIZE, TICK_FLAG_STALE,
 };
 
 use crate::book15::{parse_change_row, quoted_price, Ladder15, Touch15};
@@ -366,8 +364,11 @@ pub struct Pm15Driver {
     last_vt: [u64; PM15_LEGS],
     /// The arrival sequencer per leg (`Tick.venue_seq`).
     seq: [ArrivalSeq; PM15_LEGS],
+    /// PMJ J1b-3: the change-gated top-of-book per leg (index `2 · slot +
+    /// leg`), written into the capture's `<label>-depth.pmlr`.
+    depth: Box<[DepthPair]>,
     /// The newest Chainlink second emitted per family.
-    last_mark_s: [u64; core_types::pm_roll::PM_ROLLING_MAX],
+    last_mark_s: [u64; PM_FAMILIES_MAX],
     market_clock: FeedClock,
     rtds_clock: FeedClock,
 }
@@ -378,20 +379,32 @@ impl Pm15Driver {
     /// order); `stale_after_ms` the VT2 staleness of both sockets.
     #[must_use]
     pub fn new(assets: &[&[u8]], stale_after_ms: u32) -> Self {
+        Self::new_for(PmPeriod::M15, assets, stale_after_ms)
+    }
+
+    /// PMJ J1b: [`Self::new`] for families of `period` — the 5-minute
+    /// pipeline's driver. **Boot-only.**
+    #[must_use]
+    pub fn new_for(period: PmPeriod, assets: &[&[u8]], stale_after_ms: u32) -> Self {
         let mut ladders = Vec::with_capacity(PM15_LEGS);
         let mut i = 0usize;
         while i < PM15_LEGS {
             ladders.push(Ladder15::EMPTY);
             i += 1;
         }
+        // COPY: the 448 B empty pair into each leg's cell, at boot — the
+        // pairs live on the heap for the process — rejected: an in-place
+        // initializer, for a once-per-process path.
+        let depth = vec![DepthPair::new(DepthTopK::EMPTY); PM15_LEGS].into_boxed_slice();
         Self {
-            fams: PmFamilies::new(assets),
+            fams: PmFamilies::with_period(period, assets),
             acts: PmActions::new(),
             ladders: ladders.into_boxed_slice(),
             last: [TOUCH_UNSEEN; PM15_LEGS],
             last_vt: [0; PM15_LEGS],
             seq: [ArrivalSeq::ZERO; PM15_LEGS],
-            last_mark_s: [0; core_types::pm_roll::PM_ROLLING_MAX],
+            depth,
+            last_mark_s: [0; PM_FAMILIES_MAX],
             market_clock: FeedClock::new(stale_after_ms),
             rtds_clock: FeedClock::new(stale_after_ms),
         }
@@ -402,6 +415,19 @@ impl Pm15Driver {
     #[must_use]
     pub fn families(&self) -> &PmFamilies {
         &self.fams
+    }
+
+    /// PMJ J1b: the sym of slot `s`'s `leg` in this pipeline's pool.
+    #[inline(always)]
+    fn leg_sym(&self, s: usize, leg: u32) -> SymbolId {
+        let p = self.fams.period();
+        p.rolling_sym(s / p.pairs(), s % p.pairs(), leg)
+    }
+
+    /// PMJ J1b: slot `s`'s roll family byte (`roll_family_base() + s`).
+    #[inline(always)]
+    fn roll_family_of(&self, s: usize) -> usize {
+        self.fams.period().roll_family_base() + s
     }
 
     /// Slots bound right now (the market socket is dialled only when > 0).
@@ -574,7 +600,7 @@ impl Pm15Driver {
                     ts_ns,
                     VenueId::Polymarket,
                     ChannelId::Mark,
-                    pm_mark_sym(f),
+                    self.fams.period().mark_sym(f),
                     sec,
                     px.ts_ms,
                     px.px_1e6,
@@ -607,6 +633,12 @@ impl Pm15Driver {
                         self.last[i] = TOUCH_UNSEEN;
                         self.seq[i].reset_clock();
                         self.last_vt[i] = 0;
+                        // A new window on the slot: its first book is
+                        // captured whatever the last window's looked like.
+                        // COPY: a 448 B empty pair into the leg's cell, at
+                        // each rebind (cold: once per window) — rejected:
+                        // zeroing the two rows field by field, same bytes.
+                        self.depth[i] = DepthPair::new(DepthTopK::EMPTY);
                         leg += 1;
                     }
                     if wire.is_open() {
@@ -640,16 +672,15 @@ impl Pm15Driver {
                     venue_ms,
                 } => {
                     let s = slot as usize;
-                    let (f, pair) = (s / PM_PAIRS, s % PM_PAIRS);
                     let ev = ChannelEvent::new(
                         ts_ns,
                         VenueId::Polymarket,
                         ChannelId::InstrumentRoll,
-                        pm_rolling_sym(f, pair, PM_LEG_UP),
-                        pack_roll_seq(instance, PM_TWAP_S, s, true),
+                        self.leg_sym(s, PM_LEG_UP),
+                        pack_roll_seq(instance, PM_TWAP_S, self.roll_family_of(s), true),
                         venue_ms,
                         winner,
-                        pm_window_end_ns(window) as i64,
+                        self.fams.period().window_end_ns(window) as i64,
                     );
                     emit_event(&ev, out);
                     out.counters.inc(if winner == 0 {
@@ -669,16 +700,15 @@ impl Pm15Driver {
     /// CREATED, the two legs' order law, and the touches as they stand.
     fn created<C: Capture>(&mut self, s: usize, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
         let (instance, window) = (self.fams.slot(s).instance, self.fams.slot(s).spec.window);
-        let (f, pair) = (s / PM_PAIRS, s % PM_PAIRS);
         let ev = ChannelEvent::new(
             ts_ns,
             VenueId::Polymarket,
             ChannelId::InstrumentRoll,
-            pm_rolling_sym(f, pair, PM_LEG_UP),
-            pack_roll_seq(instance, PM_TWAP_S, s, false),
+            self.leg_sym(s, PM_LEG_UP),
+            pack_roll_seq(instance, PM_TWAP_S, self.roll_family_of(s), false),
             0,
             0,
-            pm_window_end_ns(window) as i64,
+            self.fams.period().window_end_ns(window) as i64,
         );
         emit_event(&ev, out);
         out.counters.inc(Pm15Counter::RollsCreated);
@@ -707,7 +737,7 @@ impl Pm15Driver {
             ts_ns,
             VenueId::Polymarket,
             ChannelId::OutcomeMeta,
-            pm_rolling_sym(s / PM_PAIRS, s % PM_PAIRS, leg),
+            self.leg_sym(s, leg),
             u64::from(b.instance),
             venue_ms,
             b.tick_1e6[(leg & 1) as usize],
@@ -787,7 +817,7 @@ impl Pm15Driver {
         let tick = Tick::new_stamped(
             ts_ns,
             VenueId::Polymarket,
-            pm_rolling_sym(s / PM_PAIRS, s % PM_PAIRS, leg),
+            self.leg_sym(s, leg),
             seq,
             Price::from_raw(t.bid_px),
             Qty::from_raw(t.bid_sz),
@@ -827,6 +857,7 @@ impl Pm15Driver {
             if self.fams.slot(s).ticks() {
                 let vt = scan_venue_time_ms(ev).unwrap_or(0);
                 self.emit_touch(s, leg, vt, ts_ns, out);
+                self.emit_depth(i, ts_ns, out);
             }
         }
     }
@@ -904,6 +935,28 @@ impl Pm15Driver {
         let (s, leg) = (i / 2, (i % 2) as u32);
         if self.fams.slot(s).ticks() {
             self.emit_touch(s, leg, vt, ts_ns, out);
+            self.emit_depth(i % PM15_LEGS, ts_ns, out);
+        }
+    }
+
+    /// PMJ J1b-3: leg `i`'s top of book into the capture when it changed
+    /// since the last one captured — written in place into the pair's
+    /// spare row, flipped by `commit` (never a 192 B copy). Capture only:
+    /// no depth lane carries it.
+    fn emit_depth<C: Capture>(&mut self, i: usize, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
+        let i = i % PM15_LEGS;
+        let sym = self.leg_sym(i / 2, (i % 2) as u32);
+        let pair = &mut self.depth[i];
+        let spare = pair.spare_mut();
+        spare.ts_ns = ts_ns;
+        spare.sym = sym;
+        spare.venue = VenueId::Polymarket as u8;
+        spare.flags = 0;
+        self.ladders[i].top_k(&mut spare.bids, &mut spare.asks);
+        let (snap, last) = pair.spare_and_last();
+        if snap.bids != last.bids || snap.asks != last.asks || snap.sym != last.sym {
+            out.capture.depth(snap);
+            pair.commit();
         }
     }
 
@@ -962,7 +1015,7 @@ impl Pm15Driver {
             ts_ns,
             VenueId::Polymarket,
             ChannelId::Trade,
-            pm_rolling_sym(s / PM_PAIRS, s % PM_PAIRS, leg),
+            self.leg_sym(s, leg),
             side,
             scan_venue_time_ms(p).unwrap_or(0),
             px,

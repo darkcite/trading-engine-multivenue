@@ -53,6 +53,8 @@ strategy-bin15       = { workspace = true }
 # PM15 gate 114: the rolling 15m ingress driver and slot 9's member.
 strategy-pm15        = { workspace = true }
 core-twaplock        = { workspace = true }
+# PMJ J4 gate 136: slot 11's member on the 5-minute pool.
+strategy-pmj         = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }
@@ -71,6 +73,8 @@ exec-hypercall       = { workspace = true }
 # PM15-6a gate 115: the Polymarket arm's amounts, sign, render, L2 MAC,
 # answer and user-channel scans.
 exec-polymarket      = { workspace = true }
+# PMJ J3 gate 134: the slot-11 arm's guard, signature, scanners and renders.
+exec-jupiter         = { workspace = true }
 # HYPARB H1 gate 63: the AMM walk + arb solve.
 core-amm             = { workspace = true }
 # HYPARB H7 gate 64: the EVM sign + hash + hex render.

@@ -1,0 +1,19 @@
+[package]
+name         = "strategy-pmj"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "PMJ member (slot 11): the H90 late-window law on Polymarket's rolling 5-minute crypto up/down binaries, executed through Jupiter Predict (VenueId::Jupiter) — Chainlink TWAP lock, IoC taker, a keeper-aware paper P&L at settlement. Paper only until a PMJ-DUST-GATE ruling."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-fill     = { workspace = true }
+core-time     = { workspace = true }
+core-twaplock = { workspace = true }
+core-types    = { workspace = true }
+strategy-core = { workspace = true }

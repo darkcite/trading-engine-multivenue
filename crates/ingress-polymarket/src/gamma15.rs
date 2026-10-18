@@ -31,10 +31,20 @@
 //!
 //! Cold path (the discovery thread, a few calls a window): the spec is a
 //! fixed POD; the token and condition ids are copied once into it.
+//!
+//! ## PMJ J1b: the 5-minute windows
+//!
+//! [`parse_window_spec_for`] / [`render_slug_for`] take the family's
+//! [`PmPeriod`]: the slug is `<asset>-updown-5m-<open>` on the 300 s grid
+//! and the settlement must say `5m`; every other check is the 15-minute
+//! one. [`parse_window_spec`] and [`render_slug`] are the 15-minute calls,
+//! unchanged. The spec also carries the market's Gamma id
+//! ([`PmWindowSpec::market_id`]), which Jupiter Predict names its markets
+//! by.
 
 use crate::discovery::{next_member, parse_row, PmDiscoveryErr, PmRollLaw, PM_TOKEN_MAX};
 use core_parse::{skip_json_value, skip_ws};
-use core_types::pm_roll::{pm_window_open_s, PM_TWAP_S};
+use core_types::pm_roll::{PmPeriod, PM_TWAP_S};
 
 /// Longest asset name of a family (the universe's `[a-z0-9]{1,15}`).
 pub const PM_ASSET_MAX: usize = 15;
@@ -81,12 +91,14 @@ pub struct PmWindowSpec {
     pub condition_id_len: u8,
     /// Explicit padding — always zero.
     pub _pad: [u8; 2],
-    /// The window index (open epoch / 900).
+    /// The window index (open epoch / the period's length).
     pub window: u32,
     /// `orderPriceMinTickSize` ×1e6 (10 000 or 1 000).
     pub tick_1e6: i64,
     /// `orderMinSize`, shares ×1e6.
     pub min_size_1e6: i64,
+    /// PMJ J1b: the market's Gamma `id` (0 when the answer had none).
+    pub market_id: u64,
     /// The Up token.
     pub up: PmTokenId,
     /// The Down token.
@@ -104,6 +116,7 @@ impl PmWindowSpec {
         window: 0,
         tick_1e6: 0,
         min_size_1e6: 0,
+        market_id: 0,
         up: PmTokenId::NONE,
         down: PmTokenId::NONE,
         condition_id: [0; 66],
@@ -130,7 +143,8 @@ pub enum PmLawErr {
     NotTradable,
     /// A neg-risk market.
     NegRisk,
-    /// Not the 60 s Chainlink TWAP settlement of this asset on 15 m.
+    /// Not the 60 s Chainlink TWAP settlement of this asset on the
+    /// family's period.
     Settlement,
     /// Not the 0.07 / exponent 1 / taker-only fee.
     Fee,
@@ -145,13 +159,20 @@ impl From<PmDiscoveryErr> for PmLawErr {
     }
 }
 
-/// Render the slug of `asset`'s window `window` into `dst`; its length.
-/// `dst` must hold `asset.len() + 25` bytes.
+/// Render the slug of `asset`'s 15-minute window `window` into `dst`; its
+/// length. `dst` must hold `asset.len() + 25` bytes.
 #[must_use]
 pub fn render_slug(dst: &mut [u8], asset: &[u8], window: u32) -> Option<usize> {
-    const MID: &[u8] = b"-updown-15m-";
+    render_slug_for(PmPeriod::M15, dst, asset, window)
+}
+
+/// PMJ J1b: render the slug of `asset`'s `period` window `window` into
+/// `dst`; its length. `dst` must hold `asset.len() + 25` bytes.
+#[must_use]
+pub fn render_slug_for(period: PmPeriod, dst: &mut [u8], asset: &[u8], window: u32) -> Option<usize> {
+    let mid: &[u8] = period.slug_mid();
     let mut digits = [0u8; 20];
-    let mut v = pm_window_open_s(window);
+    let mut v = period.window_open_s(window);
     let mut n = 0usize;
     loop {
         digits[n] = b'0' + (v % 10) as u8;
@@ -161,24 +182,24 @@ pub fn render_slug(dst: &mut [u8], asset: &[u8], window: u32) -> Option<usize> {
             break;
         }
     }
-    let len = asset.len() + MID.len() + n;
+    let len = asset.len() + mid.len() + n;
     if asset.is_empty() || asset.len() > PM_ASSET_MAX || dst.len() < len {
         return None;
     }
     // COPY: the asset name and the slug's fixed middle (≤ 27 B) into the
     // request target, once per window lookup (cold).
     dst[..asset.len()].copy_from_slice(asset);
-    dst[asset.len()..asset.len() + MID.len()].copy_from_slice(MID);
+    dst[asset.len()..asset.len() + mid.len()].copy_from_slice(mid);
     let mut k = 0usize;
     while k < n {
-        dst[asset.len() + MID.len() + k] = digits[n - 1 - k];
+        dst[asset.len() + mid.len() + k] = digits[n - 1 - k];
         k += 1;
     }
     Some(len)
 }
 
-/// Parse one `/events?slug=` answer for `family` (`asset`, window
-/// `window`) into `out` under the venue law (module docs). `out` is
+/// Parse one `/events?slug=` answer for 15-minute `family` (`asset`,
+/// window `window`) into `out` under the venue law (module docs). `out` is
 /// written only on `Ok`.
 ///
 /// # Errors
@@ -190,11 +211,27 @@ pub fn parse_window_spec(
     window: u32,
     out: &mut PmWindowSpec,
 ) -> Result<(), PmLawErr> {
+    parse_window_spec_for(PmPeriod::M15, body, family, asset, window, out)
+}
+
+/// PMJ J1b: [`parse_window_spec`] for a family of `period` — its slug,
+/// its window grid and its `cryptoMarketConfig.duration`.
+///
+/// # Errors
+/// [`PmLawErr`] — the first check that failed.
+pub fn parse_window_spec_for(
+    period: PmPeriod,
+    body: &[u8],
+    family: usize,
+    asset: &[u8],
+    window: u32,
+    out: &mut PmWindowSpec,
+) -> Result<(), PmLawErr> {
     let mut law = PmRollLaw::default();
     let row = one_market(body, &mut law)?;
     // The slug names this asset's window.
     let mut want = [0u8; PM_ASSET_MAX + 25];
-    let n = render_slug(&mut want, asset, window).ok_or(PmLawErr::Slug)?;
+    let n = render_slug_for(period, &mut want, asset, window).ok_or(PmLawErr::Slug)?;
     if law.slug() != &want[..n] {
         return Err(PmLawErr::Slug);
     }
@@ -207,9 +244,13 @@ pub fn parse_window_spec(
     if row.neg_risk {
         return Err(PmLawErr::NegRisk);
     }
+    let duration_ok = match period {
+        PmPeriod::M15 => law.cmc_15m,
+        PmPeriod::M5 => law.cmc_5m,
+    };
     if !law.cmc_seen
         || law.cmc_asset() != asset
-        || !law.cmc_15m
+        || !duration_ok
         || !law.cmc_twap_enabled
         || law.cmc_twap_s_1e9 != i64::from(PM_TWAP_S) * 1_000_000_000
     {
@@ -234,6 +275,7 @@ pub fn parse_window_spec(
     spec.window = window;
     spec.tick_1e6 = tick / 1_000;
     spec.min_size_1e6 = row.order_min_size_1e6;
+    spec.market_id = law.market_id;
     // COPY: the two token ids (≤ 80 B each) and the condition id (66 B)
     // into the spec, once per window (cold) — the spec outlives the body.
     spec.up.b[..up.len()].copy_from_slice(up);
@@ -326,6 +368,45 @@ mod tests {
             s.condition_id(),
             b"0xa30ed80f53aa1c14b8ec38c9c5bd78d500e4702ac00d0135f330e26a2183a059"
         );
+        // PMJ J1b: the market's Gamma id, not the event's (1198359) nor
+        // the settlement config's.
+        assert_eq!(s.market_id, 5_768_487);
+    }
+
+    /// PMJ J1b: the same answer reshaped to a 5-minute window — the slug
+    /// on the 300 s grid and the settlement's `5m` — is a 5 m spec; the
+    /// 15-minute answer is no 5-minute window and the reverse.
+    #[test]
+    fn a_5m_answer_becomes_a_5m_spec_and_the_periods_never_cross() {
+        use core_types::pm_roll::pm5_window_of_open;
+        const OPEN5: u64 = 1_792_308_000;
+        let live5 = LIVE
+            .replace("btc-updown-15m-1792217700", "btc-updown-5m-1792308000")
+            .replace(r#""duration":"15m""#, r#""duration":"5m""#)
+            .replace("btc-15m-twap-60", "btc-5m-twap-60");
+        let w5 = pm5_window_of_open(OPEN5).expect("grid");
+        let mut s = PmWindowSpec::EMPTY;
+        parse_window_spec_for(PmPeriod::M5, live5.as_bytes(), 1, b"btc", w5, &mut s)
+            .expect("the 5 m law holds");
+        assert_eq!((s.family, s.window, s.market_id), (1, w5, 5_768_487));
+        assert_eq!(s.tick_1e6, 10_000);
+        // A 5 m answer under the 15 m law, and the 15 m answer under the
+        // 5 m law (with a 5 m slug, so the settlement decides).
+        let w15 = pm_window_of_open(OPEN).expect("grid");
+        let mut t = PmWindowSpec::EMPTY;
+        assert!(parse_window_spec(live5.as_bytes(), 1, b"btc", w15, &mut t).is_err());
+        let slug_only = LIVE.replace("btc-updown-15m-1792217700", "btc-updown-5m-1792308000");
+        assert_eq!(
+            parse_window_spec_for(PmPeriod::M5, slug_only.as_bytes(), 1, b"btc", w5, &mut t),
+            Err(PmLawErr::Settlement)
+        );
+        assert_eq!(t, PmWindowSpec::EMPTY, "written only on Ok");
+        let mut d = [0u8; 40];
+        let n = render_slug_for(PmPeriod::M5, &mut d, b"eth", w5).expect("fits");
+        assert_eq!(&d[..n], b"eth-updown-5m-1792308000");
+        // A market id that is not a quoted decimal reads as 0, never a refusal.
+        let odd = LIVE.replace(r#""id":"5768487""#, r#""id":5768487"#);
+        assert_eq!(spec_of(&odd).expect("still a spec").market_id, 0);
     }
 
     #[test]

@@ -18,6 +18,11 @@
 //! is refused stays dormant for it (no roll is ever created for a window
 //! the law refused).
 //!
+//! PMJ J1b: the discovery is built per [`PmPeriod`] — one thread per
+//! pipeline. A 5-minute discovery looks [`PM5_LOOKAHEAD`] windows ahead
+//! (its families keep three token pairs), on the 300 s grid, under the
+//! 5-minute law; the 15-minute discovery is unchanged.
+//!
 //! Blocking is this thread's whole point: the ingress thread never waits
 //! on Gamma. Allocation: the client's buffers at boot; rustls allocates
 //! per TLS record (`core_net::https_req` docs).
@@ -28,15 +33,28 @@ use std::sync::Arc;
 use core_net::{HttpsReq, Method};
 use core_ring::Producer;
 use core_time::{now_ns, WallAnchor};
-use core_types::pm_roll::{pm_window_at, PM_ROLLING_MAX};
+use core_types::pm_roll::{PmPeriod, PM_ROLLING_MAX};
 
-use crate::gamma15::{parse_window_spec, render_slug, PmLawErr, PmWindowSpec, PM_ASSET_MAX};
+use crate::gamma15::{parse_window_spec_for, render_slug_for, PmLawErr, PmWindowSpec, PM_ASSET_MAX};
 use crate::pm15_loop::{Pm15Counter, Pm15Counters, PM15_SPEC_RING};
 
 /// Gamma's host.
 pub const GAMMA_HOST: &str = "gamma-api.polymarket.com";
 /// Windows looked up beyond the current one.
 pub const PM15_LOOKAHEAD: u32 = 1;
+/// PMJ J1b: windows a 5-minute discovery looks up beyond the current one
+/// (the current and the next two: ten minutes ahead, one per token pair).
+pub const PM5_LOOKAHEAD: u32 = 2;
+
+/// The look-ahead of a `period` discovery.
+#[inline]
+#[must_use]
+pub const fn lookahead(period: PmPeriod) -> u32 {
+    match period {
+        PmPeriod::M15 => PM15_LOOKAHEAD,
+        PmPeriod::M5 => PM5_LOOKAHEAD,
+    }
+}
 /// Cadence of a discovery pass, ns.
 pub const PASS_NS: u64 = 2_000_000_000;
 /// Retry after a failed fetch, ns.
@@ -54,6 +72,7 @@ const HEAD_CAP: usize = 512;
 const MEMO: usize = 4;
 
 const _: () = assert!((PM15_LOOKAHEAD as usize) < MEMO);
+const _: () = assert!((PM5_LOOKAHEAD as usize) < MEMO);
 
 /// A fetch's outcome.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -67,6 +86,8 @@ pub enum FetchErr {
 /// The discovery side (module docs).
 pub struct Pm15Discovery {
     http: HttpsReq,
+    /// PMJ J1b: the families' period (the slug, the grid, the law).
+    period: PmPeriod,
     n: usize,
     asset: [[u8; PM_ASSET_MAX]; PM_ROLLING_MAX],
     asset_len: [u8; PM_ROLLING_MAX],
@@ -90,8 +111,20 @@ impl Pm15Discovery {
         tls: Arc<rustls::ClientConfig>,
         assets: &[&[u8]],
     ) -> Result<Self, core_net::PostErrKind> {
+        Self::new_for(PmPeriod::M15, tls, assets)
+    }
+
+    /// PMJ J1b: [`Self::new`] for families of `period`. **Boot-only.**
+    ///
+    /// # Errors
+    /// The client could not be built (DNS, a bad endpoint).
+    pub fn new_for(
+        period: PmPeriod,
+        tls: Arc<rustls::ClientConfig>,
+        assets: &[&[u8]],
+    ) -> Result<Self, core_net::PostErrKind> {
         let http = HttpsReq::new(GAMMA_HOST, 443, tls, HEAD_CAP, 0, RESP_CAP)?;
-        Ok(Self::with_client(http, assets))
+        Ok(Self::with_client_for(period, http, assets))
     }
 
     /// The discovery over a given client (tests point it at a loopback).
@@ -101,9 +134,22 @@ impl Pm15Discovery {
     /// universe refuses both first.
     #[must_use]
     pub fn with_client(http: HttpsReq, assets: &[&[u8]]) -> Self {
-        assert!(assets.len() <= PM_ROLLING_MAX, "pm15: too many families");
+        Self::with_client_for(PmPeriod::M15, http, assets)
+    }
+
+    /// PMJ J1b: [`Self::with_client`] for families of `period`.
+    ///
+    /// # Panics
+    /// As [`Self::with_client`], against the period's own family cap.
+    #[must_use]
+    pub fn with_client_for(period: PmPeriod, http: HttpsReq, assets: &[&[u8]]) -> Self {
+        assert!(
+            assets.len() <= PM_ROLLING_MAX && assets.len() <= period.max_families(),
+            "pm15: too many families"
+        );
         let mut s = Self {
             http,
+            period,
             n: assets.len(),
             asset: [[0; PM_ASSET_MAX]; PM_ROLLING_MAX],
             asset_len: [0; PM_ROLLING_MAX],
@@ -137,7 +183,8 @@ impl Pm15Discovery {
         let asset_len = self.asset_len[f] as usize;
         // COPY: the path head (13 B) into the request target (per fetch).
         self.target[..HEAD.len()].copy_from_slice(HEAD);
-        let n = render_slug(
+        let n = render_slug_for(
+            self.period,
             &mut self.target[HEAD.len()..],
             &self.asset[f][..asset_len],
             window,
@@ -157,7 +204,7 @@ impl Pm15Discovery {
             return Err(FetchErr::Fetch);
         }
         let asset = &self.asset[f][..asset_len];
-        parse_window_spec(body, f, asset, window, out).map_err(FetchErr::Law)
+        parse_window_spec_for(self.period, body, f, asset, window, out).map_err(FetchErr::Law)
     }
 
     /// PM15-6c: hand every window to `tee` too (slot 9's gateway). Boot.
@@ -174,11 +221,12 @@ impl Pm15Discovery {
         counters: &Pm15Counters,
         stop: &AtomicBool,
     ) {
-        let cur = pm_window_at(wall_ns / 1_000_000_000);
+        let cur = self.period.window_at(wall_ns / 1_000_000_000);
+        let ahead = lookahead(self.period);
         let mut f = 0usize;
         while f < self.n {
             let mut d = 0u32;
-            while d <= PM15_LOOKAHEAD {
+            while d <= ahead {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }

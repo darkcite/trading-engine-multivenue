@@ -2531,6 +2531,9 @@ pub struct PaperMatcher {
     /// too, at the quote in force after the venue's taker hold. Its own
     /// table: the strict-cross members' 64 slots are not shared with it.
     held: core_fill::held::HeldBook,
+    /// PMJ J4: when a rolling 5-minute leg's IoC is judged after its
+    /// submit, ns — the keeper's delay (`pmj.toml paper_delay_ms`).
+    pm5_held_delay_ns: u64,
     /// XMM XH2: order events waiting for [`Self::try_next_order_event`],
     /// FIFO.
     events: [core_types::OrderEvent; ORDER_EVENT_OUT],
@@ -2588,6 +2591,7 @@ impl PaperMatcher {
             amm: core_fill::AmmBook::new(),
             queue: core_fill::QueueBook::new(),
             held: core_fill::held::HeldBook::new(),
+            pm5_held_delay_ns: core_fill::held::PMJ_PAPER_DELAY_NS_DEFAULT,
             events: [EMPTY_ORDER_EVENT; ORDER_EVENT_OUT],
             ev_head: 0,
             ev_len: 0,
@@ -2625,6 +2629,20 @@ impl PaperMatcher {
         self.open_len
     }
 
+    /// PMJ J4: judge a rolling 5-minute leg's IoC `ns` after its submit
+    /// (boot only: `pmj.toml paper_delay_ms`).
+    #[inline]
+    pub fn set_pm5_held_delay_ns(&mut self, ns: u64) {
+        self.pm5_held_delay_ns = ns;
+    }
+
+    /// The delay a rolling 5-minute leg's IoC is judged at, ns.
+    #[inline]
+    #[must_use]
+    pub const fn pm5_held_delay_ns(&self) -> u64 {
+        self.pm5_held_delay_ns
+    }
+
     /// Take an order into the open table.
     ///
     /// A cap refusal is COUNTED, not returned: the engine's contract is
@@ -2654,8 +2672,14 @@ impl PaperMatcher {
             || core_fill::held::held_pm_leg(order.sym)
         {
             if order.kind == core_fill::ORDER_KIND_IOC && px > 0 && qty > 0 {
+                // PMJ J4: a 5-minute leg at the keeper's delay the boot set.
+                let delay = if core_fill::held::held_pm5_leg(order.sym) {
+                    self.pm5_held_delay_ns
+                } else {
+                    core_fill::held::held_delay_ns(order.sym)
+                };
                 let o = core_fill::held::HeldOrder::new(
-                    now_ns.saturating_add(core_fill::held::held_delay_ns(order.sym)),
+                    now_ns.saturating_add(delay),
                     order.sym,
                     order.side,
                     px,
@@ -3423,6 +3447,14 @@ impl PaperDispatcher {
         self.matcher.open_len() + self.matcher.queue_len() + self.matcher.held_pending()
     }
 
+    /// PMJ J4: the matcher judges a rolling 5-minute leg's IoC `ns` after
+    /// its submit (`pmj.toml paper_delay_ms`; boot only).
+    #[must_use]
+    pub fn with_pm5_held_delay_ns(mut self, ns: u64) -> Self {
+        self.matcher.set_pm5_held_delay_ns(ns);
+        self
+    }
+
     /// Construct empty.
     pub const fn new() -> Self {
         Self {
@@ -3919,6 +3951,75 @@ mod tests {
         legacy.sym = core_types::make_symbol_id(VenueId::Polymarket, 7);
         m.submit(&legacy, 2_000_000_000);
         assert_eq!((m.held_pending(), m.open_len()), (0, 1));
+    }
+
+    /// PMJ J4: a rolling 5-minute leg's IoC (slot 11, addressed to Jupiter)
+    /// is judged by the held-quote law at the keeper's delay the boot set —
+    /// 2 s by default, `with_pm5_held_delay_ns` otherwise — and its fill
+    /// keeps the slot.
+    #[test]
+    fn a_five_minute_leg_ioc_fills_at_the_keepers_delay() {
+        let leg = core_types::pm_roll::pm5_rolling_sym(0, 2, 1);
+        let run = |delay: Option<u64>| {
+            let mut d = PaperDispatcher::new();
+            if let Some(ns) = delay {
+                d = d.with_pm5_held_delay_ns(ns);
+            }
+            let mut m = d.matcher;
+            let book = Tick::new_stamped(
+                500,
+                VenueId::Polymarket,
+                leg,
+                1,
+                Price::from_raw(920_000),
+                Qty::from_raw(9_000_000),
+                Price::from_raw(930_000),
+                Qty::from_raw(300_000_000),
+                0,
+                0,
+            );
+            m.observe_tick(&book, 500);
+            let mut o = Order::new(
+                1_000,
+                VenueId::Jupiter,
+                leg,
+                Side::Bid,
+                core_fill::ORDER_KIND_IOC,
+                Price::from_raw(940_000),
+                Qty::from_raw(5_380_000),
+                77,
+            );
+            o.strategy_id = 11;
+            m.submit(&o, 1_000);
+            assert_eq!((m.held_pending(), m.open_len()), (1, 0));
+            m
+        };
+        let other = |ts: u64| {
+            Tick::new_stamped(
+                ts,
+                VenueId::Binance,
+                core_types::make_symbol_id(VenueId::Binance, 1),
+                1,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                Price::from_raw(2),
+                Qty::from_raw(1),
+                0,
+                0,
+            )
+        };
+        let mut m = run(None);
+        assert_eq!(m.pm5_held_delay_ns(), core_fill::held::PMJ_PAPER_DELAY_NS_DEFAULT);
+        m.observe_tick(&other(2_000_000_999), 2_000_000_999);
+        assert!(m.try_next_fill().is_none(), "inside the keeper's 2 s");
+        m.observe_tick(&other(2_000_001_000), 2_000_001_000);
+        let f = m.try_next_fill().expect("the ask in force at the delay");
+        assert_eq!((f.px.raw(), f.qty.raw(), f.order_id, f.strategy_id), (930_000, 5_380_000, 77, 11));
+        let mut m = run(Some(5_000_000_000));
+        m.observe_tick(&other(2_000_001_000), 2_000_001_000);
+        assert!(m.try_next_fill().is_none(), "the boot's 5 s");
+        m.observe_tick(&other(5_000_001_000), 5_000_001_000);
+        assert!(m.try_next_fill().is_some());
     }
 
     /// HC11: a Hypercall IoC waiting for its held-quote verdict is an open
