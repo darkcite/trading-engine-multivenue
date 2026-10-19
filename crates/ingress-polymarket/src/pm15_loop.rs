@@ -3,12 +3,20 @@
 
 //! # pm15_loop — the rolling 15-minute ingress thread (PM15-2 / PM15-3)
 //!
-//! One thread, one `mio` poll, two sockets ([`core_net::WsConn`]):
+//! One thread, one `mio` poll, the market sockets and the RTDS socket
+//! ([`core_net::WsConn`]):
 //!
 //! - **market** — `wss://ws-subscriptions-clob.polymarket.com/ws/market`
 //!   with the custom features on: the bound windows' tokens, subscribed and
 //!   unsubscribed as they roll; `book`, `price_change`, `tick_size_change`,
 //!   `last_trade_price` and `market_resolved`. Text `PING` every 5 s.
+//!   PMJ J7 (R-PMJ-S17..S19): the families are spread over
+//!   [`Pm15Driver::with_market_sockets`] sockets, family `f` on shard
+//!   `f % n` — the venue closes a socket that carries too much (1013
+//!   "slow consumer: send buffer full"), and a close then withdraws only
+//!   that shard's families. Each shard has its own session, dial schedule,
+//!   keepalive and feed clock; one socket (`n = 1`) is the stream as it was
+//!   before J7.
 //! - **rtds** — the Chainlink reports ([`crate::rtds`]). Text `PING` every 5 s.
 //!
 //! The windows come from the discovery thread ([`crate::pm15_discovery`])
@@ -18,7 +26,7 @@
 //!
 //! | record | when |
 //! |---|---|
-//! | `Tick` on a leg slot | a ticking slot's touch changed (prices from the venue, sizes from its ladder, [`crate::book15`]); re-asserted unchanged at each `PONG` of the market socket; withdrawn (stale, zero) when the market session drops |
+//! | `Tick` on a leg slot | a ticking slot's touch changed (prices from the venue, sizes from its ladder, [`crate::book15`]); re-asserted unchanged at each `PONG` of the market socket that carries it; withdrawn (stale, zero) when that socket's session drops (PMJ J7: per shard) |
 //! | `InstrumentRoll` created / settled | a window opened / resolved or was retired (`core_types::pm_roll`) |
 //! | `OutcomeMeta` per leg | at creation and at every `tick_size_change` — the order law |
 //! | `Mark` on the `[mark]` slot | each Chainlink report of a family's asset, once per second |
@@ -68,10 +76,32 @@ pub const PM15_MARKET_PING_NS: u64 = 5_000_000_000;
 pub const PM15_SPEC_RING: usize = 64;
 /// Legs: two per slot.
 pub const PM15_LEGS: usize = PM_SLOTS * 2;
-/// The `mio` token of the market socket.
+/// PMJ J7 (R-PMJ-S17..S19): the most market sockets one pipeline runs —
+/// one per family.
+pub const PM15_MARKET_SOCKETS_MAX: usize = PM_FAMILIES_MAX;
+const _: () = assert!(
+    PM15_MARKET_SOCKETS_MAX >= 1 && PM15_MARKET_SOCKETS_MAX <= 32,
+    "the bound-shard mask is a u32"
+);
+/// The `mio` token of market shard 0 (shard `k`'s is
+/// [`pm15_market_token`]`(k)`).
 pub const PM15_MARKET_TOKEN: mio::Token = mio::Token(0);
-/// The `mio` token of the RTDS socket.
-pub const PM15_RTDS_TOKEN: mio::Token = mio::Token(1);
+/// The `mio` token of the RTDS socket: after every market shard's.
+pub const PM15_RTDS_TOKEN: mio::Token = mio::Token(PM15_MARKET_SOCKETS_MAX);
+
+/// PMJ J7: the `mio` token of market shard `k`.
+#[must_use]
+pub const fn pm15_market_token(k: usize) -> mio::Token {
+    mio::Token(k)
+}
+
+/// PMJ J7: the mix of a shard's index into its backoff seed (shard 0 keeps
+/// the pipeline's seed).
+const SHARD_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+/// PMJ J7: the first dial of shard `k` waits `k` × this, ns — the shards'
+/// handshakes are spread over the first ~2 s, not one 50 ms pass (shard 0
+/// dials at once, as before J7).
+const SHARD_DIAL_STAGGER_NS: u64 = 250_000_000;
 /// The poll timeout: the roll clock's resolution, ns-free (50 ms).
 const POLL_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(50);
 
@@ -195,8 +225,10 @@ pub struct Pm15Counters {
     /// u8), `u64::MAX` = none yet.
     last_law_refusal: AtomicU64,
     /// Why each socket last failed: `core_net::WsErr` as u8 + 1 (0 = never),
-    /// `[market, rtds]`.
+    /// `[market, rtds]` (PMJ J7: `market` is the last of any shard's).
     last_ws_err: [AtomicU64; 2],
+    /// PMJ J7: the market sockets open right now (a gauge).
+    market_open: AtomicU64,
 }
 
 impl Pm15Counters {
@@ -208,7 +240,21 @@ impl Pm15Counters {
             slots_bound: AtomicU64::new(0),
             last_law_refusal: AtomicU64::new(u64::MAX),
             last_ws_err: [const { AtomicU64::new(0) }; 2],
+            market_open: AtomicU64::new(0),
         }
+    }
+
+    /// PMJ J7: record how many market sockets are open.
+    #[inline]
+    pub fn set_market_open(&self, n: u64) {
+        self.market_open.store(n, Ordering::Relaxed);
+    }
+
+    /// PMJ J7: the market sockets open right now.
+    #[inline]
+    #[must_use]
+    pub fn market_sockets_open(&self) -> u64 {
+        self.market_open.load(Ordering::Relaxed)
     }
 
     /// Record why socket `which` (0 market, 1 rtds) failed.
@@ -304,7 +350,8 @@ pub const PM15_EVENT_MASK: u16 = event_lane_bit(ChannelId::InstrumentRoll)
     | event_lane_bit(ChannelId::OutcomeMeta)
     | event_lane_bit(ChannelId::Mark);
 
-/// The market socket as the driver sees it.
+/// One socket as a driver sees it (slot 9's user socket,
+/// `exec_polymarket::user`, speaks through it too).
 pub trait Pm15Wire {
     /// The session is open (frames may be queued).
     fn is_open(&self) -> bool;
@@ -322,6 +369,29 @@ impl Pm15Wire for WsConn {
     #[inline]
     fn queue(&mut self, parts: &[&[u8]]) -> bool {
         self.queue_text(parts).is_ok()
+    }
+}
+
+/// PMJ J7: the market sockets as the rolling driver sees them — one per
+/// shard of the families.
+pub trait Pm15Wires {
+    /// Shard `k`'s session is open (frames may be queued).
+    fn is_open(&self, k: usize) -> bool;
+    /// Queue one text frame laid out as `parts` on shard `k`; `false` when
+    /// it could not be queued (the session is then failed by its owner).
+    fn queue(&mut self, k: usize, parts: &[&[u8]]) -> bool;
+}
+
+/// PMJ J7: the loop's market sockets — shard `k` is `self[k]`.
+impl Pm15Wires for Vec<WsConn> {
+    #[inline]
+    fn is_open(&self, k: usize) -> bool {
+        self.get(k).is_some_and(WsConn::is_open)
+    }
+
+    #[inline]
+    fn queue(&mut self, k: usize, parts: &[&[u8]]) -> bool {
+        self.get_mut(k).is_some_and(|w| w.queue_text(parts).is_ok())
     }
 }
 
@@ -377,8 +447,15 @@ pub struct Pm15Driver {
     depth_last_ns: [u64; PM15_LEGS],
     /// The newest Chainlink second emitted per family.
     last_mark_s: [u64; PM_FAMILIES_MAX],
-    market_clock: FeedClock,
+    /// PMJ J7: each market shard's feed clock — shard `k`'s judges the
+    /// legs it carries.
+    market_clock: [FeedClock; PM15_MARKET_SOCKETS_MAX],
     rtds_clock: FeedClock,
+    /// PMJ J7 (R-PMJ-S17..S19): how many market sockets the families ride,
+    /// `1..=`[`PM15_MARKET_SOCKETS_MAX`].
+    shards: usize,
+    /// PMJ J7: the shard of each slot — its family `% shards` (set at boot).
+    slot_shard: [u8; PM_SLOTS],
 }
 
 impl Pm15Driver {
@@ -416,8 +493,10 @@ impl Pm15Driver {
             depth_min_ns: 0,
             depth_last_ns: [0; PM15_LEGS],
             last_mark_s: [0; PM_FAMILIES_MAX],
-            market_clock: FeedClock::new(stale_after_ms),
+            market_clock: [FeedClock::new(stale_after_ms); PM15_MARKET_SOCKETS_MAX],
             rtds_clock: FeedClock::new(stale_after_ms),
+            shards: 1,
+            slot_shard: [0; PM_SLOTS],
         }
     }
 
@@ -434,6 +513,61 @@ impl Pm15Driver {
         self.depth_on = on;
         self.depth_min_ns = u64::from(min_ms) * 1_000_000;
         self
+    }
+
+    /// PMJ J7 (R-PMJ-S17..S19): spread the families over `n` market
+    /// sockets — family `f` rides shard `f % n`; `1` (the
+    /// [`Self::new_for`] default) is one socket, the stream as before J7.
+    /// A shard's session carries only its families' tokens, its `PONG`
+    /// re-asserts only their touches, and its loss withdraws only them.
+    /// **Boot-only.**
+    ///
+    /// # Panics
+    /// `n` outside `1..=`[`PM15_MARKET_SOCKETS_MAX`] (the universe parser
+    /// refuses it first).
+    #[must_use]
+    pub fn with_market_sockets(mut self, n: usize) -> Self {
+        assert!(
+            (1..=PM15_MARKET_SOCKETS_MAX).contains(&n),
+            "rolling market sockets {n} out of 1..={PM15_MARKET_SOCKETS_MAX}"
+        );
+        self.shards = n;
+        let pairs = self.fams.period().pairs();
+        let mut s = 0usize;
+        while s < PM_SLOTS {
+            self.slot_shard[s] = ((s / pairs) % n) as u8;
+            s += 1;
+        }
+        self
+    }
+
+    /// PMJ J7: how many market sockets the families ride.
+    #[inline]
+    #[must_use]
+    pub fn market_shards(&self) -> usize {
+        self.shards
+    }
+
+    /// PMJ J7: the market shard that carries slot `s`.
+    #[inline(always)]
+    #[must_use]
+    pub fn shard_of(&self, s: usize) -> usize {
+        self.slot_shard[s % PM_SLOTS] as usize
+    }
+
+    /// PMJ J7: the shards that carry a bound window right now — bit `k` is
+    /// shard `k` (a shard's socket is dialled only while its bit is set).
+    #[must_use]
+    pub fn bound_shards(&self) -> u32 {
+        let mut m = 0u32;
+        let mut s = 0usize;
+        while s < self.fams.n_slots() {
+            if self.fams.slot(s).state != crate::rolling::PmSlotState::Empty {
+                m |= 1u32 << self.shard_of(s);
+            }
+            s += 1;
+        }
+        m
     }
 
     /// The families.
@@ -456,7 +590,8 @@ impl Pm15Driver {
         self.fams.period().roll_family_base() + s
     }
 
-    /// Slots bound right now (the market socket is dialled only when > 0).
+    /// Slots bound right now (PMJ J7: a market shard is dialled only while
+    /// it carries one — [`Self::bound_shards`]).
     #[must_use]
     pub fn bound(&self) -> usize {
         let mut n = 0usize;
@@ -475,7 +610,7 @@ impl Pm15Driver {
         wall_ns: u64,
         ts_ns: NsTs,
         out: &mut Pm15Out<'_, C>,
-        wire: &mut impl Pm15Wire,
+        wire: &mut impl Pm15Wires,
     ) {
         let c = match self.fams.offer(spec, wall_ns, &mut self.acts) {
             PmOffer::Bound => Pm15Counter::SpecsBound,
@@ -494,25 +629,27 @@ impl Pm15Driver {
         wall_ns: u64,
         ts_ns: NsTs,
         out: &mut Pm15Out<'_, C>,
-        wire: &mut impl Pm15Wire,
+        wire: &mut impl Pm15Wires,
     ) {
         self.fams.on_clock(wall_ns, &mut self.acts);
         self.perform(ts_ns, out, wire);
     }
 
-    /// The market session opened: subscribe every bound token (the
-    /// venue answers each with a `book` snapshot, so every ladder starts
-    /// over).
-    pub fn on_market_open(&mut self, wire: &mut impl Pm15Wire) -> bool {
-        self.reset_ladders();
+    /// The market session of shard `k` opened: subscribe every bound token
+    /// it carries (the venue answers each with a `book` snapshot, so each of
+    /// its ladders starts over).
+    pub fn on_market_open(&mut self, k: usize, wire: &mut impl Pm15Wires) -> bool {
+        debug_assert!(k < self.shards, "market shard {k} of {}", self.shards);
+        self.reset_ladders(k);
         let mut parts: [&[u8]; SUB_PARTS_MAX] = [&[]; SUB_PARTS_MAX];
         parts[0] = SUB_HEAD;
         let mut n = 1usize;
         let mut s = 0usize;
         while s < self.fams.n_slots() {
             let b = self.fams.slot(s);
+            let theirs = self.shard_of(s) != k;
             s += 1;
-            if b.state == crate::rolling::PmSlotState::Empty {
+            if b.state == crate::rolling::PmSlotState::Empty || theirs {
                 continue;
             }
             let mut leg = 0u32;
@@ -530,18 +667,23 @@ impl Pm15Driver {
         }
         parts[n] = SUB_TAIL;
         n += 1;
-        wire.queue(&parts[..n])
+        wire.queue(k, &parts[..n])
     }
 
-    /// The market session is gone: every touch emitted is withdrawn (a
-    /// stale tick, both sides zero — the member and the paper book stop
-    /// trusting it now, not at the idle law's next verdict); every ladder
-    /// starts over at the next open; the sequencers' and the estimator's
-    /// clocks reset.
-    pub fn on_market_down<C: Capture>(&mut self, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
+    /// The market session of shard `k` is gone: every touch it carried is
+    /// withdrawn (a stale tick, both sides zero — the member and the paper
+    /// book stop trusting it now, not at the idle law's next verdict); each
+    /// of its ladders starts over at its next open; its legs' sequencer
+    /// clocks and its feed clock reset. The other shards' legs are not
+    /// touched (PMJ J7).
+    pub fn on_market_down<C: Capture>(&mut self, k: usize, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
+        debug_assert!(k < self.shards, "market shard {k} of {}", self.shards);
         let mut i = 0usize;
         while i < PM15_LEGS {
-            if self.last[i] != TOUCH_UNSEEN && self.fams.slot(i / 2).ticks() {
+            if self.shard_of(i / 2) == k
+                && self.last[i] != TOUCH_UNSEEN
+                && self.fams.slot(i / 2).ticks()
+            {
                 let none = Touch15 {
                     bid_px: 0,
                     bid_sz: 0,
@@ -553,9 +695,17 @@ impl Pm15Driver {
             }
             i += 1;
         }
-        self.reset_ladders();
-        ArrivalSeq::reset_clocks(&mut self.seq);
-        self.market_clock.reset();
+        self.reset_ladders(k);
+        // A new connection for these legs (`ArrivalSeq::reset_clocks`, per
+        // leg of the shard).
+        let mut i = 0usize;
+        while i < PM15_LEGS {
+            if self.shard_of(i / 2) == k {
+                self.seq[i].reset_clock();
+            }
+            i += 1;
+        }
+        self.market_clock[k % PM15_MARKET_SOCKETS_MAX].reset();
     }
 
     /// The RTDS session is gone.
@@ -563,30 +713,37 @@ impl Pm15Driver {
         self.rtds_clock.reset();
     }
 
-    fn reset_ladders(&mut self) {
+    /// Every ladder shard `k` carries starts over.
+    fn reset_ladders(&mut self, k: usize) {
         let mut i = 0usize;
         while i < PM15_LEGS {
-            self.ladders[i].clear();
-            self.last[i] = TOUCH_UNSEEN;
-            self.last_vt[i] = 0;
+            if self.shard_of(i / 2) == k {
+                self.ladders[i].clear();
+                self.last[i] = TOUCH_UNSEEN;
+                self.last_vt[i] = 0;
+            }
             i += 1;
         }
     }
 
-    /// One market text frame, received at `ts_ns` (engine clock).
-    /// Actions it causes (a settlement's unsubscribe) are queued: call
-    /// [`Self::perform`] once the frame's borrow has ended.
+    /// One text frame of market shard `k`, received at `ts_ns` (engine
+    /// clock). Actions it causes (a settlement's unsubscribe) are queued:
+    /// call [`Self::perform`] once the frame's borrow has ended. Events
+    /// find their leg by token, whichever shard carried them; a `PONG`
+    /// speaks for its own shard only.
     pub fn on_market_text<C: Capture>(
         &mut self,
+        k: usize,
         p: &[u8],
         ts_ns: NsTs,
         wall_ns: u64,
         out: &mut Pm15Out<'_, C>,
     ) {
+        debug_assert!(k < self.shards, "market shard {k} of {}", self.shards);
         out.capture.raw_frame(ts_ns, p);
         out.status.add_msgs(1);
         if p == b"PONG" {
-            self.reassert_touches(ts_ns, out);
+            self.reassert_touches(k, ts_ns, out);
             return;
         }
         match kind_of(p) {
@@ -643,7 +800,7 @@ impl Pm15Driver {
         &mut self,
         ts_ns: NsTs,
         out: &mut Pm15Out<'_, C>,
-        wire: &mut impl Pm15Wire,
+        wire: &mut impl Pm15Wires,
     ) {
         let mut k = 0usize;
         while k < self.acts.as_slice().len() {
@@ -668,26 +825,29 @@ impl Pm15Driver {
                         self.depth_last_ns[i] = 0;
                         leg += 1;
                     }
-                    if wire.is_open() {
+                    // PMJ J7: on the socket that carries the slot's family.
+                    let k = self.shard_of(s);
+                    if wire.is_open(k) {
                         let b = self.fams.slot(s);
-                        let _ = wire.queue(&[
-                            DYN_HEAD,
-                            b.spec.up.as_bytes(),
-                            DYN_MID,
-                            b.spec.down.as_bytes(),
-                            DYN_SUB,
-                        ]);
+                        let _ = wire.queue(
+                            k,
+                            &[
+                                DYN_HEAD,
+                                b.spec.up.as_bytes(),
+                                DYN_MID,
+                                b.spec.down.as_bytes(),
+                                DYN_SUB,
+                            ],
+                        );
                     }
                 }
-                PmAction::Unsubscribe(up, down) => {
-                    if wire.is_open() {
-                        let _ = wire.queue(&[
-                            DYN_HEAD,
-                            up.as_bytes(),
-                            DYN_MID,
-                            down.as_bytes(),
-                            DYN_UNSUB,
-                        ]);
+                PmAction::Unsubscribe(s, up, down) => {
+                    let k = self.shard_of(s as usize);
+                    if wire.is_open(k) {
+                        let _ = wire.queue(
+                            k,
+                            &[DYN_HEAD, up.as_bytes(), DYN_MID, down.as_bytes(), DYN_UNSUB],
+                        );
                     }
                 }
                 PmAction::Created(s) => self.created(s as usize, ts_ns, out),
@@ -796,11 +956,14 @@ impl Pm15Driver {
     /// frame sent before the `PONG` has been read and each touch emitted is
     /// still the venue's — re-assert it, so a quiet book is not mistaken for
     /// a stale one (`strategy_pm15::TOUCH_FRESH_NS`). At most one tick per
-    /// leg per `PM15_MARKET_PING_NS`.
-    fn reassert_touches<C: Capture>(&mut self, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
+    /// leg per `PM15_MARKET_PING_NS`. PMJ J7: a `PONG` speaks only for
+    /// the legs its own shard `k` carries — another shard's socket may be
+    /// the one falling behind.
+    fn reassert_touches<C: Capture>(&mut self, k: usize, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
         let mut i = 0usize;
         while i < PM15_LEGS {
-            if self.last[i] != TOUCH_UNSEEN
+            if self.shard_of(i / 2) == k
+                && self.last[i] != TOUCH_UNSEEN
                 && self.ladders[i].is_ready()
                 && self.fams.slot(i / 2).ticks()
             {
@@ -838,12 +1001,14 @@ impl Pm15Driver {
         let (s, leg) = (i / 2, (i % 2) as u32);
         let seq = self.seq[i].next(key);
         out.status.note_arrival_seq(seq);
-        let judged = self.market_clock.judge(venue_ms, ts_ns);
+        // PMJ J7: judged by the clock of the shard that carried it.
+        let clock =
+            &mut self.market_clock[self.slot_shard[s % PM_SLOTS] as usize % PM15_MARKET_SOCKETS_MAX];
+        let judged = clock.judge(venue_ms, ts_ns);
         if judged.stale {
             out.status.inc_stale_ticks();
         }
-        out.status
-            .set_feed_delay_ema_ms(self.market_clock.delay_ema_ms());
+        out.status.set_feed_delay_ema_ms(clock.delay_ema_ms());
         out.status.add_ticks(1);
         let tick = Tick::new_stamped(
             ts_ns,
@@ -1136,10 +1301,12 @@ fn emit_event<C: Capture>(ev: &ChannelEvent, out: &mut Pm15Out<'_, C>) {
 // The loop
 // ---------------------------------------------------------------
 
-/// The two sockets (built at boot by the spawner: `WsConn::new` resolves).
+/// The sockets (built at boot by the spawner: `WsConn::new` resolves).
 pub struct Pm15Sockets {
-    /// The market socket, token [`PM15_MARKET_TOKEN`].
-    pub market: WsConn,
+    /// PMJ J7: the market sockets — shard `k` is `market[k]`, token
+    /// [`pm15_market_token`]`(k)`; exactly [`Pm15Driver::market_shards`] of
+    /// them (allocated at boot).
+    pub market: Vec<WsConn>,
     /// The RTDS socket, token [`PM15_RTDS_TOKEN`].
     pub rtds: WsConn,
 }
@@ -1162,6 +1329,10 @@ impl Dial {
 ///
 /// # Errors
 /// The `mio` poll could not be created or polled.
+///
+/// # Panics
+/// PMJ J7: `socks.market` does not hold exactly the driver's
+/// [`Pm15Driver::market_shards`] sockets (a boot wiring fault).
 #[allow(clippy::too_many_arguments)]
 pub fn run_pm15<C: Capture>(
     driver: &mut Pm15Driver,
@@ -1172,13 +1343,26 @@ pub fn run_pm15<C: Capture>(
     seed: u64,
     stop: &AtomicBool,
 ) -> io::Result<()> {
+    let n = driver.market_shards();
+    assert_eq!(
+        socks.market.len(),
+        n,
+        "the rolling ingress needs one market socket per shard"
+    );
     let mut poll = mio::Poll::new()?;
     let mut events = mio::Events::with_capacity(64);
-    let mut md = Dial {
-        backoff: Backoff::default_for_ingress(seed),
-        next_ns: 0,
+    // PMJ J7: one dial schedule per market shard (shard 0 keeps the seed);
+    // the first dials staggered.
+    let start = now_ns();
+    let mut md: [Dial; PM15_MARKET_SOCKETS_MAX] = core::array::from_fn(|k| Dial {
+        backoff: Backoff::default_for_ingress(seed ^ (k as u64).wrapping_mul(SHARD_SEED_MIX)),
+        next_ns: if k == 0 {
+            0
+        } else {
+            start.saturating_add(k as u64 * SHARD_DIAL_STAGGER_NS)
+        },
         ping_ns: 0,
-    };
+    });
     let mut rd = Dial {
         backoff: Backoff::default_for_ingress(seed ^ 0x5a5a),
         next_ns: 0,
@@ -1186,24 +1370,27 @@ pub fn run_pm15<C: Capture>(
     };
     out.status.set_state(IngressState::Connecting);
     while !stop.load(Ordering::Relaxed) {
-        poll.poll(&mut events, Some(POLL_TIMEOUT))?;
+        if let Err(e) = poll.poll(&mut events, Some(POLL_TIMEOUT)) {
+            out.counters.set_market_open(0);
+            return Err(e);
+        }
         for ev in events.iter() {
             let now = now_ns();
-            if ev.token() == PM15_MARKET_TOKEN {
-                match socks.market.on_event(ev, poll.registry(), now) {
+            let t = ev.token().0;
+            if t < n {
+                match socks.market[t].on_event(ev, poll.registry(), now) {
                     WsProgress::Opened => {
-                        md.backoff.reset();
-                        out.status.set_state(IngressState::Up);
-                        if !driver.on_market_open(&mut socks.market) {
-                            socks.market.close();
-                            market_down(driver, &mut md, out, now, WsErr::Overflow);
+                        md[t].backoff.reset();
+                        if !driver.on_market_open(t, &mut socks.market) {
+                            socks.market[t].close();
+                            market_down(driver, t, &mut md[t], out, now, WsErr::Overflow);
                             continue;
                         }
-                        md.ping_ns = now.saturating_add(PM15_MARKET_PING_NS);
-                        drain_market(driver, socks, out, &mut md, wall);
+                        md[t].ping_ns = now.saturating_add(PM15_MARKET_PING_NS);
+                        drain_market(driver, t, socks, out, &mut md[t], wall);
                     }
-                    WsProgress::Readable => drain_market(driver, socks, out, &mut md, wall),
-                    WsProgress::Failed(e) => market_down(driver, &mut md, out, now, e),
+                    WsProgress::Readable => drain_market(driver, t, socks, out, &mut md[t], wall),
+                    WsProgress::Failed(e) => market_down(driver, t, &mut md[t], out, now, e),
                     WsProgress::Waiting => {}
                 }
             } else if ev.token() == PM15_RTDS_TOKEN {
@@ -1234,31 +1421,44 @@ pub fn run_pm15<C: Capture>(
             driver.offer(&sp, wall_now, now, out, &mut socks.market);
         }
         driver.on_clock(wall_now, now, out, &mut socks.market);
-        // Dials: the market once a window is bound, RTDS at once.
-        if socks.market.is_down() && driver.bound() > 0 && now >= md.next_ns {
-            out.status.set_state(IngressState::Connecting);
-            if let Err(e) = socks.market.connect(poll.registry(), now) {
-                market_down(driver, &mut md, out, now, e);
+        // Dials: a market shard once one of its windows is bound, RTDS at once.
+        let bound = driver.bound_shards();
+        let mut k = 0usize;
+        while k < n {
+            if socks.market[k].is_down() && bound & (1u32 << k) != 0 && now >= md[k].next_ns {
+                if let Err(e) = socks.market[k].connect(poll.registry(), now) {
+                    market_down(driver, k, &mut md[k], out, now, e);
+                }
             }
+            k += 1;
         }
         if socks.rtds.is_down() && !driver.families().is_empty() && now >= rd.next_ns {
             if let Err(e) = socks.rtds.connect(poll.registry(), now) {
                 rtds_down(driver, &mut rd, out, now, e);
             }
         }
-        // Clocks and keepalives.
-        if let WsProgress::Failed(e) = socks.market.on_tick(now) {
-            market_down(driver, &mut md, out, now, e);
+        // Clocks, keepalives and flushes, each market shard, then RTDS.
+        let mut k = 0usize;
+        while k < n {
+            if let WsProgress::Failed(e) = socks.market[k].on_tick(now) {
+                market_down(driver, k, &mut md[k], out, now, e);
+            }
+            if socks.market[k].is_open() && now >= md[k].ping_ns {
+                md[k].ping_ns = now.saturating_add(PM15_MARKET_PING_NS);
+                if let Err(e) = socks.market[k].queue_text(&[b"PING"]) {
+                    socks.market[k].close();
+                    market_down(driver, k, &mut md[k], out, now, e);
+                }
+            }
+            if socks.market[k].wants_flush() {
+                if let Err(e) = socks.market[k].flush(poll.registry()) {
+                    market_down(driver, k, &mut md[k], out, now, e);
+                }
+            }
+            k += 1;
         }
         if let WsProgress::Failed(e) = socks.rtds.on_tick(now) {
             rtds_down(driver, &mut rd, out, now, e);
-        }
-        if socks.market.is_open() && now >= md.ping_ns {
-            md.ping_ns = now.saturating_add(PM15_MARKET_PING_NS);
-            if let Err(e) = socks.market.queue_text(&[b"PING"]) {
-                socks.market.close();
-                market_down(driver, &mut md, out, now, e);
-            }
         }
         if socks.rtds.is_open() && now >= rd.ping_ns {
             rd.ping_ns = now.saturating_add(RTDS_PING_NS);
@@ -1267,36 +1467,80 @@ pub fn run_pm15<C: Capture>(
                 rtds_down(driver, &mut rd, out, now, e);
             }
         }
-        if socks.market.wants_flush() {
-            if let Err(e) = socks.market.flush(poll.registry()) {
-                market_down(driver, &mut md, out, now, e);
-            }
-        }
         if socks.rtds.wants_flush() {
             if let Err(e) = socks.rtds.flush(poll.registry()) {
                 rtds_down(driver, &mut rd, out, now, e);
             }
         }
+        market_report(bound, socks, n, out);
         out.capture.maybe_flush(now);
     }
-    socks.market.close();
+    let mut k = 0usize;
+    while k < n {
+        socks.market[k].close();
+        k += 1;
+    }
     socks.rtds.close();
+    out.counters.set_market_open(0);
     out.status.set_state(IngressState::Down);
     Ok(())
 }
 
+/// PMJ J7: the market side's state over its shards, and how many of its
+/// sockets are open (`market_sockets_open`), once a loop pass; `bound` is
+/// [`Pm15Driver::bound_shards`] of the pass ([`market_state`]).
+fn market_report<C: Capture>(bound: u32, socks: &Pm15Sockets, n: usize, out: &mut Pm15Out<'_, C>) {
+    let (mut open, mut waiting, mut dialing) = (0u64, false, false);
+    let mut k = 0usize;
+    while k < n {
+        let m = &socks.market[k];
+        if m.is_open() {
+            open += 1;
+        } else if bound & (1u32 << k) != 0 {
+            if m.is_down() {
+                waiting = true;
+            } else {
+                dialing = true;
+            }
+        }
+        k += 1;
+    }
+    out.status.set_state(market_state(open, waiting, dialing));
+    out.counters.set_market_open(open);
+}
+
+/// PMJ J7: the market side's state from its shards — Backoff while a shard
+/// that carries a bound window waits to dial or redial (`waiting`, its
+/// staggered first dial included);
+/// Connecting while one dials (`dialing`) or before any socket is open;
+/// else Up (`open` sockets open). With one shard these are the states as
+/// before J7 but one: a lost socket with no window bound reads Connecting
+/// (it was left at Backoff).
+#[must_use]
+pub fn market_state(open: u64, waiting: bool, dialing: bool) -> IngressState {
+    if waiting {
+        IngressState::Backoff
+    } else if dialing || open == 0 {
+        IngressState::Connecting
+    } else {
+        IngressState::Up
+    }
+}
+
+/// Market shard `k` failed with `e`: its legs are withdrawn
+/// ([`Pm15Driver::on_market_down`]) and its next dial scheduled.
 fn market_down<C: Capture>(
     driver: &mut Pm15Driver,
+    k: usize,
     d: &mut Dial,
     out: &mut Pm15Out<'_, C>,
     now: u64,
     e: WsErr,
 ) {
     out.counters.note_ws_err(0, e);
-    driver.on_market_down(now, out);
+    driver.on_market_down(k, now, out);
     d.failed(now);
     out.status.inc_reconnects();
-    out.status.set_state(IngressState::Backoff);
     out.counters.inc(Pm15Counter::MarketReconnects);
 }
 
@@ -1313,28 +1557,29 @@ fn rtds_down<C: Capture>(
     out.counters.inc(Pm15Counter::RtdsReconnects);
 }
 
-/// Every buffered market frame, then the actions they caused.
+/// Every buffered frame of market shard `k`, then the actions they caused.
 fn drain_market<C: Capture>(
     driver: &mut Pm15Driver,
+    k: usize,
     socks: &mut Pm15Sockets,
     out: &mut Pm15Out<'_, C>,
     d: &mut Dial,
     wall: WallAnchor,
 ) {
     loop {
-        match socks.market.next_frame() {
+        match socks.market[k].next_frame() {
             WsNext::Text(span) => {
                 let now = now_ns();
-                let p = socks.market.payload(span);
+                let p = socks.market[k].payload(span);
                 out.status.touch_activity(now);
                 out.status.add_bytes(p.len() as u64);
-                driver.on_market_text(p, now, wall.wall_of(now), out);
+                driver.on_market_text(k, p, now, wall.wall_of(now), out);
                 driver.perform(now, out, &mut socks.market);
             }
             WsNext::Binary(_) => {}
             WsNext::Idle => return,
             WsNext::Failed(e) => {
-                market_down(driver, d, out, now_ns(), e);
+                market_down(driver, k, d, out, now_ns(), e);
                 return;
             }
         }

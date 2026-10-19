@@ -6,6 +6,40 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-19 — PMJ J7: `[polymarket] rolling_market_sockets` — the rolling families spread over several market sockets
+
+**What changed** (rulings R-PMJ-S17..S20; risk-policy "PMJ — slot 11", `### J7`)
+- `universe.toml` `[polymarket]` gains **`rolling_market_sockets`** (1..=8,
+  default **8** = one socket per family). Each rolling pipeline (15 m, 5 m)
+  now runs one market socket per shard of its families (family `f` on shard
+  `f mod n`; min(n, families) sockets) — seven per period at today's seven
+  families — instead of one.
+  `1` is one socket per period, the pre-J7 stream bit for bit.
+- New gauge `engine_ingress_pm15_market_sockets_open` /
+  `engine_ingress_pm5_market_sockets_open`. `…_market_reconnects_total` now
+  sums the shards' losses, and a loss withdraws only that shard's families'
+  touches (stale ticks on their legs alone).
+- Library: `ingress_polymarket::pm15_loop` — the rolling driver speaks
+  through the new shard-aware `Pm15Wires` (`is_open(k)`, `queue(k, ..)`;
+  `Pm15Wire`, one socket, stays as slot 9's user socket uses it),
+  `Pm15Sockets.market` is a `Vec<WsConn>`,
+  `Pm15Driver::{on_market_open, on_market_down, on_market_text}` take the
+  shard first, `PM15_RTDS_TOKEN` is `Token(8)`; `rolling::PmAction::Unsubscribe`
+  carries the slot first. `cli::spawn_pm15` / `spawn_pm5` take the
+  `RollingMarketSockets`. The `pm15-probe` keeps one socket.
+
+**Readers:** the capture is unchanged in format; the `pm15` / `pm5` raw
+frames now interleave several sockets' frames (each record still carries
+its own arrival stamp), and nothing in the capture says which socket a
+frame or a `PONG` came on — `PONG`s now arrive n times per 5 s, and one
+shard's loss cannot be rebuilt from the raw frames (no in-repo tool replays
+them through the driver). The boot log lines `pm15: the families ride n
+market socket(s)` / `pm5: …` name the shape; runs captured before the
+deploy (`docs/state.md` dates it) rode one socket per period.
+**Rollback:** `rolling_market_sockets = 1` with this binary. The previous
+binary refuses a universe that names the key (unknown key) — remove it with
+the binary.
+
 ## 2026-10-19 — PMJ: `[polymarket] rolling_depth` / `rolling_depth_ms` — the rolling depth capture at most one record per leg per second
 
 **What changed** (ruling R-PMJ-S15; risk-policy "PMJ — slot 11", `### J6`)

@@ -851,7 +851,8 @@ pub const PM15_RTDS_WS: core_net::WsCfg = core_net::WsCfg {
 
 /// PM15: spawn the rolling families' two threads (`ingress_polymarket`
 /// crate docs): `pm15-discovery` (Gamma, blocking, unpinned) and
-/// `ingress-pm15` (the market and RTDS sockets on one poll, pinned to
+/// `ingress-pm15` (the market sockets — PMJ J7: min(`sockets.n`, families)
+/// of them, the families spread over them — and RTDS on one poll, pinned to
 /// `core_id`), feeding `engine::PM15_LANE` — `tick_tx` and `event_tx` are
 /// that lane's producers. `assets` are the families' assets in
 /// `[polymarket] rolling` order. Opens the `pm15` capture and resolves
@@ -863,6 +864,7 @@ pub const PM15_RTDS_WS: core_net::WsCfg = core_net::WsCfg {
 pub fn spawn_pm15(
     assets: Vec<String>,
     depth: core_config::universe::RollingDepth,
+    sockets: core_config::universe::RollingMarketSockets,
     tls_config: RustlsConfig,
     wall_anchor: core_time::WallAnchor,
     stale_after_ms: u32,
@@ -887,6 +889,7 @@ pub fn spawn_pm15(
         "pm15",
         assets,
         depth,
+        sockets,
         tls_config,
         wall_anchor,
         stale_after_ms,
@@ -915,6 +918,7 @@ pub fn spawn_pm15(
 pub fn spawn_pm5(
     assets: Vec<String>,
     depth: core_config::universe::RollingDepth,
+    sockets: core_config::universe::RollingMarketSockets,
     tls_config: RustlsConfig,
     wall_anchor: core_time::WallAnchor,
     stale_after_ms: u32,
@@ -933,6 +937,7 @@ pub fn spawn_pm5(
         "pm5",
         assets,
         depth,
+        sockets,
         tls_config,
         wall_anchor,
         stale_after_ms,
@@ -957,6 +962,7 @@ fn spawn_rolling(
     label: &'static str,
     assets: Vec<String>,
     depth: core_config::universe::RollingDepth,
+    sockets: core_config::universe::RollingMarketSockets,
     tls_config: RustlsConfig,
     wall_anchor: core_time::WallAnchor,
     stale_after_ms: u32,
@@ -996,16 +1002,47 @@ fn spawn_rolling(
         discovery.set_tee(t);
     }
     let seed = now_ns();
-    let market = core_net::WsConn::new(
-        p15::PM15_MARKET_HOST,
-        443,
-        p15::PM15_MARKET_PATH,
-        tls_config.clone(),
-        PM15_MARKET_WS,
-        p15::PM15_MARKET_TOKEN,
-        seed,
-    )
-    .map_err(|e| io::Error::other(format!("{label}: market socket: {e}")))?;
+    // PMJ J7 (R-PMJ-S17..S19): one market socket per shard of the families,
+    // never more than there are families (a socket with no family would
+    // never dial); shard 0 keeps the pre-J7 seed. Allocated here, at boot.
+    let n_market = (sockets.n as usize).min(assets.len()).max(1);
+    let mut market = Vec::with_capacity(n_market);
+    let mut k = 0usize;
+    while k < n_market {
+        let mut tries = 0u32;
+        let ws = loop {
+            match core_net::WsConn::new(
+                p15::PM15_MARKET_HOST,
+                443,
+                p15::PM15_MARKET_PATH,
+                tls_config.clone(),
+                PM15_MARKET_WS,
+                p15::pm15_market_token(k),
+                seed.wrapping_add((k as u64) << 32),
+            ) {
+                Ok(w) => break w,
+                // Shard 0 resolved the host a moment ago: a later shard's
+                // lookup that fails is retried (cold, boot only) before it
+                // can fail the boot.
+                Err(core_net::WsErr::Dns) if k > 0 && tries < 3 => {
+                    tries += 1;
+                    tracing::warn!(shard = k, tries, "{label}: market socket lookup failed; retrying");
+                    thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => {
+                    return Err(io::Error::other(format!("{label}: market socket {k}: {e}")));
+                }
+            }
+        };
+        market.push(ws);
+        k += 1;
+    }
+    tracing::info!(
+        families = assets.len(),
+        market_sockets = n_market,
+        configured = sockets.n,
+        "{label}: the families ride {n_market} market socket(s)"
+    );
     let rtds = core_net::WsConn::new(
         ingress_polymarket::rtds::RTDS_HOST,
         443,
@@ -1017,8 +1054,10 @@ fn spawn_rolling(
     )
     .map_err(|e| io::Error::other(format!("{label}: rtds socket: {e}")))?;
     // R-PMJ-S15: the depth capture's policy (`[polymarket] rolling_depth*`).
-    let mut driver =
-        p15::Pm15Driver::new_for(period, &refs, stale_after_ms).with_depth_policy(depth.on, depth.min_ms);
+    // PMJ J7: the families spread over the market sockets.
+    let mut driver = p15::Pm15Driver::new_for(period, &refs, stale_after_ms)
+        .with_depth_policy(depth.on, depth.min_ms)
+        .with_market_sockets(n_market);
     drop(refs);
     let (mut spec_tx, mut spec_rx) =
         Ring::<ingress_polymarket::gamma15::PmWindowSpec, { p15::PM15_SPEC_RING }>::new().split();
@@ -9740,9 +9779,17 @@ pub struct Pm15MetricIds {
     pub gauges: [GaugeId; PM15_METRICS],
 }
 
-/// Size of the PM15 family: the tallies, the bound-slot gauge, and (PM15-5b)
-/// the two sockets' last failure (`core_net::WsErr` + 1; 0 = none yet).
-pub const PM15_METRICS: usize = ingress_polymarket::pm15_loop::PM15_COUNTERS + 3;
+/// Size of the PM15 family: the tallies, the bound-slot gauge, (PM15-5b)
+/// the two sockets' last failure (`core_net::WsErr` + 1; 0 = none yet), and
+/// (PMJ J7) the market sockets open.
+pub const PM15_METRICS: usize = ingress_polymarket::pm15_loop::PM15_COUNTERS + 4;
+
+// PMJ J7: the universe parser's bound on `rolling_market_sockets` is the
+// driver's (`Pm15Driver::with_market_sockets` panics past it).
+const _: () = assert!(
+    core_config::universe::ROLLING_MARKET_SOCKETS_MAX as usize
+        == ingress_polymarket::pm15_loop::PM15_MARKET_SOCKETS_MAX
+);
 
 /// Register the PM15 family (boot-only; the names are rendered once).
 fn register_pm15_metrics(reg: &mut MetricsRegistry) -> Result<Pm15MetricIds, &'static str> {
@@ -9751,7 +9798,8 @@ fn register_pm15_metrics(reg: &mut MetricsRegistry) -> Result<Pm15MetricIds, &'s
 
 /// PMJ J1b: register one rolling pipeline's family under `label`
 /// (`engine_ingress_<label>_<name>_total`, `…_slots_bound`,
-/// `…_last_market_err`, `…_last_rtds_err`). Boot-only.
+/// `…_last_market_err`, `…_last_rtds_err`, PMJ J7 `…_market_sockets_open`).
+/// Boot-only.
 fn register_rolling_metrics(
     reg: &mut MetricsRegistry,
     label: &str,
@@ -9777,6 +9825,9 @@ fn register_rolling_metrics(
     gauges[i + 2] = reg
         .register_gauge(&format!("engine_ingress_{label}_last_rtds_err"))
         .map_err(|_| "register rolling ingress gauge")?;
+    gauges[i + 3] = reg
+        .register_gauge(&format!("engine_ingress_{label}_market_sockets_open"))
+        .map_err(|_| "register rolling ingress gauge")?;
     Ok(Pm15MetricIds { gauges })
 }
 
@@ -9798,6 +9849,7 @@ pub fn pm15_metric_values(c: &ingress_polymarket::pm15_loop::Pm15Counters) -> [u
         };
         k += 1;
     }
+    v[i + 3] = c.market_sockets_open();
     v
 }
 

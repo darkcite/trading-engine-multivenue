@@ -169,8 +169,10 @@ pub enum PmAction {
         /// The `market_resolved` stamp, ms (0 when retired unresolved).
         venue_ms: u64,
     },
-    /// Unsubscribe these two tokens (the slot that held them is free).
-    Unsubscribe(PmTokenId, PmTokenId),
+    /// Unsubscribe these two tokens (the slot that held them is free). PMJ
+    /// J7: the slot rides first, so the owner sends the frame on the market
+    /// socket that carried the slot's family.
+    Unsubscribe(u8, PmTokenId, PmTokenId),
 }
 
 /// The owner's action queue (drained after every call).
@@ -549,7 +551,7 @@ impl PmFamilies {
         });
         // COPY: the two token ids (≤ 160 B) into the unsubscribe action —
         // cold, once per window; the slot is reused at once.
-        acts.push(PmAction::Unsubscribe(b.spec.up, b.spec.down));
+        acts.push(PmAction::Unsubscribe(s as u8, b.spec.up, b.spec.down));
         self.slot[s] = PmBinding::EMPTY;
         if self.has_pending[s] {
             self.has_pending[s] = false;
@@ -640,7 +642,7 @@ mod tests {
                     winner: PM_SETTLED_UP,
                     venue_ms: 1_792_217_816_055
                 },
-                PmAction::Unsubscribe(sp.up, sp.down),
+                PmAction::Unsubscribe(s as u8, sp.up, sp.down),
             ]
         );
         assert_eq!(f.slot(s).state, PmSlotState::Empty);
@@ -695,7 +697,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(got[1], PmAction::Unsubscribe(w0.up, w0.down));
+        assert_eq!(got[1], PmAction::Unsubscribe(s0 as u8, w0.up, w0.down));
         assert_eq!(got[2], PmAction::Subscribe(s0 as u8));
         assert_eq!(f.slot(s0).spec.window, w + 2);
         assert_eq!(f.slot(s0).state, PmSlotState::Bound);
@@ -733,7 +735,10 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(got[1], PmAction::Unsubscribe(w0.up, w0.down));
+        assert_eq!(
+            got[1],
+            PmAction::Unsubscribe(pm_roll_family(0, pm_pair_of_window(w)) as u8, w0.up, w0.down)
+        );
         assert!(matches!(got[2], PmAction::Subscribe(_)));
         // w+2 settles on a contradicting resolution: unknown.
         f.on_clock((OPEN + 1800) * S, &mut a);

@@ -43,6 +43,13 @@ rolling = []
 # first market PONG sweep at least the spacing later (<= spacing + 5 s).
 # rolling_depth = true
 # rolling_depth_ms = 1000
+# PMJ J7 (R-PMJ-S17..S19): the market sockets each rolling pipeline
+# (15 m, 5 m) spreads its families over — family f rides socket f % n.
+# The venue closes a socket that carries too much (1013 "slow consumer:
+# send buffer full"); a close then withdraws only that socket's families.
+# Default 8 (the family cap: one socket per family); 1 = one socket per
+# period, the stream as before J7.
+# rolling_market_sockets = 8
 
 [binance]
 # Lowercase stream symbols. spot[0] → SymbolId 7 (legacy anchor), then

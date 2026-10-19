@@ -54,20 +54,33 @@ impl Capture for Rec {
 #[derive(Default)]
 struct Wire {
     open: bool,
+    /// PMJ J7: bit `k` set = shard `k`'s session is down.
+    down: u32,
     frames: Vec<Vec<u8>>,
+    /// PMJ J7: the shard each frame went out on.
+    on: Vec<usize>,
 }
 
-impl Pm15Wire for Wire {
-    fn is_open(&self) -> bool {
-        self.open
+impl Pm15Wires for Wire {
+    fn is_open(&self, k: usize) -> bool {
+        self.open && self.down & (1 << k) == 0
     }
-    fn queue(&mut self, parts: &[&[u8]]) -> bool {
+    fn queue(&mut self, k: usize, parts: &[&[u8]]) -> bool {
         let mut v = Vec::new();
         for p in parts {
             v.extend_from_slice(p);
         }
         self.frames.push(v);
+        self.on.push(k);
         true
+    }
+}
+
+impl Wire {
+    /// PMJ J7: every frame sent so far, with its shard; the wire empties.
+    fn take(&mut self) -> Vec<(usize, Vec<u8>)> {
+        let frames = std::mem::take(&mut self.frames);
+        std::mem::take(&mut self.on).into_iter().zip(frames).collect()
     }
 }
 
@@ -127,6 +140,52 @@ impl Rig {
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/pm15/{name}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}"))
+}
+
+/// PMJ J7: an ETH family's tokens (the BTC answer reshaped, [`spec_as`]).
+const UP_ETH: &[u8] =
+    b"11111111111111111111111111111111111111111111111111111111111111111111111111111";
+const DOWN_ETH: &[u8] =
+    b"22222222222222222222222222222222222222222222222222222222222222222222222222222";
+
+fn utf8(b: &[u8]) -> &str {
+    std::str::from_utf8(b).unwrap()
+}
+
+fn has(hay: &[u8], needle: &[u8]) -> bool {
+    memchr::memmem::find(hay, needle).is_some()
+}
+
+/// PMJ J7: the live answer reshaped to `asset` (family `f`), the window
+/// opening at `open`, on the tokens `up` / `down`.
+fn spec_as(f: usize, asset: &str, open: u64, up: &[u8], down: &[u8]) -> PmWindowSpec {
+    let w = pm_window_of_open(open).unwrap();
+    let body = String::from_utf8(fixture("gamma_btc_1792216800.json"))
+        .unwrap()
+        .replace("btc-updown-15m-1792216800", &format!("{asset}-updown-15m-{open}"))
+        .replace(r#""asset":"btc""#, &format!(r#""asset":"{asset}""#))
+        .replace(utf8(UP), utf8(up))
+        .replace(utf8(DOWN), utf8(down));
+    let mut s = PmWindowSpec::EMPTY;
+    parse_window_spec(body.as_bytes(), f, asset.as_bytes(), w, &mut s)
+        .expect("the reshaped answer passes the law");
+    assert_eq!((s.up.as_bytes(), s.down.as_bytes()), (up, down));
+    s
+}
+
+/// The fixture's frames: `(arrival ms, frame)`.
+fn lines_of(frames: &[u8]) -> Vec<(u64, &[u8])> {
+    frames
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let tab = l.iter().position(|b| *b == b'\t').unwrap();
+            (
+                std::str::from_utf8(&l[..tab]).unwrap().parse::<u64>().unwrap(),
+                &l[tab + 1..],
+            )
+        })
+        .collect()
 }
 
 fn btc_spec() -> PmWindowSpec {
@@ -217,7 +276,7 @@ fn the_live_window_replays_into_ticks_rolls_and_its_settlement() {
     );
     // The session opens: one subscribe naming both tokens.
     wire.open = true;
-    assert!(d.on_market_open(&mut wire));
+    assert!(d.on_market_open(0, &mut wire));
     let want = format!(
         "{{\"assets_ids\":[\"{}\",\"{}\"],\"type\":\"market\",\"custom_feature_enabled\":true}}",
         std::str::from_utf8(UP).unwrap(),
@@ -232,7 +291,7 @@ fn the_live_window_replays_into_ticks_rolls_and_its_settlement() {
         let now = ms * MS;
         let mut out = rig.out();
         d.on_clock(now, now, &mut out, &mut wire);
-        d.on_market_text(p, now, now, &mut out);
+        d.on_market_text(0, p, now, now, &mut out);
         d.perform(now, &mut out, &mut wire);
         if d.fams.slot(s).state == PmSlotState::Ended {
             ended_seen = true;
@@ -400,6 +459,7 @@ fn a_session_lost_restarts_every_ladder_and_resubscribes_what_is_bound() {
     let mut wire = Wire {
         open: true,
         frames: Vec::new(),
+        ..Wire::default()
     };
     let mut d = Pm15Driver::new(&[b"btc"], 5_000);
     let now = (OPEN + 100) * 1_000_000_000;
@@ -415,11 +475,11 @@ fn a_session_lost_restarts_every_ladder_and_resubscribes_what_is_bound() {
         "[{{\"market\":\"0x70\",\"asset_id\":\"{}\",\"timestamp\":\"1792216900000\",\"hash\":\"h\",\"bids\":[{{\"price\":\"0.5\",\"size\":\"10\"}}],\"asks\":[{{\"price\":\"0.52\",\"size\":\"7\"}}],\"event_type\":\"book\"}}]",
         std::str::from_utf8(UP).unwrap()
     );
-    d.on_market_text(book.as_bytes(), now, now, &mut rig.out());
+    d.on_market_text(0, book.as_bytes(), now, now, &mut rig.out());
     assert!(d.ladders[2 * s].is_ready());
     assert_eq!(rig.rec.ticks.len(), 1);
     // PM15-5c: a PONG re-asserts the touch unchanged, on the next ordinal.
-    d.on_market_text(b"PONG", now + 5, now + 5, &mut rig.out());
+    d.on_market_text(0, b"PONG", now + 5, now + 5, &mut rig.out());
     assert_eq!(rig.rec.ticks.len(), 2);
     let (a, b) = (rig.rec.ticks[0], rig.rec.ticks[1]);
     assert_eq!(
@@ -432,7 +492,7 @@ fn a_session_lost_restarts_every_ladder_and_resubscribes_what_is_bound() {
     );
     assert_eq!(rig.counters.of(Pm15Counter::TouchesReasserted), 1);
     // The session drops: the touch is withdrawn — stale, both sides zero.
-    d.on_market_down(now + 6, &mut rig.out());
+    d.on_market_down(0, now + 6, &mut rig.out());
     assert_eq!(rig.rec.ticks.len(), 3);
     let w = rig.rec.ticks[2];
     assert!(w.is_stale());
@@ -443,21 +503,21 @@ fn a_session_lost_restarts_every_ladder_and_resubscribes_what_is_bound() {
     assert_eq!(rig.counters.of(Pm15Counter::TouchesWithdrawn), 1);
     assert!(!d.ladders[2 * s].is_ready());
     // Down, nothing is re-asserted (no ladder is ready).
-    d.on_market_text(b"PONG", now + 7, now + 7, &mut rig.out());
+    d.on_market_text(0, b"PONG", now + 7, now + 7, &mut rig.out());
     assert_eq!(rig.rec.ticks.len(), 3);
     // The next open subscribes the bound tokens again.
     wire.frames.clear();
-    assert!(d.on_market_open(&mut wire));
+    assert!(d.on_market_open(0, &mut wire));
     assert_eq!(wire.frames.len(), 1);
     assert!(memchr::memmem::find(&wire.frames[0], UP).is_some());
     assert!(memchr::memmem::find(&wire.frames[0], DOWN).is_some());
     // The same snapshot again is a touch the lane has not seen since the
     // session restarted: emitted.
-    d.on_market_text(book.as_bytes(), now, now, &mut rig.out());
+    d.on_market_text(0, book.as_bytes(), now, now, &mut rig.out());
     assert_eq!(rig.rec.ticks.len(), 4);
     // PM15-5d: an hour on, the book still quiet — the re-assertion is not
     // judged by the touch's old stamp.
-    d.on_market_text(b"PONG", now + 3_600_000_000_000, now, &mut rig.out());
+    d.on_market_text(0, b"PONG", now + 3_600_000_000_000, now, &mut rig.out());
     assert_eq!(rig.rec.ticks.len(), 5);
     assert!(!rig.rec.ticks[4].is_stale(), "a quiet book is not a stale one");
 }
@@ -561,13 +621,13 @@ fn the_live_window_fills_the_depth_capture_change_gated() {
     let t0 = lines[0].0 * MS;
     d.offer(&spec, t0, t0, &mut rig.out(), &mut wire);
     wire.open = true;
-    assert!(d.on_market_open(&mut wire));
+    assert!(d.on_market_open(0, &mut wire));
     let mut events = 0usize;
     for (ms, p) in &lines {
         let now = ms * MS;
         let mut out = rig.out();
         d.on_clock(now, now, &mut out, &mut wire);
-        d.on_market_text(p, now, now, &mut out);
+        d.on_market_text(0, p, now, now, &mut out);
         d.perform(now, &mut out, &mut wire);
         events += usize::from(memchr::memmem::find(p, b"\"price_change\"").is_some());
     }
@@ -632,13 +692,13 @@ fn the_depth_capture_keeps_one_record_per_leg_per_second_and_the_sweep_catches_u
         let t0 = lines[0].0 * MS;
         d.offer(&spec, t0, t0, &mut rig.out(), &mut wire);
         wire.open = true;
-        assert!(d.on_market_open(&mut wire));
+        assert!(d.on_market_open(0, &mut wire));
         let mut last = t0;
         for (ms, p) in &lines[..cut] {
             let now = ms * MS;
             let mut out = rig.out();
             d.on_clock(now, now, &mut out, &mut wire);
-            d.on_market_text(p, now, now, &mut out);
+            d.on_market_text(0, p, now, now, &mut out);
             d.perform(now, &mut out, &mut wire);
             last = now;
         }
@@ -646,7 +706,7 @@ fn the_depth_capture_keeps_one_record_per_leg_per_second_and_the_sweep_catches_u
         let mut sweep_ts = 0u64;
         if let Some(after) = sweep_after {
             sweep_ts = last + after;
-            d.on_market_text(b"PONG", sweep_ts, sweep_ts, &mut rig.out());
+            d.on_market_text(0, b"PONG", sweep_ts, sweep_ts, &mut rig.out());
         }
         (rig.rec, before, sweep_ts)
     };
@@ -727,4 +787,270 @@ fn the_depth_capture_keeps_one_record_per_leg_per_second_and_the_sweep_catches_u
         let (a, b) = (last_of(&ev.depths, leg).unwrap(), last_of(&late.depths, leg).unwrap());
         assert!(a.bids == b.bids && a.asks == b.asks, "the sweep caught the leg up");
     }
+}
+
+/// PMJ J7 (R-PMJ-S17..S19): two families on two market sockets. Each
+/// shard's open subscribes only its family's tokens; a `PONG` on one shard
+/// re-asserts only its legs; one shard's loss withdraws only its legs and
+/// starts only its ladders over — the other family keeps ticking; a
+/// window bound while its shard is down rides that shard's next open; a
+/// settlement's unsubscribe goes out on the family's own shard.
+#[test]
+fn each_family_rides_its_own_market_socket_and_a_loss_withdraws_only_its_legs() {
+    let (btc, eth) = (btc_spec(), spec_as(1, "eth", OPEN, UP_ETH, DOWN_ETH));
+    let mut rig = Rig::new();
+    let mut wire = Wire::default();
+    let mut d = Pm15Driver::new(&[b"btc", b"eth"], 5_000).with_market_sockets(2);
+    assert_eq!(d.market_shards(), 2);
+    let now = (OPEN + 100) * 1_000_000_000;
+    assert_eq!(d.bound_shards(), 0, "nothing bound: no shard dials");
+    d.offer(&btc, now, now, &mut rig.out(), &mut wire);
+    d.offer(&eth, now, now, &mut rig.out(), &mut wire);
+    assert!(wire.frames.is_empty(), "no session yet: the opens subscribe");
+    let (sb, se) = (
+        pm_roll_family(0, pm_pair_of_window(btc.window)),
+        pm_roll_family(1, pm_pair_of_window(eth.window)),
+    );
+    assert_eq!((d.shard_of(sb), d.shard_of(se)), (0, 1));
+    assert_eq!(d.bound_shards(), 0b11);
+    // Each shard's open names its own family's tokens, and only those.
+    wire.open = true;
+    assert!(d.on_market_open(0, &mut wire));
+    assert!(d.on_market_open(1, &mut wire));
+    let got = wire.take();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].0, 0);
+    assert!(has(&got[0].1, UP) && has(&got[0].1, DOWN));
+    assert!(!has(&got[0].1, UP_ETH) && !has(&got[0].1, DOWN_ETH));
+    assert_eq!(got[1].0, 1);
+    assert!(has(&got[1].1, UP_ETH) && has(&got[1].1, DOWN_ETH));
+    assert!(!has(&got[1].1, UP) && !has(&got[1].1, DOWN));
+    // A snapshot on every leg, each on its family's socket.
+    let book = |id: &[u8]| {
+        format!(
+            "[{{\"market\":\"0x70\",\"asset_id\":\"{}\",\"timestamp\":\"1792216900000\",\"hash\":\"h\",\"bids\":[{{\"price\":\"0.5\",\"size\":\"10\"}}],\"asks\":[{{\"price\":\"0.52\",\"size\":\"7\"}}],\"event_type\":\"book\"}}]",
+            utf8(id)
+        )
+    };
+    for id in [UP, DOWN] {
+        d.on_market_text(0, book(id).as_bytes(), now, now, &mut rig.out());
+    }
+    for id in [UP_ETH, DOWN_ETH] {
+        d.on_market_text(1, book(id).as_bytes(), now, now, &mut rig.out());
+    }
+    assert_eq!(rig.rec.ticks.len(), 4);
+    let pb = pm_pair_of_window(btc.window);
+    let btc_syms = [pm_rolling_sym(0, pb, PM_LEG_UP), pm_rolling_sym(0, pb, PM_LEG_DOWN)];
+    let pe = pm_pair_of_window(eth.window);
+    let eth_syms = [pm_rolling_sym(1, pe, PM_LEG_UP), pm_rolling_sym(1, pe, PM_LEG_DOWN)];
+    // A PONG on shard 1 speaks for ETH's legs only.
+    d.on_market_text(1, b"PONG", now + 5, now + 5, &mut rig.out());
+    assert_eq!(rig.rec.ticks.len(), 6);
+    assert!(rig.rec.ticks[4..].iter().all(|t| eth_syms.contains(&t.sym) && !t.is_stale()));
+    assert_eq!(rig.counters.of(Pm15Counter::TouchesReasserted), 2);
+    // Shard 0 drops: BTC's two touches are withdrawn, ETH's stand — and
+    // ETH's sequencer and feed clocks are not reset with BTC's.
+    let eth_clock = format!("{:?}", d.market_clock[1]);
+    d.on_market_down(0, now + 6, &mut rig.out());
+    assert_eq!(format!("{:?}", d.market_clock[1]), eth_clock, "shard 1's feed clock untouched");
+    assert_eq!(rig.rec.ticks.len(), 8);
+    assert!(rig.rec.ticks[6..]
+        .iter()
+        .all(|t| btc_syms.contains(&t.sym) && t.is_stale() && t.bid_px.raw() == 0 && t.ask_px.raw() == 0));
+    assert_eq!(rig.counters.of(Pm15Counter::TouchesWithdrawn), 2);
+    assert!(!d.ladders[2 * sb].is_ready() && !d.ladders[2 * sb + 1].is_ready());
+    assert!(d.ladders[2 * se].is_ready() && d.ladders[2 * se + 1].is_ready());
+    // Shard 0 has nothing to re-assert; shard 1 still does.
+    d.on_market_text(0, b"PONG", now + 7, now + 7, &mut rig.out());
+    assert_eq!(rig.rec.ticks.len(), 8);
+    d.on_market_text(1, b"PONG", now + 8, now + 8, &mut rig.out());
+    assert_eq!(rig.rec.ticks.len(), 10);
+    assert!(rig.rec.ticks[8..].iter().all(|t| eth_syms.contains(&t.sym) && !t.is_stale()));
+    // An ETH book older than the last one ETH ticked: its sequencer clock
+    // still holds the newer key (not reset by shard 0's loss), so the tick
+    // takes ordinal 0.
+    let old = format!(
+        "[{{\"market\":\"0x70\",\"asset_id\":\"{}\",\"timestamp\":\"1792216800000\",\"hash\":\"h\",\"bids\":[{{\"price\":\"0.49\",\"size\":\"10\"}}],\"asks\":[{{\"price\":\"0.52\",\"size\":\"7\"}}],\"event_type\":\"book\"}}]",
+        utf8(UP_ETH)
+    );
+    d.on_market_text(1, old.as_bytes(), now + 8, now + 8, &mut rig.out());
+    assert_eq!(rig.rec.ticks.len(), 11);
+    assert_eq!(rig.rec.ticks[10].sym, eth_syms[0]);
+    assert_eq!(rig.rec.ticks[10].venue_seq, 0, "shard 1's sequencer clock untouched");
+    // BTC's next window binds while shard 0 is down: nothing goes out (and
+    // nothing on ETH's socket); shard 0's next open names both BTC windows.
+    wire.down = 0b01;
+    let open2 = OPEN + 900;
+    let up2: &[u8] = b"33333333333333333333333333333333333333333333333333333333333333333333333333333";
+    let down2: &[u8] = b"44444444444444444444444444444444444444444444444444444444444444444444444444444";
+    let btc2 = spec_as(0, "btc", open2, up2, down2);
+    d.offer(&btc2, now + 9, now + 9, &mut rig.out(), &mut wire);
+    assert!(wire.take().is_empty());
+    let sb2 = pm_roll_family(0, pm_pair_of_window(btc2.window));
+    assert_ne!(sb2, sb);
+    assert_eq!(d.shard_of(sb2), 0);
+    wire.down = 0;
+    assert!(d.on_market_open(0, &mut wire));
+    let got = wire.take();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, 0);
+    assert!(has(&got[0].1, UP) && has(&got[0].1, DOWN) && has(&got[0].1, up2) && has(&got[0].1, down2));
+    assert!(!has(&got[0].1, UP_ETH));
+    // ETH resolves: its unsubscribe goes out on shard 1.
+    let resolved = format!(
+        "{{\"market\":\"0x70\",\"winning_asset_id\":\"{}\",\"winning_outcome\":\"Up\",\"timestamp\":\"1792217815901\",\"event_type\":\"market_resolved\"}}",
+        utf8(UP_ETH)
+    );
+    d.on_market_text(1, resolved.as_bytes(), now + 10, now + 10, &mut rig.out());
+    d.perform(now + 10, &mut rig.out(), &mut wire);
+    let got = wire.take();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, 1);
+    let unsub = format!(
+        "{{\"assets_ids\":[\"{}\",\"{}\"],\"operation\":\"unsubscribe\"}}",
+        utf8(UP_ETH),
+        utf8(DOWN_ETH)
+    );
+    assert_eq!(got[0].1, unsub.into_bytes());
+    assert_eq!(d.bound_shards(), 0b01, "ETH's shard carries no window now");
+    // ETH's next window binds while both sockets are open: its subscribe
+    // goes out on shard 1, and only there.
+    let up3: &[u8] = b"55555555555555555555555555555555555555555555555555555555555555555555555555555";
+    let down3: &[u8] = b"66666666666666666666666666666666666666666666666666666666666666666666666666666";
+    let eth2 = spec_as(1, "eth", open2, up3, down3);
+    d.offer(&eth2, now + 11, now + 11, &mut rig.out(), &mut wire);
+    let got = wire.take();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, 1, "a dynamic subscribe rides its family's socket");
+    assert!(has(&got[0].1, up3) && has(&got[0].1, down3) && !has(&got[0].1, UP));
+    assert!(got[0].1.ends_with(b"\"operation\":\"subscribe\",\"custom_feature_enabled\":true}"));
+    assert_eq!(d.bound_shards(), 0b11);
+}
+
+/// PMJ J7: the market side's state over its shards.
+#[test]
+fn the_market_state_reads_backoff_while_a_bound_shard_waits_and_up_once_all_are_open() {
+    assert_eq!(market_state(0, false, false), IngressState::Connecting, "before the first socket");
+    assert_eq!(market_state(0, false, true), IngressState::Connecting);
+    assert_eq!(market_state(3, false, true), IngressState::Connecting, "a shard still dials");
+    assert_eq!(market_state(3, true, true), IngressState::Backoff, "a bound shard waits to redial");
+    assert_eq!(market_state(0, true, false), IngressState::Backoff);
+    assert_eq!(market_state(7, false, false), IngressState::Up);
+}
+
+/// PMJ J7: sharding moves only the socket a frame rides. The live window
+/// replayed as two families (BTC, and the same frames on ETH's tokens),
+/// with a `PONG` on every socket every 50 frames: one socket and two give
+/// the same ticks, events and depth records, and the same dynamic frames —
+/// each on its family's socket.
+#[test]
+fn sharding_changes_only_the_socket_a_frame_rides() {
+    let (btc, eth) = (btc_spec(), spec_as(1, "eth", OPEN, UP_ETH, DOWN_ETH));
+    let frames = fixture("market_btc_1792216800.frames");
+    let eth_frames = utf8(&frames)
+        .replace(utf8(UP), utf8(UP_ETH))
+        .replace(utf8(DOWN), utf8(DOWN_ETH))
+        .into_bytes();
+    let (lb, le) = (lines_of(&frames), lines_of(&eth_frames));
+    assert_eq!(lb.len(), le.len());
+    let (sb, se) = (
+        pm_roll_family(0, pm_pair_of_window(btc.window)),
+        pm_roll_family(1, pm_pair_of_window(eth.window)),
+    );
+    let replay = |n: usize| {
+        let mut rig = Rig::new();
+        let mut wire = Wire::default();
+        let mut d = Pm15Driver::new(&[b"btc", b"eth"], 5_000).with_market_sockets(n);
+        let (kb, ke) = (d.shard_of(sb), d.shard_of(se));
+        let t0 = lb[0].0 * MS;
+        d.offer(&btc, t0, t0, &mut rig.out(), &mut wire);
+        d.offer(&eth, t0, t0, &mut rig.out(), &mut wire);
+        wire.open = true;
+        let mut k = 0usize;
+        while k < n {
+            assert!(d.on_market_open(k, &mut wire));
+            k += 1;
+        }
+        let opens = wire.take();
+        for (i, ((ms, pb), (_, pe))) in lb.iter().zip(le.iter()).enumerate() {
+            let now = ms * MS;
+            let mut out = rig.out();
+            d.on_clock(now, now, &mut out, &mut wire);
+            d.on_market_text(kb, pb, now, now, &mut out);
+            d.perform(now, &mut out, &mut wire);
+            d.on_market_text(ke, pe, now, now, &mut out);
+            d.perform(now, &mut out, &mut wire);
+            if i % 50 == 49 {
+                let mut k = 0usize;
+                while k < n {
+                    d.on_market_text(k, b"PONG", now, now, &mut out);
+                    k += 1;
+                }
+            }
+        }
+        (rig.rec, opens, wire.take())
+    };
+    let (one, opens1, sent1) = replay(1);
+    let (two, opens2, sent2) = replay(2);
+    assert!(one.ticks.len() > 100, "{} ticks", one.ticks.len());
+    assert!(one.ticks == two.ticks, "the same ticks");
+    let key = |e: &ChannelEvent| (e.ts_ns, e.sym, e.venue, e.channel, e.flags, e.venue_seq, e.venue_time_ms, e.v0, e.v1);
+    assert!(one.events.iter().map(key).eq(two.events.iter().map(key)), "the same events");
+    let dk = |x: &core_types::DepthTopK| (x.ts_ns, x.sym, x.bids, x.asks);
+    assert!(one.depths.iter().map(dk).eq(two.depths.iter().map(dk)), "the same depth records");
+    // The opens: one frame naming all four tokens, or one per family.
+    assert_eq!(opens1.len(), 1);
+    assert!([UP, DOWN, UP_ETH, DOWN_ETH].iter().all(|id| has(&opens1[0].1, id)));
+    assert_eq!(opens2.iter().map(|x| x.0).collect::<Vec<_>>(), vec![0, 1]);
+    // The dynamic frames (the settlements' unsubscribes): the same bytes in
+    // the same order, each on its family's socket.
+    assert!(!sent1.is_empty());
+    assert_eq!(
+        sent1.iter().map(|x| &x.1).collect::<Vec<_>>(),
+        sent2.iter().map(|x| &x.1).collect::<Vec<_>>()
+    );
+    assert!(sent1.iter().all(|x| x.0 == 0));
+    for (k, f) in &sent2 {
+        let eth_frame = has(f, UP_ETH);
+        assert_eq!(*k, usize::from(eth_frame), "an unsubscribe rides its family's socket");
+    }
+}
+
+/// PMJ J7: the shard table — family `f` on shard `f % n` for every period
+/// and every admitted `n`; the default is one socket; the tokens of the
+/// market shards and of RTDS never collide.
+#[test]
+fn the_shard_table_spreads_the_families_modulo_the_socket_count() {
+    let assets: [&[u8]; 7] = [b"btc", b"eth", b"sol", b"xrp", b"hype", b"doge", b"bnb"];
+    for period in [PmPeriod::M15, PmPeriod::M5] {
+        let pairs = period.pairs();
+        let mut n = 1usize;
+        while n <= PM15_MARKET_SOCKETS_MAX {
+            let d = Pm15Driver::new_for(period, &assets, 5_000).with_market_sockets(n);
+            assert_eq!(d.market_shards(), n);
+            for f in 0..assets.len() {
+                for pair in 0..pairs {
+                    assert_eq!(d.shard_of(f * pairs + pair), f % n, "{period:?} n={n} f={f}");
+                }
+            }
+            n += 1;
+        }
+        let d = Pm15Driver::new_for(period, &assets, 5_000);
+        assert_eq!(d.market_shards(), 1, "the default is one socket");
+        assert!((0..PM_SLOTS).all(|s| d.shard_of(s) == 0));
+    }
+    assert_eq!(PM15_RTDS_TOKEN, mio::Token(PM15_MARKET_SOCKETS_MAX));
+    assert!((0..PM15_MARKET_SOCKETS_MAX).all(|k| pm15_market_token(k) != PM15_RTDS_TOKEN));
+}
+
+#[test]
+#[should_panic(expected = "rolling market sockets 0 out of 1..=")]
+fn no_market_socket_at_all_is_refused() {
+    let _ = Pm15Driver::new(&[b"btc"], 5_000).with_market_sockets(0);
+}
+
+#[test]
+#[should_panic(expected = "out of 1..=")]
+fn more_market_sockets_than_the_family_cap_is_refused() {
+    let _ = Pm15Driver::new(&[b"btc"], 5_000).with_market_sockets(PM15_MARKET_SOCKETS_MAX + 1);
 }

@@ -17091,7 +17091,10 @@ ingress emits a leg's touch only when it changes — and a favourite at
   before the `PONG` has been read): `touches_reasserted`.
 - **It withdraws every touch when the session drops** — a stale tick,
   both sides zero — so neither the member nor the paper book trusts a dead
-  socket's book: `touches_withdrawn`. The market socket's idle law is 12 s
+  socket's book: `touches_withdrawn`. *(Amended by PMJ J7, R-PMJ-S19: both
+  rules are per market socket — a `PONG` re-asserts, and a lost session
+  withdraws, only the touches of the families that socket carries; see
+  "PMJ — slot 11", `### J7`.)* The market socket's idle law is 12 s
   (it was 30 s): two missed `PONG`s and a margin, well inside a 20 s late
   window.
 - **The member's freshness bound is 8 s** (the `PING` period plus 3 s),
@@ -17344,6 +17347,10 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S14 | The restart immediately once the build and the offline checks pass — off the 15-minute grid, through the exec gate (deployed 2026-10-18 13:06Z). |
 | R-PMJ-S15 | The rolling depth capture: at most one record per leg per second — `[polymarket] rolling_depth_ms` (default 1000; 0 = every change) and `rolling_depth` (off = none) (### J6). |
 | R-PMJ-S16 | The session commits J6 (explicit paths) and makes the gated restart itself, as in the 10-18 deploy. |
+| R-PMJ-S17 | Build **J7**: the rolling market socket sharded — N market sockets per period in the same ingress thread and `mio` poll, no new dependency (`claude/pmj-shard-plan-2026-10-19.md`). The `SO_RCVBUF` remedy is dropped: this host drains its sockets (### J7). |
+| R-PMJ-S18 | N = **one socket per family**: `[polymarket] rolling_market_sockets`, default 8 = the family cap, so seven families open seven sockets per period. |
+| R-PMJ-S19 | **Both periods** — pm15 (slot 9's feed) too; `rolling_market_sockets = 1` is one socket per period, the pre-J7 stream bit for bit. |
+| R-PMJ-S20 | The session commits J7 (explicit paths) and makes the gated restart itself, as R-PMJ-S16. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -17769,3 +17776,119 @@ worktree and its own target dir, both removed): run 1 A/B on_tick_all
 cooldown 0.527 / 0.543; run 3 (both under load) 6.89 / 7.05, 3.66 / 3.71,
 397 / 400, 13.4 / 13.7, 3.87 / 3.84, 0.85 / 0.88, 0.70 / 0.70 — J6 equal to
 HEAD; no bench links the rolling driver.
+
+### J7 — the rolling market socket, sharded (2026-10-19, rulings R-PMJ-S17..S20)
+
+- **Why.** After J6 the venue still closes the rolling market sockets with
+  1013 "slow consumer: send buffer full" (pm5 6×, pm15 1× in the first 7 min
+  after the J6 boot). Each socket's load at 05:01Z: pm15 ≈ 925 frames/s and
+  0.55 MB/s (28 tokens), pm5 ≈ 1 000 frames/s and 0.62 MB/s (42 tokens). This
+  host drains them: `Recv-Q` 0 on every Polymarket socket in six samples
+  3 s apart, and macOS autotuned the receive buffers to 340 / 550 KB. That
+  excludes J6's open hypotheses on this side (the receive buffer, the
+  ingress thread's work): the venue's per-connection send queue overflows.
+  Other clients report the same law: one socket per asset × timeframe ran
+  without disconnects ([polymarket-crypto #241](https://github.com/zayansalman/polymarket-crypto/pull/241)),
+  and even two assets per socket close "over time"
+  ([rs-clob-client-v2 #122](https://github.com/Polymarket/rs-clob-client-v2/issues/122)).
+  Sharding cuts each socket to its families' load and bounds a close to
+  them; it may not end the closes.
+- **The rule.** `[polymarket] rolling_market_sockets` = n (1..=8, default 8
+  — the family cap, so every family rides its own socket): family `f`
+  rides shard `f mod n`, and a pipeline opens min(n, its families) sockets —
+  seven per period today (the boot log line `pm15: the families ride n
+  market socket(s)` / `pm5: …` names it). Still one ingress thread and one
+  `mio` poll per period; market shard `k` is token `k`, RTDS token 8
+  (`PM15_MARKET_SOCKETS_MAX`). Each shard has its own `WsConn` (1 MiB receive
+  window, allocated at boot), its own dial schedule (the backoff seed mixed
+  by `k`; shard 0 keeps the pipeline's; no shard `k` dials before
+  `k` × 250 ms — discovery binds the families one by one anyway, so this is
+  a floor), its own 5 s `PING` and its own feed clock, and it dials only
+  while it carries a bound window. After a host network blip every socket
+  fails its 12 s idle law together and redials within the backoff's first
+  250–500 ms: the one burst left. Its open
+  subscribes only its families' bound tokens; a dynamic subscribe and a
+  settlement's unsubscribe go out on the slot's own shard
+  (`PmAction::Unsubscribe` now carries the slot); its `PONG` re-asserts (and
+  sweeps the depth of) **only its own legs** — another shard's socket may be
+  the one behind; its loss withdraws only its legs and restarts only their
+  ladders, their sequencer clocks and its own feed clock. A frame finds its
+  leg by token, whichever socket carried it.
+- **State and metrics.** `engine_ingress_<label>_state` over the shards:
+  Backoff while a shard that carries a bound window waits to dial or redial
+  (its staggered first dial included),
+  Connecting while one dials (or before the first socket opens), else Up
+  (`market_state`, pinned) — with one shard the states as before but one: a
+  lost socket with no window bound reads Connecting (it was left at
+  Backoff). Only the `engine_ingress_<label>_state` gauge reads it: pm15 /
+  pm5 are not `/state` ingress lanes, and no member, halt or dashboard rule
+  reads the state. `market_reconnects_total`,
+  `reconnects` and `last_market_err` are summed / the latest over the shards.
+  New gauge `engine_ingress_<label>_market_sockets_open`.
+  `feed_delay_ema_ms` is the clock of the shard whose leg ticked last.
+- **Hot path.** Frame handling is unchanged but for one read of a boot-time
+  `u8` table (the slot's shard, masked, no bounds check) per tick (its
+  clock) and in the per-shard PONG and withdrawal loops. Zero allocation
+  after boot: gate 133 runs n = 8 with one family (on shard 0), that shard
+  dropping and reopening every 50 s; the run loop itself (`run_pm15`, its
+  per-shard dial / ping / flush passes) is under no alloc gate, as before
+  J7. No new copy, no new dependency.
+- **Equivalence, pinned.** `sharding_changes_only_the_socket_a_frame_rides`:
+  the live window replayed as two families (the same frames on a second
+  family's tokens) with a `PONG` on every socket — one socket and two give
+  the same ticks, events and depth records and the same dynamic frames,
+  each on its family's socket. `each_family_rides_its_own_market_socket_and_a_loss_withdraws_only_its_legs`
+  pins the open, the PONG, the loss (the other shard's sequencer and feed
+  clocks untouched), a window bound while its shard is down, and the
+  socket of a dynamic subscribe and of an unsubscribe; `the_shard_table_spreads_the_families_modulo_the_socket_count`
+  the table and the tokens; every pre-J7 driver test runs unchanged at one
+  socket.
+- **Cost.** 14 rolling market sockets on the venue's host instead of 2 at
+  seven families per period — beside the static `pm` ingress socket and,
+  when slot 9 is armed, its `/ws/user` socket: 15–16 connections from one
+  IP (the venue documents no WebSocket connection limit; its rate limits
+  are HTTP's). 14 × (1 MiB + 64 KiB) of windows. The boot resolves the host
+  once per socket (a later shard's failed lookup is retried three times,
+  200 ms apart, before it fails the boot — and with it the engine, slot 3
+  included, as any rolling boot failure did before J7). Watch
+  `market_reconnects_total` and `last_market_err` for refused upgrades in
+  the first 15 minutes; the rollback is one key.
+- **Rollback.** `rolling_market_sockets = 1` and a restart give one socket
+  per period with this binary. The previous binary refuses the key (unknown
+  key): remove it with the binary.
+- **Risk review** (an Opus subagent, read-only, two rounds): 1 NEEDS-DOCS,
+  no blocker, 17 findings — the slot 9 law still read per-socket; the cost
+  numbers (8 sockets built per period, 7 dialled; the static `pm` and the
+  user socket on the same host); gate 133's reach overstated; no test of a
+  dynamic subscribe's socket nor of the other shard's clocks across a loss;
+  `market_state` untested and its n = 1 claim off by one case; the battery
+  to run; the dial burst at boot; 16 DNS lookups at boot; the per-tick
+  bounds check; debug asserts; the gauge on a poll failure; a test name; the
+  readers' note; the two bounds untied → min(n, families) sockets, the
+  first dials staggered, a later shard's failed lookup retried (warned),
+  the index masked, the tests and the pure `market_state` added, the docs
+  corrected (r1 #11 a cross-shard frame counter and #12 the delay EMA's
+  max over shards: noted, not done); 2 **APPROVE** (nits applied: the
+  stagger is a floor, discovery already paces the binds; Backoff includes
+  a staggered first dial; the spawner's doc; a warn per DNS retry), on the
+  condition that the battery and the bench A/B on the final tree be green.
+
+J7-GATES (2026-10-19 05:55–06:05Z, on the Mac, detached, the final tree;
+the release binary untouched by the gates): `make lint` rc 0 · `cargo
+nextest run --workspace` 4 934 passed, 10 skipped · `make alloc-assert` 136
+passed at 0 B (a fresh `Compiling bench`) · `make copy-audit` new 0 · `make
+license-check` OK (769 files) · `uv run pytest` 1 784 passed · fuzz
+`universe_toml` 60 s clean (19.1 M runs), `pm_rolling_frame` 60 s clean
+(176 k runs, two families on two sockets) · `make py-lint` RED on PM15-8's
+two E501 lines (untouched) · `make bench-check` RED on 8 untouched samples
+(dispatcher, strategy, vol, bin15, strategy_set, ledger) with the host's
+load at 15 — `hot_path` links none of the crates J7 changes (core-config,
+ingress-polymarket, cli; no crate it uses depends on them). The interleaved
+A/B against `56284590` (R-PMJ-S6; a read-only worktree and its own target
+dir, both removed), medians of three A / B: on_tick_all 6.99 / 7.94 ns (run
+3: 6.70 / 6.55), on_tick_none 3.34 / 3.55, on_fill_routed 2.34 / 2.77 (run
+3: 2.30 / 2.26), on_timer_all 3.72 / 3.73, late_fair 400 / 398,
+late_grid 13.0 / 13.0, locate_miss 3.83 / 3.73, cooldown 698 / 693 ps,
+long_day_close 38.4 / 38.4 µs, latency_arb 3.45 / 2.96 — the swings run
+both ways under the load (B's run 2 and A's run 2 the outliers); J7 equal to
+HEAD.

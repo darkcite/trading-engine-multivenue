@@ -5555,6 +5555,7 @@ fn run(args: RunArgs) -> ExitCode {
         match cli::spawn_pm15(
             assets,
             boot.pm_rolling_depth,
+            boot.pm_rolling_market_sockets,
             tls_config.clone(),
             core_time::WallAnchor::now(),
             stale_after_ms[core_types::VenueId::Polymarket as usize],
@@ -5601,6 +5602,7 @@ fn run(args: RunArgs) -> ExitCode {
         match cli::spawn_pm5(
             assets,
             boot.pm_rolling_depth,
+            boot.pm_rolling_market_sockets,
             tls_config.clone(),
             core_time::WallAnchor::now(),
             stale_after_ms[core_types::VenueId::Polymarket as usize],

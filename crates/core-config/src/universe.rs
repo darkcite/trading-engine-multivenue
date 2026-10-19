@@ -430,6 +430,34 @@ impl Default for RollingDepth {
     }
 }
 
+/// PMJ J7 (rulings R-PMJ-S17..S19): the most market sockets one rolling
+/// pipeline (one period) spreads its families over — one per family.
+pub const ROLLING_MARKET_SOCKETS_MAX: u32 = PM_ROLLING_MAX as u32;
+
+/// PMJ J7: the default — one market socket per family (the family cap,
+/// so every configured family rides its own socket; 7 families open 7).
+pub const ROLLING_MARKET_SOCKETS_DEFAULT: u32 = ROLLING_MARKET_SOCKETS_MAX;
+
+/// PMJ J7 (R-PMJ-S17..S19): `[polymarket] rolling_market_sockets` — how
+/// many market sockets each rolling pipeline (15 m, 5 m) spreads its
+/// families over: family `f` rides socket `f % n`. `1` is one socket per
+/// period, the stream as it was before J7, bit for bit. The venue closes a
+/// socket that carries too much (1013 "slow consumer"); a close then
+/// withdraws only that socket's families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RollingMarketSockets {
+    /// How many sockets, `1..=`[`ROLLING_MARKET_SOCKETS_MAX`].
+    pub n: u32,
+}
+
+impl Default for RollingMarketSockets {
+    fn default() -> Self {
+        Self {
+            n: ROLLING_MARKET_SOCKETS_DEFAULT,
+        }
+    }
+}
+
 /// The parsed universe file. Empty lists are valid at PARSE level —
 /// the boot refusal law (`assert_bootable`) is applied by the caller
 /// after allocation, so tests and tooling can parse partial files.
@@ -453,6 +481,10 @@ pub struct Universe {
     /// the rolling legs' depth capture ([`RollingDepth`]; absent = on, one
     /// record per leg per second at most).
     pub pm_rolling_depth: RollingDepth,
+    /// PMJ J7 (R-PMJ-S17..S19): `[polymarket] rolling_market_sockets` —
+    /// the market sockets per rolling pipeline ([`RollingMarketSockets`];
+    /// absent = one per family).
+    pub pm_rolling_market_sockets: RollingMarketSockets,
     /// `[binance] spot` — lowercase stream symbols in file order.
     pub binance_spot: Vec<String>,
     /// `[binance] usdm` — USDS-M futures stream symbols in file order.
@@ -679,6 +711,7 @@ enum Slot {
     PmRolling,
     PmRollingDepth,
     PmRollingDepthMs,
+    PmRollingMarketSockets,
     BnSpot,
     BnUsdm,
     BnUsdmDated,
@@ -763,6 +796,7 @@ struct Builder {
     pm_rolling: Option<Vec<String>>,
     pm_rolling_depth: Option<bool>,
     pm_rolling_depth_ms: Option<u32>,
+    pm_rolling_market_sockets: Option<u32>,
     bn_spot: Option<Vec<String>>,
     bn_usdm: Option<Vec<String>>,
     bn_usdm_dated: Option<Vec<String>>,
@@ -883,7 +917,8 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
             | Slot::HcExpiries
             | Slot::HcStrikes
             | Slot::HcSummaryEveryS
-            | Slot::PmRollingDepthMs => {
+            | Slot::PmRollingDepthMs
+            | Slot::PmRollingMarketSockets => {
                 let v = parse_uint(key, value, line_no)?;
                 store_int(&mut b, slot, v, line_no)?;
             }
@@ -942,6 +977,7 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Polymarket, "rolling") => Some(Slot::PmRolling),
         (Section::Polymarket, "rolling_depth") => Some(Slot::PmRollingDepth),
         (Section::Polymarket, "rolling_depth_ms") => Some(Slot::PmRollingDepthMs),
+        (Section::Polymarket, "rolling_market_sockets") => Some(Slot::PmRollingMarketSockets),
         (Section::Binance, "spot") => Some(Slot::BnSpot),
         (Section::Binance, "usdm") => Some(Slot::BnUsdm),
         (Section::Binance, "usdm_dated") => Some(Slot::BnUsdmDated),
@@ -1016,7 +1052,8 @@ fn elem_kind(slot: Slot) -> ElemKind {
         | Slot::HcStrikes
         | Slot::HcSummaryEveryS
         | Slot::PmRollingDepth
-        | Slot::PmRollingDepthMs => {
+        | Slot::PmRollingDepthMs
+        | Slot::PmRollingMarketSockets => {
             unreachable!("bool/int slots have no elements")
         }
     }
@@ -1642,7 +1679,8 @@ fn store_array(
         | Slot::HcStrikes
         | Slot::HcSummaryEveryS
         | Slot::PmRollingDepth
-        | Slot::PmRollingDepthMs => {
+        | Slot::PmRollingDepthMs
+        | Slot::PmRollingMarketSockets => {
             unreachable!("bool/int slots never store arrays")
         }
     }
@@ -1744,6 +1782,11 @@ fn store_int(b: &mut Builder, slot: Slot, v: u32, line_no: usize) -> Result<(), 
         Slot::PmRollingDepthMs => {
             if b.pm_rolling_depth_ms.replace(v).is_some() {
                 return Err(err(line_no, "duplicate key `rolling_depth_ms`"));
+            }
+        }
+        Slot::PmRollingMarketSockets => {
+            if b.pm_rolling_market_sockets.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `rolling_market_sockets`"));
             }
         }
         _ => unreachable!("non-integer slots never store integers"),
@@ -1997,6 +2040,21 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         min_ms: pm_rolling_depth_ms,
     };
 
+    // PMJ J7 (R-PMJ-S17..S19): the market sockets per rolling pipeline.
+    let n = b
+        .pm_rolling_market_sockets
+        .unwrap_or(ROLLING_MARKET_SOCKETS_DEFAULT);
+    if !(1..=ROLLING_MARKET_SOCKETS_MAX).contains(&n) {
+        return Err(err(
+            0,
+            format!(
+                "Polymarket `rolling_market_sockets` {n} out of range \
+                 1..={ROLLING_MARKET_SOCKETS_MAX} (1 = one socket per period)"
+            ),
+        ));
+    }
+    let pm_rolling_market_sockets = RollingMarketSockets { n };
+
     // Pairs: re-parse (validated per element already), range-check.
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     let raw_pairs = b.pairs_map.unwrap_or_default();
@@ -2030,6 +2088,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         pm_markets,
         pm_rolling,
         pm_rolling_depth,
+        pm_rolling_market_sockets,
         binance_spot,
         binance_usdm,
         binance_usdm_dated,
@@ -3190,6 +3249,35 @@ map = ["0:0", "1:1"]
         }
         // The keys live in [polymarket] only.
         assert!(parse(&format!("{base}[okx]\nrolling_depth = false\n")).is_err());
+    }
+
+    /// PMJ J7 (R-PMJ-S17..S19): the market sockets per rolling pipeline —
+    /// absent is one per family (the family cap); `1` is one socket per
+    /// period; the bounds refuse.
+    #[test]
+    fn the_rolling_market_sockets_default_to_one_per_family() {
+        let base = format!("[polymarket]\nmarkets = [\"{T1}\"]\nrolling = [\"updown:btc:5m\"]\n");
+        let d = parse(&base).unwrap();
+        assert_eq!(d.pm_rolling_market_sockets, RollingMarketSockets { n: PM_ROLLING_MAX as u32 });
+        assert_eq!(
+            Universe::default().pm_rolling_market_sockets,
+            d.pm_rolling_market_sockets,
+            "Default is the parse default"
+        );
+        let one = parse(&format!("{base}rolling_market_sockets = 1\n")).unwrap();
+        assert_eq!(one.pm_rolling_market_sockets.n, 1);
+        let seven = parse(&format!("{base}rolling_market_sockets = 7\n")).unwrap();
+        assert_eq!(seven.pm_rolling_market_sockets.n, 7);
+        for bad in [
+            "rolling_market_sockets = 0\n",
+            "rolling_market_sockets = 9\n",
+            "rolling_market_sockets = -1\n",
+            "rolling_market_sockets = two\n",
+            "rolling_market_sockets = 2\nrolling_market_sockets = 3\n",
+        ] {
+            assert!(parse(&format!("{base}{bad}")).is_err(), "{bad}");
+        }
+        assert!(parse(&format!("{base}[okx]\nrolling_market_sockets = 2\n")).is_err());
     }
 
     /// PMJ J1b: 5-minute families. Each period numbers its own families,

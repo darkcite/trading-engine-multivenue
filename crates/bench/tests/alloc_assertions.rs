@@ -20329,16 +20329,16 @@ fn pm15_ingress_driver_and_member_are_zero_alloc() {
     };
     use core_types::{ChannelEvent, ChannelId, Fill, NullCapture, Order, Price, Qty, Side, Tick, VenueId};
     use ingress_polymarket::gamma15::PmWindowSpec;
-    use ingress_polymarket::pm15_loop::{Pm15Counters, Pm15Driver, Pm15Out, Pm15Wire, PM15_EVENT_MASK};
+    use ingress_polymarket::pm15_loop::{Pm15Counters, Pm15Driver, Pm15Out, Pm15Wires, PM15_EVENT_MASK};
     use strategy_core::{Ctx, Strategy, SubmitErr};
 
     /// A wire that counts what it would send.
     struct CountWire(usize);
-    impl Pm15Wire for CountWire {
-        fn is_open(&self) -> bool {
+    impl Pm15Wires for CountWire {
+        fn is_open(&self, _k: usize) -> bool {
             true
         }
-        fn queue(&mut self, parts: &[&[u8]]) -> bool {
+        fn queue(&mut self, _k: usize, parts: &[&[u8]]) -> bool {
             let mut i = 0usize;
             while i < parts.len() {
                 self.0 += parts[i].len();
@@ -20423,9 +20423,9 @@ fn pm15_ingress_driver_and_member_are_zero_alloc() {
         let now = wall0 + i as u64 * 1_000_000;
         let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
         if i % 256 == 0 {
-            d.on_market_text(book.as_bytes(), now, now, &mut out);
+            d.on_market_text(0, book.as_bytes(), now, now, &mut out);
         }
-        d.on_market_text(changes[i % 64].as_bytes(), now, now, &mut out);
+        d.on_market_text(0, changes[i % 64].as_bytes(), now, now, &mut out);
         if i % 32 == 0 {
             d.on_rtds_text(marks[(i / 32) % 64].as_bytes(), now, &mut out);
             d.on_clock(now, now, &mut out, &mut wire);
@@ -20913,21 +20913,25 @@ fn pm15_polybolt_frames_are_zero_alloc() {
 /// on the 5 m mark slot, the roll clock across a window's end and its
 /// retirement; R-PMJ-S15: under the deployed depth policy (one record per
 /// leg per second) with a market `PONG` every 5 s, so the spacing gate and
-/// the sweep run too. Zero bytes per operation.
+/// the sweep run too; PMJ J7: on the deployed sockets (one per family), the
+/// window's shard dropping and reopening every 50 s — the withdrawal, the
+/// ladders' restart and the resubscribe. Zero bytes per operation.
 #[test]
 fn pm5_ingress_driver_is_zero_alloc() {
     use core_ring::Ring;
     use core_types::pm_roll::{pm5_window_of_open, PmPeriod};
     use core_types::{ChannelEvent, NullCapture, Tick};
     use ingress_polymarket::gamma15::PmWindowSpec;
-    use ingress_polymarket::pm15_loop::{Pm15Counters, Pm15Driver, Pm15Out, Pm15Wire, PM15_EVENT_MASK};
+    use ingress_polymarket::pm15_loop::{
+        Pm15Counters, Pm15Driver, Pm15Out, Pm15Wires, PM15_EVENT_MASK, PM15_MARKET_SOCKETS_MAX,
+    };
 
     struct CountWire(usize);
-    impl Pm15Wire for CountWire {
-        fn is_open(&self) -> bool {
+    impl Pm15Wires for CountWire {
+        fn is_open(&self, _k: usize) -> bool {
             true
         }
-        fn queue(&mut self, parts: &[&[u8]]) -> bool {
+        fn queue(&mut self, _k: usize, parts: &[&[u8]]) -> bool {
             let mut i = 0usize;
             while i < parts.len() {
                 self.0 += parts[i].len();
@@ -20959,7 +20963,10 @@ fn pm5_ingress_driver_is_zero_alloc() {
     let mut wire = CountWire(0);
     // R-PMJ-S15: the deployed depth policy (one record per leg per second,
     // the PONG sweep catching up) — the same 0 B.
-    let mut d = Pm15Driver::new_for(PmPeriod::M5, &[b"btc"], 5_000).with_depth_policy(true, 1_000);
+    let mut d = Pm15Driver::new_for(PmPeriod::M5, &[b"btc"], 5_000)
+        .with_depth_policy(true, 1_000)
+        .with_market_sockets(PM15_MARKET_SOCKETS_MAX);
+    let shard = d.shard_of(0);
     let wall0 = (OPEN5 + 10) * S;
     {
         let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
@@ -20998,14 +21005,19 @@ fn pm5_ingress_driver_is_zero_alloc() {
         let now = wall0 + i as u64 * 500_000_000;
         let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
         if i % 256 == 0 {
-            d.on_market_text(book.as_bytes(), now, now, &mut out);
+            d.on_market_text(shard, book.as_bytes(), now, now, &mut out);
         }
-        d.on_market_text(changes[i % 64].as_bytes(), now, now, &mut out);
+        d.on_market_text(shard, changes[i % 64].as_bytes(), now, now, &mut out);
         if i % 32 == 0 {
             d.on_rtds_text(marks[(i / 32) % 64].as_bytes(), now, &mut out);
         }
         if i % 10 == 0 {
-            d.on_market_text(b"PONG", now, now, &mut out);
+            d.on_market_text(shard, b"PONG", now, now, &mut out);
+        }
+        // PMJ J7: the window's shard drops and reopens.
+        if i % 100 == 99 {
+            d.on_market_down(shard, now, &mut out);
+            assert!(d.on_market_open(shard, &mut wire));
         }
         d.on_clock(now, now, &mut out, &mut wire);
         d.perform(now, &mut out, &mut wire);
@@ -21020,6 +21032,10 @@ fn pm5_ingress_driver_is_zero_alloc() {
         counters.of(ingress_polymarket::pm15_loop::Pm15Counter::RollsUnknown),
         1,
         "gate 133: the window ended and retired inside the measured run"
+    );
+    assert!(
+        counters.of(ingress_polymarket::pm15_loop::Pm15Counter::TouchesWithdrawn) > 0,
+        "gate 133: a shard's loss withdrew its touches"
     );
     assert_eq!(allocs, 0, "gate 133: the 5 m ingress driver allocated {allocs} times ({bytes} B)");
 }

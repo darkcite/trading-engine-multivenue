@@ -13,7 +13,9 @@
 //!
 //! Exercises `book15` (the ladder's snapshot load, its rows and its
 //! `top_k`), the frame classifier, `tick_size_change`, `last_trade_price`,
-//! `market_resolved`, the RTDS report parser and the roll schedule. None
+//! `market_resolved`, the RTDS report parser and the roll schedule; PMJ J7:
+//! the families spread over market sockets (shard 0 carries the window,
+//! the bytes also arrive on another shard, and both shards drop). None
 //! of it may panic or read out of bounds on any input. (The rig allocates
 //! per run; the driver's steady state is bench gates 114 and 133.)
 
@@ -23,16 +25,16 @@ use core_ring::Ring;
 use core_types::pm_roll::PmPeriod;
 use core_types::{ChannelEvent, NullCapture, Tick};
 use ingress_polymarket::gamma15::PmWindowSpec;
-use ingress_polymarket::pm15_loop::{Pm15Counters, Pm15Driver, Pm15Out, Pm15Wire, PM15_EVENT_MASK};
+use ingress_polymarket::pm15_loop::{Pm15Counters, Pm15Driver, Pm15Out, Pm15Wires, PM15_EVENT_MASK};
 use libfuzzer_sys::fuzz_target;
 
 struct NullWire;
 
-impl Pm15Wire for NullWire {
-    fn is_open(&self) -> bool {
+impl Pm15Wires for NullWire {
+    fn is_open(&self, _k: usize) -> bool {
         true
     }
-    fn queue(&mut self, _parts: &[&[u8]]) -> bool {
+    fn queue(&mut self, _k: usize, _parts: &[&[u8]]) -> bool {
         true
     }
 }
@@ -60,8 +62,12 @@ fuzz_target!(|data: &[u8]| {
         let counters = Pm15Counters::new();
         let mut cap = NullCapture;
         let mut wire = NullWire;
-        // R-PMJ-S15: the deployed depth policy, so the spacing gate is fuzzed too.
-        let mut d = Pm15Driver::new_for(period, &[b"btc"], 5_000).with_depth_policy(true, 1_000);
+        // R-PMJ-S15: the deployed depth policy, so the spacing gate is fuzzed
+        // too; PMJ J7: two families on two market sockets (the second
+        // family binds nothing, so shard 1 carries no window).
+        let mut d = Pm15Driver::new_for(period, &[b"btc", b"eth"], 5_000)
+            .with_depth_policy(true, 1_000)
+            .with_market_sockets(2);
         let now = (open + 10) * 1_000_000_000;
         let mut out = Pm15Out {
             tick: &mut tick_tx,
@@ -72,17 +78,21 @@ fuzz_target!(|data: &[u8]| {
             capture: &mut cap,
         };
         d.offer(&spec, now, now, &mut out, &mut wire);
-        let _ = d.on_market_open(&mut wire);
-        d.on_market_text(data, now, now, &mut out);
+        let _ = d.on_market_open(0, &mut wire);
+        let _ = d.on_market_open(1, &mut wire);
+        d.on_market_text(0, data, now, now, &mut out);
+        d.perform(now, &mut out, &mut wire);
+        d.on_market_text(1, data, now, now, &mut out);
         d.perform(now, &mut out, &mut wire);
         d.on_rtds_text(data, now, &mut out);
         // Past the end and the retirement of either period.
         let late = now + 2_000 * 1_000_000_000;
         d.on_clock(late, late, &mut out, &mut wire);
         d.on_clock(late + 1, late + 1, &mut out, &mut wire);
-        d.on_market_text(data, late, late, &mut out);
+        d.on_market_text(0, data, late, late, &mut out);
         d.perform(late, &mut out, &mut wire);
-        d.on_market_down(late, &mut out);
+        d.on_market_down(1, late, &mut out);
+        d.on_market_down(0, late, &mut out);
         while tick_rx.try_pop_ref().is_some() {}
         while ev_rx.try_pop_ref().is_some() {}
     }
