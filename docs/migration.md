@@ -6,6 +6,32 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-19 — PMJ: `[polymarket] rolling_depth` / `rolling_depth_ms` — the rolling depth capture at most one record per leg per second
+
+**What changed** (ruling R-PMJ-S15; risk-policy "PMJ — slot 11", `### J6`)
+- `universe.toml` `[polymarket]` gains **`rolling_depth`** (bool, default
+  `true`) and **`rolling_depth_ms`** (0..=60000, default **1000**; `0` =
+  every change). The rolling legs' `<label>-depth.pmlr` (`pm15-depth`,
+  `pm5-depth`) now keep at most one record per leg per `rolling_depth_ms`;
+  a change the spacing held is written by the first market `PONG` sweep at
+  least the spacing after the leg's last record (≤ spacing + 5 s). J1b
+  shipped every top-5-per-side change (~1.35 GB/h at 7 + 7 families).
+- Capture only: no lane carries depth, so no member and no `/state` field
+  changes, and no metric is added or renamed (the capture record gauges of
+  pm15 / pm5 fall).
+
+**Readers:** a `*-depth.pmlr` reader sees one leg's records at least
+`rolling_depth_ms` apart (a new window's first book is not held by the
+spacing; two records on one sym across a rebind can be closer). A sweep record
+is stamped with the PONG's arrival, not the frame that made the book, and
+is indistinguishable from a change record (`flags` 0). Nothing in the
+capture marks the policy — the boot log line `pm15: … depth = …` / `pm5: …`
+does; runs captured before the deploy (`docs/state.md` dates it) are
+every-change. `rolling_depth_ms = 0` restores J1b's stream exactly.
+**Rollback:** the previous binary refuses a universe that names either key
+(unknown key) — remove them with it — and goes back to every-change
+capture (~1.35 GB/h).
+
 ## 2026-10-18 — PMJ J4: slot 11 `pmj` (`BUILT_MASK` 0x0AFF), `pmj.toml`, the `engine_pmj_*` family, 5-minute held quotes
 
 **What changed** (rulings R-PMJ-1, R-PMJ-3; risk-policy "PMJ — slot 11", `### J4`)

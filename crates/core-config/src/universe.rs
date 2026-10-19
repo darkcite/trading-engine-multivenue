@@ -401,6 +401,35 @@ impl OptionsPolicy {
     }
 }
 
+/// PMJ (ruling R-PMJ-S15): the default spacing of a rolling leg's depth
+/// records, ms — at most one `<label>-depth.pmlr` record per leg per second.
+pub const ROLLING_DEPTH_MS_DEFAULT: u32 = 1_000;
+
+/// The widest spacing `[polymarket] rolling_depth_ms` admits, ms.
+pub const ROLLING_DEPTH_MS_MAX: u32 = 60_000;
+
+/// PMJ (R-PMJ-S15): the rolling families' depth capture —
+/// `[polymarket] rolling_depth` (`false` = no depth record) and
+/// `rolling_depth_ms` (the least spacing of one leg's records; `0` = every
+/// change, as J1b shipped). Capture only: no lane carries depth, so no
+/// member sees a difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RollingDepth {
+    /// Whether the rolling legs' depth is captured at all.
+    pub on: bool,
+    /// The least spacing of one leg's depth records, ms (0 = every change).
+    pub min_ms: u32,
+}
+
+impl Default for RollingDepth {
+    fn default() -> Self {
+        Self {
+            on: true,
+            min_ms: ROLLING_DEPTH_MS_DEFAULT,
+        }
+    }
+}
+
 /// The parsed universe file. Empty lists are valid at PARSE level —
 /// the boot refusal law (`assert_bootable`) is applied by the caller
 /// after allocation, so tests and tooling can parse partial files.
@@ -420,6 +449,10 @@ pub struct Universe {
     /// [`pm_rolling_5m`]): a 5-minute key, wherever it stands, moves no
     /// 15-minute family.
     pub pm_rolling: Vec<String>,
+    /// PMJ (R-PMJ-S15): `[polymarket] rolling_depth` / `rolling_depth_ms` —
+    /// the rolling legs' depth capture ([`RollingDepth`]; absent = on, one
+    /// record per leg per second at most).
+    pub pm_rolling_depth: RollingDepth,
     /// `[binance] spot` — lowercase stream symbols in file order.
     pub binance_spot: Vec<String>,
     /// `[binance] usdm` — USDS-M futures stream symbols in file order.
@@ -644,6 +677,8 @@ enum Section {
 enum Slot {
     PmMarkets,
     PmRolling,
+    PmRollingDepth,
+    PmRollingDepthMs,
     BnSpot,
     BnUsdm,
     BnUsdmDated,
@@ -726,6 +761,8 @@ struct PendingArray {
 struct Builder {
     pm_markets: Option<Vec<String>>,
     pm_rolling: Option<Vec<String>>,
+    pm_rolling_depth: Option<bool>,
+    pm_rolling_depth_ms: Option<u32>,
     bn_spot: Option<Vec<String>>,
     bn_usdm: Option<Vec<String>>,
     bn_usdm_dated: Option<Vec<String>>,
@@ -824,7 +861,7 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
             slot_for(section, key).ok_or_else(|| err(line_no, unknown_key_msg(section, key)))?;
 
         match slot {
-            Slot::OkxDepth | Slot::DeribitDepth => {
+            Slot::OkxDepth | Slot::DeribitDepth | Slot::PmRollingDepth => {
                 let v = match value {
                     "true" => true,
                     "false" => false,
@@ -845,7 +882,8 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
             | Slot::DeribitOptStrikes
             | Slot::HcExpiries
             | Slot::HcStrikes
-            | Slot::HcSummaryEveryS => {
+            | Slot::HcSummaryEveryS
+            | Slot::PmRollingDepthMs => {
                 let v = parse_uint(key, value, line_no)?;
                 store_int(&mut b, slot, v, line_no)?;
             }
@@ -902,6 +940,8 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
     match (section, key) {
         (Section::Polymarket, "markets") => Some(Slot::PmMarkets),
         (Section::Polymarket, "rolling") => Some(Slot::PmRolling),
+        (Section::Polymarket, "rolling_depth") => Some(Slot::PmRollingDepth),
+        (Section::Polymarket, "rolling_depth_ms") => Some(Slot::PmRollingDepthMs),
         (Section::Binance, "spot") => Some(Slot::BnSpot),
         (Section::Binance, "usdm") => Some(Slot::BnUsdm),
         (Section::Binance, "usdm_dated") => Some(Slot::BnUsdmDated),
@@ -974,7 +1014,9 @@ fn elem_kind(slot: Slot) -> ElemKind {
         | Slot::DeribitOptStrikes
         | Slot::HcExpiries
         | Slot::HcStrikes
-        | Slot::HcSummaryEveryS => {
+        | Slot::HcSummaryEveryS
+        | Slot::PmRollingDepth
+        | Slot::PmRollingDepthMs => {
             unreachable!("bool/int slots have no elements")
         }
     }
@@ -1598,7 +1640,9 @@ fn store_array(
         | Slot::DeribitOptStrikes
         | Slot::HcExpiries
         | Slot::HcStrikes
-        | Slot::HcSummaryEveryS => {
+        | Slot::HcSummaryEveryS
+        | Slot::PmRollingDepth
+        | Slot::PmRollingDepthMs => {
             unreachable!("bool/int slots never store arrays")
         }
     }
@@ -1615,6 +1659,11 @@ fn store_bool(b: &mut Builder, slot: Slot, v: bool, line_no: usize) -> Result<()
         Slot::DeribitDepth => {
             if b.deribit_depth.replace(v).is_some() {
                 return Err(err(line_no, "duplicate key `depth`"));
+            }
+        }
+        Slot::PmRollingDepth => {
+            if b.pm_rolling_depth.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `rolling_depth`"));
             }
         }
         _ => unreachable!("array slots never store bools"),
@@ -1690,6 +1739,11 @@ fn store_int(b: &mut Builder, slot: Slot, v: u32, line_no: usize) -> Result<(), 
         Slot::HcSummaryEveryS => {
             if b.hc_summary_every_s.replace(v).is_some() {
                 return Err(err(line_no, "duplicate key `summary_every_s`"));
+            }
+        }
+        Slot::PmRollingDepthMs => {
+            if b.pm_rolling_depth_ms.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `rolling_depth_ms`"));
             }
         }
         _ => unreachable!("non-integer slots never store integers"),
@@ -1927,6 +1981,22 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         ));
     }
 
+    // PMJ (R-PMJ-S15): the rolling depth capture's policy.
+    let pm_rolling_depth_ms = b.pm_rolling_depth_ms.unwrap_or(ROLLING_DEPTH_MS_DEFAULT);
+    if pm_rolling_depth_ms > ROLLING_DEPTH_MS_MAX {
+        return Err(err(
+            0,
+            format!(
+                "Polymarket `rolling_depth_ms` {pm_rolling_depth_ms} out of range \
+                 0..={ROLLING_DEPTH_MS_MAX} (0 = every change)"
+            ),
+        ));
+    }
+    let pm_rolling_depth = RollingDepth {
+        on: b.pm_rolling_depth.unwrap_or(true),
+        min_ms: pm_rolling_depth_ms,
+    };
+
     // Pairs: re-parse (validated per element already), range-check.
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     let raw_pairs = b.pairs_map.unwrap_or_default();
@@ -1959,6 +2029,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     Ok(Universe {
         pm_markets,
         pm_rolling,
+        pm_rolling_depth,
         binance_spot,
         binance_usdm,
         binance_usdm_dated,
@@ -3091,6 +3162,34 @@ map = ["0:0", "1:1"]
             "[polymarket]\nrolling = [\"updown:btc:15m\"]\nrolling = [\"updown:eth:15m\"]\n"
         )
         .is_err());
+    }
+
+    /// PMJ (R-PMJ-S15): the rolling depth capture's policy — absent is on at
+    /// one record per leg per second; `rolling_depth = false` turns it off;
+    /// `rolling_depth_ms = 0` keeps every change; the bounds refuse.
+    #[test]
+    fn the_rolling_depth_policy_defaults_to_one_record_per_leg_per_second() {
+        let base = format!("[polymarket]\nmarkets = [\"{T1}\"]\nrolling = [\"updown:btc:5m\"]\n");
+        let d = parse(&base).unwrap();
+        assert_eq!(d.pm_rolling_depth, RollingDepth { on: true, min_ms: 1_000 });
+        assert_eq!(Universe::default().pm_rolling_depth, d.pm_rolling_depth, "Default is the parse default");
+        let off = parse(&format!("{base}rolling_depth = false\n")).unwrap();
+        assert!(!off.pm_rolling_depth.on);
+        let every = parse(&format!("{base}rolling_depth_ms = 0\n")).unwrap();
+        assert_eq!(every.pm_rolling_depth, RollingDepth { on: true, min_ms: 0 });
+        let slow = parse(&format!("{base}rolling_depth = true\nrolling_depth_ms = 60000\n")).unwrap();
+        assert_eq!(slow.pm_rolling_depth.min_ms, ROLLING_DEPTH_MS_MAX);
+        for bad in [
+            "rolling_depth_ms = 60001\n",
+            "rolling_depth_ms = -1\n",
+            "rolling_depth = maybe\n",
+            "rolling_depth = false\nrolling_depth = true\n",
+            "rolling_depth_ms = 5\nrolling_depth_ms = 6\n",
+        ] {
+            assert!(parse(&format!("{base}{bad}")).is_err(), "{bad}");
+        }
+        // The keys live in [polymarket] only.
+        assert!(parse(&format!("{base}[okx]\nrolling_depth = false\n")).is_err());
     }
 
     /// PMJ J1b: 5-minute families. Each period numbers its own families,

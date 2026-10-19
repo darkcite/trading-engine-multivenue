@@ -367,6 +367,14 @@ pub struct Pm15Driver {
     /// PMJ J1b-3: the change-gated top-of-book per leg (index `2 · slot +
     /// leg`), written into the capture's `<label>-depth.pmlr`.
     depth: Box<[DepthPair]>,
+    /// PMJ (R-PMJ-S15): whether the legs' depth is captured at all.
+    depth_on: bool,
+    /// PMJ (R-PMJ-S15): the least spacing of one leg's depth records, ns
+    /// (0 = every change).
+    depth_min_ns: u64,
+    /// PMJ (R-PMJ-S15): when each leg's last depth record was captured, ns
+    /// (0 = none since its window bound).
+    depth_last_ns: [u64; PM15_LEGS],
     /// The newest Chainlink second emitted per family.
     last_mark_s: [u64; PM_FAMILIES_MAX],
     market_clock: FeedClock,
@@ -404,10 +412,28 @@ impl Pm15Driver {
             last_vt: [0; PM15_LEGS],
             seq: [ArrivalSeq::ZERO; PM15_LEGS],
             depth,
+            depth_on: true,
+            depth_min_ns: 0,
+            depth_last_ns: [0; PM15_LEGS],
             last_mark_s: [0; PM_FAMILIES_MAX],
             market_clock: FeedClock::new(stale_after_ms),
             rtds_clock: FeedClock::new(stale_after_ms),
         }
+    }
+
+    /// PMJ (R-PMJ-S15): the depth capture's policy — `on` false records no
+    /// depth; otherwise one leg's records are at least `min_ms` apart (0 =
+    /// every change, the [`Self::new_for`] default). A change held back by
+    /// the spacing is captured by the next change past it or by the first
+    /// `PONG` sweep ([`PM15_MARKET_PING_NS`]) at least the spacing after the
+    /// leg's last record — at most `min_ms` + one sweep late while the leg
+    /// still ticks (a window that resolves, retires or loses its session
+    /// first takes its held change with it). **Boot-only.**
+    #[must_use]
+    pub fn with_depth_policy(mut self, on: bool, min_ms: u32) -> Self {
+        self.depth_on = on;
+        self.depth_min_ns = u64::from(min_ms) * 1_000_000;
+        self
     }
 
     /// The families.
@@ -639,6 +665,7 @@ impl Pm15Driver {
                         // each rebind (cold: once per window) — rejected:
                         // zeroing the two rows field by field, same bytes.
                         self.depth[i] = DepthPair::new(DepthTopK::EMPTY);
+                        self.depth_last_ns[i] = 0;
                         leg += 1;
                     }
                     if wire.is_open() {
@@ -785,6 +812,10 @@ impl Pm15Driver {
                 // book would be called stale (PM15-5d).
                 self.push_touch(i, t, self.last_vt[i], 0, 0, ts_ns, out);
                 out.counters.inc(Pm15Counter::TouchesReasserted);
+                // R-PMJ-S15: the sweep that captures a change the spacing held.
+                if self.depth_min_ns != 0 {
+                    self.emit_depth(i, ts_ns, out);
+                }
             }
             i += 1;
         }
@@ -945,6 +976,14 @@ impl Pm15Driver {
     /// no depth lane carries it.
     fn emit_depth<C: Capture>(&mut self, i: usize, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
         let i = i % PM15_LEGS;
+        // R-PMJ-S15: off, or the leg's last record is under the spacing.
+        if !self.depth_on
+            || (self.depth_min_ns != 0
+                && self.depth_last_ns[i] != 0
+                && ts_ns.saturating_sub(self.depth_last_ns[i]) < self.depth_min_ns)
+        {
+            return;
+        }
         let sym = self.leg_sym(i / 2, (i % 2) as u32);
         let pair = &mut self.depth[i];
         let spare = pair.spare_mut();
@@ -957,6 +996,7 @@ impl Pm15Driver {
         if snap.bids != last.bids || snap.asks != last.asks || snap.sym != last.sym {
             out.capture.depth(snap);
             pair.commit();
+            self.depth_last_ns[i] = ts_ns;
         }
     }
 

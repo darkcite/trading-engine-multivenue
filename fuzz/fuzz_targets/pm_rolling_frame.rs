@@ -60,7 +60,8 @@ fuzz_target!(|data: &[u8]| {
         let counters = Pm15Counters::new();
         let mut cap = NullCapture;
         let mut wire = NullWire;
-        let mut d = Pm15Driver::new_for(period, &[b"btc"], 5_000);
+        // R-PMJ-S15: the deployed depth policy, so the spacing gate is fuzzed too.
+        let mut d = Pm15Driver::new_for(period, &[b"btc"], 5_000).with_depth_policy(true, 1_000);
         let now = (open + 10) * 1_000_000_000;
         let mut out = Pm15Out {
             tick: &mut tick_tx,

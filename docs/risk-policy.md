@@ -17342,6 +17342,8 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S12 | Slot 11's 5-minute families: **all seven** (btc eth sol xrp hype doge bnb), appended to `universe.toml` `[polymarket] rolling` after the 15-minute ones. |
 | R-PMJ-S13 | Read-only git (log / status / show) is allowed to the session for the deploy; the operator asked the session to make the commits (J2 `9d9d9359`, J1b + J3 + J4 `88f70509`). |
 | R-PMJ-S14 | The restart immediately once the build and the offline checks pass — off the 15-minute grid, through the exec gate (deployed 2026-10-18 13:06Z). |
+| R-PMJ-S15 | The rolling depth capture: at most one record per leg per second — `[polymarket] rolling_depth_ms` (default 1000; 0 = every change) and `rolling_depth` (off = none) (### J6). |
+| R-PMJ-S16 | The session commits J6 (explicit paths) and makes the gated restart itself, as in the 10-18 deploy. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -17702,3 +17704,68 @@ on_tick_none 2.51 → 3.06 ns (3.060 / 3.058 / 3.066), on_timer_all 2.26 →
 records why. Against it the two pass (+0.2 %, −0.1 %); `bin15/late_fair_in_window`
 stays red as before. A set-bit fan-in (the cost by enabled members, not
 built rows) is a possible later lane.
+
+### J6 — the rolling depth capture, bounded (2026-10-19, ruling R-PMJ-S15)
+- **Why:** J1b's rolling depth capture (`pm15-depth.pmlr` + `pm5-depth.pmlr`)
+  recorded every top-5-per-side change of every leg — ~1.35 GB/h at 7 + 7
+  families, half the run dir's ~2.7 GB/h (the operator's Mac, 2026-10-18) —
+  and the disk fell to 3.6 GiB free (relieved by the S3 push and cleanup at
+  19:35–20:00Z and 2026-10-19 03:15–03:22Z).
+- **The rule:** `[polymarket] rolling_depth` (default on) and
+  `rolling_depth_ms` (default 1000, 0..=60000; 0 = every change, J1b's
+  stream bit for bit): a leg's records are at least the spacing apart, a
+  new window's first book is not held by the spacing (it is written at its
+  first book or change once the slot goes live), and a change
+  the spacing held is written by the first market `PONG` sweep at least the
+  spacing after the leg's last record — so at most spacing + 5 s late (~6 s
+  at the default). That is a departure from the ruling's "the next PONG",
+  made to keep the one-record-per-spacing cap. A sweep record carries the
+  PONG's arrival time. A held change is lost when the leg stops ticking
+  before the sweep (its window resolves or retires, its slot breaks, or the
+  market session drops and the ladders clear) — at most the last spacing +
+  5 s of a window; the first book after a reconnect (not a rebind) waits for
+  the spacing too. Capture only: no lane, member, cap, halt or law reads
+  depth; the ticks and events are identical under every policy, on the
+  replay and on the PONG sweep (pinned by
+  `the_depth_capture_keeps_one_record_per_leg_per_second_and_the_sweep_catches_up`).
+- **The market sockets (diagnosed, not changed):** Polymarket closes the
+  rolling market sockets with **1013 "slow consumer: send buffer full"**
+  (on 2026-10-19 00:11–03:25Z: pm5 111×, pm15 42×). A standalone probe on
+  its own connection (12 tokens; vault `docs/research/pmj/j5probe/`, logs in
+  `~/multivenue/research/pmj/ws-close-*.log`) saw the same code on its
+  dynamically re-subscribing connection (after 65–367 s) while its static
+  one held 868 s — consistent with a venue-side per-connection limit at the
+  5-minute books' message rate, but not conclusive: the probe's own stalls
+  (synchronous discovery calls) and this host's receive side are not
+  excluded, nor is J1b's per-change depth work on the ingress thread. Each
+  close withdraws the touches until the resubscribe. **To do:** re-count
+  the closes per hour after J6 deploys; the remedies (the subscription
+  sharded over several sockets, or a larger kernel receive buffer — a new
+  dependency) are their own ruling.
+- **Risk review** (an Opus subagent at xhigh, read-only, three rounds): 1
+  NEEDS-DOCS (the new test never reached the PONG sweep — its fixture's
+  last frame resolves the window; the 1013 diagnosis overstated; "≤ 5 s"
+  wrong, it is spacing + 5 s; the loss when a leg stops ticking; the
+  readers' note; the ruling row) → the test rewritten to search a cut that
+  holds a change back and to pin ticks and events identical on the replay
+  and the sweep, the docs corrected; 2 BLOCK (the rewritten test did not
+  compile: `ChannelEvent` has no `PartialEq`) → compared by its fields; 3
+  **APPROVE**, on the conditions that bench-check's reds be judged by an
+  A/B against HEAD (R-PMJ-S6) and that the restart keep the restart law.
+
+J6-GATES (2026-10-19, on the Mac, detached; the release binary untouched by
+the gates): `make lint` rc 0, 0 warnings · `cargo nextest run --workspace`
+4 927 passed, 10 skipped · `make alloc-assert` 136 passed at 0 B (gate 133
+under the deployed policy with PONGs) · `make copy-audit` new 0 · `make
+license-check` OK (769 files) · `uv run pytest` 1 784 passed · fuzz
+`universe_toml` 60 s clean (18.1 M runs), `pm_rolling_frame` 60 s clean
+(193 k runs, under the deployed policy) · `make py-lint` RED on PM15-8's two
+E501 lines (untouched) · `make bench-check` RED on untouched groups
+(strategy_set, bin15, ledger, dispatcher, cooldown) with the host's load at
+14–20 — the interleaved A/B against HEAD `86d69f8a` (R-PMJ-S6; a read-only
+worktree and its own target dir, both removed): run 1 A/B on_tick_all
+5.10 / 5.11 ns, on_timer_all 2.87 / 3.00, late_fair 397 / 394, late_grid
+2.41 / 2.39, locate_miss 3.32 / 3.60, queued_submit 0.596 / 0.590,
+cooldown 0.527 / 0.543; run 3 (both under load) 6.89 / 7.05, 3.66 / 3.71,
+397 / 400, 13.4 / 13.7, 3.87 / 3.84, 0.85 / 0.88, 0.70 / 0.70 — J6 equal to
+HEAD; no bench links the rolling driver.

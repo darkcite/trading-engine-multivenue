@@ -862,6 +862,7 @@ pub const PM15_RTDS_WS: core_net::WsCfg = core_net::WsCfg {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_pm15(
     assets: Vec<String>,
+    depth: core_config::universe::RollingDepth,
     tls_config: RustlsConfig,
     wall_anchor: core_time::WallAnchor,
     stale_after_ms: u32,
@@ -885,6 +886,7 @@ pub fn spawn_pm15(
         core_types::pm_roll::PmPeriod::M15,
         "pm15",
         assets,
+        depth,
         tls_config,
         wall_anchor,
         stale_after_ms,
@@ -912,6 +914,7 @@ pub fn spawn_pm15(
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_pm5(
     assets: Vec<String>,
+    depth: core_config::universe::RollingDepth,
     tls_config: RustlsConfig,
     wall_anchor: core_time::WallAnchor,
     stale_after_ms: u32,
@@ -929,6 +932,7 @@ pub fn spawn_pm5(
         core_types::pm_roll::PmPeriod::M5,
         "pm5",
         assets,
+        depth,
         tls_config,
         wall_anchor,
         stale_after_ms,
@@ -952,6 +956,7 @@ fn spawn_rolling(
     period: core_types::pm_roll::PmPeriod,
     label: &'static str,
     assets: Vec<String>,
+    depth: core_config::universe::RollingDepth,
     tls_config: RustlsConfig,
     wall_anchor: core_time::WallAnchor,
     stale_after_ms: u32,
@@ -1011,7 +1016,9 @@ fn spawn_rolling(
         seed.rotate_left(17),
     )
     .map_err(|e| io::Error::other(format!("{label}: rtds socket: {e}")))?;
-    let mut driver = p15::Pm15Driver::new_for(period, &refs, stale_after_ms);
+    // R-PMJ-S15: the depth capture's policy (`[polymarket] rolling_depth*`).
+    let mut driver =
+        p15::Pm15Driver::new_for(period, &refs, stale_after_ms).with_depth_policy(depth.on, depth.min_ms);
     drop(refs);
     let (mut spec_tx, mut spec_rx) =
         Ring::<ingress_polymarket::gamma15::PmWindowSpec, { p15::PM15_SPEC_RING }>::new().split();

@@ -20911,7 +20911,9 @@ fn pm15_polybolt_frames_are_zero_alloc() {
 /// snapshots, `price_change` events (the ladder, the venue touch, the
 /// change-gated tick and the change-gated top-of-book), Chainlink reports
 /// on the 5 m mark slot, the roll clock across a window's end and its
-/// retirement. Zero bytes per operation.
+/// retirement; R-PMJ-S15: under the deployed depth policy (one record per
+/// leg per second) with a market `PONG` every 5 s, so the spacing gate and
+/// the sweep run too. Zero bytes per operation.
 #[test]
 fn pm5_ingress_driver_is_zero_alloc() {
     use core_ring::Ring;
@@ -20955,7 +20957,9 @@ fn pm5_ingress_driver_is_zero_alloc() {
     let counters = Pm15Counters::new();
     let mut cap = NullCapture;
     let mut wire = CountWire(0);
-    let mut d = Pm15Driver::new_for(PmPeriod::M5, &[b"btc"], 5_000);
+    // R-PMJ-S15: the deployed depth policy (one record per leg per second,
+    // the PONG sweep catching up) — the same 0 B.
+    let mut d = Pm15Driver::new_for(PmPeriod::M5, &[b"btc"], 5_000).with_depth_policy(true, 1_000);
     let wall0 = (OPEN5 + 10) * S;
     {
         let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
@@ -20999,6 +21003,9 @@ fn pm5_ingress_driver_is_zero_alloc() {
         d.on_market_text(changes[i % 64].as_bytes(), now, now, &mut out);
         if i % 32 == 0 {
             d.on_rtds_text(marks[(i / 32) % 64].as_bytes(), now, &mut out);
+        }
+        if i % 10 == 0 {
+            d.on_market_text(b"PONG", now, now, &mut out);
         }
         d.on_clock(now, now, &mut out, &mut wire);
         d.perform(now, &mut out, &mut wire);

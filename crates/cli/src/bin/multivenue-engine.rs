@@ -5551,9 +5551,10 @@ fn run(args: RunArgs) -> ExitCode {
                 }
             }
         }
-        info!(families = ?assets, "pm15: starting the rolling discovery + ingress threads");
+        info!(families = ?assets, depth = ?boot.pm_rolling_depth, "pm15: starting the rolling discovery + ingress threads");
         match cli::spawn_pm15(
             assets,
+            boot.pm_rolling_depth,
             tls_config.clone(),
             core_time::WallAnchor::now(),
             stale_after_ms[core_types::VenueId::Polymarket as usize],
@@ -5596,9 +5597,10 @@ fn run(args: RunArgs) -> ExitCode {
                 }
             }
         }
-        info!(families = ?assets, "pm5: starting the 5-minute discovery + ingress threads");
+        info!(families = ?assets, depth = ?boot.pm_rolling_depth, "pm5: starting the 5-minute discovery + ingress threads");
         match cli::spawn_pm5(
             assets,
+            boot.pm_rolling_depth,
             tls_config.clone(),
             core_time::WallAnchor::now(),
             stale_after_ms[core_types::VenueId::Polymarket as usize],

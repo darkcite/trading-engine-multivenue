@@ -602,3 +602,129 @@ fn the_live_window_fills_the_depth_capture_change_gated() {
     }
 }
 
+/// PMJ (R-PMJ-S15): the same replay under the deployed policy — at most one
+/// record per leg per second (a window's first book not held by the spacing), far fewer than
+/// every change; a change the spacing held is written by the first `PONG`
+/// sweep at least the spacing after the leg's last record; `rolling_depth =
+/// false` records none; and the policy is capture-only — the ticks and
+/// events are the same under every policy.
+#[test]
+fn the_depth_capture_keeps_one_record_per_leg_per_second_and_the_sweep_catches_up() {
+    let spec = btc_spec();
+    let w = spec.window;
+    let frames = fixture("market_btc_1792216800.frames");
+    let lines: Vec<(u64, &[u8])> = frames
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let tab = l.iter().position(|b| *b == b'\t').unwrap();
+            (
+                std::str::from_utf8(&l[..tab]).unwrap().parse::<u64>().unwrap(),
+                &l[tab + 1..],
+            )
+        })
+        .collect();
+    // Replay `lines[..cut]`, then (`sweep_after` ns later, if any) a PONG.
+    let replay = |on: bool, min_ms: u32, cut: usize, sweep_after: Option<u64>| {
+        let mut rig = Rig::new();
+        let mut wire = Wire::default();
+        let mut d = Pm15Driver::new(&[b"btc"], 5_000).with_depth_policy(on, min_ms);
+        let t0 = lines[0].0 * MS;
+        d.offer(&spec, t0, t0, &mut rig.out(), &mut wire);
+        wire.open = true;
+        assert!(d.on_market_open(&mut wire));
+        let mut last = t0;
+        for (ms, p) in &lines[..cut] {
+            let now = ms * MS;
+            let mut out = rig.out();
+            d.on_clock(now, now, &mut out, &mut wire);
+            d.on_market_text(p, now, now, &mut out);
+            d.perform(now, &mut out, &mut wire);
+            last = now;
+        }
+        let before = rig.rec.depths.len();
+        let mut sweep_ts = 0u64;
+        if let Some(after) = sweep_after {
+            sweep_ts = last + after;
+            d.on_market_text(b"PONG", sweep_ts, sweep_ts, &mut rig.out());
+        }
+        (rig.rec, before, sweep_ts)
+    };
+    let n = lines.len();
+    let (every, _, _) = replay(true, 0, n, None);
+    let (capped, _, _) = replay(true, 1_000, n, None);
+    let (none, _, _) = replay(false, 0, n, None);
+    assert!(none.depths.is_empty(), "rolling_depth = false records nothing");
+    assert!(every.depths.len() > 100);
+    assert!(capped.depths.len() * 3 < every.depths.len(), "{} capped vs {} every change", capped.depths.len(), every.depths.len());
+    // Capture-only: the policy never touches a tick or an event
+    // (`ChannelEvent` carries padding and no `PartialEq`: its fields).
+    let key = |e: &ChannelEvent| (e.ts_ns, e.sym, e.venue, e.channel, e.flags, e.venue_seq, e.venue_time_ms, e.v0, e.v1);
+    let same = |a: &Rec, b: &Rec| {
+        a.ticks.len() == b.ticks.len()
+            && a.ticks.iter().zip(b.ticks.iter()).all(|(x, y)| x == y)
+            && a.events.iter().map(key).eq(b.events.iter().map(key))
+    };
+    assert!(same(&capped, &every) && same(&none, &every), "ticks and events identical under every policy");
+    let up = pm_rolling_sym(0, pm_pair_of_window(w), PM_LEG_UP);
+    let down = pm_rolling_sym(0, pm_pair_of_window(w), PM_LEG_DOWN);
+    for leg in [up, down] {
+        let ts: Vec<u64> = capped.depths.iter().filter(|x| x.sym == leg).map(|x| x.ts_ns).collect();
+        assert!(!ts.is_empty(), "the leg's first book is captured at once");
+        let mut k = 1usize;
+        while k < ts.len() {
+            assert!(ts[k] - ts[k - 1] >= 1_000 * MS, "records {} ns apart", ts[k] - ts[k - 1]);
+            k += 1;
+        }
+    }
+    // The sweep: the latest cut (before the window resolves and its slot stops
+    // ticking) where the spacing holds a leg's newest book back and that
+    // leg's last record is under the spacing at the cut's last frame. A PONG
+    // under the spacing writes nothing for it; one past it writes the held
+    // book.
+    let last_of = |ds: &[core_types::DepthTopK], leg| ds.iter().rev().find(|x| x.sym == leg).copied();
+    let held_at = |cut: usize| -> Vec<SymbolId> {
+        let (ev, _, _) = replay(true, 0, cut, None);
+        let (cp, _, _) = replay(true, 1_000, cut, None);
+        let last_frame = lines[cut - 1].0 * MS;
+        [up, down]
+            .into_iter()
+            .filter(|&leg| match (last_of(&ev.depths, leg), last_of(&cp.depths, leg)) {
+                (Some(a), Some(b)) => (a.bids != b.bids || a.asks != b.asks) && last_frame + MS - b.ts_ns < 1_000 * MS,
+                _ => false,
+            })
+            .collect()
+    };
+    let mut cut = n - 1;
+    let mut held: Vec<SymbolId> = Vec::new();
+    while cut > n / 2 {
+        held = held_at(cut);
+        if !held.is_empty() {
+            break;
+        }
+        cut -= 1;
+    }
+    assert!(!held.is_empty(), "the fixture holds a change back somewhere");
+    let (ev, _, _) = replay(true, 0, cut, None);
+    let (early, b0, _) = replay(true, 1_000, cut, Some(MS));
+    assert!(
+        early.depths[b0..].iter().all(|x| !held.contains(&x.sym)),
+        "a PONG under the spacing writes nothing for the held leg"
+    );
+    let (late, b1, sweep_ts) = replay(true, 1_000, cut, Some(1_100 * MS));
+    assert!(
+        late.depths[b1..].iter().any(|x| held.contains(&x.sym)),
+        "the sweep past the spacing wrote the held book"
+    );
+    // Capture-only on the PONG path too: the sweep's re-asserted ticks are
+    // the same with and without the spacing.
+    let (late_every, _, _) = replay(true, 0, cut, Some(1_100 * MS));
+    assert!(same(&late, &late_every), "the sweep changes no tick or event");
+    for x in &late.depths[b1..] {
+        assert_eq!(x.ts_ns, sweep_ts, "stamped at the sweep");
+    }
+    for leg in [up, down] {
+        let (a, b) = (last_of(&ev.depths, leg).unwrap(), last_of(&late.depths, leg).unwrap());
+        assert!(a.bids == b.bids && a.asks == b.asks, "the sweep caught the leg up");
+    }
+}

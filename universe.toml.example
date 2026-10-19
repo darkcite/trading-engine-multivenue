@@ -35,6 +35,14 @@ markets = [
 # a 5 m key anywhere in the list moves no 15 m family. Append, never
 # reorder, within a period.
 rolling = []
+# PMJ (R-PMJ-S15): the rolling legs' depth capture (`<label>-depth.pmlr`,
+# capture only — no member reads it). `rolling_depth = false` records
+# none; `rolling_depth_ms` is the least spacing of one leg's records
+# (default 1000; 0 = every top-5-per-side change, ~1.35 GB/h at 7 + 7
+# families; at most 60000). A change the spacing held is captured by the
+# first market PONG sweep at least the spacing later (<= spacing + 5 s).
+# rolling_depth = true
+# rolling_depth_ms = 1000
 
 [binance]
 # Lowercase stream symbols. spot[0] → SymbolId 7 (legacy anchor), then
