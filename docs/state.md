@@ -63,6 +63,28 @@ affected paragraph at each lane close; the superseded text goes to
   `universe.toml` and a restart (this binary), or the kit
   `~/multivenue/rollback-pmj-20261019/multivenue-engine.b5c263e6` (then remove
   the key if it was added).
+- **2026-10-19 08:35Z: the scheduled `0833` boot (`4690bcac`) took the new
+  paper frames (rulings R-PMJ-S21, S22):** `pm15.toml` session loss −$3 500
+  (per order and per market stay $250); `pmj.toml` $250 deposit (max
+  $250.01), $250 per market, −$3 500 session. Boot tells `frame=$250/order:
+  $250/market:-$3500/session` for both. By R-PM-8 −$3 500 is also slot 9's
+  live session bound once armed; today slot 9 has no arm. Rollback:
+  `~/multivenue/rollback-pmj-20261019/{pm15,pmj}.toml.pre-frame-0710`.
+- **2026-10-19 08:49Z: the engine boots `ed4e14bd` (PMJ J8, rulings
+  R-PMJ-S23..S26):** the rolling legs' paper IoC sweeps the touch and the
+  depth behind it up to its limit (the venue's FAK) at submit + delta; slot 9
+  decides no entry under `price_floor` 0.90 (`pm15.toml price_floor_1e6`,
+  absent = 0.90; boot tell `…:floor0.900:…`); slot 11's IoCs are also judged
+  in shadow at 350 ms and 1 s (`engine_paper_matcher_pmj_*`). **Slot 9 and
+  11 paper P&L before and after this boot are different laws; P0's count is
+  segmented here.** Restart: the `0010` stamp forced at 08:47:21Z (14 min
+  after the `0833` drain, off the 15-minute grid), daily-restart's exec gate,
+  drain and relaunch; boot 08:49:18Z, masks 2815, `vm rows_active` 2, slots
+  3 / 9 / 11 configured and enabled, `market_sockets_open` 7 / 7. Rollback:
+  `price_floor_1e6 = 0` in `pm15.toml` and a restart restores slot 9's
+  frozen law (this binary; the sweep has no switch), or the kit
+  `~/multivenue/rollback-pmj-20261019/multivenue-engine.4690bcac` (then
+  remove the key if it was added).
 - `exec.HALT` is present and slot 3 reads halted (`ws-gap`) on `/state` both
   BEFORE and after this restart — not changed by the PMJ deploy; the
   operator's to clear.
