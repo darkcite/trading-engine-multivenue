@@ -100,6 +100,17 @@ affected paragraph at each lane close; the superseded text goes to
   `ed4e14bd` until the next scheduled restart, which boots `dda68846`;
   tonight's 00:20Z `pnl_report` already runs it. Rollback kit:
   `~/multivenue/rollback-pmj-20261019/multivenue-engine.ed4e14bd`.
+- **2026-10-19 16:06Z: the scheduled `1605` restart booted `dda68846`** (run
+  `run-1792425969573319000`) with PMJ J11's config (R-PMJ-S47 / S55):
+  `pmj.toml` `paper_delay_ms` 5000 and `min_tau_s` 6 — slot 11's tell
+  `law=6-20s … paper=+5000ms`, artifact hash `09e53291…`; slot 9's tell is
+  unchanged (`law=2-20s … floor0.900`, `ef485100…`). `/state`: masks 2815,
+  `vm rows_active` 2, `market_sockets_open` 7 / 7 on both periods, depth drops
+  0; `exec.HALT` still present with slot 3 `ws-gap` (unchanged). No run booted
+  between the `pmj.toml` edit (14:07:54Z) and J9's `J11_FROM_NS` (16:00Z), so
+  slot 11's `j11` ledger segment starts exactly at this run. Rollback: restore
+  `~/multivenue/rollback-pmj-20261019/pmj.toml.pre-j11` and restart (plus a J9
+  `SEGMENTS` row).
 - `exec.HALT` is present and slot 3 reads halted (`ws-gap`) on `/state` both
   BEFORE and after this restart — not changed by the PMJ deploy; the
   operator's to clear.
