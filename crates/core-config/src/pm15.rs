@@ -47,7 +47,7 @@ fn err(msg: impl Into<String>) -> Pm15Error {
 }
 
 /// Every key the grammar accepts; an unknown key is a refusal.
-const PM15_KEYS: [&str; 15] = [
+const PM15_KEYS: [&str; 16] = [
     "families",
     "perp",
     "tau_min_ns",
@@ -63,6 +63,7 @@ const PM15_KEYS: [&str; 15] = [
     "order_ttl_ns",
     "live_assets",
     "phi_lut",
+    "price_floor_1e6",
 ];
 
 /// `pm15.toml` as parsed. Descriptors stay strings: `pm15_boot` resolves
@@ -96,6 +97,10 @@ pub struct Pm15File {
     pub max_orders_market: u8,
     /// An IoC's time-to-live, ns (absent = 1 s).
     pub order_ttl_ns: u64,
+    /// PMJ J8 (R-PMJ-S24): the least ask an entry takes ×1e6,
+    /// `500_000..=999_999`, or `0` = no floor (P0's law as frozen; the
+    /// rollback with the J8 binary); absent = 0.90.
+    pub price_floor_1e6: i64,
     /// The assets ruling R-PM-4 lets arm live (absent = none); a subset of
     /// `families`. The member trades every family in paper; the execution
     /// side refuses a live order on any other.
@@ -215,6 +220,10 @@ pub fn parse(src: &str) -> Result<Pm15File, Pm15Error> {
         1,
         16,
     )? as u8;
+    let price_floor_1e6 = opt_int(&kv, "price_floor_1e6", 900_000).map_err(m)?;
+    if price_floor_1e6 != 0 {
+        in_range("price_floor_1e6", price_floor_1e6, 500_000, 999_999)?;
+    }
     let order_ttl_ns = in_range(
         "order_ttl_ns",
         opt_int(&kv, "order_ttl_ns", 1_000_000_000).map_err(m)?,
@@ -259,6 +268,7 @@ pub fn parse(src: &str) -> Result<Pm15File, Pm15Error> {
         session_loss_usd_1e6,
         max_orders_market,
         order_ttl_ns,
+        price_floor_1e6,
         live_assets,
         phi_lut,
     })
@@ -302,8 +312,8 @@ mod tests {
             (250_000_000, 250_000_000, 500_000_000)
         );
         assert_eq!(
-            (f.max_orders_market, f.order_ttl_ns),
-            (4, 1_000_000_000),
+            (f.max_orders_market, f.order_ttl_ns, f.price_floor_1e6),
+            (4, 1_000_000_000, 900_000),
             "the stated defaults"
         );
         assert_eq!(f.live_assets, vec!["btc", "eth"]);
@@ -354,6 +364,11 @@ mod tests {
             "no day cap key exists"
         );
         assert!(parse(&src("order_ttl_ns = 100\n")).is_err());
+        // PMJ J8 (R-PMJ-S24): the floor's bounds.
+        assert_eq!(parse(&src("price_floor_1e6 = 950000\n")).unwrap().price_floor_1e6, 950_000);
+        assert!(parse(&src("price_floor_1e6 = 499999\n")).is_err());
+        assert_eq!(parse(&src("price_floor_1e6 = 0\n")).unwrap().price_floor_1e6, 0, "0 = no floor");
+        assert!(parse(&src("price_floor_1e6 = 1000000\n")).is_err());
         assert!(parse(&base.replacen("phi_lut = [500000", "phi_lut = [500001", 1)).is_err());
     }
 }

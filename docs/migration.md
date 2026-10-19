@@ -6,6 +6,39 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-19 — PMJ J8: the rolling legs' paper fill sweeps the depth lane; slot 9's `price_floor_1e6`; slot 11's shadow verdicts
+
+**What changed** (rulings R-PMJ-S21..S26; risk-policy "PMJ — slot 11", `### J8`)
+- Paper fills of a Polymarket rolling leg's IoC (slots 9 and 11) now take the
+  touch AND the levels behind it up to the limit — one fill at the
+  size-weighted price, rounded against the taker. A fill's `px` is no longer
+  always a printed level; its `qty` may exceed the touch's size.
+- `engine::NUM_DEPTH_LANES` 2 → 4 (`PM15_DEPTH_LANE` 2, `PM5_DEPTH_LANE` 3);
+  `OrderDispatch::observe_depth` (default no-op); `ingress_polymarket::
+  pm15_loop::Pm15Out.depth`; `cli::spawn_pm15` / `spawn_pm5` take the depth
+  producer. Members see the same depth as before (OKX, Deribit only).
+- `pm15.toml` gains optional **`price_floor_1e6`** (500000..=999999, or 0 =
+  none; absent = 900000): slot 9 no longer decides entries under 0.90. Its
+  boot tell names it (`…:ask<=p-0.020:floor0.900:…`).
+- `clob_dispatcher::MatcherCounters` grows (176 → 296 B): `held_swept_deeper`,
+  `held_levels_lagged`, `pmj_shadow_refused` and
+  `pmj_{judged,filled,qty_1e6,usd_1e6}[3]`; metrics
+  `engine_paper_matcher_held_{swept_deeper,levels_lagged}_total`,
+  `engine_paper_matcher_pmj_shadow_refused_total` and
+  `engine_paper_matcher_pmj_{shadow350ms,shadow1s,real}_{judged,filled,qty_1e6,usd_1e6}_total`.
+- Config, not code (same day, 07:10Z): `pm15.toml` session loss −$3 500;
+  `pmj.toml` deposit $250 (max $250.01), $250 per market, −$3 500.
+
+**Readers:** slot 9 / 11 paper P&L before and after the J8 boot are different
+laws; `docs/state.md` dates the boot. The capture's records are unchanged in
+format (the depth lane is not captured; `*-depth.pmlr` keeps J6's policy).
+`/state` `counters.depths` (`Engine::depths_dispatched`) now counts the
+rolling legs' depth lanes too — about 2 000 records a second more.
+**Rollback:** the previous binary; with this one, `pm15.toml
+price_floor_1e6 = 0` restores slot 9's frozen law (the sweep has no switch).
+The previous binary refuses `price_floor_1e6` in `pm15.toml` (unknown key) —
+remove it with the binary.
+
 ## 2026-10-19 — PMJ J7: `[polymarket] rolling_market_sockets` — the rolling families spread over several market sockets
 
 **What changed** (rulings R-PMJ-S17..S20; risk-policy "PMJ — slot 11", `### J7`)

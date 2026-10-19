@@ -177,6 +177,9 @@ fn harness(tag: &str) -> Harness {
     // WS10-B: depth lanes ride in every engine (producers dropped).
     let (_d0p, d0) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     let (_d1p, d1) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
+    // PMJ J8: the rolling legs' depth lanes.
+    let (_d2p, d2) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
+    let (_d3p, d3) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     // VM2 V2: opt lanes ride in every engine (producers dropped).
     let (_o0p, o0) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_o1p, o1) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
@@ -195,7 +198,7 @@ fn harness(tag: &str) -> Harness {
         PaperDispatcher::new(),
         [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9],
         [e0, e1, e2, e3, e4, e5, e6, e7, e8, e9],
-        [d0, d1],
+        [d0, d1, d2, d3],
         [o0, o1, o2, o3],
         sc,
         [f0, f1, f2, f3, f4],

@@ -659,9 +659,10 @@ pub struct Rings {
     /// push (§3.3 unspawned shape — the engine drains them empty).
     pub event: [Arc<Ring<ChannelEvent, EVENT_RING_SIZE>>; engine::NUM_EVENT_LANES],
     /// WS10-B: one depth ring per depth lane (`engine::depth_lane_of`
-    /// order: 0 = OKX, 1 = Deribit). Producers ride into the two
-    /// depth-capable spawns; without a depth subscription the lane
-    /// reads empty forever (§3.3).
+    /// order: 0 = OKX, 1 = Deribit; PMJ J8: 2 = the 15-minute rolling
+    /// legs, 3 = the 5-minute ones). Producers ride into the depth-capable
+    /// spawns; without a depth subscription the lane reads empty forever
+    /// (§3.3).
     pub depth: [Arc<Ring<DepthTopK, DEPTH_RING_SIZE>>; engine::NUM_DEPTH_LANES],
     /// VM2 V2: one options-summary ring per opt lane
     /// (`engine::opt_lane_of` order: 0 = OKX, 1 = Deribit,
@@ -715,7 +716,7 @@ impl Rings {
                 // PMJ J1b: lane 9 — the same for the 5-minute families.
                 Ring::new(),
             ],
-            depth: [Ring::new(), Ring::new()],
+            depth: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             opt: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
         }
     }
@@ -870,6 +871,7 @@ pub fn spawn_pm15(
     stale_after_ms: u32,
     tick_tx: Producer<Tick, TICK_RING_SIZE>,
     event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: Arc<IngressStatus>,
     counters: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
     core_id: usize,
@@ -895,6 +897,7 @@ pub fn spawn_pm15(
         stale_after_ms,
         tick_tx,
         event_tx,
+        depth_tx,
         status,
         counters,
         core_id,
@@ -924,6 +927,7 @@ pub fn spawn_pm5(
     stale_after_ms: u32,
     tick_tx: Producer<Tick, TICK_RING_SIZE>,
     event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: Arc<IngressStatus>,
     counters: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
     core_id: usize,
@@ -943,6 +947,7 @@ pub fn spawn_pm5(
         stale_after_ms,
         tick_tx,
         event_tx,
+        depth_tx,
         status,
         counters,
         core_id,
@@ -968,6 +973,7 @@ fn spawn_rolling(
     stale_after_ms: u32,
     mut tick_tx: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mut depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: Arc<IngressStatus>,
     counters: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
     core_id: usize,
@@ -1082,6 +1088,8 @@ fn spawn_rolling(
                 status: &status,
                 counters: &counters,
                 capture: &mut capture,
+                // PMJ J8: the paper book's levels.
+                depth: Some(&mut depth_tx),
             };
             if let Err(e) = p15::run_pm15(
                 &mut driver,
@@ -6229,6 +6237,12 @@ fn register_vrp_metrics(
     })
 }
 
+/// PMJ J8: the classes of slot 11's verdict tallies (`MatcherCounters::pmj_*`
+/// index order).
+pub const PMJ_MATCHER_CLASSES: [&str; 3] = ["shadow350ms", "shadow1s", "real"];
+/// PMJ J8: the words of slot 11's verdict tallies.
+pub const PMJ_MATCHER_WORDS: [&str; 4] = ["judged", "filled", "qty_1e6", "usd_1e6"];
+
 /// X1: the paper matcher's family. Boot-only.
 #[derive(Copy, Clone, Debug)]
 pub struct PaperMatcherMetricIds {
@@ -6295,6 +6309,12 @@ pub struct PaperMatcherMetricIds {
     /// canceled,fills}_total` — the queue law's own tally, in that order —
     /// and `engine_paper_matcher_order_events_overflow_total` (must stay 0).
     pub queue: [core_metrics::CounterId; 6],
+    /// PMJ J8: `engine_paper_matcher_held_swept_deeper_total`,
+    /// `…_held_levels_lagged_total`, `…_pmj_shadow_refused_total`, then
+    /// `engine_paper_matcher_pmj_<class>_<word>_total` for class
+    /// `shadow350ms`, `shadow1s`, `real` × word `judged`, `filled`,
+    /// `qty_1e6`, `usd_1e6` ([`PMJ_MATCHER_CLASSES`] × [`PMJ_MATCHER_WORDS`]).
+    pub pmj: [core_metrics::CounterId; 3 + 12],
     /// XMM XH2: `engine_set_order_events_unrouted_total` — order events
     /// that reached the set for a slot not enabled or not built, or
     /// attributed to none. Counted, never fanned out.
@@ -6341,9 +6361,26 @@ fn register_paper_matcher_metrics(
         one("engine_paper_matcher_order_events_overflow_total")?,
     ];
     let order_events_unrouted = one("engine_set_order_events_unrouted_total")?;
+    let mut pmj = [core_metrics::CounterId::default(); 3 + 12];
+    pmj[0] = one("engine_paper_matcher_held_swept_deeper_total")?;
+    pmj[1] = one("engine_paper_matcher_held_levels_lagged_total")?;
+    pmj[2] = one("engine_paper_matcher_pmj_shadow_refused_total")?;
+    let mut w = 0usize;
+    while w < PMJ_MATCHER_WORDS.len() {
+        let mut c = 0usize;
+        while c < PMJ_MATCHER_CLASSES.len() {
+            pmj[3 + w * 3 + c] = one(&format!(
+                "engine_paper_matcher_pmj_{}_{}_total",
+                PMJ_MATCHER_CLASSES[c], PMJ_MATCHER_WORDS[w]
+            ))?;
+            c += 1;
+        }
+        w += 1;
+    }
     Ok(PaperMatcherMetricIds {
         amm,
         queue,
+        pmj,
         order_events_unrouted,
         intake,
         fills,
@@ -7430,6 +7467,25 @@ fn mirror_paper_matcher_metrics(
         .inc(cur.queue_fills.saturating_sub(last.queue_fills));
     reg.counter(ids.queue[5])
         .inc(cur.order_events_overflow.saturating_sub(last.order_events_overflow));
+    // PMJ J8: the sweep's depth, and slot 11's verdicts by delay class.
+    reg.counter(ids.pmj[0])
+        .inc(cur.held_swept_deeper.saturating_sub(last.held_swept_deeper));
+    reg.counter(ids.pmj[1])
+        .inc(cur.held_levels_lagged.saturating_sub(last.held_levels_lagged));
+    reg.counter(ids.pmj[2])
+        .inc(cur.pmj_shadow_refused.saturating_sub(last.pmj_shadow_refused));
+    let mut c = 0usize;
+    while c < 3 {
+        reg.counter(ids.pmj[3 + c])
+            .inc(cur.pmj_judged[c].saturating_sub(last.pmj_judged[c]));
+        reg.counter(ids.pmj[6 + c])
+            .inc(cur.pmj_filled[c].saturating_sub(last.pmj_filled[c]));
+        reg.counter(ids.pmj[9 + c])
+            .inc(cur.pmj_qty_1e6[c].saturating_sub(last.pmj_qty_1e6[c]));
+        reg.counter(ids.pmj[12 + c])
+            .inc(cur.pmj_usd_1e6[c].saturating_sub(last.pmj_usd_1e6[c]));
+        c += 1;
+    }
     // E5: the engine-level tally, which counts verbs on BOTH arms —
     // the matcher family above sees only the paper one, so a live
     // slot's cancels would otherwise be invisible here.

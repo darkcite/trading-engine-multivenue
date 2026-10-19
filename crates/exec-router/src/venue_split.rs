@@ -45,7 +45,7 @@ use clob_dispatcher::{
     Retired, RouteAliases,
 };
 use core_types::{
-    CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, OptSummary, Order, SymbolId, Tick,
+    CancelReq, ChannelEvent, DepthTopK, Fill, ModifyReq, NsTs, OptSummary, Order, SymbolId, Tick,
 };
 
 /// A slot's coverage bit: arm `a` trades it.
@@ -243,6 +243,13 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for VenueSplit<A, B> {
     fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         self.a.observe_tick(tick, now_ns);
         self.b.observe_tick(tick, now_ns);
+    }
+
+    /// PMJ J8: both arms see every rolling depth record, like every tick.
+    #[inline]
+    fn observe_depth(&mut self, depth: &DepthTopK, now_ns: NsTs) {
+        self.a.observe_depth(depth, now_ns);
+        self.b.observe_depth(depth, now_ns);
     }
 
     #[inline]

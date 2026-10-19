@@ -1491,6 +1491,9 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (mut d0_p, d0) =
         Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     let (_d1p, d1) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
+    // PMJ J8: the rolling legs' depth lanes, producer-dropped.
+    let (_d2p, d2) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
+    let (_d3p, d3) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     // VM2 V2: opt lanes (producer-dropped — empty-lane steady cost is
     // part of the measured window, the §3.3 shape).
     let (_o0p, o0) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
@@ -1526,7 +1529,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         PaperDispatcher::new(),
         [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9],
         [e0, e1, e2, e3, e4, e5, e6, e7, e8, e9],
-        [d0, d1],
+        [d0, d1, d2, d3],
         [o0, o1, o2, o3],
         sc,
         [f0, f1, f2, f3, f4],
@@ -20388,7 +20391,7 @@ fn pm15_ingress_driver_and_member_are_zero_alloc() {
     let mut d = Pm15Driver::new(&[b"btc"], 5_000);
     let wall0 = (OPEN + 100) * S;
     {
-        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
+        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap, depth: None };
         d.offer(&spec, wall0, wall0, &mut out, &mut wire);
     }
     let us = std::str::from_utf8(up).unwrap();
@@ -20421,7 +20424,7 @@ fn pm15_ingress_driver_and_member_are_zero_alloc() {
     let mut i = 0usize;
     while i < 2_000 {
         let now = wall0 + i as u64 * 1_000_000;
-        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
+        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap, depth: None };
         if i % 256 == 0 {
             d.on_market_text(0, book.as_bytes(), now, now, &mut out);
         }
@@ -20913,14 +20916,15 @@ fn pm15_polybolt_frames_are_zero_alloc() {
 /// on the 5 m mark slot, the roll clock across a window's end and its
 /// retirement; R-PMJ-S15: under the deployed depth policy (one record per
 /// leg per second) with a market `PONG` every 5 s, so the spacing gate and
-/// the sweep run too; PMJ J7: on the deployed sockets (one per family), the
+/// the sweep run too; PMJ J8: the depth lane on (every top-five change
+/// pushed, drained each step); PMJ J7: on the deployed sockets (one per family), the
 /// window's shard dropping and reopening every 50 s — the withdrawal, the
 /// ladders' restart and the resubscribe. Zero bytes per operation.
 #[test]
 fn pm5_ingress_driver_is_zero_alloc() {
     use core_ring::Ring;
     use core_types::pm_roll::{pm5_window_of_open, PmPeriod};
-    use core_types::{ChannelEvent, NullCapture, Tick};
+    use core_types::{ChannelEvent, DepthTopK, NullCapture, Tick};
     use ingress_polymarket::gamma15::PmWindowSpec;
     use ingress_polymarket::pm15_loop::{
         Pm15Counters, Pm15Driver, Pm15Out, Pm15Wires, PM15_EVENT_MASK, PM15_MARKET_SOCKETS_MAX,
@@ -20957,6 +20961,8 @@ fn pm5_ingress_driver_is_zero_alloc() {
     spec.down.len = down.len() as u8;
     let (mut tick_tx, mut tick_rx) = Ring::<Tick, { ingress_polymarket::DEFAULT_TICK_RING_CAP }>::new().split();
     let (mut ev_tx, mut ev_rx) = Ring::<ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    // PMJ J8: the depth lane, drained each step as the engine drains it.
+    let (mut depth_tx, mut depth_rx) = Ring::<DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     let status = core_metrics::IngressStatus::new();
     let counters = Pm15Counters::new();
     let mut cap = NullCapture;
@@ -20969,7 +20975,7 @@ fn pm5_ingress_driver_is_zero_alloc() {
     let shard = d.shard_of(0);
     let wall0 = (OPEN5 + 10) * S;
     {
-        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
+        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap, depth: Some(&mut depth_tx) };
         d.offer(&spec, wall0, wall0, &mut out, &mut wire);
     }
     let us = std::str::from_utf8(up).unwrap();
@@ -21003,7 +21009,7 @@ fn pm5_ingress_driver_is_zero_alloc() {
         // 2 000 steps of 0.5 s: across the window's end (300 s) and its
         // retirement 540 s later.
         let now = wall0 + i as u64 * 500_000_000;
-        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap };
+        let mut out = Pm15Out { tick: &mut tick_tx, event: &mut ev_tx, event_mask: PM15_EVENT_MASK, status: &status, counters: &counters, capture: &mut cap, depth: Some(&mut depth_tx) };
         if i % 256 == 0 {
             d.on_market_text(shard, book.as_bytes(), now, now, &mut out);
         }
@@ -21022,6 +21028,7 @@ fn pm5_ingress_driver_is_zero_alloc() {
         d.on_clock(now, now, &mut out, &mut wire);
         d.perform(now, &mut out, &mut wire);
         while tick_rx.try_pop_ref().is_some() {}
+        while depth_rx.try_pop_ref().is_some() {}
         while ev_rx.try_pop_ref().is_some() {}
         i += 1;
     }
@@ -21037,6 +21044,7 @@ fn pm5_ingress_driver_is_zero_alloc() {
         counters.of(ingress_polymarket::pm15_loop::Pm15Counter::TouchesWithdrawn) > 0,
         "gate 133: a shard's loss withdrew its touches"
     );
+    assert_eq!(status.depth_ring_drops_total(), 0, "gate 133: the depth lane kept up");
     assert_eq!(allocs, 0, "gate 133: the 5 m ingress driver allocated {allocs} times ({bytes} B)");
 }
 
@@ -21309,7 +21317,9 @@ fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
 /// matcher's 5-minute held-quote branch, in steady state — the report grid,
 /// nowcast, pricer, persistence, the price floor, the $5 deposit sizing, the
 /// take, the IoC held for the keeper's delay and judged at the quote in
-/// force, its fill and the settlement. Zero bytes per operation.
+/// force, its fill and the settlement; PMJ J8: the depth lane's records
+/// into the matcher each step, the FAK sweep past a thin touch, and the
+/// shadow judgements at 350 ms and 1 s. Zero bytes per operation.
 #[test]
 fn pmj_member_steady_state_is_zero_alloc() {
     use clob_dispatcher::PaperMatcher;
@@ -21318,7 +21328,7 @@ fn pmj_member_steady_state_is_zero_alloc() {
         pm5_instance_id, pm5_mark_sym, pm5_pair_of_window, pm5_roll_family, pm5_rolling_sym,
         pm5_window_end_ns, pm5_window_of_open, PM_LEG_DOWN, PM_LEG_UP, PM_SETTLED_UP, PM_TWAP_S,
     };
-    use core_types::{ChannelEvent, ChannelId, Order, OrderEvent, Price, Qty, Tick, VenueId};
+    use core_types::{ChannelEvent, ChannelId, DepthLevel, DepthTopK, Order, OrderEvent, Price, Qty, Tick, VenueId, DEPTH_K};
     use strategy_core::{Ctx, Strategy, SubmitErr};
 
     /// The paper side: every order to the matcher, as slot 11's.
@@ -21395,10 +21405,15 @@ fn pmj_member_steady_state_is_zero_alloc() {
                 m.on_tick(&Tick::new(t_perp, VenueId::Hyperliquid, perp, 1, Price::from_raw(px - 500_000), Qty::from_raw(1), Price::from_raw(px + 500_000), Qty::from_raw(1)), &mut c);
             }
             let now = s * S + 1_300_000_000;
-            let up = Tick::new(now, VenueId::Polymarket, pm5_rolling_sym(0, pair, PM_LEG_UP), 1, Price::from_raw(920_000), Qty::from_raw(500_000_000), Price::from_raw(930_000), Qty::from_raw(500_000_000));
+            // A thin touch (2 shares at 0.93) with depth behind it.
+            let up = Tick::new(now, VenueId::Polymarket, pm5_rolling_sym(0, pair, PM_LEG_UP), 1, Price::from_raw(920_000), Qty::from_raw(500_000_000), Price::from_raw(930_000), Qty::from_raw(2_000_000));
             let down = Tick::new(now, VenueId::Polymarket, pm5_rolling_sym(0, pair, PM_LEG_DOWN), 1, Price::from_raw(70_000), Qty::from_raw(500_000_000), Price::from_raw(80_000), Qty::from_raw(500_000_000));
             pm.observe_tick(&up, now);
             pm.observe_tick(&down, now);
+            let mut asks = [DepthLevel::EMPTY; DEPTH_K];
+            asks[0] = DepthLevel { px_1e6: 930_000, qty_1e6: 2_000_000 };
+            asks[1] = DepthLevel { px_1e6: 940_000, qty_1e6: 500_000_000 };
+            pm.observe_depth(&DepthTopK::new(now, VenueId::Polymarket, pm5_rolling_sym(0, pair, PM_LEG_UP), 0, [DepthLevel::EMPTY; DEPTH_K], asks), now);
             {
                 let mut c = PaperCtx { pm: &mut pm, now, n: &mut n };
                 m.on_venue_event(&ChannelEvent::new(now, VenueId::Polymarket, ChannelId::Mark, pm5_mark_sym(0), s, s * 1_000, px, px * 1_000_000), &mut c);
@@ -21427,6 +21442,8 @@ fn pmj_member_steady_state_is_zero_alloc() {
     let ct = m.counters();
     assert!(n >= 4 && fills >= 4 && ct.settled_won == 4, "gate 136: the member took, the held law filled and the member settled every cycle ({n} orders, {fills} fills, {events} events, {ct:?})");
     assert_eq!(pm.held_pending(), 0, "gate 136: every held IoC judged");
+    let mc = pm.counters_snapshot();
+    assert!(mc.held_swept_deeper >= 4 && mc.pmj_judged[0] >= 4 && mc.pmj_judged[1] >= 4, "gate 136: the sweep went past the touch and the shadows were judged ({mc:?})");
     assert_eq!(allocs, 0, "gate 136: slot 11's member and the 5-minute held law allocated {allocs} times ({bytes} B)");
     std::hint::black_box(ct);
 }

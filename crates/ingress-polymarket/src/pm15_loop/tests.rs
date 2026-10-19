@@ -117,6 +117,7 @@ impl Rig {
             status: &self.status,
             counters: &self.counters,
             capture: &mut self.rec,
+            depth: None,
         }
     }
 
@@ -1053,4 +1054,102 @@ fn no_market_socket_at_all_is_refused() {
 #[should_panic(expected = "out of 1..=")]
 fn more_market_sockets_than_the_family_cap_is_refused() {
     let _ = Pm15Driver::new(&[b"btc"], 5_000).with_market_sockets(PM15_MARKET_SOCKETS_MAX + 1);
+}
+
+/// PMJ J8 (R-PMJ-S23): the depth lane carries a ticking leg's top five on
+/// every change — whatever the capture's policy (here one record per second)
+/// — nothing for an unchanged book, and, after a session loss (the paper
+/// book dropped the levels with the withdrawn touch), the first book again
+/// even when it is unchanged.
+#[test]
+fn the_depth_lane_carries_every_change_and_the_first_book_after_a_loss() {
+    let spec = btc_spec();
+    let mut rig = Rig::new();
+    let (mut dtx, mut drx) = Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split();
+    let mut wire = Wire {
+        open: true,
+        frames: Vec::new(),
+        ..Wire::default()
+    };
+    let mut d = Pm15Driver::new(&[b"btc"], 5_000).with_depth_policy(true, 1_000);
+    let now = (OPEN + 100) * 1_000_000_000;
+    let up_sym = pm_rolling_sym(0, pm_pair_of_window(spec.window), PM_LEG_UP);
+    let book = format!(
+        "[{{\"market\":\"0x70\",\"asset_id\":\"{}\",\"timestamp\":\"1792216900000\",\"hash\":\"h\",\"bids\":[{{\"price\":\"0.5\",\"size\":\"10\"}}],\"asks\":[{{\"price\":\"0.52\",\"size\":\"7\"}},{{\"price\":\"0.53\",\"size\":\"40\"}}],\"event_type\":\"book\"}}]",
+        utf8(UP)
+    );
+    let change = |sz: u32| {
+        format!(
+            "{{\"market\":\"0x70\", \"price_changes\":[{{\"asset_id\":\"{}\", \"price\":\"0.53\", \"size\":\"{sz}\", \"side\":\"SELL\", \"hash\":\"a\", \"best_bid\":\"0.5\", \"best_ask\":\"0.52\"}}], \"timestamp\":\"1792216900001\", \"event_type\":\"price_change\"}}",
+            utf8(UP)
+        )
+    };
+    let lane = |drx: &mut Consumer<DepthTopK, DEPTH_RING_SIZE>| {
+        let mut v = Vec::new();
+        while let Some(x) = drx.try_pop_ref() {
+            v.push(*x);
+        }
+        v
+    };
+    macro_rules! out {
+        () => {
+            Pm15Out {
+                tick: &mut rig.tick,
+                event: &mut rig.event,
+                event_mask: PM15_EVENT_MASK,
+                status: &rig.status,
+                counters: &rig.counters,
+                capture: &mut rig.rec,
+                depth: Some(&mut dtx),
+            }
+        };
+    }
+    d.offer(&spec, now, now, &mut out!(), &mut wire);
+    d.on_market_text(0, book.as_bytes(), now, now, &mut out!());
+    let got = lane(&mut drx);
+    assert_eq!(got.len(), 1, "the first book");
+    assert_eq!(got[0].sym, up_sym);
+    assert_eq!((got[0].asks[0].px_1e6, got[0].asks[1].px_1e6), (520_000, 530_000));
+    assert_eq!(rig.rec.depths.len(), 1, "the capture took the first book too");
+    // The same book: nothing on the lane.
+    d.on_market_text(0, book.as_bytes(), now + MS, now + MS, &mut out!());
+    assert!(lane(&mut drx).is_empty());
+    // A level behind the touch changes, inside the capture's second: the
+    // lane carries it, the capture holds it back.
+    d.on_market_text(0, change(25).as_bytes(), now + 2 * MS, now + 2 * MS, &mut out!());
+    let got = lane(&mut drx);
+    assert_eq!(got.len(), 1);
+    assert_eq!((got[0].asks[1].px_1e6, got[0].asks[1].qty_1e6), (530_000, 25_000_000));
+    assert_eq!(rig.rec.depths.len(), 1, "the capture's spacing is its own");
+    // The book returns to the snapshot; the session drops and comes back
+    // with the very same book: the lane again, though nothing changed since
+    // its last record.
+    d.on_market_text(0, book.as_bytes(), now + 3 * MS, now + 3 * MS, &mut out!());
+    assert_eq!(lane(&mut drx).len(), 1, "back to the snapshot");
+    d.on_market_down(0, now + 4 * MS, &mut out!());
+    assert!(d.on_market_open(0, &mut wire));
+    d.on_market_text(0, change(40).as_bytes(), now + 5 * MS, now + 5 * MS, &mut out!());
+    assert!(lane(&mut drx).is_empty(), "no ladder before the snapshot");
+    d.on_market_text(0, book.as_bytes(), now + 6 * MS, now + 6 * MS, &mut out!());
+    let got = lane(&mut drx);
+    assert_eq!(got.len(), 1, "the first book after the loss, unchanged");
+    assert_eq!(got[0].asks[1].qty_1e6, 40_000_000);
+    // A rebind of the slot (the window resolves; the next one on the same
+    // pair binds, here on the same tokens) resets the lane too: the same
+    // book reaches it again.
+    let resolved = format!(
+        "{{\"market\":\"0x70\",\"winning_asset_id\":\"{}\",\"winning_outcome\":\"Up\",\"timestamp\":\"1792217815901\",\"event_type\":\"market_resolved\"}}",
+        utf8(UP)
+    );
+    d.on_market_text(0, resolved.as_bytes(), now + 7 * MS, now + 7 * MS, &mut out!());
+    d.perform(now + 7 * MS, &mut out!(), &mut wire);
+    let next = spec_as(0, "btc", OPEN + 1_800, UP, DOWN);
+    assert_eq!(pm_pair_of_window(next.window), pm_pair_of_window(spec.window));
+    let later = (OPEN + 1_800 + 100) * 1_000_000_000;
+    d.offer(&next, later, later, &mut out!(), &mut wire);
+    d.on_market_text(0, book.as_bytes(), later, later, &mut out!());
+    let got = lane(&mut drx);
+    assert_eq!(got.len(), 1, "the first book after the rebind, unchanged");
+    assert_eq!(got[0].sym, up_sym);
+    assert_eq!(rig.status.depth_ring_drops_total(), 0);
 }

@@ -48,7 +48,7 @@ use clob_dispatcher::{
     CancelAllState, DispatchError, DispatchStats, ExecCounters, MatcherCounters, OrderDispatch,
     RouteAliases,
 };
-use core_types::{CancelReq, Fill, ModifyReq, NsTs, Order, Side, SymbolId, Tick};
+use core_types::{CancelReq, DepthTopK, Fill, ModifyReq, NsTs, Order, Side, SymbolId, Tick};
 
 /// **BX3 (F9)** — retirements the router drains per `on_idle`. A bound,
 /// so one arm's burst (a venue cancelling a whole book, a TTL wheel
@@ -1344,6 +1344,14 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         self.live.observe_tick(tick, now_ns);
     }
 
+    /// PMJ J8: every rolling depth record reaches the paper matcher,
+    /// ungated, for the reason every tick does; the live arm learns its
+    /// fills from the venue.
+    #[inline]
+    fn observe_depth(&mut self, depth: &DepthTopK, now_ns: NsTs) {
+        self.paper.observe_depth(depth, now_ns);
+    }
+
     /// HYPARB H2: every pool event reaches the paper matcher, ungated,
     /// for the same reason every tick does.
     #[inline]
@@ -1373,7 +1381,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     }
 
     /// LAW E-2 — the paper arm's numbers, never the live arm's.
-    // COPY: 176 B by value, the metrics cadence only (the trait's note).
+    // COPY: 296 B by value, the metrics cadence only (the trait's note).
     #[inline]
     fn matcher_counters(&self) -> MatcherCounters {
         self.paper.matcher_counters()

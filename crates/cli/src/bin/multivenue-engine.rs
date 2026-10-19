@@ -4727,7 +4727,10 @@ fn run(args: RunArgs) -> ExitCode {
     // deribit 1). Producers ride into the two depth-capable spawns.
     let (okx_depth_prod, okx_depth_cons) = rings.depth[0].clone().split();
     let (deribit_depth_prod, deribit_depth_cons) = rings.depth[1].clone().split();
-    let depth_lane_cons = [okx_depth_cons, deribit_depth_cons];
+    // PMJ J8: the rolling legs' depth lanes — the paper fill law's levels.
+    let (pm15_depth_prod, pm15_depth_cons) = rings.depth[engine::PM15_DEPTH_LANE].clone().split();
+    let (pm5_depth_prod, pm5_depth_cons) = rings.depth[engine::PM5_DEPTH_LANE].clone().split();
+    let depth_lane_cons = [okx_depth_cons, deribit_depth_cons, pm15_depth_cons, pm5_depth_cons];
     // VM2 V2: options-summary lanes (engine::opt_lane_of order —
     // okx 0, deribit 1, binance 2, hypercall 3 — HC1). Producers ride
     // into the options-capable spawns.
@@ -5539,6 +5542,7 @@ fn run(args: RunArgs) -> ExitCode {
     if pm15_keys.is_empty() {
         drop(pm15_prod);
         drop(pm15_event_prod);
+        drop(pm15_depth_prod);
     } else {
         let mut assets = Vec::with_capacity(pm15_keys.len());
         for key in &pm15_keys {
@@ -5561,6 +5565,7 @@ fn run(args: RunArgs) -> ExitCode {
             stale_after_ms[core_types::VenueId::Polymarket as usize],
             pm15_prod,
             pm15_event_prod,
+            pm15_depth_prod,
             statuses.pm15.clone(),
             statuses.pm15c.clone(),
             12,
@@ -5586,6 +5591,7 @@ fn run(args: RunArgs) -> ExitCode {
     if pm5_keys.is_empty() {
         drop(pm5_prod);
         drop(pm5_event_prod);
+        drop(pm5_depth_prod);
     } else {
         let mut assets = Vec::with_capacity(pm5_keys.len());
         for key in &pm5_keys {
@@ -5608,6 +5614,7 @@ fn run(args: RunArgs) -> ExitCode {
             stale_after_ms[core_types::VenueId::Polymarket as usize],
             pm5_prod,
             pm5_event_prod,
+            pm5_depth_prod,
             statuses.pm5.clone(),
             statuses.pm5c.clone(),
             13,

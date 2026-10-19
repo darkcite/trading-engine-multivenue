@@ -16989,7 +16989,13 @@ section).
   `pm15`.
 - **The law** (doc 39 §4, frozen): τ ∈ [2, 20) s; the favoured side
   p ≥ 0.90 for 2 consecutive report seconds; an IoC at an ask ≤ p − 0.02;
-  at most 4 IoCs per market. The pricer is `core-twaplock::report`
+  at most 4 IoCs per market. *(Amended 2026-10-19 by PMJ J8, ruling
+  R-PMJ-S24 — a documented deviation from doc 39 §4: the ask must also be
+  at least `price_floor` 0.90, slot 11's floor — and its paper fills
+  follow the J8 sweep. P0's count is segmented at the J8 boot (`docs/state.md`
+  dates it): the windows before it ran the frozen law and the touch fill,
+  the ones after it the amended law and the sweep. See "PMJ — slot 11",
+  `### J8`.)* The pricer is `core-twaplock::report`
   (Chainlink reports on their own second, samples [T−60, T−1]).
 - **The strike:** the RTDS mean of [open − 60, open − 1] (within 0.1–15
   ppm of the venue's, measured). Gamma publishes a window's `priceToBeat`
@@ -16998,7 +17004,9 @@ section).
   `strikes_missing`, `hold_strike`) and is never traded.
 - **The caps:** $250 per order, $250 committed per market (fills plus the
   one in flight), the session's realised loss at −$500 halts the member.
-  No day cap.
+  No day cap. *(R-PMJ-S21, 2026-10-19: the session bound is −$3 500 in
+  `pm15.toml` from the next boot — and, by R-PM-8, slot 9's live bound once
+  armed.)*
 - **Paper fills (PM15-5c):** the held-quote law (`core_fill::held`, the
   HC11 law Hypercall's IoCs already use): an IoC fills at the leg's quote
   in force **350 ms after submit** — the activation Δ (200 ms, the
@@ -17006,7 +17014,9 @@ section).
   crypto markets since 2026-09-04) — at the touch, capped by its size, or
   gets nothing. The strict-cross law it replaces waited for the leg's
   first tick after activation: on a delta feed a quiet leg sends none, so
-  an order the venue would fill was cancelled at its TTL. The fee
+  an order the venue would fill was cancelled at its TTL. *(PMJ J8,
+  R-PMJ-S23: no longer the touch alone — the touch, then the depth lane's
+  levels behind it up to the limit, as the venue's FAK; `### J8`.)* The fee
   0.07·p·(1 − p) per share; settlement +1 / 0 per share at
   `market_resolved`. The offline harness has no held law (as for
   Hypercall): slot 9's paper is judged in the engine only.
@@ -17351,6 +17361,12 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S18 | N = **one socket per family**: `[polymarket] rolling_market_sockets`, default 8 = the family cap, so seven families open seven sockets per period. |
 | R-PMJ-S19 | **Both periods** — pm15 (slot 9's feed) too; `rolling_market_sockets = 1` is one socket per period, the pre-J7 stream bit for bit. |
 | R-PMJ-S20 | The session commits J7 (explicit paths) and makes the gated restart itself, as R-PMJ-S16. |
+| R-PMJ-S21 | Slot 9's frame: $250 per order and per window market kept; the session loss bound scaled to 7 × $500 = **−$3 500** (`pm15.toml`, effective at the next boot; R-PM-8's "paper runs the same frame" makes it slot 9's live bound too once armed). |
+| R-PMJ-S22 | Slot 11's PAPER frame = slot 9's: **$250** deposit per order (max $250.01), $250 per window market, −$3 500 session (`pmj.toml`; the live dust frame stays J5's). |
+| R-PMJ-S23 | Build **J8 F1**: the rolling legs' paper IoC matched as the venue matches a FAK — the touch, then the depth lane's levels behind it up to the limit (slots 9 and 11) (### J8). |
+| R-PMJ-S24 | Slot 9's law gains slot 11's **0.90 floor** on the ask — a documented deviation from doc 39 §4 (P0's frozen law). |
+| R-PMJ-S25 | Slot 11 keeps the 2 s keeper delay (until J0) and is judged in **shadow** at 350 ms and 1 s too (counted, never booked). |
+| R-PMJ-S26 | The session commits J8 (explicit paths) and forces the gated restart, as R-PMJ-S20. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -17619,7 +17635,8 @@ HEAD too, J1b's A/B).
   5-minute IoC is judged against the touch held at its submit +
   `paper_delay_ms` (2 s default, `pmj.toml`;
   `PaperDispatcher::with_pm5_held_delay_ns`) — the keeper's latency, not the
-  CLOB's. The 15-minute legs keep pm15's delay. The delay is bounded by the
+  CLOB's *(PMJ J8: the touch and the levels behind it, the FAK sweep,
+  `### J8`)*. The 15-minute legs keep pm15's delay. The delay is bounded by the
   keeper's lead (`paper_delay_ms` < max(`tau_min`, `min_tau_s`), else the
   parse refuses): an order decided at the window's floor is still judged
   before the close, never against a book the venue has closed. The pending
@@ -17892,3 +17909,69 @@ late_grid 13.0 / 13.0, locate_miss 3.83 / 3.73, cooldown 698 / 693 ps,
 long_day_close 38.4 / 38.4 µs, latency_arb 3.45 / 2.96 — the swings run
 both ways under the load (B's run 2 and A's run 2 the outliers); J7 equal to
 HEAD.
+
+### J8 — the paper fill matches the venue (2026-10-19, rulings R-PMJ-S21..S26)
+
+- **Why.** The touch alone is not how the venue matches a FAK, and slot 9
+  entered far under its belief in near-tie windows; the measurement and the
+  takes are the plan's (`claude/pmj-fill-plan-2026-10-19.md`, the vault's
+  `docs/research/pmj/fill/`), not this document's.
+- **F1 — the FAK sweep (R-PMJ-S23).** `core_fill::held`: a rolling leg's IoC
+  takes the touch in force at submit + Δ (unchanged: 350 ms for pm15,
+  `paper_delay_ms` for pmj), then the levels held behind it up to the limit,
+  best first, up to its size; ONE fill at the size-weighted price, rounded
+  against the taker; each level's size consumed. The touch is the gate (none,
+  stale or past the limit fills nothing); a level at the touch's price or
+  better is never taken from the levels; five levels and no more (the rest
+  cancels — fewer shares booked, on a losing take as on a winning one). The
+  levels must be as new as the touch: when the touch changed after the levels
+  last arrived (the frame's depth record still in its lane — the depth lanes
+  drain after the tick lanes), the order sweeps the touch alone, counted
+  (`engine_paper_matcher_held_levels_lagged_total`). How to read that
+  counter: any stale tick clears the leg's last touch, so the next touch —
+  a PONG's re-assert of the same price included — counts as a change, and
+  the leg sweeps the touch alone until its levels next arrive; the counter
+  over-reads and the paper fill under-fills there, never the reverse. The
+  opposite lag — levels newer than the touch — is not caught: it needs a
+  dropped tick (counted) or more rolling ticks backed up in one engine pass
+  than the drain takes, and the touch in force still gates the fill. The
+  Hypercall options keep the touch law.
+  - **The depth lanes.** `engine::NUM_DEPTH_LANES` 2 → 4:
+    `PM15_DEPTH_LANE` 2 and `PM5_DEPTH_LANE` 3, one per rolling ingress
+    thread (single writer each). The ingress pushes a ticking leg's top five
+    on every change — its own change gate (`lane` pairs), independent of the
+    capture's 1-per-second policy, so no disk; reset at each rebind and each
+    shard's loss and open, so the first book after a loss reaches the lane
+    even unchanged. The engine hands every depth record to the dispatcher
+    first (`OrderDispatch::observe_depth`, default no-op; the paper matcher
+    judges due held IoCs against the book before the record, as for a tick,
+    then holds it); members still see only OKX's and Deribit's
+    (`NUM_VENUE_DEPTH_LANES`). The routed dispatcher hands depth to its paper
+    arm only; a withdrawn (stale) touch clears its leg's levels.
+  - **Cost.** One more `top_k` and compare per book event of a ticking leg
+    on the ingress thread (the lane's gate; J6's capture ran it at most once
+    a second per leg) — a scan of the leg's grid on a sparse 0.001 book —
+    and one 160 B copy per lane record into the paper book (documented);
+    about 1 000 lane records a second per period. `/state` `counters.depths`
+    (`depths_dispatched`) counts the rolling lanes too. A full lane is
+    counted (`depth_ring_drops`) and the record re-offered at the leg's next
+    pass. New counter `engine_paper_matcher_held_swept_deeper_total`.
+- **F2 — slot 9's floor (R-PMJ-S24).** `strategy-pm15`: an ask under
+  `price_floor` (`pm15.toml price_floor_1e6`, absent = 0.90; 0.50..1, or 0 =
+  none) at the decision is no entry (`skip_price`, shared with an ask over
+  the limit), as slot 11's. The fill 350 ms later can still land under the
+  floor (the limit is p − e). P0's law amended, documented above.
+- **F3 — slot 11's shadow delays (R-PMJ-S25).** Each slot-11 IoC is judged
+  in shadow at 350 ms and 1 s after submit against the book then — on
+  copies: nothing consumed, nothing booked — beside its real verdict at
+  `paper_delay_ms`: `engine_paper_matcher_pmj_{shadow350ms,shadow1s,real}_
+  {judged,filled,qty_1e6,usd_1e6}_total` (refusals of a full shadow table:
+  `…_pmj_shadow_refused_total`, 0 while `paper_delay_ms` ≥ 1 s). J0's
+  measured keeper latency can then be priced on the paper history.
+- **What it changes in the books.** More of each rolling take fills, at a
+  worse size-weighted price; slot 9 stops deciding entries under 0.90. Slot
+  9 and 11 paper P&L before and after the J8 boot are different laws (the
+  shadows price slot 11's delay, they do not reconstruct the touch law).
+- **Rollback.** The previous binary, `4690bcac` (the deploy's kit). With
+  this binary, `price_floor_1e6 = 0` in `pm15.toml` restores slot 9's law
+  as frozen; the sweep has no switch.

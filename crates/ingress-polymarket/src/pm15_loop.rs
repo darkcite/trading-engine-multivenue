@@ -55,7 +55,8 @@ use core_time::{now_ns, FeedClock, WallAnchor};
 use core_types::pm_roll::{PmPeriod, PM_FAMILIES_MAX, PM_LEG_UP, PM_TWAP_S};
 use core_types::{
     event_lane_bit, pack_roll_seq, ArrivalSeq, Capture, ChannelEvent, ChannelId, DepthPair,
-    DepthTopK, NsTs, Price, Qty, SymbolId, Tick, VenueId, EVENT_RING_SIZE, TICK_FLAG_STALE,
+    DepthTopK, NsTs, Price, Qty, SymbolId, Tick, VenueId, DEPTH_RING_SIZE, EVENT_RING_SIZE,
+    TICK_FLAG_STALE,
 };
 
 use crate::book15::{parse_change_row, quoted_price, Ladder15, Touch15};
@@ -342,6 +343,10 @@ pub struct Pm15Out<'a, C: Capture> {
     pub counters: &'a Pm15Counters,
     /// The capture.
     pub capture: &'a mut C,
+    /// PMJ J8 (R-PMJ-S23): the depth lane (`engine::PM15_DEPTH_LANE` /
+    /// `PM5_DEPTH_LANE`) — a ticking leg's top five per side on every
+    /// change, for the paper fill law; `None` = no lane (tools, tests).
+    pub depth: Option<&'a mut Producer<DepthTopK, DEPTH_RING_SIZE>>,
 }
 
 /// The lane mask the engine runs PM15 with: the roll, the order law and
@@ -445,6 +450,9 @@ pub struct Pm15Driver {
     /// PMJ (R-PMJ-S15): when each leg's last depth record was captured, ns
     /// (0 = none since its window bound).
     depth_last_ns: [u64; PM15_LEGS],
+    /// PMJ J8: the top five per side last pushed to the depth lane, per leg
+    /// (its change gate — every change, whatever the capture's policy).
+    lane: Box<[DepthPair]>,
     /// The newest Chainlink second emitted per family.
     last_mark_s: [u64; PM_FAMILIES_MAX],
     /// PMJ J7: each market shard's feed clock — shard `k`'s judges the
@@ -481,6 +489,8 @@ impl Pm15Driver {
         // pairs live on the heap for the process — rejected: an in-place
         // initializer, for a once-per-process path.
         let depth = vec![DepthPair::new(DepthTopK::EMPTY); PM15_LEGS].into_boxed_slice();
+        // COPY: as `depth` — the lane's own pairs, at boot.
+        let lane = vec![DepthPair::new(DepthTopK::EMPTY); PM15_LEGS].into_boxed_slice();
         Self {
             fams: PmFamilies::with_period(period, assets),
             acts: PmActions::new(),
@@ -492,6 +502,7 @@ impl Pm15Driver {
             depth_on: true,
             depth_min_ns: 0,
             depth_last_ns: [0; PM15_LEGS],
+            lane,
             last_mark_s: [0; PM_FAMILIES_MAX],
             market_clock: [FeedClock::new(stale_after_ms); PM15_MARKET_SOCKETS_MAX],
             rtds_clock: FeedClock::new(stale_after_ms),
@@ -721,6 +732,11 @@ impl Pm15Driver {
                 self.ladders[i].clear();
                 self.last[i] = TOUCH_UNSEEN;
                 self.last_vt[i] = 0;
+                // PMJ J8: the paper book dropped these levels with the
+                // withdrawn touch; the first book after the open must
+                // reach the lane even if it is unchanged.
+                // COPY: a 448 B empty pair per leg — cold (a session).
+                self.lane[i] = DepthPair::new(DepthTopK::EMPTY);
             }
             i += 1;
         }
@@ -823,6 +839,9 @@ impl Pm15Driver {
                         // zeroing the two rows field by field, same bytes.
                         self.depth[i] = DepthPair::new(DepthTopK::EMPTY);
                         self.depth_last_ns[i] = 0;
+                        // PMJ J8: and its first book reaches the lane.
+                        // COPY: the same 448 B empty pair, the lane's cell.
+                        self.lane[i] = DepthPair::new(DepthTopK::EMPTY);
                         leg += 1;
                     }
                     // PMJ J7: on the socket that carries the slot's family.
@@ -1141,6 +1160,28 @@ impl Pm15Driver {
     /// no depth lane carries it.
     fn emit_depth<C: Capture>(&mut self, i: usize, ts_ns: NsTs, out: &mut Pm15Out<'_, C>) {
         let i = i % PM15_LEGS;
+        // PMJ J8 (R-PMJ-S23): the depth lane — every change, whatever the
+        // capture's policy below.
+        if let Some(tx) = out.depth.as_deref_mut() {
+            let sym = self.leg_sym(i / 2, (i % 2) as u32);
+            let pair = &mut self.lane[i];
+            let spare = pair.spare_mut();
+            spare.ts_ns = ts_ns;
+            spare.sym = sym;
+            spare.venue = VenueId::Polymarket as u8;
+            spare.flags = 0;
+            self.ladders[i].top_k(&mut spare.bids, &mut spare.asks);
+            let (snap, last) = pair.spare_and_last();
+            if snap.bids != last.bids || snap.asks != last.asks || snap.sym != last.sym {
+                // A full lane: counted, and not committed — the next pass
+                // offers the leg's book again.
+                if tx.try_push_ref(snap) {
+                    pair.commit();
+                } else {
+                    out.status.inc_depth_ring_drops();
+                }
+            }
+        }
         // R-PMJ-S15: off, or the leg's last record is under the spacing.
         if !self.depth_on
             || (self.depth_min_ns != 0

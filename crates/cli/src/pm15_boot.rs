@@ -118,6 +118,7 @@ fn resolve_file(
     params.usd_market_1e6 = file.usd_market_1e6;
     params.session_loss_1e6 = file.session_loss_usd_1e6;
     params.order_ttl_ns = file.order_ttl_ns;
+    params.price_floor_1e6 = file.price_floor_1e6;
     let mut lut = Box::new(core_twaplock::late::LateLut::flat());
     let mut i = 0usize;
     while i < core_config::pm15::PM15_PHI_POINTS {
@@ -135,7 +136,7 @@ fn resolve_file(
 }
 
 /// The boot tell: `pm15: artifact configured hash=… families=btc+eth+…
-/// law=2-20s:p>=0.900:ask<=p-0.020:persist2:k1.550 frame=$250/order:$250/market:-$500/session live=btc+eth`.
+/// law=2-20s:p>=0.900:ask<=p-0.020:floor0.900:persist2:k1.550 frame=$250/order:$250/market:-$500/session live=btc+eth`.
 #[must_use]
 pub fn render_boot_tell(boot: &Pm15Boot) -> String {
     let mut hex = String::with_capacity(64);
@@ -144,13 +145,14 @@ pub fn render_boot_tell(boot: &Pm15Boot) -> String {
     }
     let p = &boot.params;
     format!(
-        "pm15: artifact configured hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:persist{}:k{:.3} \
+        "pm15: artifact configured hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:floor{:.3}:persist{}:k{:.3} \
          frame=${}/order:${}/market:-${}/session live={}",
         boot.families.join("+"),
         p.tau_min_ns / 1_000_000_000,
         p.tau_max_ns / 1_000_000_000,
         p.p_min_1e6 as f64 / 1e6,
         p.e_1e6 as f64 / 1e6,
+        p.price_floor_1e6 as f64 / 1e6,
         p.persist,
         p.sigma_k_1e3 as f64 / 1e3,
         p.usd_order_1e6 / 1_000_000,
@@ -235,6 +237,7 @@ mod tests {
             session_loss_usd_1e6: 500_000_000,
             max_orders_market: 4,
             order_ttl_ns: 1_000_000_000,
+            price_floor_1e6: 900_000,
             live_assets: vec!["btc".into(), "eth".into()],
             phi_lut: vec![500_000; core_config::pm15::PM15_PHI_POINTS],
         }
@@ -263,6 +266,9 @@ mod tests {
             "{tell}"
         );
         assert!(tell.contains("live=btc+eth"), "{tell}");
+        // PMJ J8 (R-PMJ-S24): the floor rides the law.
+        assert_eq!(b.params.price_floor_1e6, 900_000);
+        assert!(tell.contains(":ask<=p-0.020:floor0.900:persist2:"), "{tell}");
         // A permutation, a short list, an unresolvable perp.
         let swapped = vec!["updown:eth:15m".to_string(), "updown:btc:15m".to_string()];
         assert!(resolve_file(file(), [0; 32], PathBuf::from("x"), &resolve, &swapped).is_err());

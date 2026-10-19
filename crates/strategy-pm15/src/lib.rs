@@ -23,7 +23,12 @@
 //!    favoured side's belief `p ≥ p_min` on `persist` consecutive report
 //!    seconds, and its ask `≤ p − e` ⇒ one IoC BUY at `p − e` (on the
 //!    leg's tick), sized to the order cap, inside the market cap. One IoC
-//!    in flight per market; re-entry while room and belief remain.
+//!    in flight per market; re-entry while room and belief remain. PMJ J8
+//!    (ruling R-PMJ-S24, a documented deviation from doc 39 §4): the ask
+//!    must also be at least `price_floor` (0.90) — a favourite the book
+//!    prices under it is no H90 entry, the near-tie windows where the
+//!    strike estimate and the venue disagree (slot 11's law, and the month
+//!    research's).
 //! 5. **The book**: positions from fills only; at the settled roll each
 //!    leg pays 1 or 0, minus its cost and the venue's taker fee
 //!    `0.07·p·(1 − p)` per share — the session's realised P&L. Once it is
@@ -113,6 +118,9 @@ pub struct Pm15Params {
     pub session_loss_1e6: i64,
     /// An IoC's time-to-live at the dispatcher, ns.
     pub order_ttl_ns: u64,
+    /// PMJ J8 (R-PMJ-S24): the least ask an entry takes ×1e6 (0.90; 0 = no
+    /// floor, P0's law as frozen).
+    pub price_floor_1e6: i64,
 }
 
 impl Default for Pm15Params {
@@ -133,6 +141,7 @@ impl Default for Pm15Params {
             usd_market_1e6: 250_000_000,
             session_loss_1e6: 500_000_000,
             order_ttl_ns: 1_000_000_000,
+            price_floor_1e6: 900_000,
         }
     }
 }
@@ -334,7 +343,8 @@ impl Pm15Strategy {
             && params.usd_order_1e6 > 0
             && params.usd_market_1e6 >= params.usd_order_1e6
             && params.session_loss_1e6 > 0
-            && params.order_ttl_ns > 0;
+            && params.order_ttl_ns > 0
+            && (params.price_floor_1e6 == 0 || (500_000..ONE_1E6).contains(&params.price_floor_1e6));
         if !ok {
             return Err(Pm15ConfigErr::Bound);
         }
@@ -668,6 +678,12 @@ impl Pm15Strategy {
         }
         if book.ask_1e6 <= 0 || book.ts_ns == 0 {
             self.counters.skip_book += 1;
+            return;
+        }
+        // PMJ J8 (R-PMJ-S24): the floor — a favourite the book prices under
+        // it is no H90 entry.
+        if book.ask_1e6 < p.price_floor_1e6 {
+            self.counters.skip_price += 1;
             return;
         }
         if now.saturating_sub(book.ts_ns) >= TOUCH_FRESH_NS {

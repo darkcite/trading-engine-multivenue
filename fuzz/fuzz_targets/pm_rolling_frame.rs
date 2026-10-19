@@ -23,7 +23,7 @@
 
 use core_ring::Ring;
 use core_types::pm_roll::PmPeriod;
-use core_types::{ChannelEvent, NullCapture, Tick};
+use core_types::{ChannelEvent, DepthTopK, NullCapture, Tick};
 use ingress_polymarket::gamma15::PmWindowSpec;
 use ingress_polymarket::pm15_loop::{Pm15Counters, Pm15Driver, Pm15Out, Pm15Wires, PM15_EVENT_MASK};
 use libfuzzer_sys::fuzz_target;
@@ -58,6 +58,9 @@ fuzz_target!(|data: &[u8]| {
             Ring::<Tick, { ingress_polymarket::DEFAULT_TICK_RING_CAP }>::new().split();
         let (mut ev_tx, mut ev_rx) =
             Ring::<ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+        // PMJ J8: the depth lane on, so its change gate is fuzzed too.
+        let (mut depth_tx, mut depth_rx) =
+            Ring::<DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
         let status = core_metrics::IngressStatus::new();
         let counters = Pm15Counters::new();
         let mut cap = NullCapture;
@@ -76,6 +79,7 @@ fuzz_target!(|data: &[u8]| {
             status: &status,
             counters: &counters,
             capture: &mut cap,
+            depth: Some(&mut depth_tx),
         };
         d.offer(&spec, now, now, &mut out, &mut wire);
         let _ = d.on_market_open(0, &mut wire);
@@ -95,5 +99,6 @@ fuzz_target!(|data: &[u8]| {
         d.on_market_down(0, late, &mut out);
         while tick_rx.try_pop_ref().is_some() {}
         while ev_rx.try_pop_ref().is_some() {}
+        while depth_rx.try_pop_ref().is_some() {}
     }
 });

@@ -110,6 +110,7 @@ pub fn run(assets: &[String], seconds: u64) -> Result<(), String> {
                 status: &i_status,
                 counters: &i_counters,
                 capture: &mut capture,
+                depth: None,
             };
             if let Err(e) = run_pm15(
                 &mut driver,

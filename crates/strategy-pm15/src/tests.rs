@@ -185,6 +185,15 @@ fn configure_refuses_every_bad_frame() {
         m.configure(q, lut(), WallAnchor::new(0, 0)),
         Err(Pm15ConfigErr::Bound)
     );
+    // PMJ J8 (R-PMJ-S24): the floor is 0 (none) or in 0.50..1.
+    for bad in [1, 499_999, 1_000_000, -1] {
+        let mut q = p;
+        q.price_floor_1e6 = bad;
+        assert_eq!(m.configure(q, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "{bad}");
+    }
+    let mut q = p;
+    q.price_floor_1e6 = 0;
+    assert!(Pm15Strategy::new().configure(q, lut(), WallAnchor::new(0, 0)).is_ok(), "0 = no floor");
     assert!(!m.is_configured());
     assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Ok(()));
 }
@@ -242,8 +251,15 @@ fn a_decided_window_takes_once_fills_and_settles_into_the_session_pnl() {
     m.on_tick(&touch(w, PM_LEG_UP, c.now, 920_000, 930_000), &mut c);
     assert!(c.orders.is_empty(), "one second of belief is not two");
     assert!(m.counters().skip_persist > 0, "{:?}", m.counters());
-    // The next report second: two in a row — the take.
+    // PMJ J8 (R-PMJ-S24): the book drops under the 0.90 floor before the
+    // next report second — two seconds of belief, and still no take: an
+    // ask under the floor is no H90 entry, however far under the belief.
+    m.on_tick(&touch(w, PM_LEG_UP, c.now, 840_000, 850_000), &mut c);
+    let skip_price = m.counters().skip_price;
     second(&mut m, &mut c, end - 20, BASE + 400_000_000);
+    assert!(c.orders.is_empty(), "an ask under the floor: no take");
+    assert!(m.counters().skip_price > skip_price, "{:?}", m.counters());
+    // The book comes back over the floor: the take.
     m.on_tick(&touch(w, PM_LEG_UP, c.now, 920_000, 930_000), &mut c);
     assert_eq!(c.orders.len(), 1, "{:?}", m.counters());
     let o = c.orders[0];

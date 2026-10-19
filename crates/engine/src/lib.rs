@@ -150,7 +150,26 @@ pub const NUM_EVENT_LANES: usize = NUM_TICK_LANES;
 /// [`DepthTopK`] slots, [`DEPTH_RING_SIZE`] capacity, mapped by
 /// [`depth_lane_of`]. Extending to another venue grows this constant
 /// and the map — mechanical, like the tick lanes.
-pub const NUM_DEPTH_LANES: usize = 2;
+///
+/// PMJ J8 (R-PMJ-S23): lanes 2 and 3 carry the Polymarket rolling legs'
+/// top five per side — [`PM15_DEPTH_LANE`], [`PM5_DEPTH_LANE`], one per
+/// rolling ingress thread (Polymarket is one venue byte with two
+/// producers, so they are named, not mapped). They reach the dispatcher
+/// only, for the paper fill law; members see the venue lanes alone
+/// ([`NUM_VENUE_DEPTH_LANES`]).
+pub const NUM_DEPTH_LANES: usize = 4;
+
+/// PMJ J8: the depth lanes whose records also reach the members (OKX,
+/// Deribit) — the lanes before the rolling ones.
+pub const NUM_VENUE_DEPTH_LANES: usize = 2;
+
+/// PMJ J8: the 15-minute rolling legs' depth lane (`ingress-pm15`).
+pub const PM15_DEPTH_LANE: usize = 2;
+
+/// PMJ J8: the 5-minute rolling legs' depth lane (`ingress-pm5`).
+pub const PM5_DEPTH_LANE: usize = 3;
+
+const _: () = assert!(PM15_DEPTH_LANE >= NUM_VENUE_DEPTH_LANES && PM5_DEPTH_LANE < NUM_DEPTH_LANES);
 
 /// Depth-lane index for a venue with an L2 subscription; `None` for
 /// every other venue. Cold-path helper for boot wiring.
@@ -361,8 +380,9 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Cumulative venue events dispatched to `on_venue_event`
     /// (WS10-A, all event lanes combined).
     pub events_dispatched: u64,
-    /// Cumulative depth snapshots dispatched to `on_depth`
-    /// (WS10-B, both depth lanes combined).
+    /// Cumulative depth snapshots drained from every depth lane (WS10-B;
+    /// PMJ J8: the rolling legs' lanes too — those reach the dispatcher
+    /// only, the venue lanes the members as well).
     pub depths_dispatched: u64,
     /// Cumulative options records dispatched to `on_opt_summary`
     /// (VM2 V2, all opt lanes combined).
@@ -897,15 +917,21 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     Some(d) => {
                         consumed += 1;
                         let now = now_ns();
-                        let mut ctx = EngineCtx {
-                            disp: &mut self.disp,
-                            decide_lat: &self.decide_lat,
-                            order_capture: self.order_capture.as_mut(),
-                            recent_orders: &mut self.recent_orders,
-                            lifecycle: &mut self.lifecycle,
-                            now,
-                        };
-                        self.strat.on_depth(&d, &mut ctx);
+                        // PMJ J8: the dispatcher first, as a tick — a
+                        // PAPER one judges its due rolling IoCs against
+                        // the book before this record, then holds it.
+                        self.disp.observe_depth(&d, now);
+                        if lane < NUM_VENUE_DEPTH_LANES {
+                            let mut ctx = EngineCtx {
+                                disp: &mut self.disp,
+                                decide_lat: &self.decide_lat,
+                                order_capture: self.order_capture.as_mut(),
+                                recent_orders: &mut self.recent_orders,
+                                lifecycle: &mut self.lifecycle,
+                                now,
+                            };
+                            self.strat.on_depth(&d, &mut ctx);
+                        }
                         self.depths_dispatched = self.depths_dispatched.wrapping_add(1);
                     }
                     None => break,
@@ -2541,6 +2567,82 @@ mod tests {
         // Empty lanes are per-iteration no-ops.
         eng.tick(16);
         assert_eq!(eng.depths_dispatched, 2);
+    }
+
+    /// PMJ J8: a dispatcher that counts the depth records it is shown.
+    #[derive(Debug, Default)]
+    struct DepthWitness {
+        depths: usize,
+        rolling: usize,
+    }
+    impl OrderDispatch for DepthWitness {
+        fn cancel(&mut self, _r: &core_types::CancelReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
+        fn modify(&mut self, _r: &core_types::ModifyReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> DispatchStats {
+            DispatchStats::default()
+        }
+        fn observe_depth(&mut self, d: &DepthTopK, _now_ns: NsTs) {
+            self.depths += 1;
+            if d.venue == VenueId::Polymarket as u8 {
+                self.rolling += 1;
+            }
+        }
+    }
+
+    /// PMJ J8 (R-PMJ-S23): every depth lane reaches the dispatcher; only the
+    /// venue lanes (OKX, Deribit) reach the members — the rolling legs'
+    /// lanes are the paper fill law's alone.
+    #[test]
+    fn rolling_depth_reaches_the_dispatcher_and_never_a_member() {
+        let (_tp, tc) = split_tick_lanes();
+        let (_ep, ec) = split_event_lanes();
+        let (mut dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
+        let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            Counter::default(),
+            DepthWitness::default(),
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+        let none = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+        let pm = |ts: u64| DepthTopK::new(ts, VenueId::Polymarket, 4_096, 0, none, none);
+        assert!(dp[PM15_DEPTH_LANE].try_push_ref(&pm(1)));
+        assert!(dp[PM5_DEPTH_LANE].try_push_ref(&pm(2)));
+        eng.tick(16);
+        assert_eq!((eng.disp.depths, eng.disp.rolling), (2, 2));
+        assert_eq!(eng.strategy().depths, 0, "no member sees a rolling leg's depth");
+        assert_eq!(eng.depths_dispatched, 2);
+        let okx = DepthTopK::new(3, VenueId::Okx, 7, 0, none, none);
+        assert!(dp[depth_lane_of(VenueId::Okx).unwrap()].try_push_ref(&okx));
+        // A Deribit record by name: `DepthTopK::EMPTY`'s venue byte is 0,
+        // which is Polymarket's.
+        let deribit = DepthTopK::new(4, VenueId::Deribit, 7, 0, none, none);
+        assert!(dp[depth_lane_of(VenueId::Deribit).unwrap()].try_push_ref(&deribit));
+        eng.tick(16);
+        assert_eq!((eng.disp.depths, eng.disp.rolling), (4, 2));
+        assert_eq!(eng.strategy().depths, 2, "the venue lanes reach both");
     }
 
     #[test]
