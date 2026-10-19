@@ -41,6 +41,14 @@ affected paragraph at each lane close; the superseded text goes to
 - The boot at 13:06Z also shipped `a946a668` (SETUP docs). Rollback kit:
   `~/multivenue/rollback-pmj-20261018/` (the pre-deploy `universe.toml`,
   `strategy.conf`, the `eee660b` binary and its wrapper).
+- **2026-10-19 04:54Z: the engine boots `b5c263e6` (PMJ J6, ruling
+  R-PMJ-S15):** the rolling legs' depth capture (`pm15-depth.pmlr`,
+  `pm5-depth.pmlr`) keeps at most one record per leg per second
+  (`[polymarket] rolling_depth_ms`, default 1000; the universe names no key,
+  so the default is in force — boot log `depth=RollingDepth { on: true,
+  min_ms: 1000 }`). Runs before this boot are every-change (~1.35 GB/h for
+  the two); after it, ~8 MB/h each. Rollback kit for this boot:
+  `~/multivenue/rollback-pmj-20261019/multivenue-engine.88f70509`.
 - `exec.HALT` is present and slot 3 reads halted (`ws-gap`) on `/state` both
   BEFORE and after this restart — not changed by the PMJ deploy; the
   operator's to clear.
