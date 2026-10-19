@@ -49,6 +49,20 @@ affected paragraph at each lane close; the superseded text goes to
   min_ms: 1000 }`). Runs before this boot are every-change (~1.35 GB/h for
   the two); after it, ~8 MB/h each. Rollback kit for this boot:
   `~/multivenue/rollback-pmj-20261019/multivenue-engine.88f70509`.
+- **2026-10-19 06:19Z: the engine boots `4690bcac` (PMJ J7, rulings
+  R-PMJ-S17..S20):** each rolling pipeline spreads its families over one
+  market socket per family (`[polymarket] rolling_market_sockets`, default 8;
+  the universe names no key, so the default is in force — boot log `pm15: the
+  families ride 7 market socket(s)` / `pm5: …`; gauges
+  `engine_ingress_pm15_market_sockets_open` = `engine_ingress_pm5_market_sockets_open`
+  = 7). A market-socket loss now withdraws only that family's touches. Runs
+  before this boot rode one market socket per period. Restart: the `0010`
+  stamp forced at 06:17:38Z (off the 15-minute grid), daily-restart's exec
+  gate, drain and relaunch; masks 2815, `vm rows_active` 2, slots 3 / 9 / 11
+  configured and enabled. Rollback: `rolling_market_sockets = 1` in
+  `universe.toml` and a restart (this binary), or the kit
+  `~/multivenue/rollback-pmj-20261019/multivenue-engine.b5c263e6` (then remove
+  the key if it was added).
 - `exec.HALT` is present and slot 3 reads halted (`ws-gap`) on `/state` both
   BEFORE and after this restart — not changed by the PMJ deploy; the
   operator's to clear.
