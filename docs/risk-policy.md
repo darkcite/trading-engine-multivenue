@@ -17367,6 +17367,10 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S24 | Slot 9's law gains slot 11's **0.90 floor** on the ask — a documented deviation from doc 39 §4 (P0's frozen law). |
 | R-PMJ-S25 | Slot 11 keeps the 2 s keeper delay (until J0) and is judged in **shadow** at 350 ms and 1 s too (counted, never booked). |
 | R-PMJ-S26 | The session commits J8 (explicit paths) and forces the gated restart, as R-PMJ-S20. |
+| R-PMJ-S27 | **J9**: slots 9 and 11's paper P&L kept since start and recalculated every 15 minutes, counted from the first local run of 2026-10-19 (00:11Z), segmented by fill law (### J9). |
+| R-PMJ-S28 | A window the capture never saw resolve is labelled by **Gamma's resolved market** (by slug), never by our own marks. |
+| R-PMJ-S29 | The book shows in the dashboard's pm15 and pmj blocks, under each slot's session line. |
+| R-PMJ-S30 | The session commits J9 (explicit paths) and installs its agent and reloads the dashboard; the engine is not touched. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -17975,3 +17979,55 @@ HEAD.
 - **Rollback.** The previous binary, `4690bcac` (the deploy's kit). With
   this binary, `price_floor_1e6 = 0` in `pm15.toml` restores slot 9's law
   as frozen; the sweep has no switch.
+
+### J9 — slots 9 and 11's paper P&L, since start (2026-10-19, rulings R-PMJ-S27..S30)
+
+- **Why.** The members' P&L counters (`engine_pm15_pnl_usd_1e6`,
+  `engine_pmj_pnl_usd_1e6`) are per engine session: they restart at every
+  boot. A window that ends before a boot and resolves after it is settled
+  by neither session (the old one stops, the new one holds no such
+  instance). A window the ingress retires unresolved (`v0` 0) the member
+  books as a full loss (`settled_unknown`); J9 waits for Gamma there
+  instead (R-PMJ-S28). A late fill whose instance no market holds is not
+  booked by the member (`unknown_fills`, must stay 0); J9 books it.
+- **What.** `claude_worker.pm_paper_pnl`, a worker-side pass — Python only,
+  no engine change — run by launchd `com.multivenue.pm-pnl` at :06, :21,
+  :36 and :51 (`scripts/pm-pnl.sh`):
+  - every slot 9 / 11 PAPER trade fill since the start
+    (`engine-fills.pmlr`); a venue-origin fill of either slot (an armed
+    arm) is counted, never booked here; an unreadable capture is reported
+    and skipped;
+  - its window named from the member's client order id and the run's
+    instrument manifest — the sym's family, pair and leg, the order id's
+    and the instance's must agree, and the pair must be the window's, or
+    the fill is reported `unmapped`;
+  - labelled on the venue's result: the settled roll row of the fill's own
+    run's capture (`market_resolved`), else Gamma's resolved market by slug
+    (R-PMJ-S28) — a later run's capture is not consulted, so with Gamma
+    down such a window stays open; Gamma re-checks each capture label once
+    (after the windows that need it, within 64 reads a pass, none after 3
+    failures in a row), and a disagreement is counted, never absorbed; an
+    unlabelled window stays open at cost, never guessed;
+  - priced with the member's own arithmetic (cost, the paper fee 0.07 /
+    0.14 · p(1 − p) per share, payout 1 or 0 per share);
+  - the ledger `~/multivenue/worker/pm/paper-pnl.tsv` (rewritten atomically
+    in window order: a row is never modified or removed), the open fills
+    `open.tsv` (they outlive their run directory), and the summary
+    `paper-pnl.json` the dashboard serves as `pm_pnl`.
+  - An unreadable capture stays flagged at every pass while its run
+    directory is there (every run since the start is re-read): inspect it,
+    and remove the run once retention allows.
+- **Segments.** Each fill carries its run's fill law, by run epoch
+  (`pm_paper_pnl.SEGMENTS`): `touch` (before the J8 boot) and `j8` (the
+  sweep; slot 9's floor). The page shows one line per segment and never
+  sums across them. **Any change to slot 9's or 11's fill or entry law — a
+  rollback (the `4690bcac` kit, `price_floor_1e6 = 0`) included — adds a
+  `SEGMENTS` row in the same change.**
+- **Laws.** Read-only on the captures; writes only `worker/pm/`; never
+  `state.db`, the engine or a secret (`.env` is not sourced); the CMDLINE
+  LAW (venv alias + `scripts/pm-pnl.py`); a lock serializes passes. Its
+  only socket is Gamma's public read, at most 64 a pass.
+- **Not covered.** Slot 11's shadow verdicts (350 ms / 1 s) are aggregate
+  counters with no per-order record, so they cannot be settled per window.
+- **Rollback.** `launchctl bootout gui/$UID/com.multivenue.pm-pnl`; the
+  page's ledger lines then read the last summary written, and say its time.

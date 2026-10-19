@@ -257,7 +257,7 @@ function renderStrategies() {
 // PAPER) — from /metrics: the member's and the 5-minute ingress's counters
 // (engine_pmj_*, engine_ingress_pm5_*) ----
 function pmjBlock() {
-  if (!PM || PM.engine_pmj_rolls_total === undefined) return '<div class="muted" style="margin-top:6px">pmj: <span class="dim">n/a (no engine_pmj_* on /metrics)</span></div>';
+  if (!PM || PM.engine_pmj_rolls_total === undefined) return '<div class="muted" style="margin-top:6px">pmj: <span class="dim">n/a (no engine_pmj_* on /metrics)</span></div>' + `<div class="kv">${pmLedger('11')}</div>`;
   const g = k => PM['engine_pmj_' + k];
   const i = k => PM['engine_ingress_pm5_' + k];
   const c = v => n(v, 0);
@@ -265,13 +265,13 @@ function pmjBlock() {
   const must0 = v => v ? `<span class="bad">${c(v)}</span>` : '0';
   return `<div class="kv" style="margin-top:6px"><div>pmj (slot 11, Jupiter · PAPER)</div><div>markets live ${c(g('markets_live'))} · rolls ${c(g('rolls_total'))}, settled ${c(g('rolls_settled_total'))} · ${g('halted') ? '<span class="bad">HALTED</span>' : '<span class="ok">running</span>'}</div>` +
     `<div>strikes computed / missing</div><div>${c(g('strikes_computed_total'))} / ${c(g('strikes_missing_total'))}</div>` +
-    `<div>priced · skipped: persist / book / book old / law / price (floor) / cap ($5)</div><div>${c(g('reprices_total'))} · ${c(g('skip_persist_total'))} / ${c(g('skip_book_total'))} / ${c(g('skip_book_old_total'))} / ${c(g('skip_law_total'))} / ${c(g('skip_price_total'))} / ${c(g('skip_cap_total'))}</div>` +
+    `<div>priced · skipped: persist / book / book old / law / price (floor) / cap</div><div>${c(g('reprices_total'))} · ${c(g('skip_persist_total'))} / ${c(g('skip_book_total'))} / ${c(g('skip_book_old_total'))} / ${c(g('skip_law_total'))} / ${c(g('skip_price_total'))} / ${c(g('skip_cap_total'))}</div>` +
     `<div>takes submitted / filled / unfilled · fills (late)</div><div>${c(g('takes_submitted_total'))} / ${c(g('takes_filled_total'))} / ${c(g('takes_unfilled_total'))} · ${c(g('fills_total'))} (${c(g('late_fills_total'))})</div>` +
     `<div>settled won / lost / unknown</div><div>${c(g('settled_won_total'))} / ${c(g('settled_lost_total'))} / ${c(g('settled_unknown_total'))}</div>` +
-    `<div>P&amp;L · fees (2×) · bought · open cost</div><div>${usd(g('pnl_usd_1e6') / 1e6)} · ${d(g('fees_usd_1e6'))} · ${d(g('bought_usd_1e6'))} · ${d(g('open_cost_usd_1e6'))}</div>` +
+    `<div>session P&amp;L (this boot) · fees (2×) · bought · open cost</div><div>${usd(g('pnl_usd_1e6') / 1e6)} · ${d(g('fees_usd_1e6'))} · ${d(g('bought_usd_1e6'))} · ${d(g('open_cost_usd_1e6'))}</div>` +
     `<div>5 m ingress: slots bound · ticks · marks · reconnects market / rtds</div><div>${c(i('slots_bound'))} · ${c(i('ticks_total'))} · ${c(i('marks_total'))} · ${c(i('market_reconnects_total'))} / ${c(i('rtds_reconnects_total'))}</div>` +
     `<div>must stay 0: parse errors / unknown fills / refused submits / unknown rolls</div><div>${must0(i('parse_errors_total'))} / ${must0(g('unknown_fills_total'))} / ${must0(g('submit_refused_total'))} / ${must0(g('rolls_unknown_total'))}</div>` +
-    `<div>arm</div><div class="dim">paper — the Jupiter arm is not built (PAPER only until a PMJ-DUST-GATE ruling)</div></div>`;
+    `<div>arm</div><div class="dim">paper — the Jupiter arm is not built (PAPER only until a PMJ-DUST-GATE ruling)</div>` + pmLedger('11') + '</div>';
 }
 
 // ---- xmm (slot 6, XMM XH3; /state schema 2 — tolerant of an older engine) ----
@@ -313,8 +313,37 @@ function parseProm(text) {
   }
   return out;
 }
+// ---- PMJ P&L lane: slot 9 / 11 paper book since start, settled on the venue's
+// result every 15 min (claude_worker.pm_paper_pnl → worker/pm/paper-pnl.json,
+// served as W.pm_pnl). One line per fill-law segment, never summed across. ----
+function pmLedger(sid) {
+  const L = W && W.pm_pnl;
+  const S = L && L.slots && L.slots[sid];
+  if (!S) return '<div>ledger since start</div><div class="dim">n/a (no worker/pm/paper-pnl.json yet)</div>';
+  const out = [];
+  for (const g of S.segments || []) {
+    const ev = g.ev_pct === null || g.ev_pct === undefined ? '' : ` · ${n(g.ev_pct, 2)} %/$`;
+    out.push(`<div>ledger · ${esc(g.segment)} <span class="dim">since ${esc(g.from_utc)}</span></div>` +
+      `<div>${n(g.settled, 0)} settled (${n(g.won, 0)} won / ${n(g.lost, 0)} lost) · stake $${n(g.stake_usd, 2)} · fees ${n(g.fees_usd, 2)} · net ${usd(g.net_usd)}${ev} · max DD ${n(g.max_drawdown_usd, 2)} · open ${n(g.open, 0)} ($${n(g.open_cost_usd, 2)})</div>`);
+    if ((g.by_family || []).length) {
+      out.push(`<div class="dim">&nbsp;&nbsp;by family</div><div class="dim">${g.by_family.map(f => `${esc(f.family)} ${n(f.settled, 0)}: ${usd(f.net_usd)}`).join(' · ')}</div>`);
+    }
+  }
+  const c = S.counts || {};
+  const flag = (v, cls) => v ? `<span class="${cls}">${n(v, 0)}</span>` : '0';
+  // A pass every 15 min: older than 40 min means the lane stopped (refused, crashed, unloaded).
+  const ageMin = (Date.now() - Date.parse(L.generated_utc || '')) / 60000;
+  const pass = `<span class="${ageMin > 40 || isNaN(ageMin) ? 'warn' : 'dim'}">pass ${esc(L.generated_utc || '?')}</span>`;
+  out.push(`<div>labels capture / Gamma · disagree · awaiting / unlabelled · must stay 0: unmapped / venue fills / unreadable runs</div>` +
+    `<div>${n(c.label_capture || 0, 0)} / ${n(c.label_gamma || 0, 0)} · ${flag(c.gamma_disagree, 'bad')} · ${n(c.awaiting || 0, 0)} / ${flag(c.unlabelled, 'warn')} · ${flag(c.unmapped, 'bad')} / ${flag(c.venue_fills, 'bad')} / ${flag((L.unreadable || []).length, 'bad')} · ${pass}</div>`);
+  if ((S.recent || []).length) {
+    out.push(`<div class="dim">&nbsp;&nbsp;last settled</div><div class="dim">${S.recent.map(r => `${esc(String(r.window_end_utc).slice(11, 16))} ${esc(r.family)} ${esc(r.leg)} ${n(r.qty, 2)}@${n(r.px, 3)} ${r.won ? 'won' : 'lost'} ${usd(r.pnl_usd)}`).join(' · ')}</div>`);
+  }
+  return out.join('');
+}
+
 function pm15Block() {
-  if (!PM || PM.engine_pm15_rolls_total === undefined) return '<div class="muted" style="margin-top:6px">pm15: <span class="dim">n/a (no engine_pm15_* on /metrics)</span></div>';
+  if (!PM || PM.engine_pm15_rolls_total === undefined) return '<div class="muted" style="margin-top:6px">pm15: <span class="dim">n/a (no engine_pm15_* on /metrics)</span></div>' + `<div class="kv">${pmLedger('9')}</div>`;
   const g = k => PM['engine_pm15_' + k];
   const i = k => PM['engine_ingress_pm15_' + k];
   const c = v => n(v, 0);
@@ -331,9 +360,9 @@ function pm15Block() {
     `<div>priced · skipped: persist / book / book old / law / price / cap</div><div>${c(g('reprices_total'))} · ${c(g('skip_persist_total'))} / ${c(g('skip_book_total'))} / ${c(g('skip_book_old_total'))} / ${c(g('skip_law_total'))} / ${c(g('skip_price_total'))} / ${c(g('skip_cap_total'))}</div>` +
     `<div>takes submitted / filled / unfilled · fills (late)</div><div>${c(g('takes_submitted_total'))} / ${c(g('takes_filled_total'))} / ${c(g('takes_unfilled_total'))} · ${c(g('fills_total'))} (${c(g('late_fills_total'))})</div>` +
     `<div>settled won / lost / unknown</div><div>${c(g('settled_won_total'))} / ${c(g('settled_lost_total'))} / ${c(g('settled_unknown_total'))}</div>` +
-    `<div>P&amp;L · fees · bought · open cost</div><div>${usd(g('pnl_usd_1e6') / 1e6)} · ${d(g('fees_usd_1e6'))} · ${d(g('bought_usd_1e6'))} · ${d(g('open_cost_usd_1e6'))}</div>` +
+    `<div>session P&amp;L (this boot) · fees · bought · open cost</div><div>${usd(g('pnl_usd_1e6') / 1e6)} · ${d(g('fees_usd_1e6'))} · ${d(g('bought_usd_1e6'))} · ${d(g('open_cost_usd_1e6'))}</div>` +
     `<div>ingress: slots bound · ticks · marks · reconnects market / rtds</div><div>${c(i('slots_bound'))} · ${c(i('ticks_total'))} · ${c(i('marks_total'))} · ${c(i('market_reconnects_total'))} / ${c(i('rtds_reconnects_total'))}</div>` +
-    `<div>must stay 0: parse errors / unknown fills / refused submits / unknown rolls</div><div>${must0(i('parse_errors_total'))} / ${must0(g('unknown_fills_total'))} / ${must0(g('submit_refused_total'))} / ${must0(g('rolls_unknown_total'))}</div>${arm}</div>`;
+    `<div>must stay 0: parse errors / unknown fills / refused submits / unknown rolls</div><div>${must0(i('parse_errors_total'))} / ${must0(g('unknown_fills_total'))} / ${must0(g('submit_refused_total'))} / ${must0(g('rolls_unknown_total'))}</div>${arm}${pmLedger('9')}</div>`;
 }
 
 // ---- P&L ----

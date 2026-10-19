@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The PMJ P&L lane (TEMPLATE — rendered by install-launchd.sh, or by hand
+     for this one label; rulings R-PMJ-S27..S30): slots 9 and 11's paper P&L
+     since start, settled on the venue's result, every 15 minutes — at :06,
+     :21, :36 and :51, after each 15-minute window has resolved (+116..218 s),
+     and at load. Read-only on the captures; it writes ~/multivenue/worker/pm/
+     only. NO KeepAlive: a failed pass waits for the next quarter. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.multivenue.pm-pnl</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@REPO@/scripts/pm-pnl.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>@REPO@</string>
+  <key>RunAtLoad</key><true/>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>6</integer></dict>
+    <dict><key>Minute</key><integer>21</integer></dict>
+    <dict><key>Minute</key><integer>36</integer></dict>
+    <dict><key>Minute</key><integer>51</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/pm-pnl.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/pm-pnl.log</string>
+  <key>Nice</key><integer>10</integer>
+</dict>
+</plist>

@@ -645,3 +645,25 @@ cache is disposable — the bucket holds everything in it.
 (keep it equal to retention's `MIN_FREE_GIB`), and the cache is capped by
 `MULTIVENUE_S3_CACHE_MAX_GIB` with LRU eviction. The volume ENOSPC-wedged every
 capture lane once, and writers do not retry after ENOSPC.
+
+## PMJ P&L lane (slots 9 and 11's paper book)
+
+`com.multivenue.pm-pnl` runs `scripts/pm-pnl.sh` at :06, :21, :36 and :51
+(and at load): one pass of `claude_worker.pm_paper_pnl` over the captures,
+writing `~/multivenue/worker/pm/{paper-pnl.tsv,open.tsv,paper-pnl.json}`; the
+dashboard's pm15 and pmj blocks read the summary (risk-policy "PMJ — slot
+11", ### J9). Install the ONE agent by hand from the main checkout
+(`pm-pnl.sh` runs `$MULTIVENUE_REPO`, default `~/trading-engine-multivenue`)
+— do **not** re-run `scripts/install-launchd.sh`, which restarts the engine —
+then restart the dashboard server so it serves `pm_pnl`:
+
+```sh
+sed -e "s|@REPO@|$PWD|g" -e "s|@HOME@|$HOME|g" \
+  launchd/com.multivenue.pm-pnl.plist > ~/Library/LaunchAgents/com.multivenue.pm-pnl.plist
+launchctl bootout gui/$UID/com.multivenue.pm-pnl 2>/dev/null || true
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.multivenue.pm-pnl.plist
+launchctl kickstart -k gui/$UID/com.multivenue.dashboard
+```
+
+Log: `~/multivenue/logs/launchd/pm-pnl.log`. Remove:
+`launchctl bootout gui/$UID/com.multivenue.pm-pnl`.
