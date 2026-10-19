@@ -85,6 +85,14 @@ affected paragraph at each lane close; the superseded text goes to
   frozen law (this binary; the sweep has no switch), or the kit
   `~/multivenue/rollback-pmj-20261019/multivenue-engine.4690bcac` (then
   remove the key if it was added).
+- **2026-10-19 09:37Z: PMJ J9 installed (`e4f6b566`, rulings
+  R-PMJ-S27..S30):** launchd `com.multivenue.pm-pnl` (:06, :21, :36, :51
+  and at load) keeps slots 9 and 11's paper P&L since 2026-10-19 00:11Z in
+  `~/multivenue/worker/pm/` (ledger, open fills, summary), settled on the
+  venue's result; the dashboard (`com.multivenue.dashboard` restarted)
+  shows it per fill-law segment in the pm15 and pmj blocks. The engine was
+  not touched (same pid, `ed4e14bd`). Remove:
+  `launchctl bootout gui/$UID/com.multivenue.pm-pnl`.
 - `exec.HALT` is present and slot 3 reads halted (`ws-gap`) on `/state` both
   BEFORE and after this restart — not changed by the PMJ deploy; the
   operator's to clear.
