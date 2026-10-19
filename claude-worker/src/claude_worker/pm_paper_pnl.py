@@ -54,10 +54,12 @@ waits for the next one):
    ``pm/open.tsv``, and writes the summary ``pm/paper-pnl.json`` that the
    dashboard's pm15 and pmj blocks read.
 
-**Segments.** Each fill carries the fill LAW its run ran (:data:`SEGMENTS`,
-by run epoch): ``touch`` (before J8: the touch alone, capped by its size)
-and ``j8`` (the FAK sweep behind the touch; slot 9's 0.90 floor). The
-summary never sums across segments. **Any change to slot 9's or 11's fill
+**Segments.** Each fill carries the fill LAW its run ran for its slot
+(:data:`SEGMENTS`, by run epoch and slot): ``touch`` (before J8: the touch
+alone, capped by its size), ``j8`` (the FAK sweep behind the touch; slot 9's
+0.90 floor) and, for slot 11 only, ``j11`` (the sweep judged 5 s after
+submit, decisions at tau >= 6 s: R-PMJ-S47 / S55). The summary never sums
+across segments. **Any change to slot 9's or 11's fill
 or entry law -- a rollback included -- adds a row here in the same
 change.**
 
@@ -101,11 +103,32 @@ FEE_DEN: int = 1_000_000_000_000_000_000
 #: 2026-10-19, run-1792368684525363000).
 FROM_NS: int = 1_792_368_684_525_363_000
 
-#: ``(segment, first run epoch, the fill law)``, oldest first: a fill belongs
-#: to the last segment whose epoch its run's is at or after.
-SEGMENTS: tuple[tuple[str, int, str], ...] = (
-    ("touch", 0, "the touch alone, capped by its size (before J8)"),
-    ("j8", 1_792_399_727_031_380_000, "the FAK sweep behind the touch; slot 9's 0.90 floor (J8)"),
+#: The first boot that reads slot 11's 5 s paper delay and 6 s lead (J11,
+#: R-PMJ-S47 / S55): ``pmj.toml`` changed before 2026-10-19 16:00Z, and the
+#: 16:05Z daily restart is the first boot after it. No run boots between the
+#: edit and 16:00Z (no restart is scheduled then).
+J11_FROM_NS: int = 1_792_425_600_000_000_000
+
+#: Both rolling members.
+BOTH_SLOTS: frozenset[int] = frozenset({9, 11})
+
+#: ``(segment, first run epoch, the fill law, the slots it applies to)``, oldest
+#: first: a fill belongs to the last segment of ITS slot whose epoch its run's is
+#: at or after. A change that touches one slot's law adds a row for that slot only.
+SEGMENTS: tuple[tuple[str, int, str, frozenset[int]], ...] = (
+    ("touch", 0, "the touch alone, capped by its size (before J8)", BOTH_SLOTS),
+    (
+        "j8",
+        1_792_399_727_031_380_000,
+        "the FAK sweep behind the touch; slot 9's 0.90 floor (J8)",
+        BOTH_SLOTS,
+    ),
+    (
+        "j11",
+        J11_FROM_NS,
+        "the J8 sweep judged 5 s after submit (Jupiter's keeper); decisions at tau >= 6 s (J11)",
+        frozenset({11}),
+    ),
 )
 
 #: core-types ``PM_ROLLING_ORDINAL_BASE`` / ``PM_ROLLING_STRIDE`` (15 m) and
@@ -312,10 +335,10 @@ def run_epoch(run: str) -> int | None:
         return None
 
 
-def segment_of(epoch: int) -> str:
+def segment_of(epoch: int, sid: int) -> str:
     name = SEGMENTS[0][0]
-    for seg, start, _law in SEGMENTS:
-        if epoch >= start:
+    for seg, start, _law, slots in SEGMENTS:
+        if sid in slots and epoch >= start:
             name = seg
     return name
 
@@ -376,7 +399,7 @@ def name_fill(
         run=run, idx=idx, fill_ts=f.ts_ns, strategy_id=f.strategy_id, sym=f.sym, asset=asset,
         period=period, leg=leg, side=f.side, px_1e6=f.px, qty_1e6=f.qty, order_id=f.order_id,
         instance=inst, window_end_ns=(open_s + slot.window_s) * 1_000_000_000,
-        slug=f"{asset}-updown-{period}-{open_s}", segment=segment_of(epoch),
+        slug=f"{asset}-updown-{period}-{open_s}", segment=segment_of(epoch, f.strategy_id),
     )
 
 
@@ -733,10 +756,11 @@ def slot_summary(
     rows = sorted((r for r in rows if r.fill.strategy_id == slot.sid), key=lambda r: _order(r.fill))
     opens = [o for o in opens if o.fill.strategy_id == slot.sid]
     segments: list[dict[str, typing.Any]] = []
-    for i, (seg, start, law) in enumerate(SEGMENTS):
+    mine = [s for s in SEGMENTS if slot.sid in s[3]]
+    for i, (seg, start, law, _slots) in enumerate(mine):
         rs = [r for r in rows if r.fill.segment == seg]
         os_ = [o for o in opens if o.fill.segment == seg]
-        current = i == len(SEGMENTS) - 1
+        current = i == len(mine) - 1
         if not rs and not os_ and not current:
             continue
         by_fam: dict[str, list[Row]] = collections.defaultdict(list)

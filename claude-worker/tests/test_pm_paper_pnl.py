@@ -39,7 +39,8 @@ M = claude_worker.pm_paper_pnl
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _S = 1_000_000_000
 _EPOCH = 1_792_368_000 * _S  # a run before J8
-_EPOCH_J8 = M.SEGMENTS[-1][1] + 60 * _S
+_START = {s[0]: s[1] for s in M.SEGMENTS}
+_EPOCH_J8 = _START["j8"] + 60 * _S
 _FROM = _EPOCH - 3_600 * _S
 #: SOL 15m (family 2): window 1 991 521 rides pair 1. BTC 5m (family 0):
 #: window 5 974 564 rides pair 1 (w % 3).
@@ -209,9 +210,15 @@ def test_descriptors_and_segments() -> None:
     for bad in ("polymarket-rolling:updown:btc:15m[mark]", "binance:BTCUSDT", "",
                 "polymarket-rolling:updown:btc:15m[up7]", "polymarket-rolling:updown::5m[up0]"):
         assert M.parse_descriptor(bad) is None, bad
-    assert M.segment_of(_EPOCH) == "touch"
-    assert M.segment_of(M.SEGMENTS[-1][1]) == "j8"
-    assert M.segment_of(M.SEGMENTS[-1][1] - 1) == "touch"
+    for sid in (9, 11):
+        assert M.segment_of(_EPOCH, sid) == "touch"
+        assert M.segment_of(_START["j8"], sid) == "j8"
+        assert M.segment_of(_START["j8"] - 1, sid) == "touch"
+    # J11 moves slot 11 only (R-PMJ-S47 / S55): slot 9 stays on j8
+    assert M.segment_of(_START["j11"], 11) == "j11"
+    assert M.segment_of(_START["j11"] - 1, 11) == "j8"
+    assert M.segment_of(_START["j11"], 9) == "j8"
+    assert [s[0] for s in M.SEGMENTS] == ["touch", "j8", "j11"]
 
 
 def test_every_naming_source_must_agree() -> None:
@@ -449,7 +456,7 @@ def test_segments_are_never_summed(tmp_path: pathlib.Path) -> None:
     segs = slot["segments"]
     assert [g["segment"] for g in segs] == ["touch", "j8"]
     assert (segs[0]["net_usd"], segs[1]["settled"], segs[1]["lost"]) == (0.27963, 1, 1)
-    assert segs[1]["from_utc"] == M.utc_iso(M.SEGMENTS[-1][1])
+    assert segs[1]["from_utc"] == M.utc_iso(_START["j8"])
     assert not {"net_usd", "settled", "stake_usd"} & set(slot), "no slot-wide total"
     assert set(res.net_usd_1e6[9]) == {"touch", "j8"}
 
@@ -460,6 +467,29 @@ def test_the_current_segment_shows_even_when_empty(tmp_path: pathlib.Path) -> No
     M.run_pass(root, _FROM, _now(), None)
     segs = _summary(root)["slots"]["9"]["segments"]
     assert [g["segment"] for g in segs] == ["touch", "j8"] and segs[1]["settled"] == 0
+    segs = _summary(root)["slots"]["11"]["segments"]
+    assert [g["segment"] for g in segs] == ["touch", "j11"] and segs[1]["settled"] == 0
+
+
+def test_j11_splits_slot_11_only(tmp_path: pathlib.Path) -> None:
+    root = _root(tmp_path)
+    o15 = o5 = 1_792_427_400  # 15m pair 0, 5m pair 0, after J11's first boot
+    i15, i5 = _inst15(o15, 2), _inst5(o5, 0)
+    _run(
+        root, epoch=_START["j11"] + 300 * _S,
+        fills=[(5 * _S, _SOL15[0, "up"], 9, 950_000, 20_000_000, _oid(i15, 2, 0)),
+               (6 * _S, _BTC5[0, "up"], 11, 960_000, 10_000_000, _oid(i5, 0, 0))],
+        ev15=[_settled(_SOL15[0, "up"], i15, M.SETTLED_UP)],
+        ev5=[_settled(_BTC5[0, "up"], i5, M.SETTLED_UP)],
+    )
+    res = M.run_pass(root, _FROM, (o15 + 1_000) * _S, None)
+    assert res.settled_new == 2
+    assert set(res.net_usd_1e6[9]) == {"j8"} and set(res.net_usd_1e6[11]) == {"j11"}
+    slots = _summary(root)["slots"]
+    assert [g["segment"] for g in slots["9"]["segments"]] == ["j8"]
+    s11 = slots["11"]["segments"]
+    assert [g["segment"] for g in s11] == ["j11"] and s11[0]["settled"] == 1
+    assert s11[0]["from_utc"] == M.utc_iso(_START["j11"])
 
 
 def test_a_fill_that_cannot_be_named_is_reported_not_booked(tmp_path: pathlib.Path) -> None:
@@ -536,6 +566,9 @@ def test_the_dashboard_serves_the_summary_and_both_blocks_read_it(tmp_path: path
     # audit-pnl's day report settles only HIP-4 rolls and marks these binaries out
     assert "cells ? cells[0] : p ? n(p.fills, 0)" in html
     assert "Polymarket paper (slots 9 / 11)" in html and "not settled by audit-pnl" in html
+    # audit-pnl's fee ladder is [@0, @1, @2 bps] (FEE_LADDER_BPS): never labelled "@tier" (J11)
+    assert "'@tier'" not in html and "net @0/1/tier" not in html
+    assert "'@2 bps'" in html and "net @0/1/2 bps" in html
 
 
 def test_the_launchd_job_is_wired_and_names_no_worker() -> None:

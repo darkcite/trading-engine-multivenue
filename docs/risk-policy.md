@@ -17383,6 +17383,22 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S40 | A per-order record of slot 11's shadow verdicts is **parked until J0**. |
 | R-PMJ-S41 | Housekeeping: PM15-8's two E501 lines are wrapped; `bin15/late_fair_in_window` is re-baselined (the median of three `make bench-check` runs; equal at HEAD and J8). |
 | R-PMJ-S42 | **J10**: `audit-pnl` settles Polymarket's rolling windows on the capture's settled roll rows (a window retired unresolved pays 0, as the member books it), and its fee ladder charges Polymarket's p-dependent taker law (rate · p · (1 − p) per share; slot 11 at twice the rate, its paper law; makers 0), closing fees.toml's pm caveat. The session commits and rebuilds the release binary; no forced restart. |
+| R-PMJ-S43 | **J0's wallet**: the dedicated PMJ hot wallet does not exist yet. J0's checklist opens with Anton creating it (its secret never enters a session) and putting its public key in `.env` as `PMJ_WALLET_PUBKEY`, or passing `--owner`. |
+| R-PMJ-S44 | **LAW PMJ-G and Jupiter's co-signer**: every public create-order carries a second, read-only required signer (`AJooF3xRkSx1PUC5Y9dNZHy9LMHcx5xKhPxj4iW4jepf`), which PMJ-G refuses. The session drafts an amendment in the vault (one pinned co-signer, `guard_cosigners`: read-only, not the fee payer, no durable nonce, its signature verified when present); it becomes law only after Anton's own J0 build confirms the second signer and he rules. |
+| R-PMJ-S45 | **The price cap**: `maxBuyPriceUsd` does not bind on public fills. J0 probes for a field that does (a `maxSlippageBps` or other value that reaches the signed `create_order` data). If none binds, the lane **stops at J0**; if one does, J5's guard computes the effective limit from the signed bytes and refuses above the member's limit. |
+| R-PMJ-S46 | **The deposit mint**: J0 builds both USDC and JupUSD; the mint is chosen after Anton's builds. |
+| R-PMJ-S47 | **Slot 11's paper delay** becomes **5 s** (Jupiter's keeper on the public tape) from the 2026-10-19 16:05Z boot; J9 gains a slot-11 segment in the same change (### J11). |
+| R-PMJ-S48 | Slot 11's paper fee stays at **2×** Polymarket's rate until Anton's own J0 fills confirm 1× on buys. |
+| R-PMJ-S49 | **P0**: the bars are scored on the post-J8 CONF segment only, under the floored law; IS is refit under the floor; pre-J8 CONF is a side table, never pooled (doc 39 §10, written before any CONF read). |
+| R-PMJ-S50 | **F4**: the strike law is re-measured on at least 3 days of captures (about 10-22) before law (iii) is ruled. Law (iii) is the venue-aligned trapezoid strike and settlement with a per-asset residual σ, a frozen-law change for slots 9 and 11 (a P0 segment and a J9 segment). |
+| R-PMJ-S51 | J10's carry-head gap is **closed as a known limit**: the J9 ledger is slots 9 and 11's paper truth, and the dashboard reads it. |
+| R-PMJ-S52 | The dashboard's "@tier" labels on audit-pnl's fee ladder become "@2 bps" (the ladder is [@0, @1, @2 bps]); J10's window counters are documented as windows, not positions. |
+| R-PMJ-S53 | F4 (c2): a read-only probe of Polymarket's RTDS for a TWAP or Chainlink stream (the engine's own socket, no credentials). It found none, so (c2) is closed. |
+| R-PMJ-S54 | DOGE's report precision (RTDS v1, ×1e12) folds into law (iii) if (iii) is ruled. |
+| R-PMJ-S55 | With the 5 s delay, slot 11's keeper lead becomes **`min_tau_s` = 6** (`pmj.rs`: the paper delay must be under the lead), so slot 11 decides at τ ∈ [6, 20) s. Slot 9 is unchanged. |
+| R-PMJ-S56 | F4's re-measure data is snapshotted from closed runs until 10-22 by a self-removing vault job, outside git. |
+| R-PMJ-S57 | P0's **B3 stays as frozen** (at most 2 % of fired markets lost). |
+| R-PMJ-S58 | With the Mac's disk near full, the F4 snapshot keeps the pm15 / pm5 events and the manifest only, under a 10 GiB free floor; ticks for the post-J8 check are pulled from the S3 archive at re-measure time if disk allows. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -18081,9 +18097,13 @@ HEAD.
   (the first fresh touch after Δ_pm, displayed size), not J8's held-book
   sweep, so its slot 9 / 11 rows are the model's; the J9 ledger is the
   paper book.
-- **Not covered (follow-up).** The nightly's carry head knows HIP-4 only: a
+- **Known limit (R-PMJ-S51).** The nightly's carry head knows HIP-4 only: a
   window whose fill and settled row fall in two ≤ 2 h units is not settled
-  in the first.
+  in the first. Closed as a known limit: the J9 ledger is slots 9 and 11's
+  paper truth, and the dashboard reads it.
+- **Counters (R-PMJ-S52).** `flattened_run_end` and `open_at_end` (and every
+  `pm_settlement` count) count windows on traded slots, never positions or
+  shares.
 - **Rollback.** The previous binary.
 - **Housekeeping in the same change (R-PMJ-S41).** PM15-8's two E501 lines in
   `claude-worker/tests/test_dashboard.py` wrapped (py-lint green);
@@ -18091,3 +18111,27 @@ HEAD.
   (`crates/bench/baselines/hot_path.json`, the median of three
   `make bench-check` runs, 395.2 / 414.4 / 396.0 ns) — no PMJ change moved
   it (the A/B read it equal at J7 and J8).
+
+### J11 — slot 11's paper delay follows Jupiter's keeper; J9 segments per slot (2026-10-19, rulings R-PMJ-S47, S51, S52, S55)
+
+- **Why.** J0's public tape (vault `docs/research/pmj/j0/`) puts Jupiter's
+  keeper at a median of about 5 s from the create-order transaction to its
+  Polymarket print, against slot 11's assumed 2 s. A paper fill judged at
+  2 s books takes the venue could not give.
+- **Config** (`~/multivenue/pmj.toml`, outside git): `paper_delay_ms`
+  2000 → 5000 and `min_tau_s` 3 → 6. `pmj.rs` requires the delay to be
+  under the keeper's lead, so an order decided at τ = 6 s is judged at
+  τ ≥ 1 s, before the close. Slot 11's law becomes τ ∈ [6, 20) s; slot 9 is
+  unchanged. The J8 shadows (350 ms / 1 s) stay; they now price a faster
+  keeper. It takes effect at the 2026-10-19 16:05Z daily restart; the
+  previous file is `~/multivenue/rollback-pmj-20261019/pmj.toml.pre-j11`.
+- **J9.** Each `SEGMENTS` row names the slots it applies to, and
+  `segment_of(epoch, sid)` picks the last row of the fill's slot. The new
+  row `j11` (slot 11 only) starts at the first boot at or after 2026-10-19
+  16:00Z (`J11_FROM_NS`); slot 9's book stays on `j8`.
+- **Dashboard (R-PMJ-S52).** audit-pnl's fee ladder is `FEE_LADDER_BPS`
+  [0, 1, 2]; its third column was labelled "@tier" in four places and now
+  reads "@2 bps". The members table's "Σ net @tier" is another figure (each
+  member's evidence at its tier) and stays.
+- **Rollback.** Restore `pmj.toml.pre-j11` and restart; per J9's rule the
+  rollback adds a `SEGMENTS` row.
