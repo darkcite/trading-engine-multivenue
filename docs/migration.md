@@ -6,6 +6,43 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-19 — PMJ J10: `audit-pnl` settles Polymarket's rolling windows and charges their p-dependent fee
+
+**What changed** (ruling R-PMJ-S42; risk-policy "PMJ — slot 11", `### J10`)
+- `multivenue-engine audit-pnl` now reads `pm15-ticks` / `pm5-ticks` for the
+  rolling legs a run placed orders on (inside the run's tick span), and the
+  settled roll rows of `pm15-events` / `pm5-events`: each window on a traded
+  slot settles at the venue's result (a window retired unresolved, or one
+  whose pair was re-created with no result, at 0 on both legs; one a run
+  ended without a result for at a later run's settled row, else at 0 at its
+  run's last instant when a later run follows, else — the root's last run —
+  it marks out).
+- audit-pnl's interner never issues dense id 7 on the Polymarket byte (the
+  legacy anchor's id, judged as Binance): a root with seven or more
+  Polymarket descriptors renumbers from the seventh on, and that leg is now
+  judged on Polymarket's Δ.
+- A rolling leg's taker fill pays `rate · p · (1 − p)` per share (0.07; slot
+  11 at 0.14), its maker fill and its settlement nothing — in place of the
+  flat `pm` bps from `fees.toml`.
+- The paper view settles rolling paper fills on the same schedule.
+- `FillEngine` accepts a Jupiter-routed order on a Polymarket sym (slot 11).
+
+**Readers**
+- Day reports before and after this binary differ for slots 9 / 11 (before:
+  no fills, and every paper fill a total loss at a zero mark).
+- New stderr lines `audit-pnl: run-<e>: pm rolling orders=… ticks=…` and
+  `audit-pnl: pm settlement table: …`, and an additive JSON key
+  `pm_settlement` — all only when a run traded a rolling leg;
+  `audit_pnl_version` stays 2. Roots without a rolling trade (every pre-PM15
+  pool) are byte-identical — except one whose orders hit its seventh
+  Polymarket descriptor, which is now judged on Polymarket's Δ (above).
+- The replay's fill law for these legs is the harness's (IOC at the first
+  fresh touch after Δ_pm, displayed size), not paper's held-book sweep: the
+  J9 ledger (`worker/pm/paper-pnl.json`) stays the paper truth.
+
+**Rollback**
+- The previous binary. Nothing on disk changes format.
+
 ## 2026-10-19 — PMJ J8: the rolling legs' paper fill sweeps the depth lane; slot 9's `price_floor_1e6`; slot 11's shadow verdicts
 
 **What changed** (rulings R-PMJ-S21..S26; risk-policy "PMJ — slot 11", `### J8`)

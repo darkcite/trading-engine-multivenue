@@ -574,6 +574,90 @@ pub fn apply_binary_settlements(
     reg
 }
 
+/// PMJ J10 (R-PMJ-S42): one Polymarket rolling window's settlement, read
+/// off the capture's SETTLED roll row (`pm15-events` / `pm5-events`).
+///
+/// Polymarket publishes the result itself (`market_resolved`), so there
+/// is no law to apply here — only the venue's winner to pay out. The
+/// legs are dense syms (`None`: a leg this root never interned, so no
+/// position can exist on it). The slot syms are reused by the next
+/// window of the same pair, which is why this rides the per-sym queue
+/// [`fill::BinarySettle`] exactly as a HIP-4 slot does.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VenueBinarySettle {
+    /// The window's Up leg, dense (`None`: never interned by this root).
+    pub sym_up: Option<u32>,
+    /// The window's Down leg, dense (`None`: never interned by this root).
+    pub sym_down: Option<u32>,
+    /// The window's instance id (`pm_roll::pm_instance_id` / `pm5_instance_id`).
+    pub instance: u32,
+    /// Wall ns of the settled row — the instant the result is known.
+    pub settle_ns: u64,
+    /// `PM_SETTLED_UP` (+1), `PM_SETTLED_DOWN` (−1) or `PM_SETTLED_UNKNOWN`
+    /// (0: retired unresolved, or flattened — both legs pay 0, as the
+    /// member books it).
+    pub winner: i64,
+}
+
+impl VenueBinarySettle {
+    /// `(up, down)` payout ×1e6.
+    #[must_use]
+    pub fn values_1e6(&self) -> (i64, i64) {
+        match self.winner {
+            core_types::pm_roll::PM_SETTLED_UP => (1_000_000, 0),
+            core_types::pm_roll::PM_SETTLED_DOWN => (0, 1_000_000),
+            _ => (0, 0),
+        }
+    }
+}
+
+/// PMJ J10: what [`apply_venue_settlements`] registered.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VenueRegistration {
+    /// Windows registered (their settled row lies inside the window).
+    pub settled: u64,
+    /// Of those, settled at 0 / 0 (retired unresolved or flattened).
+    pub unknown: u64,
+    /// Settled rows past the window's last wall instant — never applied.
+    pub after_window: u64,
+}
+
+/// PMJ J10: register every Polymarket window's payout on `engine`, at the
+/// settled row's wall instant (`halt_ns == settle_ns`: the members never
+/// trade a window that late, and `binary_pass` cancels anything still
+/// resting there).
+///
+/// DOCTRINE: offline path — allocates freely.
+pub fn apply_venue_settlements(
+    engine: &mut FillEngine,
+    windows: &[VenueBinarySettle],
+    window_end_wall_ns: u64,
+) -> VenueRegistration {
+    let mut reg = VenueRegistration::default();
+    for w in windows {
+        if w.settle_ns > window_end_wall_ns {
+            reg.after_window += 1;
+            continue;
+        }
+        let (up, down) = w.values_1e6();
+        for (sym, value) in [(w.sym_up, up), (w.sym_down, down)] {
+            if let Some(sym) = sym {
+                engine.set_binary_settle(
+                    sym,
+                    fill::BinarySettle {
+                        halt_ns: w.settle_ns,
+                        settle_ns: w.settle_ns,
+                        value_1e6: value,
+                    },
+                );
+            }
+        }
+        reg.settled += 1;
+        reg.unknown += u64::from(up == 0 && down == 0);
+    }
+    reg
+}
+
 /// BIN15 S1: what the sidecar carries about one instance's settlement.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BinaryLabel {
@@ -904,6 +988,32 @@ mod tests {
         let mut below = a;
         below.next_strike_1e6 = 99;
         assert_eq!(below.y_next_strike(), 0);
+    }
+
+    /// PMJ J10 (R-PMJ-S42): a Polymarket window pays the venue's winner on
+    /// its two legs, both 0 when it retired unresolved, and a settled row
+    /// past the window is never applied.
+    #[test]
+    fn a_venue_settled_window_pays_its_winner_and_an_unknown_pays_nothing() {
+        let w = |winner: i64, settle_ns: u64| VenueBinarySettle {
+            sym_up: Some(1),
+            sym_down: Some(2),
+            instance: 7,
+            settle_ns,
+            winner,
+        };
+        assert_eq!(w(core_types::pm_roll::PM_SETTLED_UP, 0).values_1e6(), (1_000_000, 0));
+        assert_eq!(w(core_types::pm_roll::PM_SETTLED_DOWN, 0).values_1e6(), (0, 1_000_000));
+        assert_eq!(w(core_types::pm_roll::PM_SETTLED_UNKNOWN, 0).values_1e6(), (0, 0));
+        let mut e = FillEngine::new(crate::backtest::ModelParams::default(), 0);
+        let one_leg =
+            VenueBinarySettle { sym_down: None, ..w(core_types::pm_roll::PM_SETTLED_UP, 10) };
+        let reg = apply_venue_settlements(
+            &mut e,
+            &[w(core_types::pm_roll::PM_SETTLED_UP, 10), w(0, 20), w(-1, 99), one_leg],
+            50,
+        );
+        assert_eq!(reg, VenueRegistration { settled: 3, unknown: 1, after_window: 1 });
     }
 
     /// The WHOLE chain on a synthetic timeline: two captured instances

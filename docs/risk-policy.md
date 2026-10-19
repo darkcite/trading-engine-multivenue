@@ -17371,6 +17371,18 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S28 | A window the capture never saw resolve is labelled by **Gamma's resolved market** (by slug), never by our own marks. |
 | R-PMJ-S29 | The book shows in the dashboard's pm15 and pmj blocks, under each slot's session line. |
 | R-PMJ-S30 | The session commits J9 (explicit paths) and installs its agent and reloads the dashboard; the engine is not touched. |
+| R-PMJ-S31 | Slot 9's **P0 scorer** is written now (vault, doc 39 §8), hashed before any CONF outcome is scored, split at the J8 boot (the amended law), and run once after 10-28 00:00Z. |
+| R-PMJ-S32 | Slot 9's paper keeps **all seven families** (`live_assets` stays btc+eth); the J9 ledger's per-family book judges the unstudied ones. |
+| R-PMJ-S33 | Slot 9's **flip to live** sets `pm15.toml` to the stage frame — **$500 per order, $500 per window market, −$1 000 session** — until P0 PASS and ≥ 100 live entries at ≥ 97 %; paper follows (R-PM-8). |
+| R-PMJ-S34 | **F4** (the strike estimate's error in near-tie windows): a research plan now — measure it against Polymarket's resolved strike, propose its uncertainty in the belief (vault). |
+| R-PMJ-S35 | The Polymarket account has **no date**: slot 9's live items (key-check, miss-probe, PolyBolt, the flip) stay parked; paper continues. |
+| R-PMJ-S36 | The `pm15-standalone` cut stays **deferred** until after P0. |
+| R-PMJ-S37 | **J0**: the session prepares a read-only probe kit (scripts that source `.env` themselves; the session never reads it) and a checklist; Anton runs it; the results feed the `guard_*` keys and J5's plan. |
+| R-PMJ-S38 | The TERM slot-11 clash (R-PMJ-1b) stays with TERM's session. |
+| R-PMJ-S39 | The **miss block** stays 2 × ttl in both members. |
+| R-PMJ-S40 | A per-order record of slot 11's shadow verdicts is **parked until J0**. |
+| R-PMJ-S41 | Housekeeping: PM15-8's two E501 lines are wrapped; `bin15/late_fair_in_window` is re-baselined (the median of three `make bench-check` runs; equal at HEAD and J8). |
+| R-PMJ-S42 | **J10**: `audit-pnl` settles Polymarket's rolling windows on the capture's settled roll rows (a window retired unresolved pays 0, as the member books it), and its fee ladder charges Polymarket's p-dependent taker law (rate · p · (1 − p) per share; slot 11 at twice the rate, its paper law; makers 0), closing fees.toml's pm caveat. The session commits and rebuilds the release binary; no forced restart. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -18031,3 +18043,51 @@ HEAD.
   counters with no per-order record, so they cannot be settled per window.
 - **Rollback.** `launchctl bootout gui/$UID/com.multivenue.pm-pnl`; the
   page's ledger lines then read the last summary written, and say its time.
+
+### J10 — `audit-pnl` settles Polymarket's rolling windows (2026-10-19, ruling R-PMJ-S42)
+
+- **Why.** The nightly day report (`pnl_report` → `audit-pnl`) never opened
+  the rolling captures: slot 9 / 11 intents could not fill in its replay,
+  its HIP-4-only settlement pass never saw a Polymarket window, and its
+  paper view booked every rolling paper fill as a total loss (no mark, no
+  settlement). Its `pm` fee was a flat 350 bps of notional.
+- **What.**
+  - A run that placed an order on a rolling leg also loads that leg's
+    `pm15` / `pm5` ticks, inside the run's tick span (the anchor, the
+    window's end and every other run are unchanged).
+  - A separate pass reads the settled roll rows (kind byte strict) for legs
+    the root already interned: winner +1 / −1 pays 1 / 0 on Up / Down; a
+    window retired unresolved pays 0 on both (the member's book); a window
+    with no row whose pair the run re-created is flattened at 0 there. A
+    window a run ended without a result for settles at a later run's
+    settled row when one saw it resolve, else — when a later run follows — is
+    flattened at 0 at its own run's last instant (its slot sym is reused, so
+    leaving it open would let the next window's settlement close it at the
+    wrong winner); only in the root's last run does it stay open and mark out
+    (counted; the counters name windows on traded slots, with or without a
+    position). Each rides
+    the per-sym settlement queue HIP-4 slots use. Keys are (Up descriptor,
+    instance). A Polymarket descriptor is never issued the dense id of the
+    legacy anchor (7), which the model judges as Binance.
+  - A rolling leg's taker fill pays `rate · p · (1 − p)` per share, ceiled
+    (0.07; slot 11 at 0.14, its paper law until J0), its maker fill and its
+    settlement nothing.
+  - The paper view settles rolling paper fills on the same schedule (still
+    fee-free, as for every venue in that view).
+  - Reported only when a run traded a rolling leg: `audit-pnl: run-<e>: pm
+    rolling orders=… ticks=…`, `audit-pnl: pm settlement table: …`, JSON
+    `pm_settlement`.
+- **Not the paper law.** The replay fills these IoCs by the harness's law
+  (the first fresh touch after Δ_pm, displayed size), not J8's held-book
+  sweep, so its slot 9 / 11 rows are the model's; the J9 ledger is the
+  paper book.
+- **Not covered (follow-up).** The nightly's carry head knows HIP-4 only: a
+  window whose fill and settled row fall in two ≤ 2 h units is not settled
+  in the first.
+- **Rollback.** The previous binary.
+- **Housekeeping in the same change (R-PMJ-S41).** PM15-8's two E501 lines in
+  `claude-worker/tests/test_dashboard.py` wrapped (py-lint green);
+  `bin15/late_fair_in_window` re-baselined 340 → 396 ns
+  (`crates/bench/baselines/hot_path.json`, the median of three
+  `make bench-check` runs, 395.2 / 414.4 / 396.0 ns) — no PMJ change moved
+  it (the A/B read it equal at J7 and J8).

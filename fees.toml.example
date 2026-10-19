@@ -54,6 +54,11 @@
 # p = 0.20. Read any PM row in a report as a p ~ 0.50 approximation until
 # `backtest::fill` learns the p-dependent law. (Geopolitics markets are
 # fee-free; the crypto category we trade is the 0.07 rate.)
+# PMJ J10 (2026-10-19, R-PMJ-S42): it has, for the ROLLING up/down legs
+# (`polymarket-rolling:` descriptors, slots 9 and 11) — audit-pnl charges
+# their taker fills rate · p · (1 − p) per share (0.07; slot 11 twice that,
+# its paper law), their makers and their settlement nothing, whatever this
+# file says. The static `pm` markets keep this flat approximation.
 #
 # deribit CAVEAT — spot fees are published but WAIVED until Deribit's spot book
 # is routed to Coinbase. 2:5 carries the standing (unwaived) rate deliberately:
