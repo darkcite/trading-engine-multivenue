@@ -93,6 +93,13 @@ affected paragraph at each lane close; the superseded text goes to
   shows it per fill-law segment in the pm15 and pmj blocks. The engine was
   not touched (same pid, `ed4e14bd`). Remove:
   `launchctl bootout gui/$UID/com.multivenue.pm-pnl`.
+- **2026-10-19 11:28Z: `target/release` rebuilt at `dda68846` (PMJ J10, ruling
+  R-PMJ-S42) — no restart.** J10 changes `audit-pnl` only (the nightly day
+  report settles Polymarket's rolling windows, with their p-dependent fee);
+  the engine's runtime code is unchanged. The running engine stays on
+  `ed4e14bd` until the next scheduled restart, which boots `dda68846`;
+  tonight's 00:20Z `pnl_report` already runs it. Rollback kit:
+  `~/multivenue/rollback-pmj-20261019/multivenue-engine.ed4e14bd`.
 - `exec.HALT` is present and slot 3 reads halted (`ws-gap`) on `/state` both
   BEFORE and after this restart — not changed by the PMJ deploy; the
   operator's to clear.
