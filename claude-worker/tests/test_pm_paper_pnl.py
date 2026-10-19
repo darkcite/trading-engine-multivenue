@@ -532,6 +532,10 @@ def test_the_dashboard_serves_the_summary_and_both_blocks_read_it(tmp_path: path
     assert "function pmLedger(sid)" in html and "W.pm_pnl" in html
     # each slot's book shows with the engine's counters, and without them (engine down)
     assert html.count("pmLedger('9')") == 2 and html.count("pmLedger('11')") == 2
+    # the strategies table and the P&L panel take slots 9 / 11 from the ledger too:
+    # audit-pnl's day report settles only HIP-4 rolls and marks these binaries out
+    assert "cells ? cells[0] : p ? n(p.fills, 0)" in html
+    assert "Polymarket paper (slots 9 / 11)" in html and "not settled by audit-pnl" in html
 
 
 def test_the_launchd_job_is_wired_and_names_no_worker() -> None:
