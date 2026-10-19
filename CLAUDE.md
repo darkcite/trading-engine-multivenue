@@ -118,7 +118,12 @@ refused). A binary rollback rolls the wrapper back too.
   binding): no AI-promoted member goes live before one keyed `serve` cycle
   with auto-promotion and one monitor-triggered rollback are observed live.
   **Waived for BIN15 only** (O-E1, 2026-09-15: hand-coded, no AI promotion
-  path). No `serve`, no Anthropic API calls until the operator opens it.
+  path). No `serve`, no Anthropic API calls from `claude-worker` or anything
+  the engine reaches, until the operator opens it. **Exempt (O-AR0,
+  2026-10-19):** the AIRES research workspace — Claude Managed Agents driven
+  from the Mac by the research controller; its own key `MV_RESEARCH_API_KEY`
+  in `.env` (O-AR9), never the worker's; it never touches 9191, `ai.sock`,
+  exec keys or venue credentials; research only.
 - **Execution laws:** a live slot never falls back to paper (E-1); every live
   submit AND modify passes the risk gate, a cancel is never blocked by a cap;
   the HTTP response is the ACK, the `userFills` stream is the FILL (E-5); a
