@@ -650,6 +650,17 @@ pub const RETIRED_WHY_WORDS: [&str; 6] = [
 /// (`clob_dispatcher::RETIRED_WHY_UNKNOWN`, pinned in `cli`).
 pub const RETIRED_WHY_UNKNOWN: usize = 7;
 
+/// **O-WSG1 — the hold bits' words**, index = the bits
+/// (`exec_router::halt::hold_word`'s copy; `cli` pins the two together).
+pub const HOLD_WORDS: [&str; 4] = ["none", "ws-gap", "recon-stale", "ws-gap+recon-stale"];
+
+/// The word for a slot's hold bits; bits this binary does not know are
+/// masked off.
+#[must_use]
+pub fn hold_word(v: u8) -> &'static str {
+    HOLD_WORDS[(v & 3) as usize]
+}
+
 /// The word for a `HaltReason` byte, or `"unknown"` for one this
 /// binary does not have. Never a panic and never an empty string: a
 /// reason we cannot name is still a halt.
@@ -763,6 +774,9 @@ pub struct ExecSnapshot {
     pub file_present: u8,
     /// Per-slot `HaltReason as u8`; `0` = running.
     pub halted: [u8; SNAPSHOT_SLOTS],
+    /// **O-WSG1** — per-slot hold bits (`exec_router::halt::HOLD_*`);
+    /// `0` = not held. A hold lifts by itself.
+    pub held: [u8; SNAPSHOT_SLOTS],
     /// Halt edges since boot.
     pub halts: u64,
     /// Requests refused because their slot is halted.
@@ -838,6 +852,10 @@ pub struct ExecSnapshot {
     /// **BX11** — the Binance arm's own words (`exec.arms.binance_gw`;
     /// rendered only when `present`).
     pub arms_binance_gw: BinanceGwSnapshot,
+    /// **O-WSG1** — hold edges since boot.
+    pub holds: u64,
+    /// **O-WSG1** — requests refused because their slot was held.
+    pub refused_held: u64,
 }
 
 /// **BX6 — one venue arm's numbers** in `/state` `exec.arms.<venue>`:
@@ -1256,10 +1274,11 @@ mod tests {
         // same alignment: still 31,872 B. S16-5's schema 3 widens the
         // per-slot arrays 8 → 16: `slots` +192 B (three 64 B lines);
         // `exec.halted`'s +8 B fit the 64 B alignment. 32,064 B, 704 B
-        // left.
+        // left. O-WSG1's hold (`exec.held` 16 B and two counters) crosses
+        // one alignment: 32,128 B, 640 B left.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
-        assert_eq!(n, 32_064, "the S16-5 figure: a change states its own");
+        assert_eq!(n, 32_128, "the O-WSG1 figure: a change states its own");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);
         assert_eq!(core::mem::size_of::<HarSnapshot>(), 2_216);
     }

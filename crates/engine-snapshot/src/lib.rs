@@ -52,11 +52,12 @@ mod snapshot;
 pub use cell::SnapshotCell;
 pub use json::{encode_state_json, JsonOverflow, STATE_JSON_MAX};
 pub use snapshot::{
-    bn_mode_word, congestion_word, deadman_availability_word, halt_reason_word, sweep_word,
+    bn_mode_word, congestion_word, deadman_availability_word, halt_reason_word, hold_word,
+    sweep_word,
     AiSnapshot, ArmSnapshot, BinanceGwSnapshot, BootInfo, CaptureSnapshot, EngineSnapshot,
     ExecSnapshot, GatewayArmSnapshot, HarSnapshot,
     HcvSnapshot, HyparbSnapshot, IngressSnapshot, LatencySnapshot, LoopCounters, RecentRing,
-    VmSnapshot, XmmSnapshot, BN_REFUSAL_WORDS, BOOT_TEXT_MAX, HALT_REASON_WORDS, RECENT_FILLS,
+    VmSnapshot, XmmSnapshot, BN_REFUSAL_WORDS, BOOT_TEXT_MAX, HALT_REASON_WORDS, HOLD_WORDS, RECENT_FILLS,
     RECENT_ORDERS,
     RESERVED_SLOT_NAME, RETIRED_WHY_UNKNOWN, RETIRED_WHY_WORDS, RUN_DIR_MAX, SLOT_NAMES,
     SNAPSHOT_HYPARB_COINS,

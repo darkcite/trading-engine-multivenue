@@ -5584,6 +5584,19 @@ pub struct ExecMetricIds {
     pub retired: core_metrics::CounterId,
     /// `engine_exec_halts_total` (E6 c4) — halt EDGES. **The alarm.**
     pub halts: core_metrics::CounterId,
+    /// `engine_exec_holds_total` (O-WSG1) — hold EDGES: a slot that
+    /// stopped placing because its stream went down or its reconciliation
+    /// went stale, and resumes by itself. Not an alarm; its RATE is the
+    /// venue's connectivity.
+    pub holds: core_metrics::CounterId,
+    /// `engine_exec_refused_held_total` (O-WSG1) — requests refused
+    /// because their slot was HELD.
+    pub refused_held: core_metrics::CounterId,
+    /// `engine_exec_held_mask` (gauge, O-WSG1) — bit `1 << slot` for every
+    /// slot held now (slot 3 alone reads 8). One gauge, not one a slot: the
+    /// fixed registry's worst case (every slot live) has no sixteen gauges
+    /// to spare. `/state` `exec.held` spells each slot's reason.
+    pub held_mask: GaugeId,
     /// `engine_exec_cancel_all_failures_total` (E6 c4) — cancel-all
     /// requests the arm would not accept.
     pub cancel_all_failures: core_metrics::CounterId,
@@ -6529,6 +6542,8 @@ fn register_exec_metrics(
     let refused_unpriced = one("engine_exec_refused_unpriced_total")?;
     let retired = one("engine_exec_retired_total")?;
     let halts = one("engine_exec_halts_total")?;
+    let holds = one("engine_exec_holds_total")?;
+    let refused_held = one("engine_exec_refused_held_total")?;
     let cancel_all_failures = one("engine_exec_cancel_all_failures_total")?;
     let cancel_all_stranded = one("engine_exec_cancel_all_stranded_total")?;
     let cancel_on_off = one("engine_exec_cancel_on_off_total")?;
@@ -6543,6 +6558,9 @@ fn register_exec_metrics(
     let seeded = reg
         .register_gauge("engine_exec_seeded")
         .map_err(|_| "register engine_exec_seeded")?;
+    let held_mask = reg
+        .register_gauge("engine_exec_held_mask")
+        .map_err(|_| "register engine_exec_held_mask")?;
     let budget_remaining = reg
         .register_gauge("engine_exec_hl_budget_remaining")
         .map_err(|_| "register engine_exec_hl_budget_remaining")?;
@@ -6620,6 +6638,9 @@ fn register_exec_metrics(
         refused_unpriced,
         retired,
         halts,
+        holds,
+        refused_held,
+        held_mask,
         cancel_all_failures,
         cancel_all_stranded,
         cancel_on_off,
@@ -6668,6 +6689,15 @@ fn mirror_exec_metrics(
         .inc(retired_cur.saturating_sub(retired_last));
     reg.counter(ids.halts)
         .inc(cur.halts.saturating_sub(last.halts));
+    reg.counter(ids.holds)
+        .inc(cur.holds.saturating_sub(last.holds));
+    reg.counter(ids.refused_held)
+        .inc(cur.refused_held.saturating_sub(last.refused_held));
+    let mut held_mask = 0i64;
+    for (s, h) in cur.held.iter().enumerate() {
+        held_mask |= i64::from(*h != 0) << s;
+    }
+    reg.gauge(ids.held_mask).set(held_mask);
     reg.counter(ids.cancel_all_failures)
         .inc(cur.cancel_all_failures.saturating_sub(last.cancel_all_failures));
     reg.counter(ids.cancel_all_stranded)
@@ -6724,6 +6754,23 @@ fn mirror_exec_metrics(
         let Some(slot) = slot else { continue };
         reg.gauge(slot.mode).set(i64::from(cur.modes[s]));
         reg.gauge(slot.halted).set(i64::from(cur.halted[s]));
+        // O-WSG1: the hold's edges, told once each (cold: the mirror's
+        // cadence). A hold that began and ended between two mirrors shows
+        // in `engine_exec_holds_total` alone.
+        if cur.held[s] != 0 && last.held[s] == 0 {
+            tracing::warn!(
+                slot = s,
+                reason = exec_router::halt::hold_word(cur.held[s]),
+                holds = cur.holds,
+                "exec: slot HELD — no new orders until the stream is back and re-read; resumes by itself (O-WSG1)"
+            );
+        } else if cur.held[s] == 0 && last.held[s] != 0 {
+            tracing::info!(
+                slot = s,
+                was = exec_router::halt::hold_word(last.held[s]),
+                "exec: slot RESUMED — the stream is back and the re-read agreed"
+            );
+        }
         reg.counter(slot.live_submits).inc(
             cur.live_submits_by_slot[s].saturating_sub(last.live_submits_by_slot[s]),
         );
@@ -9429,6 +9476,10 @@ fn fill_snapshot<S, D>(
     ex.file_present = ec.halt_file_present;
     ex.halts = ec.halts;
     ex.refused_halted = ec.refused_halted;
+    // O-WSG1: the hold beside the halt.
+    ex.held = ec.held;
+    ex.holds = ec.holds;
+    ex.refused_held = ec.refused_held;
     ex.refused_unseeded = ec.refused_unseeded;
     ex.cancel_all_failures = ec.cancel_all_failures;
     ex.cancel_all_stranded = ec.cancel_all_stranded;
@@ -13803,7 +13854,8 @@ mod tests {
         // slots 8–15 (`engine_strategy_regime_gate_8` … `_15`): measured
         // 595 / 468 of 640 / 512 with them (the lanes since BX11 the rest).
         // HK42 three gauges, the Binance options connections' own
-        // (`engine_ingress_binance_options_*`).
+        // (`engine_ingress_binance_options_*`). O-WSG1 two counters and ONE
+        // gauge (`engine_exec_held_mask`): a gauge a slot did not fit.
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
@@ -15195,6 +15247,10 @@ mod tests {
             "engine_exec_slot3_live_submits_total",
             "engine_exec_slot3_refused_total",
             "engine_exec_slot3_halted",
+            // O-WSG1 — the hold family.
+            "engine_exec_holds_total",
+            "engine_exec_refused_held_total",
+            "engine_exec_held_mask",
         ] {
             assert!(text.contains(name), "missing exec row {name}");
         }
@@ -15572,6 +15628,9 @@ mod tests {
             "engine_exec_refused_unpriced_total",
             "engine_exec_retired_total",
             "engine_exec_halts_total",
+            "engine_exec_holds_total",
+            "engine_exec_refused_held_total",
+            "engine_exec_held_mask",
             "engine_exec_cancel_all_failures_total",
             "engine_exec_cancel_all_stranded_total",
             "engine_exec_seeded",

@@ -59,6 +59,9 @@ pub enum RiskRefusal {
     /// runtime gap XH4h-2 recorded (ai-exec and vm pick their symbols
     /// at runtime).
     ForeignRow,
+    /// **O-WSG1** — the slot is HELD (its stream is down or its
+    /// reconciliation stale). Lifts by itself; see `crate::halt`.
+    Held,
 }
 
 /// Router counters. `Copy` POD; every field saturates rather than
@@ -174,6 +177,9 @@ pub struct RouteCounters {
     /// rows' owner. Last, on a fifth line of its own: the per-slot arrays
     /// keep their lines.
     pub refused_foreign_row: u64,
+    /// **O-WSG1** — refused because the slot is HELD ([`RiskRefusal::Held`]).
+    /// On the foreign-row line: cold, like it.
+    pub refused_held: u64,
 }
 
 // S16-3 re-pin (320 → 448 B, five lines → seven): the sixteen aggregates
@@ -185,6 +191,7 @@ const _: () = assert!(core::mem::size_of::<RouteCounters>() == 448);
 const _: () = assert!(core::mem::offset_of!(RouteCounters, live_submits_by_slot) == 128);
 const _: () = assert!(core::mem::offset_of!(RouteCounters, refused_by_slot) == 128 + 8 * EXEC_SLOTS);
 const _: () = assert!(core::mem::offset_of!(RouteCounters, refused_foreign_row) == 384);
+const _: () = assert!(core::mem::offset_of!(RouteCounters, refused_held) == 392);
 
 impl RouteCounters {
     /// A zeroed set.
@@ -211,6 +218,7 @@ impl RouteCounters {
             live_submits_by_slot: [0; EXEC_SLOTS],
             refused_by_slot: [0; EXEC_SLOTS],
             refused_foreign_row: 0,
+            refused_held: 0,
         }
     }
 
@@ -281,6 +289,7 @@ impl RouteCounters {
             RiskRefusal::CapPerp => &mut self.refused_cap_perp,
             RiskRefusal::MaxResting => &mut self.refused_max_resting,
             RiskRefusal::ForeignRow => &mut self.refused_foreign_row,
+            RiskRefusal::Held => &mut self.refused_held,
         };
         *field = field.saturating_add(1);
         Self::bump_slot(&mut self.refused_by_slot, strategy_id);

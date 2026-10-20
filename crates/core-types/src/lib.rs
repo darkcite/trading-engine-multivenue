@@ -2132,6 +2132,12 @@ pub const EXEC_BLOCKED_NOT_READY: u8 = 1 << 3;
 /// [`ExecHealth::blocked`]: the arm's request budget is at its floor or
 /// unread too long — growth refused.
 pub const EXEC_BLOCKED_BUDGET: u8 = 1 << 4;
+/// [`ExecHealth::blocked`]: the router HOLDS the slot (O-WSG1,
+/// 2026-10-20) — its user stream is down past the slot's threshold, or its
+/// reconciliation is stale. Lifts by itself once the stream is back and a
+/// fresh reconciliation agrees; unlike [`EXEC_BLOCKED_HALTED`] it needs no
+/// operator.
+pub const EXEC_BLOCKED_HELD: u8 = 1 << 5;
 
 /// [`ExecHealth::congestion`]: the arm's rates have room.
 pub const EXEC_CONGESTION_NONE: u8 = 0;

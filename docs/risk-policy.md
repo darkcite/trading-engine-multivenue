@@ -165,7 +165,86 @@ the full table is the `exec_router::halt` module docs. (Until 2026-10-13 this li
 "NOT YET ENFORCED" and "DARK until BX6"; HK10 brought it current.)
 
 Halt is **sticky**: it requires a manual engine restart. No "auto-resume"
-logic is permitted — a halted engine means a human investigates.
+logic is permitted — a halted engine means a human investigates. **The
+one exception is the two connectivity HOLDS of O-WSG1..4 (2026-10-20,
+below): they are not halts.**
+
+### O-WSG1..4 — a dark venue HOLDS the slot, it does not halt it (operator rulings 2026-10-20)
+
+**The ask (Anton, 2026-10-20):** do not halt the slot when Hyperliquid's
+WebSocket goes silent for several minutes; keep reconnecting and resume
+trading as soon as possible.
+
+**Why.** Main's slot 3 latched `ws-gap` at 10-17 21:22:27Z and at 10-18
+05:15:24Z. Both came during Hyperliquid WebSocket outages of several
+minutes:
+
+- The market-data socket on the same host went silent first, and its
+  reconnects then timed out with 0 of 108 subscription acks.
+- On 10-18 Binance data flowed normally throughout, so the Mac's network
+  was up.
+
+Each latch stopped the slot until a human archived `exec.HALT`. The 10-18
+latch held it from 05:15Z until the O-WSG deploy. The every-boot
+"STARTED HALTED … reason=ws-gap" lines between were the file being read
+back at each restart, not new gaps.
+
+**The rulings:**
+
+| ruling | question | answer |
+|---|---|---|
+| O-WSG1 | When does a held slot trade again? | All four must hold. (a) The user stream is back: its gap under `halt_on_ws_gap_ms` again, which a gap does only once the stream returns. (b) A reconciliation built ONLY from reads issued since the stream came back has agreed with the venue: orders, sheet and spot half, reported by the arm as `resync_pending == 0`. (c) No hold condition stands. (d) The hold edge's cancel is confirmed. |
+| O-WSG2 | When does a hold start? | At `halt_on_ws_gap_ms` = **5 000** on slot 3, main and standalone (30 000 before). That stops trading blind early in a real outage, when market data is stale anyway, and stays well above the gateway's sub-second redials. |
+| O-WSG3 | Is a stale reconciliation a hold too? | Yes. `halt_on_recon_stale_ms` now holds and resumes the same way, because a long outage fails the REST reads too: the 10-17 23:24–23:30Z outage ran about 6 minutes against a 300 s stale bound. |
+| O-WSG4 | Rollout | Main, and the standalone (`bin15-h90-standalone`), committed and deployed. Main's 10-18 `ws-gap` latch is archived at the deploy. |
+
+**A hold, against a halt** (`exec_router::halt`):
+
+| | halt | hold (O-WSG1) |
+|---|---|---|
+| new places and modifies | refused (`refused_halted`) | refused (`refused_held`) |
+| cancels | always pass | always pass |
+| the slot's resting orders | asked back on the edge | asked back on the edge (blind, the arm cannot see them fill) |
+| `exec.HALT` | written; read back at boot | never written |
+| ends | an operator archives the file and restarts | by itself, under O-WSG1 |
+| triggers | every other `HaltReason` | a stream gap ≥ `halt_on_ws_gap_ms`; a reconciliation not agreed for `halt_on_recon_stale_ms` |
+
+**What still halts, sticky and for a human:**
+
+- a reconciliation DRIFT, including one the post-gap re-read finds;
+- the reject and asset-refusal streaks;
+- the budget floor;
+- the gateway's own halt word;
+- a venue lock and margin risk;
+- the ALO rate;
+- the E7 session bounds;
+- the operator.
+
+**Resume latency.** The gateway redials with a 0.5 → 8 s backoff (10 s
+dial budget, re-resolving the host every third failure). Once the stream
+is back after a gap of 2 s or more, the arm reads its sheet and its open
+orders at once instead of at the 10 s cadence (`RESYNC_NOW_NS`), so the
+slot resumes about one read round-trip after the venue answers again.
+
+**Surfaces:**
+
+- `/metrics`: `engine_exec_holds_total`, `engine_exec_refused_held_total`
+  and `engine_exec_held_mask` (bit `1 << slot` per held slot: slot 3 alone
+  reads 8; one gauge, because the fixed registry's every-slot-live worst
+  case has no sixteen to spare).
+- `/state` `exec`: `held` (words), `holds` and `refused_held`.
+- `ExecHealth`: `EXEC_BLOCKED_HELD`.
+- Log: "exec: slot HELD …" and "exec: slot RESUMED …".
+
+**Limits:**
+
+- The router law is venue-agnostic. `resync_pending` comes only from the
+  Hyperliquid GATEWAY arm (`transport = "gateway"`, slot 3's).
+- The other arms report 0. Their holds lift once the stream is up and a
+  reconciliation is fresh.
+- The keys keep their `halt_on_*` names so every artifact still parses.
+- A `ws-gap` or `recon-stale` line already in `exec.HALT` (an older
+  binary's, or an operator's) is still read as a halt.
 
 ### Member-scoped halt: VRP kill criterion 3 (2026-09-10)
 
@@ -4670,7 +4749,7 @@ once the answer is no, the size of the next order is beside the point.
 | `AssetRefusals` | consecutive asset-id refusals ≥ N | `halt_on_asset_refusal_streak` |
 | `BudgetFloor` | the arm reports its allowance spent | *(none — see below)* |
 | `ReconDrift` | reconciler disagreement ≥ $X | `halt_on_recon_drift_usd_1e6` |
-| `WsGap` | user stream silent ≥ N ms | `halt_on_ws_gap_ms` |
+| `WsGap` | user stream silent ≥ N ms | `halt_on_ws_gap_ms` — **a HOLD since O-WSG1 (2026-10-20), not a halt** |
 
 `trigger_for` evaluates them in that order and returns the FIRST one
 that fires.
@@ -7529,8 +7608,8 @@ are `docs/binance-runbook.md`.
 * **Tested.** `mode.rs` `the_maker_list_is_um_classic_only`; `arm.rs`
   `a_maker_needs_a_working_dead_man`; `bn_live.rs`
   `coinm_binds_ioc_only_and_inverse_at_its_face`; e2e
-  `a_dead_gateway_halts_ws_gap_and_the_venues_countdown_cancels_the_makers`
-  (BX11: the loopback venue's countdown fires),
+  `a_dead_gateway_holds_on_the_gap_and_the_venues_countdown_cancels_the_makers`
+  (BX11: the loopback venue's countdown fires; a hold since O-WSG1),
   `a_renewal_queued_before_the_session_died_is_not_sent`; on Demo the
   battery's `--bn-drill gap` (BX11). BX8: `mode.rs`
   `the_classic_futures_are_built` (no spot maker); `arm.rs`
@@ -8888,11 +8967,11 @@ blind.
 
 | drill | where | proof |
 |---|---|---|
-| The gateway dies under resting makers | loopback | `a_dead_gateway_halts_ws_gap_and_the_venues_countdown_cancels_the_makers`: `WsGap` at the slot's `ws_gap_ms`; the loopback venue's countdown fires and cancels the makers |
+| The gateway dies under resting makers | loopback | `a_dead_gateway_holds_on_the_gap_and_the_venues_countdown_cancels_the_makers` (renamed at O-WSG1): the gap HOLD at the slot's `ws_gap_ms`; the loopback venue's countdown fires and cancels the makers |
 | The same | **Demo** | the battery's `--bn-drill gap`: two makers rest under the dead-man; the gateway thread stops without its sweep; the venue lists neither within the countdown + 10 s, each one's status reads CANCELED (the read retried to the deadline), and no sooner than the countdown less two heartbeats (65 if not — a maker filled, cancelled too soon or not at all; a failure before the kill is 52; after a signal nothing more is read, the makers cancelled by id) |
 | The operator's flatten on a real position | **Demo** | the battery's `--bn-drill flatten` (`--binance um` or `cm`): one IoC opens a position, reconciled; the gateway stops; `bn_ops::flatten` closes it with its own reduce-only IoC and reads flat (if not: its code, 60–63; before the stop, 57, 56 or 52) |
 | Once a drill stopped the gateway | **Demo** | unless a signal came, the end runs the operator's flatten on each lane's symbol (the arm's orders cancelled by id first), then reads the account flat (58 if not) |
-| Reconciliation withheld | loopback | `a_withheld_reconciliation_halts_a_classic_arm_stale`: `ReconStale` |
+| Reconciliation withheld | loopback | `a_withheld_reconciliation_holds_a_classic_arm_stale` (renamed at O-WSG1): the stale HOLD |
 | A 429 | loopback only | `BudgetFloor`, the reason asserted (the departure: a breach on Demo risks an IP ban the running engine's market data shares) |
 | A margin ratio, a scan failure | loopback | `the_margin_and_scan_failure_halts_end_to_end`: `MarginRisk`, `ReconDrift`, the reasons asserted |
 
@@ -15095,7 +15174,7 @@ WebSocket gateway arm, off the engine thread), at a safe minute.
 | exec | `halt_on_recon_drift_usd_1e6` | $1 | on a $5 account, $1 is a large drift |
 | exec | `request_topup_weight` | 1 000 requests ($0.50) | XMM XH5c-2: one purchase must cost at most a quarter of the $4 loss bound (5 000 = $2.50 was refused at boot, 2026-10-16 20:37Z) |
 | exec | `halt_on_reject_streak` / `halt_on_asset_refusal_streak` | 5 / 3 | unchanged |
-| exec | `halt_on_ws_gap_ms` / `halt_on_recon_stale_ms` | 30 s / 300 s | unchanged |
+| exec | `halt_on_ws_gap_ms` / `halt_on_recon_stale_ms` | 5 s / 300 s | both HOLDS since O-WSG1; the gap 5 s since O-WSG2 (2026-10-20; 30 s before) |
 | exec | `halt_on_alo_reject_pct` | 20 | the gateway's window halt (XH-7) |
 
 - **Every other line of the live cut is the paper artifact's**, byte for

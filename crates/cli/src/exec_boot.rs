@@ -2480,6 +2480,20 @@ mod tests {
         assert_eq!(engine_snapshot::halt_reason_word(200), "unknown");
     }
 
+    /// **O-WSG1:** `/state` spells the hold bits from its own copy too.
+    #[test]
+    fn the_hold_words_match_the_router() {
+        let mut bits = 0u8;
+        while (bits as usize) < engine_snapshot::HOLD_WORDS.len() {
+            assert_eq!(
+                engine_snapshot::hold_word(bits),
+                exec_router::halt::hold_word(bits),
+                "`/state` and the router disagree about hold bits {bits}"
+            );
+            bits += 1;
+        }
+    }
+
     /// **BX3 (F9):** `/state` spells the retirement `why` from its own
     /// copy of the codes, for the same reason. Pinned here: the words
     /// cover exactly the defined codes, in code order, and the unknown

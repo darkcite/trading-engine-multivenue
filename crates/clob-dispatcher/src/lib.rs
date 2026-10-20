@@ -1261,7 +1261,9 @@ const _: () = assert!(core::mem::size_of::<LiveArmCounters>() == 272);
 // `live_submits` moves 16 → 24 (+8); the three halt bytes + `halted`
 // grow 11 → 19 B, padded 16 → 24 (+8); the two per-slot `u64` arrays
 // +64 B each. Copied once per 1 Hz mirror, never on the submit path.
-const _: () = assert!(core::mem::size_of::<ExecCounters>() == 1080);
+// O-WSG1 (1 080 → 1 112 B): the hold — `refused_held`, `holds` and the
+// sixteen `held` bytes at the tail.
+const _: () = assert!(core::mem::size_of::<ExecCounters>() == 1112);
 const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 24);
 
 /// **XMM XH4f (D11) — the Hyperliquid gateway arm's numbers** (slot 6's
@@ -1272,7 +1274,7 @@ const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 24);
 /// the ones it publishes at its heartbeat), the budget, the rates and the
 /// latencies, and the router's words for the arm's slot. Counters are
 /// totals since boot; the fields after [`Self::refused_foreign_row`] are
-/// levels. [`ExecCounters`] keeps its pinned size (1 080 B since S16-3).
+/// levels. [`ExecCounters`] keeps its pinned size (1 112 B since O-WSG1).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct GatewayArmReport {
@@ -2097,6 +2099,13 @@ pub struct HaltSignal {
     /// the last reconciliation. Meaningful only while
     /// [`Self::pnl_judged`] is set; `0` otherwise.
     pub pnl_delta_usd_1e6: i64,
+    /// **O-WSG1 (2026-10-20)** `1` from the instant the user-event stream
+    /// came back after a gap until a reconciliation built only from reads
+    /// issued since then has AGREED with the venue. Not a trigger: the
+    /// router releases a slot held on a stream gap or a stale
+    /// reconciliation only once this reads `0` — what happened while the
+    /// arm was blind has been re-read, not assumed.
+    pub resync_pending: u8,
 }
 
 impl HaltSignal {
@@ -2127,6 +2136,7 @@ impl HaltSignal {
             alo_reject_permille: 0,
             recon_age_ns,
             pnl_delta_usd_1e6: 0,
+            resync_pending: 0,
         }
     }
 
@@ -2156,6 +2166,15 @@ impl HaltSignal {
         self
     }
 
+    /// O-WSG1: attach whether the arm still owes a reconciliation since
+    /// its stream last came back.
+    #[inline]
+    #[must_use]
+    pub const fn with_resync_pending(mut self, pending: bool) -> Self {
+        self.resync_pending = pending as u8;
+        self
+    }
+
     /// BX3: attach the venue's verdicts — a restriction it imposed, and
     /// the arm's margin judgement.
     #[inline]
@@ -2169,7 +2188,8 @@ impl HaltSignal {
     /// **BX3 (O-BX17) — one slot's signal from two arms that both
     /// trade it.** The worse of each observation: the MAX of the
     /// streaks, the drift, the stream gap, the reconciliation age and the
-    /// ALO rate; the OR of the flags that trip a halt; the AND of the two
+    /// ALO rate; the OR of the flags that trip a halt and of
+    /// `resync_pending`; the AND of the two
     /// that permit trading (`reconciled`, `pnl_judged`) — a slot is
     /// seeded, and its session bound judged, only when both arms can say
     /// so; the SUM of the session P&L. Symmetric: `a.merged(b) ==
@@ -2220,11 +2240,15 @@ impl HaltSignal {
             alo_reject_permille: max_u16(self.alo_reject_permille, o.alo_reject_permille),
             recon_age_ns: max_u64(self.recon_age_ns, o.recon_age_ns),
             pnl_delta_usd_1e6: self.pnl_delta_usd_1e6.saturating_add(o.pnl_delta_usd_1e6),
+            resync_pending: ((self.resync_pending | o.resync_pending) != 0) as u8,
         }
     }
 }
 
-const _: () = assert!(core::mem::size_of::<HaltSignal>() == 48);
+// O-WSG1: `resync_pending` takes the tail (48 → 56 B; the signal is read
+// by value once a poll per live slot, cold).
+const _: () = assert!(core::mem::size_of::<HaltSignal>() == 56);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, resync_pending) == 48);
 const _: () = assert!(core::mem::offset_of!(HaltSignal, venue_lock) == 27);
 const _: () = assert!(core::mem::offset_of!(HaltSignal, margin_risk) == 28);
 const _: () = assert!(core::mem::offset_of!(HaltSignal, gateway_halted) == 29);
@@ -2353,6 +2377,14 @@ pub struct ExecCounters {
     /// **BX6** — the Binance arm's own numbers (`/state`
     /// `exec.arms.binance`), valid when [`Self::arm_bn_present`].
     pub arm_bn: LiveArmCounters,
+    /// **O-WSG1 (2026-10-20) — refused because the slot is HELD** (its
+    /// user stream is down or its reconciliation stale): the hold, not a
+    /// halt, so it lifts by itself. Distinct from `refused_halted`.
+    pub refused_held: u64,
+    /// Hold edges — slots that went from trading to held.
+    pub holds: u64,
+    /// Per-slot hold bits (`exec_router::halt::HOLD_*`); `0` = not held.
+    pub held: [u8; EXEC_COUNTER_SLOTS],
 }
 
 /// X1 counters — what the matcher did, mirrored to `/metrics` as
