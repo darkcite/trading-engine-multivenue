@@ -15070,7 +15070,7 @@ independent rebuild exact). **Plan:** vault doc 33. **Nothing here arms a slot.*
     `p_yes = Φ(z)` from `late_phi_lut`, an artifact table that reaches 1.0, so
     near-certain instances are priced as such.
   - **The entry.** The favourite side, when `p ≥ late_p_min_1e6` (0.90) and its
-    ask ≤ p − `late_e_1e6` (2 c) on `late_persist_polls` (2) consecutive
+    ask ≤ p − `late_e_1e6` (2 c) on `late_persist_polls` (2; 1 since O-H90-11) consecutive
     snapshots of that leg. One IoC at that ask, sized at the whole resting ask
     up to `late_usd_1e6` ($100) and the caps. One entry per instance; a gateway
     refusal re-arms it.
@@ -15179,7 +15179,7 @@ WebSocket gateway arm, off the engine thread), at a safe minute.
 
 - **Every other line of the live cut is the paper artifact's**, byte for
   byte (the late law at its ruled values: [2, 30) s, p ≥ 0.90, 2 c,
-  persistence 2, k 1.55). The paper copy stays as `bin15.paper-s7.toml`,
+  persistence 1 since O-H90-11 (2026-10-20; 2 before), k 1.55). The paper copy stays as `bin15.paper-s7.toml`,
   which the nightly accrual replays at paper's $100 / $1 000 / $30 000.
 - **The agent's approval expires 2026-10-19 ~13:54Z.** After it, every live
   order is refused, and the reject streak halts slot 3. Renewing it is the
@@ -15187,6 +15187,51 @@ WebSocket gateway arm, off the engine thread), at a safe minute.
 - **Disarm:** `scripts/bin15-flip.sh paper` (halts slot 3 through
   `exec.HALT`, checks the venue shows nothing of ours resting, restarts at a
   safe minute), or `echo 3 >> ~/multivenue/exec.HALT` for an immediate halt.
+
+### BIN15 H90 O-H90-11 — the late law at persistence 1, live (operator ruling 2026-10-20)
+
+**Ruling (Anton, 2026-10-20 17:30Z):** the late law fires on the first
+qualifying snapshot of the favoured leg: `late_persist_polls = 1` (was 2).
+It applies to main's slot 3 (LIVE at the $2 / $5 dust frame, this file) and to
+the standalone (branch `bin15-h90-standalone`, slot 3 LIVE at $250 / −$500,
+its own entry there). Every other line of the law and of both frames is
+unchanged.
+
+- **What changes:** one line of the paper artifact, so of the live cut too.
+  `bin15-flip.sh paper`, the edit, then `bin15-flip.sh live --gateway` (the
+  flip keeps parity by construction: the live cut is the paper artifact
+  plus its header). The boot tell's late law reads `persist1`. No code
+  changes; `core-config` already bounds the key to `[1, 8]`.
+- **Evidence:** vault `~/multivenue/research/outcome/h90/p1/` and project doc
+  `claude/bin15-p1-results-2026-10-20.md`. An engine-faithful replay of the
+  captured HIP-4 tape (09-13 → 10-20): every touch tick of either leg, the
+  S5 poll, the IoC judged against the favoured leg's raw tick one post
+  round trip (130 ms) after the decision.
+  - Persistence 1: 221 trades, 2 losses, +$1 886. Persistence 2: 144, 1,
+    +$904. Worst day +$1.36 vs +$4.64; maximum drawdown $18.64 vs $11.29.
+  - Day bootstrap: P(P1 ≤ P2) 0.000 over all days, 0.037 since 10-11; the
+    same within $10 at 280 ms, and with the price read at the tick.
+  - About 35 % of persistence 1's IoCs find the quote gone (vs 5 % at
+    persistence 2). A miss is not a refusal: it does not count toward
+    `halt_on_reject_streak` (`exec-hyperliquid` E7-F2).
+- **The forward test** (PR-BIN15-P1, frozen before the first persistence-1
+  boot; vault `p1/PREREG-PR-BIN15-P1-2026-10-20.md`, project
+  `claude/bin15-p1-spec-2026-10-20.md`): 14 UTC days or 60 standalone
+  fills, whichever is later, against the frozen replay's persistence 2 on
+  the same days' tape.
+  - **Kill, any one, reverts the standalone to persistence 2 at the next
+    safe minute:** the window's realised late-entry net reaches −$250; two
+    losses within the first 30 fills on fills persistence 2 would not have
+    taken; the live miss rate above 60 % after 30 attempts; the hit rate
+    below 93 % after 40 fills.
+  - Every halt and bound above binds unchanged (the −$500 session bound
+    first).
+- **Main's slot 3 in the test:** read for its fill and miss rates only; its
+  P&L at $2 is not a criterion. The kill criteria are the standalone's; the
+  operator rules on main when one fires.
+- **Revert:** `bin15-flip.sh paper`, `late_persist_polls = 2` in the paper
+  artifact, `bin15-flip.sh live --gateway`, each at a safe minute; the
+  pre-change artifacts are kept as `bin15.toml.bak-*-o-h90-11`.
 
 ## HK — the housekeeping lane (2026-10-13)
 
