@@ -117,6 +117,34 @@ affected paragraph at each lane close; the superseded text goes to
 - The binary, boot time, mask and `exec.configured` lines below predate both:
   read `/state` `boot.git_sha` and its `exec` block.
 
+## Corrections found 2026-10-20 (they supersede the dated text above — verify on `/state`)
+
+- **2026-10-20 05:50Z: the engine boots `9a57e345` (EXEC O-WSG1..4, operator
+  rulings 2026-10-20; risk-policy "O-WSG1..4").**
+  - **The hold.** A user-stream gap and a stale reconciliation HOLD a live
+    slot instead of halting it. The slot places nothing and its resting
+    orders are asked back, but no `exec.HALT` is written.
+  - **The resume.** The slot resumes by itself once the gap is back under
+    the threshold, a reconciliation from reads issued since then has agreed
+    (the gateway arm's `resync_pending`), and the hold's cancel is
+    confirmed.
+  - **Slot 3's gap threshold** is `halt_on_ws_gap_ms = 5000` in
+    `~/multivenue/exec.toml` (30000 before; backup `exec.toml.bak-20261020T054906Z-wsg`).
+  - **Boot tell:** `slot 3 HALTS … ws_gap_ms=5000`.
+- **Slot 3's 10-18 05:15Z `ws-gap` latch is archived.** The file is now
+  `~/multivenue/logs/exec.HALT.20261020T054906Z-wsg-archived`, and slot 3
+  booted unhalted and LIVE at the $2 / $5 frame (`/state`: `halted` none,
+  `held` none, seeded 1).
+- **The restart:** the `0010` stamp forced at 05:49:06Z (a safe minute),
+  then daily-restart's exec gate (PASS), the drain and the relaunch.
+- **Watch:**
+  - `/metrics`: `engine_exec_held_mask` (8 = slot 3 held),
+    `engine_exec_holds_total` and `engine_exec_refused_held_total`;
+  - `/state` `exec.held`;
+  - the log: "exec: slot HELD …" and "exec: slot RESUMED …".
+- **Rollback kit:** `~/multivenue/rollback-wsg-20261020/`, holding the
+  dda68846 binary, `exec.toml.pre-wsg` and `exec.HALT.pre-wsg`.
+
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
