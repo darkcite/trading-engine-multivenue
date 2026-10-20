@@ -145,6 +145,21 @@ affected paragraph at each lane close; the superseded text goes to
 - **Rollback kit:** `~/multivenue/rollback-wsg-20261020/`, holding the
   dda68846 binary, `exec.toml.pre-wsg` and `exec.HALT.pre-wsg`.
 
+- **2026-10-20 06:39Z: the engine boots `c8d7145b` (the HL gateway's client
+  heartbeat).**
+  - **The fault.** Hyperliquid closes a `/ws` socket 60 s after its last
+    client ping or subscribe (`Close 1000 "Inactive"`), and posts do not
+    count. The gateway pinged only on inbound silence, which its reads
+    never allowed, so it was cut and redialled every 60 s (278 dials in
+    4 h 42 m), and any post in flight at a cut was left in doubt.
+  - **The fix.** `GwConn::maintain` now sends a ping 30 s after the last
+    one it sent, however busy the socket.
+  - **Verified:** 1 dial, 0 drops and 0 failed reads in the first 3.6
+    minutes after the boot (one drop a minute before).
+  - **The restart:** the `0010` stamp forced at 06:37:18Z, then the exec
+    gate (PASS) and the drain at 06:38Z.
+  - **Rollback:** `~/multivenue/rollback-wsg-20261020/multivenue-engine.9a57e345`.
+
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
