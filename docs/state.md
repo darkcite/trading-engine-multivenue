@@ -160,6 +160,29 @@ affected paragraph at each lane close; the superseded text goes to
     gate (PASS) and the drain at 06:38Z.
   - **Rollback:** `~/multivenue/rollback-wsg-20261020/multivenue-engine.9a57e345`.
 
+- **2026-10-20 17:50Z: slot 3's late law at persistence 1 (operator ruling
+  O-H90-11; risk-policy "BIN15 H90 O-H90-11", `a39e0228`).**
+  - **The change.** `late_persist_polls = 1` (was 2) in the paper artifact
+    and so in the live cut: the law fires on the first qualifying snapshot
+    of the favoured leg. Every other line is unchanged; slot 3 stays LIVE
+    at the $2 / $5 dust frame on its gateway.
+  - **The flips.** `bin15-flip.sh paper` (SIGTERM 17:39:49Z, venue clear,
+    the 10-20 05:50Z session anchor archived), the edit, then
+    `bin15-flip.sh live --gateway` (exec-smoke PASS 17:42Z, SIGTERM
+    17:49:02Z). Boot 17:50:26Z on `c8d7145b`: the tell reads
+    `late=2-30s:p>=0.90:ask<=p-2c:persist1:$2:k1.550` and "LIVE ARM
+    ARMED"; `bin15-flip.sh status`: slot 3 LIVE, halted none. Every other
+    slot restarted twice with the engine (about 2 minutes each).
+  - **Artifacts:** live cut `3630f7c4…`, paper copy `67ed54a3…`; the
+    pre-change pair `~/multivenue/bin15{,.paper-s7}.toml.bak-20261020T173937Z-o-h90-11`.
+  - **The test.** PR-BIN15-P1 runs on the standalone (`bin15-h90-standalone`,
+    slot 3 LIVE at $250, on persistence 1 since its 17:36:52Z boot); main's
+    slot 3 is read for its fill and miss rates only. Project docs
+    `claude/bin15-p1-spec-2026-10-20.md` (the pre-registration) and
+    `claude/bin15-p1-results-2026-10-20.md` (the evidence).
+  - **Revert:** `bin15-flip.sh paper`, `late_persist_polls = 2`, then
+    `bin15-flip.sh live --gateway`, each at a safe minute.
+
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
