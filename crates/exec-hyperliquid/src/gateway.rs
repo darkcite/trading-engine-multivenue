@@ -367,8 +367,13 @@ const STREAM_RESERVE: usize = 512;
 /// is counted and the arm halts (XG-2).
 const ROOM_WAIT_NS: u64 = 50_000_000;
 
-/// Ping after 30 s of silence; dead after 60 s (the venue cuts idle
-/// sockets at 60 s).
+/// A client heartbeat: a ping 30 s after the last one we sent (the dial
+/// before the first), however busy the socket is; dead after 60 s with no
+/// inbound byte. The venue closes a socket 60 s after its last client ping
+/// or subscribe (`Close 1000 "Inactive"`) and a post does not count, so
+/// the quiet-time ping this was until 2026-10-20 never came due on a socket
+/// posting reads every few seconds — it was cut every 60 s
+/// (`GwConn::maintain`).
 const KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
     ping_interval_ns: 30_000_000_000,
     idle_timeout_ns: 60_000_000_000,
