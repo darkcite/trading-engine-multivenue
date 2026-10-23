@@ -47,7 +47,7 @@ fn err(msg: impl Into<String>) -> Pm15Error {
 }
 
 /// Every key the grammar accepts; an unknown key is a refusal.
-const PM15_KEYS: [&str; 16] = [
+const PM15_KEYS: [&str; 19] = [
     "families",
     "perp",
     "tau_min_ns",
@@ -64,6 +64,10 @@ const PM15_KEYS: [&str; 16] = [
     "live_assets",
     "phi_lut",
     "price_floor_1e6",
+    // PMJ J12: crate::strike_law's three keys.
+    "strike_law",
+    "sigma_res_ratio_1e3",
+    "sigma_res_min_ppm",
 ];
 
 /// `pm15.toml` as parsed. Descriptors stay strings: `pm15_boot` resolves
@@ -107,6 +111,9 @@ pub struct Pm15File {
     pub live_assets: Vec<String>,
     /// `Φ(z) ×1e6` for `z = 0, 0.002, …, 8.192`.
     pub phi_lut: Vec<u32>,
+    /// PMJ J12: the strike law and law (iii)'s residual
+    /// ([`crate::strike_law`]; absent = the first law).
+    pub strike_law: crate::strike_law::StrikeLaw,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES.
@@ -254,6 +261,7 @@ pub fn parse(src: &str) -> Result<Pm15File, Pm15Error> {
         false,
     )
     .map_err(m)?;
+    let strike_law = crate::strike_law::parse(&kv, families.len()).map_err(err)?;
     Ok(Pm15File {
         families,
         perp,
@@ -271,6 +279,7 @@ pub fn parse(src: &str) -> Result<Pm15File, Pm15Error> {
         price_floor_1e6,
         live_assets,
         phi_lut,
+        strike_law,
     })
 }
 
@@ -370,5 +379,37 @@ mod tests {
         assert_eq!(parse(&src("price_floor_1e6 = 0\n")).unwrap().price_floor_1e6, 0, "0 = no floor");
         assert!(parse(&src("price_floor_1e6 = 1000000\n")).is_err());
         assert!(parse(&base.replacen("phi_lut = [500000", "phi_lut = [500001", 1)).is_err());
+    }
+
+    #[test]
+    fn law_iii_parses_and_its_keys_need_it() {
+        use crate::strike_law::{STRIKE_LAW_MEAN60, STRIKE_LAW_TRAP62};
+        let f = parse(&src("")).expect("valid");
+        assert_eq!(f.strike_law.law, STRIKE_LAW_MEAN60, "absent = the first law");
+        let f = parse(&src("strike_law = \"mean60\"\n")).expect("valid");
+        assert_eq!(f.strike_law, crate::strike_law::StrikeLaw::default());
+        let f = parse(&src(
+            "strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 130\nsigma_res_min_ppm = [3, 5]\n",
+        ))
+        .expect("valid");
+        assert_eq!(
+            (f.strike_law.law, f.strike_law.sigma_res_ratio_1e3, f.strike_law.sigma_res_min_ppm.clone()),
+            (STRIKE_LAW_TRAP62, 130, vec![3, 5])
+        );
+        for (bad, why) in [
+            ("strike_law = \"trap60\"\n", "an unknown law"),
+            ("strike_law = 1\n", "not a string"),
+            ("strike_law = \"trap62\"\n", "no residual"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 130\n", "no floors"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 0\nsigma_res_min_ppm = [3, 5]\n", "ratio 0"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 1001\nsigma_res_min_ppm = [3, 5]\n", "ratio > 1000"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 130\nsigma_res_min_ppm = [3]\n", "one floor for two families"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 130\nsigma_res_min_ppm = [3, 0]\n", "a floor of 0"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 130\nsigma_res_min_ppm = [3, 101]\n", "a floor over 100"),
+            ("sigma_res_ratio_1e3 = 130\n", "law (iii)'s key under the first law"),
+            ("strike_law = \"mean60\"\nsigma_res_min_ppm = [3, 5]\n", "law (iii)'s key under the first law"),
+        ] {
+            assert!(parse(&src(bad)).is_err(), "{why}: {bad}");
+        }
     }
 }

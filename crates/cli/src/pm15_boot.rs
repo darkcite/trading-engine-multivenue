@@ -118,6 +118,14 @@ fn resolve_file(
     params.usd_market_1e6 = file.usd_market_1e6;
     params.session_loss_1e6 = file.session_loss_usd_1e6;
     params.order_ttl_ns = file.order_ttl_ns;
+    // PMJ J12: the strike law and law (iii)'s residual.
+    params.strike_law = file.strike_law.law;
+    params.res_ratio_1e3 = file.strike_law.sigma_res_ratio_1e3;
+    let mut f = 0usize;
+    while f < file.strike_law.sigma_res_min_ppm.len() {
+        params.res_min_ppm[f] = file.strike_law.sigma_res_min_ppm[f];
+        f += 1;
+    }
     params.price_floor_1e6 = file.price_floor_1e6;
     let mut lut = Box::new(core_twaplock::late::LateLut::flat());
     let mut i = 0usize;
@@ -135,6 +143,24 @@ fn resolve_file(
     })
 }
 
+/// PMJ J12: the law's tail of the boot tell — empty under the first law (so
+/// its tell is unchanged), `:strike=trap62:res=130/3,5,…` under law (iii).
+fn strike_tell(law: u8, ratio_1e3: i64, floors: &[i64]) -> String {
+    if law == core_twaplock::report::STRIKE_LAW_MEAN60 {
+        return String::new();
+    }
+    let mut s = format!(":strike=trap62:res={ratio_1e3}/");
+    let mut i = 0usize;
+    while i < floors.len() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&floors[i].to_string());
+        i += 1;
+    }
+    s
+}
+
 /// The boot tell: `pm15: artifact configured hash=… families=btc+eth+…
 /// law=2-20s:p>=0.900:ask<=p-0.020:floor0.900:persist2:k1.550 frame=$250/order:$250/market:-$500/session live=btc+eth`.
 #[must_use]
@@ -145,7 +171,7 @@ pub fn render_boot_tell(boot: &Pm15Boot) -> String {
     }
     let p = &boot.params;
     format!(
-        "pm15: artifact configured hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:floor{:.3}:persist{}:k{:.3} \
+        "pm15: artifact configured hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:floor{:.3}:persist{}:k{:.3}{} \
          frame=${}/order:${}/market:-${}/session live={}",
         boot.families.join("+"),
         p.tau_min_ns / 1_000_000_000,
@@ -155,6 +181,7 @@ pub fn render_boot_tell(boot: &Pm15Boot) -> String {
         p.price_floor_1e6 as f64 / 1e6,
         p.persist,
         p.sigma_k_1e3 as f64 / 1e3,
+        strike_tell(p.strike_law, p.res_ratio_1e3, &p.res_min_ppm[..p.n_families]),
         p.usd_order_1e6 / 1_000_000,
         p.usd_market_1e6 / 1_000_000,
         p.session_loss_1e6 / 1_000_000,
@@ -224,6 +251,7 @@ mod tests {
 
     fn file() -> core_config::pm15::Pm15File {
         core_config::pm15::Pm15File {
+            strike_law: core_config::strike_law::StrikeLaw::default(),
             families: vec!["btc".into(), "eth".into()],
             perp: vec!["hyperliquid:BTC".into(), "hyperliquid:ETH".into()],
             tau_min_ns: 2_000_000_000,

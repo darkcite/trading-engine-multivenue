@@ -35,6 +35,16 @@
 //!    at or under `−session_loss`, entries stop (the paper frame equals
 //!    the live one, ruling R-PM-8).
 //!
+//! ## The strike law (PMJ J12, R-PMJ-S61)
+//!
+//! `strike_law` picks one of two laws at boot. [`STRIKE_LAW_MEAN60`] is the
+//! first: the strike is the mean of the reports of `[open − 60, open − 1]`
+//! and the price `report_fair`. [`STRIKE_LAW_TRAP62`] is law (iii), the
+//! venue's measured law: the trapezoid of `[open − 62, open − 2]` (known one
+//! report earlier), priced by `report_fair_trap` with a residual of
+//! `max(res_ratio · σ, res_min_ppm)`. Law (iii) reads the reports ×1e9 (v1)
+//! and the perp's BBO ×1e9, so a market's `strike_1e6` holds ×1e9 under it.
+//!
 //! ## What it does NOT do
 //!
 //! It never sells, never rests a quote, never trades a window it did not
@@ -53,7 +63,10 @@
 use core_fill::ORDER_KIND_IOC;
 use core_time::{NsTs, WallAnchor};
 use core_twaplock::late::{LateHold, LateLut, SEC_NS};
-use core_twaplock::report::{report_fair, ReportGrid};
+use core_twaplock::report::{
+    report_fair, report_fair_trap, ReportGrid, TrapResidual, FINE_PER_1E6, FINE_PER_V1,
+    PM_TRAP_LAST_OFFSET_S, STRIKE_LAW_MEAN60, STRIKE_LAW_TRAP62,
+};
 use core_types::pm_roll::{
     pm_instance_parts, pm_rolling_of, pm_window_open_s, PM_OFF_MARK, PM_PAIRS, PM_ROLLING_MAX,
     PM_SETTLED_DOWN, PM_SETTLED_UP,
@@ -105,8 +118,12 @@ pub struct Pm15Params {
     pub persist: u8,
     /// IoCs at most per market.
     pub max_orders_market: u8,
+    /// The strike law (PMJ J12): [`STRIKE_LAW_MEAN60`], the first, or
+    /// [`STRIKE_LAW_TRAP62`], law (iii) — which reads the reports ×1e9 and
+    /// keeps the market's strike in that scale.
+    pub strike_law: u8,
     /// Explicit padding — always zero.
-    pub _pad: [u8; 6],
+    pub _pad: [u8; 5],
     /// The pricer's σ scale ×1e3.
     pub sigma_k_1e3: i64,
     /// Most one order spends ×1e6 USD.
@@ -121,6 +138,11 @@ pub struct Pm15Params {
     /// PMJ J8 (R-PMJ-S24): the least ask an entry takes ×1e6 (0.90; 0 = no
     /// floor, P0's law as frozen).
     pub price_floor_1e6: i64,
+    /// Law (iii)'s residual: ρ ×1e3 of the raw σ (F4 §11; 0 under the
+    /// first law).
+    pub res_ratio_1e3: i64,
+    /// Law (iii)'s residual floor per family, ppm of the strike.
+    pub res_min_ppm: [i64; PM15_MAX_FAMILIES],
 }
 
 impl Default for Pm15Params {
@@ -135,14 +157,38 @@ impl Default for Pm15Params {
             e_1e6: 20_000,
             persist: 2,
             max_orders_market: 4,
-            _pad: [0; 6],
+            strike_law: STRIKE_LAW_MEAN60,
+            _pad: [0; 5],
             sigma_k_1e3: 1_550,
             usd_order_1e6: 250_000_000,
             usd_market_1e6: 250_000_000,
             session_loss_1e6: 500_000_000,
             order_ttl_ns: 1_000_000_000,
             price_floor_1e6: 900_000,
+            res_ratio_1e3: 0,
+            res_min_ppm: [0; PM15_MAX_FAMILIES],
         }
+    }
+}
+
+/// Law (iii)'s keys hold (PMJ J12); the first law needs none.
+fn strike_law_ok(p: &Pm15Params) -> bool {
+    match p.strike_law {
+        STRIKE_LAW_MEAN60 => true,
+        STRIKE_LAW_TRAP62 => {
+            if !(1..=1_000).contains(&p.res_ratio_1e3) {
+                return false;
+            }
+            let mut f = 0usize;
+            while f < p.n_families && f < PM15_MAX_FAMILIES {
+                if !(1..=100).contains(&p.res_min_ppm[f]) {
+                    return false;
+                }
+                f += 1;
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -211,7 +257,8 @@ pub struct Market {
     pub open_ns: u64,
     /// The window's end, Unix ns.
     pub end_ns: u64,
-    /// The strike ×1e6 (0 = not known yet).
+    /// The strike in the grid's scale — ×1e6 under the first law, ×1e9
+    /// under law (iii) (PMJ J12) — 0 = not known yet.
     pub strike_1e6: i64,
     /// 0 none, 1 estimated from the reports.
     pub strike_src: u8,
@@ -344,7 +391,8 @@ impl Pm15Strategy {
             && params.usd_market_1e6 >= params.usd_order_1e6
             && params.session_loss_1e6 > 0
             && params.order_ttl_ns > 0
-            && (params.price_floor_1e6 == 0 || (500_000..ONE_1E6).contains(&params.price_floor_1e6));
+            && (params.price_floor_1e6 == 0 || (500_000..ONE_1E6).contains(&params.price_floor_1e6))
+            && strike_law_ok(&params);
         if !ok {
             return Err(Pm15ConfigErr::Bound);
         }
@@ -482,10 +530,19 @@ impl Pm15Strategy {
         }
         let open_s = m.open_ns / SEC_NS;
         let g = &self.grids[f];
-        if g.last_sec() + 1 < open_s {
+        let trap = self.params.strike_law == STRIKE_LAW_TRAP62;
+        // The first law waits for the report of `open − 1`, law (iii) for
+        // `open − 2` (its last label).
+        let lag = if trap { PM_TRAP_LAST_OFFSET_S } else { 1 };
+        if g.last_sec() + lag < open_s {
             return;
         }
-        match g.mean(open_s - 60, open_s - 1) {
+        let k = if trap {
+            g.trap(open_s)
+        } else {
+            g.mean(open_s - 60, open_s - 1)
+        };
+        match k {
             Some(k) if k > 0 => {
                 let m = &mut self.markets[f][pair];
                 m.strike_1e6 = k;
@@ -557,7 +614,17 @@ impl Pm15Strategy {
         if f >= self.params.n_families || off != PM_OFF_MARK || ev.v0 <= 0 {
             return;
         }
-        self.grids[f].on_report(ev.venue_seq, ev.v0);
+        // Law (iii) keeps the report's fine scale (×1e9, from v1's ×1e12 —
+        // DOGE's ×1e6 steps are 12.6 ppm); the first law keeps v0 ×1e6.
+        let px = if self.params.strike_law == STRIKE_LAW_TRAP62 {
+            ev.v1 / FINE_PER_V1
+        } else {
+            ev.v0
+        };
+        if px <= 0 {
+            return;
+        }
+        self.grids[f].on_report(ev.venue_seq, px);
         let now = ctx.now_ns();
         let mut pair = 0usize;
         while pair < PM_PAIRS {
@@ -596,14 +663,31 @@ impl Pm15Strategy {
             self.counters.hold_strike += 1;
             return;
         }
-        let fair = match report_fair(
-            &self.grids[f],
-            &self.lut,
-            m.strike_1e6,
-            m.end_ns,
-            wall,
-            p.sigma_k_1e3,
-        ) {
+        let priced = if p.strike_law == STRIKE_LAW_TRAP62 {
+            report_fair_trap(
+                &self.grids[f],
+                &self.lut,
+                m.strike_1e6,
+                m.end_ns,
+                wall,
+                p.sigma_k_1e3,
+                TrapResidual {
+                    ratio_1e3: p.res_ratio_1e3,
+                    min_ppm: p.res_min_ppm[f],
+                },
+            )
+            .map(|(fair, _)| fair)
+        } else {
+            report_fair(
+                &self.grids[f],
+                &self.lut,
+                m.strike_1e6,
+                m.end_ns,
+                wall,
+                p.sigma_k_1e3,
+            )
+        };
+        let fair = match priced {
             Ok(fair) => fair,
             Err(h) => {
                 match h {
@@ -908,7 +992,13 @@ impl Strategy for Pm15Strategy {
         while let Some(f) = self.family_of_perp(tick.sym, from) {
             let (b, a) = (tick.bid_px.raw(), tick.ask_px.raw());
             if b > 0 && a > 0 && !tick.is_stale() {
-                self.grids[f].on_perp(self.anchor.wall_of(tick.ts_ns), b + a);
+                // The nowcast in the grid's scale (law (iii): ×1e9).
+                let x2 = if self.params.strike_law == STRIKE_LAW_TRAP62 {
+                    (b + a).saturating_mul(FINE_PER_1E6)
+                } else {
+                    b + a
+                };
+                self.grids[f].on_perp(self.anchor.wall_of(tick.ts_ns), x2);
             }
             from = f + 1;
         }

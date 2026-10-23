@@ -320,3 +320,61 @@ fn the_member_names_itself_pmj_and_reports_on_its_own_family() {
     assert_eq!(m.pm15_counters(), Pm15Counters::default(), "slot 9's family stays slot 9's");
     assert_eq!(m.pmj_counters(), m.counters());
 }
+
+// ---- PMJ J12: law (iii) ----------------------------------------------------
+
+fn params_trap() -> PmjParams {
+    let mut p = params();
+    p.strike_law = STRIKE_LAW_TRAP62;
+    p.res_ratio_1e3 = 130;
+    p.res_min_ppm[0] = 3;
+    p
+}
+
+#[test]
+fn law_iii_needs_its_residual_keys() {
+    let mut m = PmjStrategy::new();
+    let w = |m: &mut PmjStrategy, p: PmjParams| m.configure(p, lut(), WallAnchor::new(0, 0));
+    let mut no_floor = params_trap();
+    no_floor.res_min_ppm[0] = 0;
+    for bad in [
+        PmjParams { res_ratio_1e3: 0, ..params_trap() },
+        PmjParams { res_ratio_1e3: 1_001, ..params_trap() },
+        PmjParams { strike_law: 2, ..params() },
+        no_floor,
+    ] {
+        assert_eq!(w(&mut m, bad), Err(PmjConfigErr::Bound), "{bad:?}");
+    }
+    assert_eq!(w(&mut m, params_trap()), Ok(()));
+    assert_eq!(PmjParams::default().strike_law, STRIKE_LAW_MEAN60, "the first law by default");
+}
+
+#[test]
+fn law_iii_strikes_on_the_trapezoid_at_open_minus_two_in_the_fine_scale() {
+    let mut m = member_with(params_trap());
+    let mut c = TestCtx { now: 0, orders: Vec::new() };
+    let w = pm5_window_of_open(OPEN).unwrap();
+    let pair = pm5_pair_of_window(w);
+    tape(&mut m, &mut c, OPEN - 3, 1_100, BASE, 2_000_000);
+    c.now = OPEN * S;
+    m.on_venue_event(&roll(w, false, 0), &mut c);
+    assert_eq!(m.market(0, pair).strike_src, 0, "open − 2 not reported yet");
+    // OPEN − 2 is even: the tape's +step second. The trapezoid of the
+    // alternation over [open − 62, open − 2] is its base, ×1e9.
+    second(&mut m, &mut c, OPEN - 2, BASE + 2_000_000);
+    let mk = *m.market(0, pair);
+    assert_eq!(mk.strike_src, 1);
+    assert_eq!(mk.strike_1e6, BASE * 1_000);
+}
+
+#[test]
+fn law_iii_takes_a_decided_window_as_the_first_law_does() {
+    let mut m = member_with(params_trap());
+    let mut c = TestCtx { now: 0, orders: Vec::new() };
+    let (w, end) = decided(&mut m, &mut c);
+    assert_eq!(m.market(0, pm5_pair_of_window(w)).strike_1e6, BASE * 1_000);
+    late_seconds(&mut m, &mut c, w, end, 930_000);
+    assert_eq!(c.orders.len(), 1, "{:?}", m.counters());
+    let o = c.orders[0];
+    assert!(o.px.raw() >= 930_000 && o.px.raw() < 1_000_000, "limit {}", o.px.raw());
+}

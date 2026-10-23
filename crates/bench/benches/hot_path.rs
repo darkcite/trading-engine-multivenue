@@ -468,7 +468,9 @@ fn bench_long_vol_day_close(c: &mut Criterion) {
 //     per-mark advance and one `late_fair` inside the window, on a grid
 //     warmed with 900 s of marks and perp BBOs (σ, the basis and the
 //     observed half of the settlement minute all live). Baselined since
-//     HK16 (hot_path.json); the 0 B law is alloc gate 52b's.
+//     HK16 (hot_path.json); the 0 B law is alloc gate 52b's. The per-mark
+//     bench re-baselined at PMJ J12 (R-PMJ-S65): its walk now reverts, so
+//     every iteration takes the live path.
 // -----------------------------------------------------------------
 
 fn bench_bin15_late(c: &mut Criterion) {
@@ -506,13 +508,69 @@ fn bench_bin15_late(c: &mut Criterion) {
         b.iter(|| black_box(late_fair(&g, &lut, black_box(79_000_000_000), expiry, now, 1_550)));
     });
     let mut wall = WALL0 + t * SEC;
+    // The timed walk reverts to its start (1/1024 of the gap per second),
+    // so the mark stays positive (stationary sd ~1.3e8 against 7.9e10) and
+    // every iteration takes the live path. The plain walk crossed zero after
+    // ~80 M iterations, and from then on `on_mark` / `on_perp` returned on
+    // the rejected input: the bench timed that return in some runs and the
+    // live path in others (R-PMJ-S65). The prefill above is unchanged.
     c.bench_function("bin15/late_grid_mark_and_perp_1s", |b| {
         b.iter(|| {
             let m = step(&mut s, &mut px);
+            px -= (px - 79_000_000_000) >> 10;
             wall += SEC;
             g.on_mark(wall + 200_000_000, m);
             g.on_perp(wall + 300_000_000, 2 * m);
             black_box(g.sec());
+        });
+    });
+}
+
+// -----------------------------------------------------------------
+// 12b. PMJ J12 — slots 9 / 11's pricer on Polymarket's reports, both
+//     strike laws, at a late-window instant (20 s to the end, 41 / 43
+//     settlement samples observed): the first law (`report_fair`, ×1e6)
+//     and law (iii) (`report_fair_trap`, the trapezoid, ×1e9, with its
+//     residual). Unbaselined (the 0 B law is alloc gates 136 / 136b).
+// -----------------------------------------------------------------
+
+fn bench_pm_report(c: &mut Criterion) {
+    use core_twaplock::late::{LateLut, LATE_PHI_POINTS, LATE_PHI_STEP_1E6};
+    use core_twaplock::report::{report_fair, report_fair_trap, ReportGrid, TrapResidual};
+    const SEC: u64 = 1_000_000_000;
+    let mut lut = Box::new(LateLut::flat());
+    let mut i = 0usize;
+    while i < LATE_PHI_POINTS {
+        let z = i as i64 * LATE_PHI_STEP_1E6;
+        lut.phi[i] = (500_000 + z.min(4_000_000) / 8) as u32;
+        i += 1;
+    }
+    let feed = |scale: i64| {
+        let mut g = Box::new(ReportGrid::new());
+        let (mut s, mut px) = (0x2545_F491_4F6C_DD1Du64, 79_000_000_000i64);
+        let mut t = 2_970u64;
+        while t <= 3_580 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            px += (s % 19_750_001) as i64 - 9_875_000;
+            g.on_perp(t * SEC - 200_000_000, 2 * px * scale);
+            g.on_report(t, px * scale);
+            t += 1;
+        }
+        g
+    };
+    let g6 = feed(1);
+    let g9 = feed(1_000);
+    let end = 3_600 * SEC;
+    let wall = 3_580 * SEC + 1_300_000_000;
+    c.bench_function("pm/report_fair_in_window", |b| {
+        b.iter(|| black_box(report_fair(&g6, &lut, black_box(79_000_000_000), end, wall, 1_550)));
+    });
+    let res = TrapResidual { ratio_1e3: 130, min_ppm: 3 };
+    c.bench_function("pm/report_fair_trap_in_window", |b| {
+        b.iter(|| {
+            black_box(report_fair_trap(&g9, &lut, black_box(79_000_000_000_000), end, wall, 1_550, res))
         });
     });
 }
@@ -598,6 +656,7 @@ criterion_group!(
     bench_signer_hypercall_place_order,
     bench_long_vol_day_close,
     bench_bin15_late,
+    bench_pm_report,
     bench_strategy_set,
     bench_ledger,
 );

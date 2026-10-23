@@ -327,6 +327,13 @@ function parseProm(text) {
 // ---- PMJ P&L lane: slot 9 / 11 paper book since start, settled on the venue's
 // result every 15 min (claude_worker.pm_paper_pnl → worker/pm/paper-pnl.json,
 // served as W.pm_pnl). One line per fill-law segment, never summed across. ----
+// R-PMJ-S62: fills at or above the 0.90 entry floor apart from those below it
+// (bought after the price fell during the judge delay).
+function pmFloorCell(g) {
+  const a = g.at_or_above, b = g.below_floor;
+  if (!a || !b) return '<span class="dim">—</span>';
+  return `≥0.90 ${n(a.settled, 0)} (${n(a.won, 0)}/${n(a.lost, 0)}) ${usd(a.net_usd)} · <0.90 ${n(b.settled, 0)} (${n(b.won, 0)}/${n(b.lost, 0)}) ${usd(b.net_usd)}`;
+}
 function pmLedger(sid) {
   const L = W && W.pm_pnl;
   const S = L && L.slots && L.slots[sid];
@@ -336,6 +343,7 @@ function pmLedger(sid) {
     const ev = g.ev_pct === null || g.ev_pct === undefined ? '' : ` · ${n(g.ev_pct, 2)} %/$`;
     out.push(`<div>ledger · ${esc(g.segment)} <span class="dim">since ${esc(g.from_utc)}</span></div>` +
       `<div>${n(g.settled, 0)} settled (${n(g.won, 0)} won / ${n(g.lost, 0)} lost) · stake $${n(g.stake_usd, 2)} · fees ${n(g.fees_usd, 2)} · net ${usd(g.net_usd)}${ev} · max DD ${n(g.max_drawdown_usd, 2)} · open ${n(g.open, 0)} ($${n(g.open_cost_usd, 2)})</div>`);
+    if (g.below_floor && g.at_or_above) out.push(`<div class="dim">&nbsp;&nbsp;${pmFloorCell(g)}</div>`);
     if ((g.by_family || []).length) {
       out.push(`<div class="dim">&nbsp;&nbsp;by family</div><div class="dim">${g.by_family.map(f => `${esc(f.family)} ${n(f.settled, 0)}: ${usd(f.net_usd)}`).join(' · ')}</div>`);
     }
@@ -410,11 +418,11 @@ function renderPnl() {
         const d = (g.days || []).find(x => x.day === today);
         rows.push([`${esc(sid)} ${esc(S.name)}`, `${esc(g.segment)} <span class="dim">since ${esc(g.from_utc)}</span>`, n(g.settled, 0), `${n(g.won, 0)} / ${n(g.lost, 0)}`,
           `$${n(g.stake_usd, 2)}`, n(g.fees_usd, 2), usd(g.net_usd), g.ev_pct === null || g.ev_pct === undefined ? '<span class="dim">—</span>' : `${n(g.ev_pct, 2)} %`,
-          usd(-Math.abs(Number(g.max_drawdown_usd))), d ? usd(d.net_usd) : '<span class="dim">—</span>', `${n(g.open, 0)} ($${n(g.open_cost_usd, 2)})`]);
+          usd(-Math.abs(Number(g.max_drawdown_usd))), pmFloorCell(g), d ? usd(d.net_usd) : '<span class="dim">—</span>', `${n(g.open, 0)} ($${n(g.open_cost_usd, 2)})`]);
       }
     }
     parts.push(`<div class="muted" style="margin-top:6px">Polymarket paper (slots 9 / 11) — settled on the venue's result, every 15 min · pass ${esc(LP.generated_utc || '?')} · segments are fill laws, never summed</div>` +
-      table(['slot','segment','settled','won / lost','stake','fees','net','EV/$','max DD', `today (${today})`, 'open'], rows, [2,3,4,5,6,7,8,9]));
+      table(['slot','segment','settled','won / lost','stake','fees','net','EV/$','max DD','fill ≥0.90 · <0.90', `today (${today})`, 'open'], rows, [2,3,4,5,6,7,8,10]));
   }
   if (P && P.series && P.series.length) {
     parts.push(`<div class="muted" style="margin-top:6px">day series (${P.series.length})</div>` + table(['day','runs','fills','paper net', 'per strategy @2 bps'], P.series.slice().reverse().map(s => [esc(s.day), n(s.runs, 0), n(s.paper_fills, 0), usd(s.paper_net_usd), Object.keys(s.strategies).map(k => `${esc(k)} ${usd(s.strategies[k].fee_ladder_net_usd ? s.strategies[k].fee_ladder_net_usd[2] : s.strategies[k].net_usd)}`).join(' · ')]), [1,2,3]));

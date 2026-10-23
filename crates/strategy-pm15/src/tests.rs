@@ -548,3 +548,78 @@ fn five_minute_records_leave_slot_9_untouched() {
     assert!(c.orders.is_empty(), "a 5 m record made slot 9 order");
     assert_eq!(m.market(0, pm_pair_of_window(w)).instance, pm_instance_id(w, 0).unwrap());
 }
+
+// ---- PMJ J12: law (iii) ----------------------------------------------------
+
+fn member_trap() -> Pm15Strategy {
+    let mut perp_sym = [SYMBOL_ID_NONE; PM15_MAX_FAMILIES];
+    perp_sym[0] = perp();
+    let mut res_min_ppm = [0; PM15_MAX_FAMILIES];
+    res_min_ppm[0] = 3;
+    let p = Pm15Params {
+        n_families: 1,
+        perp_sym,
+        strike_law: STRIKE_LAW_TRAP62,
+        res_ratio_1e3: 130,
+        res_min_ppm,
+        ..Pm15Params::default()
+    };
+    let mut m = Pm15Strategy::new();
+    m.configure(p, lut(), WallAnchor::new(0, 0)).expect("valid");
+    m
+}
+
+#[test]
+fn law_iii_needs_its_residual_keys() {
+    let mut perp_sym = [SYMBOL_ID_NONE; PM15_MAX_FAMILIES];
+    perp_sym[0] = perp();
+    let mut p = Pm15Params {
+        n_families: 1,
+        perp_sym,
+        strike_law: STRIKE_LAW_TRAP62,
+        ..Pm15Params::default()
+    };
+    let mut m = Pm15Strategy::new();
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "no keys");
+    p.res_ratio_1e3 = 130;
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "no floor");
+    p.res_min_ppm[0] = 101;
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "floor > 100");
+    p.res_min_ppm[0] = 3;
+    let mut q = p;
+    q.strike_law = 2;
+    assert_eq!(m.configure(q, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "law 2");
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Ok(()));
+    assert_eq!(Pm15Params::default().strike_law, STRIKE_LAW_MEAN60, "the first law by default");
+}
+
+#[test]
+fn law_iii_strikes_at_open_minus_two_and_takes_a_decided_window() {
+    let w = pm_window_of_open(OPEN).unwrap();
+    let end = OPEN + 900;
+    let mut m = member_trap();
+    let mut c = TestCtx {
+        now: 0,
+        orders: Vec::new(),
+    };
+    tape(&mut m, &mut c, OPEN - 3, 1_100, BASE, 2_000_000);
+    c.now = OPEN * S;
+    m.on_venue_event(&roll(w, false, 0), &mut c);
+    m.on_venue_event(&law(w, PM_LEG_UP, 10_000), &mut c);
+    m.on_venue_event(&law(w, PM_LEG_DOWN, 10_000), &mut c);
+    assert_eq!(m.market(0, pm_pair_of_window(w)).strike_src, 0, "open − 2 not reported yet");
+    // OPEN − 2 is even: the +step second; the trapezoid is the base, ×1e9.
+    second(&mut m, &mut c, OPEN - 2, BASE + 2_000_000);
+    let mk = *m.market(0, pm_pair_of_window(w));
+    assert_eq!((mk.strike_src, mk.strike_1e6), (1, BASE * 1_000));
+    tape(&mut m, &mut c, end - 22, 900 - 21, BASE + 400_000_000, 2_000_000);
+    let mut s = end - 21;
+    while s <= end - 20 {
+        second(&mut m, &mut c, s, BASE + 400_000_000);
+        m.on_tick(&touch(w, PM_LEG_UP, c.now, 920_000, 930_000), &mut c);
+        m.on_tick(&touch(w, PM_LEG_DOWN, c.now, 70_000, 80_000), &mut c);
+        s += 1;
+    }
+    assert_eq!(c.orders.len(), 1, "{:?}", m.counters());
+    assert_eq!(c.orders[0].sym, pm_rolling_sym(0, pm_pair_of_window(w), PM_LEG_UP));
+}

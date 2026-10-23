@@ -218,7 +218,12 @@ def test_descriptors_and_segments() -> None:
     assert M.segment_of(_START["j11"], 11) == "j11"
     assert M.segment_of(_START["j11"] - 1, 11) == "j8"
     assert M.segment_of(_START["j11"], 9) == "j8"
-    assert [s[0] for s in M.SEGMENTS] == ["touch", "j8", "j11"]
+    # J12 moves slot 11 only until slot 9's own flip (R-PMJ-S61 / S63)
+    assert M.segment_of(_START["j12"], 11) == "j12"
+    assert M.segment_of(_START["j12"] - 1, 11) == "j11"
+    assert M.segment_of(_START["j12"], 9) == "j8"
+    assert _START["j12"] == 1_792_771_200 * _S  # 2026-10-23 16:00Z
+    assert [s[0] for s in M.SEGMENTS] == ["touch", "j8", "j11", "j12"]
 
 
 def test_every_naming_source_must_agree() -> None:
@@ -461,6 +466,32 @@ def test_segments_are_never_summed(tmp_path: pathlib.Path) -> None:
     assert set(res.net_usd_1e6[9]) == {"touch", "j8"}
 
 
+def test_fills_below_the_floor_are_booked_apart(tmp_path: pathlib.Path) -> None:
+    """R-PMJ-S62: a segment books its fills under the 0.90 entry floor apart."""
+    root = _root(tmp_path)
+    o15 = 1_792_400_400  # 15m pair 0
+    i15 = _inst15(o15, 2)
+    _run(
+        root,
+        epoch=_EPOCH_J8,
+        fills=[
+            (5 * _S, _SOL15[0, "up"], 9, 950_000, 20_000_000, _oid(i15, 2, 0)),
+            (6 * _S, _SOL15[0, "down"], 9, 580_000, 10_000_000, _oid(i15, 2, 1)),
+        ],
+        ev15=[_settled(_SOL15[0, "up"], i15, M.SETTLED_UP)],
+        ev5=[],
+    )
+    res = M.run_pass(root, _FROM, (o15 + 1_000) * _S, None)
+    assert res.settled_new == 2
+    (j8,) = [g for g in _summary(root)["slots"]["9"]["segments"] if g["segment"] == "j8"]
+    above, below = j8["at_or_above"], j8["below_floor"]
+    assert (above["settled"], above["won"], above["lost"]) == (1, 1, 0)
+    assert (below["settled"], below["won"], below["lost"]) == (1, 0, 1)
+    assert below["stake_usd"] == 5.8 and below["net_usd"] < -5.8
+    assert round(above["net_usd"] + below["net_usd"], 6) == j8["net_usd"]
+    assert M.PRICE_FLOOR_1E6 == 900_000
+
+
 def test_the_current_segment_shows_even_when_empty(tmp_path: pathlib.Path) -> None:
     root = _root(tmp_path)
     _run(root)
@@ -468,7 +499,7 @@ def test_the_current_segment_shows_even_when_empty(tmp_path: pathlib.Path) -> No
     segs = _summary(root)["slots"]["9"]["segments"]
     assert [g["segment"] for g in segs] == ["touch", "j8"] and segs[1]["settled"] == 0
     segs = _summary(root)["slots"]["11"]["segments"]
-    assert [g["segment"] for g in segs] == ["touch", "j11"] and segs[1]["settled"] == 0
+    assert [g["segment"] for g in segs] == ["touch", "j12"] and segs[1]["settled"] == 0
 
 
 def test_j11_splits_slot_11_only(tmp_path: pathlib.Path) -> None:
@@ -488,8 +519,30 @@ def test_j11_splits_slot_11_only(tmp_path: pathlib.Path) -> None:
     slots = _summary(root)["slots"]
     assert [g["segment"] for g in slots["9"]["segments"]] == ["j8"]
     s11 = slots["11"]["segments"]
-    assert [g["segment"] for g in s11] == ["j11"] and s11[0]["settled"] == 1
-    assert s11[0]["from_utc"] == M.utc_iso(_START["j11"])
+    # j12, the current segment of slot 11, shows even while empty
+    assert [g["segment"] for g in s11] == ["j11", "j12"] and s11[0]["settled"] == 1
+    assert s11[0]["from_utc"] == M.utc_iso(_START["j11"]) and s11[1]["settled"] == 0
+
+
+def test_j12_splits_slot_11_only(tmp_path: pathlib.Path) -> None:
+    root = _root(tmp_path)
+    o15 = o5 = 1_792_773_000  # 15m pair 0, 5m pair 0, after J12's first boot
+    i15, i5 = _inst15(o15, 2), _inst5(o5, 0)
+    _run(
+        root, epoch=_START["j12"] + 300 * _S,
+        fills=[(5 * _S, _SOL15[0, "up"], 9, 950_000, 20_000_000, _oid(i15, 2, 0)),
+               (6 * _S, _BTC5[0, "up"], 11, 960_000, 10_000_000, _oid(i5, 0, 0))],
+        ev15=[_settled(_SOL15[0, "up"], i15, M.SETTLED_UP)],
+        ev5=[_settled(_BTC5[0, "up"], i5, M.SETTLED_UP)],
+    )
+    res = M.run_pass(root, _FROM, (o15 + 1_000) * _S, None)
+    assert res.settled_new == 2
+    assert set(res.net_usd_1e6[9]) == {"j8"} and set(res.net_usd_1e6[11]) == {"j12"}
+    slots = _summary(root)["slots"]
+    assert [g["segment"] for g in slots["9"]["segments"]] == ["j8"]
+    s11 = slots["11"]["segments"]
+    assert [g["segment"] for g in s11] == ["j12"] and s11[0]["settled"] == 1
+    assert s11[0]["from_utc"] == M.utc_iso(_START["j12"])
 
 
 def test_a_fill_that_cannot_be_named_is_reported_not_booked(tmp_path: pathlib.Path) -> None:
@@ -569,6 +622,8 @@ def test_the_dashboard_serves_the_summary_and_both_blocks_read_it(tmp_path: path
     # audit-pnl's fee ladder is [@0, @1, @2 bps] (FEE_LADDER_BPS): never labelled "@tier" (J11)
     assert "'@tier'" not in html and "net @0/1/tier" not in html
     assert "'@2 bps'" in html and "net @0/1/2 bps" in html
+    # R-PMJ-S62: the fills under the 0.90 floor shown apart, in both views
+    assert html.count("pmFloorCell(g)") == 3 and "fill ≥0.90 · <0.90" in html
 
 
 def test_the_launchd_job_is_wired_and_names_no_worker() -> None:

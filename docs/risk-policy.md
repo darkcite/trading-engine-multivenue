@@ -17523,6 +17523,13 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S56 | F4's re-measure data is snapshotted from closed runs until 10-22 by a self-removing vault job, outside git. |
 | R-PMJ-S57 | P0's **B3 stays as frozen** (at most 2 % of fired markets lost). |
 | R-PMJ-S58 | With the Mac's disk near full, the F4 snapshot keeps the pm15 / pm5 events and the manifest only, under a 10 GiB free floor; ticks for the post-J8 check are pulled from the S3 archive at re-measure time if disk allows. |
+| R-PMJ-S59 | The slot 9 / 11 loss analysis (fills land when the price falls during the judge delay; the two 10-19 losers were the weakest entries) changes nothing yet: **collect more days first**, re-run with the F4 re-measure around 10-22. |
+| R-PMJ-S60 | After the 10-22 re-run, out of sample: p_min 0.95 and k 1.80 do not help. **Both slots keep p_min 0.90 and k 1.55.** |
+| R-PMJ-S61 | **Law (iii)** (F4: the trapezoid of the reports over `[open − 62, open − 2]` for the strike and the settlement, plus a volatility-scaled residual) is built as J12 behind a per-slot `strike_law` switch. Slot 11 switches at the next scheduled restart after the build; slot 9 after 10-28 00:00Z, when P0's confirmatory window has closed. |
+| R-PMJ-S62 | The J9 ledger books each segment's fills under the 0.90 entry floor apart from the rest (`below_floor` / `at_or_above`), on the dashboard too. |
+| R-PMJ-S63 | Slot 11 switches to law (iii) at the 10-23 16:05Z restart. The J12 A/B's criterion 2 is read statistically (won ≥ expected − 2 sd): on its letter both laws miss it on slot 11, trap62 by −0.55 sd and mean60, the law running, by −0.64 sd, and wrong-side fills are equal (3 against 3). |
+| R-PMJ-S64 | J12 is one commit, and the release binary is rebuilt once the remaining gates pass. No extra restart: the engine boots it at the 16:05Z restart. |
+| R-PMJ-S65 | `bin15/late_grid_mark_and_perp_1s` is fixed and re-baselined in the J12 commit. Its random-walk mark crossed zero after about 80 M iterations, after which `on_mark` / `on_perp` returned on the rejected input, so the bench timed that return in some runs and the live path in others. The timed loop's walk now reverts to its start; the prefill is unchanged. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -18259,3 +18266,77 @@ HEAD.
   member's evidence at its tier) and stays.
 - **Rollback.** Restore `pmj.toml.pre-j11` and restart; per J9's rule the
   rollback adds a `SEGMENTS` row.
+
+### J12 — law (iii), the measured strike and settlement law, behind `strike_law` (2026-10-23, rulings R-PMJ-S59..S65)
+
+- **Why.** F4 (vault `docs/research/pmj/f4/`) measured the venue's law on
+  9 000+ windows. The strike `priceToBeat` and the settlement `finalPrice`
+  are the TRAPEZOID of the Chainlink reports over the labels `[T − 62,
+  T − 2]` (weights ½, 1, …, 1, ½), about 2 s behind the first law's mean of
+  `[T − 60, T − 1]`. On days it was not fitted on, the trapezoid matches the
+  published strike 3.3× more closely, and our own numbers call the wrong
+  outcome far less often. What it still misses scales with the asset's 1-s
+  volatility, so the residual is σ_res = max(ρ · σ, floor), with ρ fitted
+  against the raw σ (F4 §11: 0.13).
+- **The law, `core_twaplock::report`.**
+  - `ReportGrid::trap(open)` is the strike; `report_fair_trap` prices on the
+    trapezoid's own samples with its closed-form tail variance (pinned
+    against the double sum) and `sd′ = √(sd² + (σ_res · K)²)`.
+  - The report ring grows to 128 s, so `o − 62` is still held once
+    `o − 1` has arrived. The first law reads only its old 61-s horizon, so its
+    results are unchanged value for value.
+  - `late::price_twap` and BIN15's law are untouched.
+- **The members** (`strategy-pm15`, `strategy-pmj`). `strike_law` is `mean60`
+  (the default: the first law, byte-identical) or `trap62`. Under `trap62`:
+  - the strike is fixed once the report of `open − 2` is in;
+  - the grid holds the reports ×1e9 from v1 (DOGE's ×1e6 steps were
+    12.6 ppm), with the perp's BBO scaled to match;
+  - a market's strike is held in that scale;
+  - σ is measured on the fine reports too, so the quantization the ×1e6
+    steps added to a coarse asset's σ (DOGE) leaves both the main sd and the
+    residual. The F4 fit and the A/B ran on the same fine reports.
+- **Not counted (by choice).** Whether the residual's floor or ρ · σ set it.
+  `report_fair_trap` returns it, but the members' counters are pinned, so
+  it is not exported.
+- **The keys** (`pm15.toml`, `pmj.toml`; `core_config::strike_law`):
+  - `strike_law = "mean60" | "trap62"`;
+  - `sigma_res_ratio_1e3`, `1..=1000`;
+  - `sigma_res_min_ppm`, one per family, `1..=100`.
+
+  The residual keys are required under `trap62` and refused under `mean60`.
+  The boot tell adds `:strike=trap62:res=<ratio>/<floors>` under law (iii);
+  under `mean60` it is unchanged.
+- **Proof.**
+  - Unit tests in `report.rs`, both members and both configs.
+  - Alloc gates 136b and 114b: slot 11's and slot 9's members under law
+    (iii), 0 B.
+  - A real-member A/B (`crates/cli/examples/pm_law_ab.rs`, vault
+    `docs/research/pmj/j12/ab-2026-10-23.md`) over 27 runs from 10-19 08:49Z
+    to 10-23. It reproduces the engine's own mean60 orders 98–100 %. The two
+    laws are indistinguishable on that sample: wrong-side fills are 3 against
+    3 on slot 11 and 0 against 0 on slot 9.
+  - Calibration at p ≥ 0.90 sits within 1 sd of the belief under both laws.
+    Read statistically (R-PMJ-S63), both slots pass the plan's criterion 2.
+- **Deploy.** Config only, per slot, at a scheduled restart, with a J9
+  `SEGMENTS` row in the same change. Slot 9 only after 10-28 00:00Z.
+  - Slot 11 (R-PMJ-S63): `~/multivenue/pmj.toml` gets `strike_law =
+    "trap62"`, `sigma_res_ratio_1e3 = 130` and `sigma_res_min_ppm = [3, 5,
+    6, 5, 6, 6, 3]` (btc, eth, sol, xrp, hype, doge, bnb) before 16:00Z on
+    10-23; the 16:05Z restart is its first boot. The `j12` row
+    (`J12_FROM_NS`, 16:00Z, slot 11 only) is in this commit.
+- **Rollback.** `strike_law = "mean60"` and a restart, plus a `SEGMENTS` row.
+- **The bench gate (R-PMJ-S65).** `bin15/late_grid_mark_and_perp_1s` failed
+  bench-check at 12.2 ns against HK16's 1.6 ns. `late.rs` has not changed
+  since 10-17; the bench was at fault. Its random-walk mark crosses zero after
+  about 80 M iterations (simulated exactly), and from then on `on_mark` /
+  `on_perp` return on the rejected input. HK16's 1.6 ns timed that return; a
+  run that iterates less times the live path.
+  - The timed walk now reverts to its start (1/1024 of the gap per second,
+    stationary sd about 1.3e8 against 7.9e10), so every iteration takes the
+    live path. The prefill, and with it `late_fair_in_window`, is unchanged.
+  - Re-baselined 1.6 → 12.25 ns (`crates/bench/baselines/hot_path.json`): the
+    median of three `make bench-check` runs, 12.249 / 12.255 / 12.233 ns.
+  - `strategy_set/on_tick_all` read 5.09–5.10 ns on the same runs (+10 %,
+    inside the 15 % gate). It read the same at J8 and J10 on 10-19 (5.10–5.11
+    ns), so J12 did not move it, and it is left as it is.
+

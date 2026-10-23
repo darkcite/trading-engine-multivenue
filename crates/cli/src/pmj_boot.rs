@@ -130,6 +130,14 @@ fn resolve_file(
     params.usd_market_1e6 = file.usd_market_1e6;
     params.session_loss_1e6 = file.session_loss_usd_1e6;
     params.order_ttl_ns = file.order_ttl_ns;
+    // PMJ J12: the strike law and law (iii)'s residual.
+    params.strike_law = file.strike_law.law;
+    params.res_ratio_1e3 = file.strike_law.sigma_res_ratio_1e3;
+    let mut f = 0usize;
+    while f < file.strike_law.sigma_res_min_ppm.len() {
+        params.res_min_ppm[f] = file.strike_law.sigma_res_min_ppm[f];
+        f += 1;
+    }
     let mut lut = Box::new(core_twaplock::late::LateLut::flat());
     let mut i = 0usize;
     while i < core_config::pmj::PMJ_PHI_POINTS {
@@ -149,6 +157,24 @@ fn resolve_file(
     })
 }
 
+/// PMJ J12: the law's tail of the boot tell — empty under the first law (so
+/// its tell is unchanged), `:strike=trap62:res=130/3,5,…` under law (iii).
+fn strike_tell(law: u8, ratio_1e3: i64, floors: &[i64]) -> String {
+    if law == core_twaplock::report::STRIKE_LAW_MEAN60 {
+        return String::new();
+    }
+    let mut s = format!(":strike=trap62:res={ratio_1e3}/");
+    let mut i = 0usize;
+    while i < floors.len() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&floors[i].to_string());
+        i += 1;
+    }
+    s
+}
+
 /// The boot tell: `pmj: artifact configured (PAPER) hash=… families=btc+eth
 /// law=3-20s:p>=0.900:ask<=p-0.020:floor0.900:persist2:k1.550
 /// frame=$5/order:$10/market:-$50/session max=$5.01/order paper=+2000ms
@@ -162,7 +188,7 @@ pub fn render_boot_tell(boot: &PmjBoot) -> String {
     let p = &boot.params;
     let tau_floor = p.tau_min_ns.max(p.min_tau_ns);
     format!(
-        "pmj: artifact configured (PAPER) hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:floor{:.3}:persist{}:k{:.3} \
+        "pmj: artifact configured (PAPER) hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:floor{:.3}:persist{}:k{:.3}{} \
          frame=${}/order:${}/market:-${}/session max=${}.{:02}/order paper=+{}ms guard={}p/{}alt/acct-{} live={}",
         boot.families.join("+"),
         tau_floor / 1_000_000_000,
@@ -172,6 +198,7 @@ pub fn render_boot_tell(boot: &PmjBoot) -> String {
         p.price_floor_1e6 as f64 / 1e6,
         p.persist,
         p.sigma_k_1e3 as f64 / 1e3,
+        strike_tell(p.strike_law, p.res_ratio_1e3, &p.res_min_ppm[..p.n_families]),
         p.deposit_usd_1e6 / 1_000_000,
         p.usd_market_1e6 / 1_000_000,
         p.session_loss_1e6 / 1_000_000,
@@ -239,6 +266,7 @@ mod tests {
 
     fn file() -> core_config::pmj::PmjFile {
         core_config::pmj::PmjFile {
+            strike_law: core_config::strike_law::StrikeLaw::default(),
             families: vec!["btc".into(), "eth".into()],
             perp: vec!["hyperliquid:BTC".into(), "hyperliquid:ETH".into()],
             tau_min_ns: 2_000_000_000,
@@ -302,5 +330,19 @@ mod tests {
     fn the_member_is_wanted_only_by_its_own_bit() {
         assert!(pmj_wanted(strategy_set::BIT_PMJ));
         assert!(!pmj_wanted(strategy_set::BIT_PM15 | strategy_set::ALL_MASK));
+    }
+
+    #[test]
+    fn the_strike_laws_agree_across_crates_and_tell_themselves() {
+        assert_eq!(
+            core_config::strike_law::STRIKE_LAW_MEAN60,
+            core_twaplock::report::STRIKE_LAW_MEAN60
+        );
+        assert_eq!(
+            core_config::strike_law::STRIKE_LAW_TRAP62,
+            core_twaplock::report::STRIKE_LAW_TRAP62
+        );
+        assert_eq!(super::strike_tell(0, 0, &[]), "", "the first law's tell is unchanged");
+        assert_eq!(super::strike_tell(1, 130, &[3, 5, 6]), ":strike=trap62:res=130/3,5,6");
     }
 }

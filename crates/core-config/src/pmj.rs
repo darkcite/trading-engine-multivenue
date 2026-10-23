@@ -76,7 +76,7 @@ fn err(msg: impl Into<String>) -> PmjError {
 }
 
 /// Every key the grammar accepts; an unknown key is a refusal.
-const PMJ_KEYS: [&str; 25] = [
+const PMJ_KEYS: [&str; 28] = [
     "families",
     "perp",
     "tau_min_ns",
@@ -102,6 +102,10 @@ const PMJ_KEYS: [&str; 25] = [
     "guard_deposit_account",
     "guard_max_sol_lamports",
     "guard_max_cu_price",
+    // PMJ J12: crate::strike_law's three keys.
+    "strike_law",
+    "sigma_res_ratio_1e3",
+    "sigma_res_min_ppm",
 ];
 
 /// `pmj.toml` as parsed. Descriptors and keys stay strings: `pmj_boot`
@@ -163,6 +167,9 @@ pub struct PmjFile {
     pub guard_max_sol_lamports: u64,
     /// The highest compute unit price, micro-lamports (absent = 0).
     pub guard_max_cu_price: u64,
+    /// PMJ J12: the strike law and law (iii)'s residual
+    /// ([`crate::strike_law`]; absent = the first law).
+    pub strike_law: crate::strike_law::StrikeLaw,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES.
@@ -363,6 +370,7 @@ pub fn parse(src: &str) -> Result<PmjFile, PmjError> {
     if !guard_deposit_account.is_empty() {
         b58_key("guard_deposit_account", 0, &guard_deposit_account)?;
     }
+    let strike_law = crate::strike_law::parse(&kv, families.len()).map_err(err)?;
     let guard_max_sol_lamports = in_range(
         "guard_max_sol_lamports",
         opt_int(&kv, "guard_max_sol_lamports", 0).map_err(m)?,
@@ -401,6 +409,7 @@ pub fn parse(src: &str) -> Result<PmjFile, PmjError> {
         guard_deposit_account,
         guard_max_sol_lamports,
         guard_max_cu_price,
+        strike_law,
     })
 }
 
@@ -496,5 +505,37 @@ mod tests {
         assert!(parse(&base.replacen("[pmj]", "[pm15]", 1)).is_err(), "the section");
         assert!(parse(&src("usd_order_1e6 = 250000000\n")).is_err(), "pm15's size key");
         assert!(parse(&base.replacen("deposit_usd_1e6 = 5000000\n", "", 1)).is_err(), "no deposit");
+    }
+
+    #[test]
+    fn law_iii_parses_and_its_keys_need_it() {
+        use crate::strike_law::{STRIKE_LAW_MEAN60, STRIKE_LAW_TRAP62};
+        let f = parse(&src("")).expect("valid");
+        assert_eq!(f.strike_law.law, STRIKE_LAW_MEAN60, "absent = the first law");
+        let f = parse(&src("strike_law = \"mean60\"\n")).expect("valid");
+        assert_eq!(f.strike_law, crate::strike_law::StrikeLaw::default());
+        let f = parse(&src(
+            "strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 130\nsigma_res_min_ppm = [3, 5]\n",
+        ))
+        .expect("valid");
+        assert_eq!(
+            (f.strike_law.law, f.strike_law.sigma_res_ratio_1e3, f.strike_law.sigma_res_min_ppm.clone()),
+            (STRIKE_LAW_TRAP62, 130, vec![3, 5])
+        );
+        for (bad, why) in [
+            ("strike_law = \"trap60\"\n", "an unknown law"),
+            ("strike_law = 1\n", "not a string"),
+            ("strike_law = \"trap62\"\n", "no residual"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 130\n", "no floors"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 0\nsigma_res_min_ppm = [3, 5]\n", "ratio 0"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 1001\nsigma_res_min_ppm = [3, 5]\n", "ratio > 1000"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 130\nsigma_res_min_ppm = [3]\n", "one floor for two families"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 130\nsigma_res_min_ppm = [3, 0]\n", "a floor of 0"),
+            ("strike_law = \"trap62\"\nsigma_res_ratio_1e3 = 130\nsigma_res_min_ppm = [3, 101]\n", "a floor over 100"),
+            ("sigma_res_ratio_1e3 = 130\n", "law (iii)'s key under the first law"),
+            ("strike_law = \"mean60\"\nsigma_res_min_ppm = [3, 5]\n", "law (iii)'s key under the first law"),
+        ] {
+            assert!(parse(&src(bad)).is_err(), "{why}: {bad}");
+        }
     }
 }

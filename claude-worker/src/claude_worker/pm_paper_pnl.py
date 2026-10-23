@@ -58,7 +58,9 @@ waits for the next one):
 (:data:`SEGMENTS`, by run epoch and slot): ``touch`` (before J8: the touch
 alone, capped by its size), ``j8`` (the FAK sweep behind the touch; slot 9's
 0.90 floor) and, for slot 11 only, ``j11`` (the sweep judged 5 s after
-submit, decisions at tau >= 6 s: R-PMJ-S47 / S55). The summary never sums
+submit, decisions at tau >= 6 s: R-PMJ-S47 / S55) and ``j12`` (law (iii): the
+trapezoid strike and settlement with the vol-scaled residual, R-PMJ-S61 /
+S63). The summary never sums
 across segments. **Any change to slot 9's or 11's fill
 or entry law -- a rollback included -- adds a row here in the same
 change.**
@@ -109,8 +111,23 @@ FROM_NS: int = 1_792_368_684_525_363_000
 #: edit and 16:00Z (no restart is scheduled then).
 J11_FROM_NS: int = 1_792_425_600_000_000_000
 
+#: The first boot that reads slot 11's law (iii) (J12, R-PMJ-S61 / S63):
+#: ``pmj.toml`` gets ``strike_law = "trap62"`` before 2026-10-23 16:00Z, and
+#: the 16:05Z daily restart is the first boot after it. No run boots between
+#: the edit and 16:00Z (no restart is scheduled then). Slot 9's row lands with
+#: its own flip, after 10-28 00:00Z.
+J12_FROM_NS: int = 1_792_771_200_000_000_000
+
 #: Both rolling members.
 BOTH_SLOTS: frozenset[int] = frozenset({9, 11})
+
+#: The members' entry floor on the ask (`price_floor_1e6` in `pm15.toml` and
+#: `pmj.toml`, 0.90 since J8). A fill BELOW it was bought after the price fell
+#: during the judge delay -- the losses' signature (R-PMJ-S62): each segment
+#: books those fills apart (`below_floor`) from the rest (`at_or_above`). The
+#: pre-J8 `touch` segment had no floor; it is split at the same 0.90 so the
+#: segments read alike.
+PRICE_FLOOR_1E6: int = 900_000
 
 #: ``(segment, first run epoch, the fill law, the slots it applies to)``, oldest
 #: first: a fill belongs to the last segment of ITS slot whose epoch its run's is
@@ -127,6 +144,12 @@ SEGMENTS: tuple[tuple[str, int, str, frozenset[int]], ...] = (
         "j11",
         J11_FROM_NS,
         "the J8 sweep judged 5 s after submit (Jupiter's keeper); decisions at tau >= 6 s (J11)",
+        frozenset({11}),
+    ),
+    (
+        "j12",
+        J12_FROM_NS,
+        "J11's fill law; law (iii): the trapezoid strike/settlement + vol-scaled residual (J12)",
         frozenset({11}),
     ),
 )
@@ -725,6 +748,17 @@ def book(rows: list[Row]) -> dict[str, typing.Any]:
     }
 
 
+def floor_split(rows: list[Row]) -> dict[str, dict[str, typing.Any]]:
+    """The rows' book split at :data:`PRICE_FLOOR_1E6` (R-PMJ-S62)."""
+    keys = ("settled", "won", "lost", "stake_usd", "fees_usd", "net_usd")
+    below = book([r for r in rows if r.fill.px_1e6 < PRICE_FLOOR_1E6])
+    above = book([r for r in rows if r.fill.px_1e6 >= PRICE_FLOOR_1E6])
+    return {
+        "below_floor": {k: below[k] for k in keys},
+        "at_or_above": {k: above[k] for k in keys},
+    }
+
+
 def _row_view(r: Row) -> dict[str, typing.Any]:
     f = r.fill
     return {
@@ -778,6 +812,7 @@ def slot_summary(
                 "open_cost_usd": usd(sum(o.fill.cost_usd_1e6 for o in os_)),
                 "by_family": [dict(book(v), family=k) for k, v in sorted(by_fam.items())],
                 "days": [dict(book(v), day=k) for k, v in sorted(by_day.items())],
+                **floor_split(rs),
             }
         )
         segments.append(b)

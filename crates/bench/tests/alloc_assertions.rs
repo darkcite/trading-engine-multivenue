@@ -20324,6 +20324,18 @@ fn binance_equity_lane_render_and_scan_steady_state() {
 /// persistence, take, fill and settlement. Zero bytes per operation.
 #[test]
 fn pm15_ingress_driver_and_member_are_zero_alloc() {
+    pm15_ingress_and_member(core_twaplock::report::STRIKE_LAW_MEAN60);
+}
+
+/// PMJ J12 gate 114b: gate 114 with slot 9's member under law (iii)
+/// (`strike_law` trap62: the trapezoid strike, `report_fair_trap`, the fine
+/// ×1e9 scale from the ingress's v1). Zero bytes per operation.
+#[test]
+fn pm15_member_under_law_iii_is_zero_alloc() {
+    pm15_ingress_and_member(core_twaplock::report::STRIKE_LAW_TRAP62);
+}
+
+fn pm15_ingress_and_member(strike_law: u8) {
     use core_ring::Ring;
     use core_twaplock::late::LateLut;
     use core_types::pm_roll::{
@@ -20453,7 +20465,17 @@ fn pm15_ingress_driver_and_member_are_zero_alloc() {
     let perp = core_types::make_symbol_id(VenueId::Hyperliquid, 1);
     let mut perp_sym = [core_types::SYMBOL_ID_NONE; strategy_pm15::PM15_MAX_FAMILIES];
     perp_sym[0] = perp;
-    let p = strategy_pm15::Pm15Params { n_families: 1, perp_sym, ..strategy_pm15::Pm15Params::default() };
+    let mut res_min_ppm = [0i64; strategy_pm15::PM15_MAX_FAMILIES];
+    res_min_ppm[0] = 3;
+    let trap = strike_law == core_twaplock::report::STRIKE_LAW_TRAP62;
+    let p = strategy_pm15::Pm15Params {
+        n_families: 1,
+        perp_sym,
+        strike_law,
+        res_ratio_1e3: if trap { 130 } else { 0 },
+        res_min_ppm: if trap { res_min_ppm } else { [0; strategy_pm15::PM15_MAX_FAMILIES] },
+        ..strategy_pm15::Pm15Params::default()
+    };
     let mut m = strategy_pm15::Pm15Strategy::new();
     m.configure(p, lut, core_time::WallAnchor::new(0, 0)).expect("gate 114: configure");
     let roll = |wc: u32, settled: bool, v0: i64| {
@@ -21322,6 +21344,18 @@ fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
 /// shadow judgements at 350 ms and 1 s. Zero bytes per operation.
 #[test]
 fn pmj_member_steady_state_is_zero_alloc() {
+    pmj_member_steady_state(core_twaplock::report::STRIKE_LAW_MEAN60);
+}
+
+/// PMJ J12 gate 136b: gate 136 under law (iii) (`strike_law` trap62: the
+/// trapezoid strike, `report_fair_trap`, the fine ×1e9 scale). Zero bytes
+/// per operation.
+#[test]
+fn pmj_member_under_law_iii_steady_state_is_zero_alloc() {
+    pmj_member_steady_state(core_twaplock::report::STRIKE_LAW_TRAP62);
+}
+
+fn pmj_member_steady_state(strike_law: u8) {
     use clob_dispatcher::PaperMatcher;
     use core_twaplock::late::LateLut;
     use core_types::pm_roll::{
@@ -21363,7 +21397,17 @@ fn pmj_member_steady_state_is_zero_alloc() {
     let perp = core_types::make_symbol_id(VenueId::Hyperliquid, 1);
     let mut perp_sym = [core_types::SYMBOL_ID_NONE; strategy_pmj::PMJ_MAX_FAMILIES];
     perp_sym[0] = perp;
-    let p = strategy_pmj::PmjParams { n_families: 1, perp_sym, ..strategy_pmj::PmjParams::default() };
+    let mut res_min_ppm = [0i64; strategy_pmj::PMJ_MAX_FAMILIES];
+    res_min_ppm[0] = 3;
+    let trap = strike_law == core_twaplock::report::STRIKE_LAW_TRAP62;
+    let p = strategy_pmj::PmjParams {
+        n_families: 1,
+        perp_sym,
+        strike_law,
+        res_ratio_1e3: if trap { 130 } else { 0 },
+        res_min_ppm: if trap { res_min_ppm } else { [0; strategy_pmj::PMJ_MAX_FAMILIES] },
+        ..strategy_pmj::PmjParams::default()
+    };
     let mut m = strategy_pmj::PmjStrategy::new();
     m.configure(p, lut, core_time::WallAnchor::new(0, 0)).expect("gate 136: configure");
     let mut pm = Box::new(PaperMatcher::new());
