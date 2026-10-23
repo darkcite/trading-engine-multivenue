@@ -208,6 +208,34 @@ affected paragraph at each lane close; the superseded text goes to
   - **Rollback.** Restore `pmj.toml.pre-j12` and restart (plus a J9 `SEGMENTS`
     row), or the previous binary.
 
+## Corrections found 2026-10-23 (BIN15 — they supersede the slot 3 text above; verify on `/state`)
+
+- **Slot 3 (bin15) is PAPER** since 2026-10-23 19:34Z (`scripts/bin15-flip.sh paper`,
+  ruling F-10: its API wallet `0x0a1f…54a1` is no longer an agent, every order was
+  refused). `exec.toml` slot 3 `mode = "paper"`, `ARM_LIVE` commented out; the
+  `exec.HALT` `slot=3 reason=reject-streak` line is left for the operator. Slot 3
+  goes live again only with a new API wallet key from Anton.
+- **2026-10-23 20:16Z: main booted `300186e5`** (the 20:15Z drain) — BIN15 fills A
+  + B-1 (plan `claude/bin15-fills-plan-2026-10-23.md`, rulings F-1..F-11):
+  - **The book (O8b).** A HIP-4 outcome leg's touch is composed from both legs'
+    own `bbo` (a leg's ask = 1 − the other leg's bid); an emptied side reaches the
+    engine (ask 0), so a ghost ask can no longer stand. This is every HL outcome
+    reader on main (bin15 slot 3, xmm slot 6; both paper): about 2.2 updates/s per
+    leg instead of the `l2Book`'s ~0.19.
+  - **The law.** `late_refire_fresh = 1` in `~/multivenue/bin15.toml` (backup
+    `bin15.toml.bak-20261023T200630Z-fills-b1`): after a refused IoC the instance
+    fires again only on another touch of its leg. Boot tell
+    `late=2-30s:p>=0.90:ask<=p-2c:persist1:$100:k1.550:fresh`, artifact
+    `545fc348…`.
+  - **Committed, not yet built on main:** `7f5743c8` (B-2 `late_max_quote_age_ms`
+    = the ask's age at its price), `1803a652` (B-4 `late_lead`), `c1920c89`
+    (`late_lead = "none"`). All three keys are unset; main's next release build
+    from committed state carries them with no behaviour change.
+- **The standalone is unchanged and LIVE** (`61d899a7`, `0x66b5…2806`). Its
+  branch carries G20–G24 (the same fixes, plus the Binance USDⓈ-M feed, dark),
+  NOT deployed: ruling F-11 — nothing updated goes live on the money account
+  until Anton confirms.
+
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
