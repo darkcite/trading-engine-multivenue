@@ -2639,6 +2639,156 @@ fn hl_family_roll_is_zero_alloc() {
     assert_eq!(bytes, 0, "hl family roll bytes should be zero: saw {bytes}");
 }
 
+/// BIN15 fills A (O8b, 2026-10-23): a bound family's outcome legs — own
+/// `bbo` pushes with one side, both sides and none, composed into BOTH
+/// legs' touches, and an `l2Book` with an emptied side — through the run
+/// loop at 0 B/op. The composition runs on every outcome push, so it is a
+/// hot path like any tick.
+#[test]
+fn hl_outcome_bbo_composition_is_zero_alloc() {
+    use ingress_hyperliquid::family::{rolling_sym, HlFamilyTable, HlRollStatus};
+    use ingress_hyperliquid::run_loop as hwl;
+
+    // ---- boot (NOT measured) ----
+    let mut transport = TestTransport::with_capacity(512 * 1024);
+    let sym_btc: SymbolId = (4 << 24) | 1;
+    let mut coins = ingress_hyperliquid::HlCoinTable::new();
+    coins.insert(b"BTC", sym_btc).unwrap();
+    let yes = coins.reserve(rolling_sym(0, 0)).unwrap();
+    let no = coins.reserve(rolling_sym(0, 1)).unwrap();
+    let mut families = HlFamilyTable::new();
+    let (kind, und, period) = HlFamilyTable::parse_key(b"out:BTC:15m").unwrap();
+    families
+        .push(
+            kind,
+            und,
+            period,
+            [yes as u8, no as u8],
+            [rolling_sym(0, 0), rolling_sym(0, 1)],
+        )
+        .unwrap();
+    const EXPIRY_2649_NS: u64 = 1_789_194_600_000_000_000;
+    let wall = core_time::WallAnchor::new(core_time::now_ns(), EXPIRY_2649_NS - 30_000_000_000);
+    let roll_status = std::sync::Arc::new(HlRollStatus::new());
+    let mut driver = hwl::Driver::new(0x0B16u64, coins, u64::MAX / 4, u64::MAX / 4);
+    driver.set_families(families, roll_status.clone(), wall);
+    hwl::note_transport_ready(&mut driver, core_net::Status::Ready);
+    let (mut hl_etx, _herx) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let status = core_metrics::IngressStatus::new();
+    let ring: std::sync::Arc<Ring<Tick, { hwl::TICK_RING_CAP }>> = Ring::new();
+    let (mut prod, mut cons) = ring.split();
+    let lane = core_types::EVENT_LANE_FUNDING
+        | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll);
+    let mut drive = |t: &mut TestTransport, d: &mut hwl::Driver| {
+        hwl::drive_one(
+            t,
+            d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut hl_etx,
+            lane,
+            &status,
+            &mut core_types::NullCapture,
+        )
+        .unwrap();
+    };
+    drive(&mut transport, &mut driver);
+    let mut scratch = [0u8; 16384];
+    let _ = transport.drain_outgoing(&mut scratch);
+    let key = core_net::sec_websocket_key_from_seed(0x0B16u64);
+    let accept = core_net::expected_accept(&key);
+    let mut resp = [0u8; 256];
+    let mut n = 0;
+    for src in [
+        &b"HTTP/1.1 101 Switching Protocols\r\n"[..],
+        &b"Upgrade: websocket\r\n"[..],
+        &b"Connection: Upgrade\r\n"[..],
+        &b"Sec-WebSocket-Accept: "[..],
+        &accept[..],
+        &b"\r\n\r\n"[..],
+    ] {
+        resp[n..n + src.len()].copy_from_slice(src);
+        n += src.len();
+    }
+    transport.inject_incoming(&resp[..n]);
+    drive(&mut transport, &mut driver);
+    assert_eq!(driver.state(), hwl::State::Steady);
+    let _ = transport.drain_outgoing(&mut scratch);
+
+    fn push_text_frame(stream: &mut Vec<u8>, body: &[u8]) {
+        stream.push(0x81);
+        if body.len() <= 125 {
+            stream.push(body.len() as u8);
+        } else {
+            assert!(body.len() <= u16::MAX as usize);
+            stream.push(126);
+            stream.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        }
+        stream.extend_from_slice(body);
+    }
+    // Bind outcome 2649 (06:30Z) to the family: its legs are #26490 / #26491.
+    const CREATED_2649: &[u8] = br##"{"channel":"outcomeMetaUpdates","data":[{"outcomeCreated":{"outcome":2649,"name":"template:binaryPrice","description":"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77177|time:20260912-0630","sideSpecs":[{"name":"template:Yes"},{"name":"template:No"}],"quoteToken":"USDC","venue":"out","deployerFeeScale":"1.0"}}]}"##;
+    let mut stream: Vec<u8> = Vec::with_capacity(4 * 1024);
+    push_text_frame(&mut stream, CREATED_2649);
+    transport.inject_incoming(&stream);
+    while transport.incoming_len() > 0 {
+        drive(&mut transport, &mut driver);
+        let _ = transport.drain_outgoing(&mut scratch);
+    }
+    assert_eq!(roll_status.rolls_total(), 1, "the family is bound");
+
+    // The script: per round, each leg's own one-sided push, a two-sided
+    // push, an emptied leg, and an `l2Book` whose asks are gone.
+    const ROUNDS: u64 = 200;
+    let t0_ms = EXPIRY_2649_NS / 1_000_000 - 25_000;
+    let mut stream: Vec<u8> = Vec::with_capacity(256 * 1024);
+    let mut r = 0u64;
+    while r < ROUNDS {
+        let ms = t0_ms + r * 10;
+        let (m1, m2, m3, m4) = (ms + 1, ms + 2, ms + 3, ms + 4);
+        for body in [
+            format!(r##"{{"channel":"bbo","data":{{"coin":"#26490","time":{ms},"bbo":[{{"px":"0.81","sz":"25.0","n":1}},null]}}}}"##),
+            format!(r##"{{"channel":"bbo","data":{{"coin":"#26491","time":{m1},"bbo":[{{"px":"0.15","sz":"40.0","n":1}},null]}}}}"##),
+            format!(r##"{{"channel":"bbo","data":{{"coin":"#26490","time":{m2},"bbo":[{{"px":"0.82","sz":"20.0","n":1}},{{"px":"0.86","sz":"9.0","n":1}}]}}}}"##),
+            format!(r##"{{"channel":"bbo","data":{{"coin":"#26491","time":{m3},"bbo":[null,null]}}}}"##),
+            format!(r##"{{"channel":"l2Book","data":{{"coin":"#26491","time":{m4},"levels":[[{{"px":"0.13","sz":"25.0","n":1}}],[]]}}}}"##),
+        ] {
+            push_text_frame(&mut stream, body.as_bytes());
+        }
+        r += 1;
+    }
+    let injected = transport.inject_incoming(&stream);
+    assert_eq!(injected, stream.len(), "transport must hold the script");
+    let one_sided_before = roll_status.outcome_bbo_one_sided();
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+    let mut drives = 0u32;
+    let mut ticks = 0u64;
+    let mut out_scratch = [0u8; 16384];
+    while transport.incoming_len() > 0 {
+        drive(&mut transport, &mut driver);
+        let _ = transport.drain_outgoing(&mut out_scratch);
+        while let Some(_t) = cons.try_pop_ref() {
+            ticks += 1;
+        }
+        drives += 1;
+        assert!(drives <= 8_192, "scripted stream failed to drain");
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+
+    assert_eq!(status.parse_errors_total(), 0);
+    assert!(
+        ticks >= ROUNDS * 4,
+        "the composed touches reached the ring: {ticks} ticks"
+    );
+    assert!(roll_status.outcome_bbo_one_sided() > one_sided_before, "one-sided pushes counted");
+    assert_eq!(allocs, 0, "outcome bbo composition allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "outcome bbo composition bytes should be zero: saw {bytes}");
+}
+
 /// BIN15 O1: the LIVE `outcomeMetaUpdates` shapes through the
 /// lifecycle parser, the zero-copy description accessor and the
 /// description grammar — 10 000 iterations, zero allocations. The

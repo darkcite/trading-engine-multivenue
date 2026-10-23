@@ -659,6 +659,41 @@ fn parse_bbo_fill(payload: &[u8], sym: SymbolId, out: &mut HlBboFrame) -> Option
     Some(())
 }
 
+/// BIN15 O8b: [`parse_bbo`] that also reads a both-`null` push
+/// (`"bbo":[null,null]`) — for a HIP-4 leg of a bound family that is the
+/// leg's OWN book emptied on both sides, news the composition needs (the
+/// other leg then mirrors in alone). Every other coin keeps
+/// [`parse_bbo`]'s refusal: for a perp both-`null` carries nothing.
+#[inline]
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_bbo_any(payload: &[u8], sym: SymbolId, out: &mut HlBboFrame) -> bool {
+    parse_bbo_any_fill(payload, sym, out).is_some()
+}
+
+#[inline(always)]
+fn parse_bbo_any_fill(payload: &[u8], sym: SymbolId, out: &mut HlBboFrame) -> Option<()> {
+    let pos = find_field(payload, b"\"bbo\":")?;
+    if *payload.get(pos)? != b'[' {
+        return None;
+    }
+    let (bid_px_1e6, bid_qty_1e6, bid_end) = scan_level_obj(payload, pos + 1)?;
+    if *payload.get(bid_end)? != b',' {
+        return None;
+    }
+    let (ask_px_1e6, ask_qty_1e6, _ask_end) = scan_level_obj(payload, bid_end + 1)?;
+    let ts_ns = scan_bare_ms_to_ns(payload, b"\"time\":")?;
+    *out = HlBboFrame {
+        ts_ns,
+        bid_px_1e6,
+        bid_qty_1e6,
+        ask_px_1e6,
+        ask_qty_1e6,
+        sym,
+        _pad: [0; 20],
+    };
+    Some(())
+}
+
 /// Parse an `l2Book` snapshot into its [`HlL2BookFrame`] header.
 /// `levels` is `[bids, asks]`, each best-first; levels themselves
 /// stay in the rx buffer (§4.5).

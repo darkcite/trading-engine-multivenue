@@ -301,6 +301,15 @@ pub struct Driver {
     /// 192 B copy. Boot-owned, one pair per [`HL_MAX_COINS`] slot;
     /// outcome and (XMM XH1) perp coins touch theirs, spot coins never.
     depth: Box<[DepthPair]>,
+    /// BIN15 O8b (2026-10-23): each outcome leg's OWN top of book, as
+    /// its last `bbo` said it, indexed like the [`HlCoinTable`] rows. The
+    /// venue's `bbo` for a HIP-4 leg carries that leg's resting orders
+    /// only: a `null` side is EMPTY, and the other leg's best bid is
+    /// this leg's best ask (`1 − b`; buying here mints the pair against
+    /// it), so a leg's two-sided touch is composed from both legs' rows
+    /// ([`compose_outcome`]). Boot-owned; zeroed per connection and when
+    /// a family rolls or retires.
+    own: Box<[OwnBbo]>,
     /// Set once the post-upgrade subscribe frames have been queued.
     subscribed: bool,
     /// Set once every expected ack is in — `found & expected ==
@@ -371,6 +380,8 @@ impl Driver {
             roll_spec: HlOutcomeSpec::empty(0),
             depth: vec![DepthPair::new(DepthTopK::new(0, VenueId::Hyperliquid, 0, 0, [DepthLevel::EMPTY; DEPTH_K], [DepthLevel::EMPTY; DEPTH_K])); HL_MAX_COINS]
                 .into_boxed_slice(),
+            // COPY: boot-time, one 40 B row per coin slot.
+            own: vec![OwnBbo::NONE; HL_MAX_COINS].into_boxed_slice(),
             subscribed: false,
             verified: false,
             feed_clock: FeedClock::new(VenueId::Hyperliquid.default_stale_after_ms()),
@@ -498,6 +509,9 @@ impl Driver {
         // far-future stamp poisoned. rx is cleared and the old socket gone:
         // no tick of the old connection can follow.
         core_types::ArrivalSeq::reset_clocks(&mut self.coin_seq);
+        // O8b: a new connection re-sends every leg's book; nothing of the
+        // old one may stand in for it.
+        self.own.fill(OwnBbo::NONE);
         self.retire_dead_families(self.wall.wall_of(now_ns()))
     }
 
@@ -532,6 +546,10 @@ impl Driver {
             if dead {
                 // `retire` refuses only a row index the table never
                 // handed out — a programming error, never venue input.
+                if let Some(row) = self.families.get(f) {
+                    self.own[usize::from(row.coin_idx[0]) % HL_MAX_COINS] = OwnBbo::NONE;
+                    self.own[usize::from(row.coin_idx[1]) % HL_MAX_COINS] = OwnBbo::NONE;
+                }
                 let ok = self.families.retire(f, &mut self.coins).is_ok();
                 debug_assert!(ok, "hl retire: family {f} names a missing coin row");
                 retired += usize::from(ok);
@@ -982,7 +1000,10 @@ fn perform_roll<C: Capture>(
                 side += 1;
             }
         }
-        // (b) Rebind both slots and make the family live.
+        // (b) Rebind both slots and make the family live. O8b: the
+        // outgoing instance's books say nothing about the incoming one.
+        drv.own[coin_idx[0] % HL_MAX_COINS] = OwnBbo::NONE;
+        drv.own[coin_idx[1] % HL_MAX_COINS] = OwnBbo::NONE;
         if drv.families.bind(family_idx, spec, &mut drv.coins).is_err() {
             debug_assert!(false, "hl roll: rebind refused");
             return Ok(());
@@ -1291,9 +1312,15 @@ enum Dispatch {
     /// `bbo` push became the phase-1 tick.
     Bbo,
     /// BIN15 O8: a HIP-4 outcome leg's one-sided `bbo` (its ask
-    /// `null`) — well-formed, dropped by policy, counted on its own
-    /// (`HlRollStatus::outcome_bbo_one_sided`), never as a rejection.
+    /// `null`) on a leg with no known pair — well-formed, dropped by
+    /// policy, counted on its own (`HlRollStatus::outcome_bbo_one_sided`),
+    /// never as a rejection.
     OutcomeBboOneSided,
+    /// BIN15 O8b: an outcome leg of a bound family — its own row updated
+    /// and the touch composed for it (`tick`) and, once the other leg's
+    /// book is known, for the other leg (`tick2`, `paired`).
+    /// `one_sided`: the push had a `null` ask (counted as O8 counts it).
+    OutcomeBbo { one_sided: bool, paired: bool },
     /// `l2Book` snapshot header (staleness food), plus — BIN15 O8 —
     /// the touch it yields for a HIP-4 outcome leg, whose `bbo` the
     /// venue publishes one-sided: `touch` says the phase-1 tick holds
@@ -1551,6 +1578,9 @@ fn handle_data_frame<C: Capture>(
     // 1 → phase 2 by value. `Dispatch::Bbo` and `Dispatch::L2Book {
     // touch: true }` say it was written.
     let mut tick = Tick::ZERO;
+    // BIN15 O8b: an outcome leg's push re-composes BOTH legs' touches (the
+    // other leg's ask is this leg's bid mirrored); the other's lands here.
+    let mut tick2 = Tick::ZERO;
     // Phase 1: immutable borrow of rx (+ coins) — classify, resolve
     // the coin, pre-parse into a Copy dispatch value. Capture hooks
     // that need parsed values fire here (events); the raw tap sees
@@ -1725,7 +1755,88 @@ fn handle_data_frame<C: Capture>(
                         Some((sym, Some(coin_idx))) => match channel {
                             HlChannel::Bbo => {
                                 let mut bbo = crate::HlBboFrame::ZERO;
-                                match parse_bbo(payload, sym, &mut bbo).then_some(&bbo) {
+                                // O8b: a bound family's leg reads a both-`null` push
+                                // too — its own book EMPTIED, which is news.
+                                let fam_leg = drv
+                                    .coins
+                                    .get(coin_idx)
+                                    .is_some_and(|(c, _)| is_outcome_coin(c))
+                                    && drv.families.index_of_coin_row(coin_idx).is_some();
+                                let parsed = if fam_leg {
+                                    crate::parse_bbo_any(payload, sym, &mut bbo)
+                                } else {
+                                    parse_bbo(payload, sym, &mut bbo)
+                                };
+                                match parsed.then_some(&bbo) {
+                                    // BIN15 O8b (2026-10-23, the probe of #16315x/#16316x/
+                                    // #16317x): a HIP-4 leg's `bbo` carries ITS OWN resting
+                                    // orders only. A `null` ask is an EMPTY own side, and the
+                                    // leg's real ask is the other leg's best bid mirrored
+                                    // (`1 − b`, the size of that bid): the venue mints the pair
+                                    // against it, which is how all three live fills of
+                                    // 10-22/23 filled. Dropping the push (O8) left the last
+                                    // ask standing in every book after its side emptied —
+                                    // 23 IoCs at a ghost on 10-22 19:14Z. For a leg of a
+                                    // bound family the row is kept and both legs' touches
+                                    // are composed from the two rows; until the other leg's
+                                    // first push a one-sided push is still O8's drop (its ask
+                                    // is unknown, not empty), and `l2Book` carries the touch.
+                                    Some(f) if fam_leg => {
+                                        let one_sided = f.ask_px_1e6 == 0;
+                                        drv.own[coin_idx] = OwnBbo::of(f);
+                                        let pair = drv.families.index_of_coin_row(coin_idx).and_then(
+                                            |(fi, side)| {
+                                                drv.families.get(fi).map(|r| {
+                                                    (usize::from(r.coin_idx[1 - side]), r.sym[1 - side])
+                                                })
+                                            },
+                                        );
+                                        let other = pair
+                                            .and_then(|(o, _)| drv.own.get(o).copied())
+                                            .unwrap_or(OwnBbo::NONE);
+                                        if other.seen == 0 && one_sided {
+                                            Dispatch::OutcomeBboOneSided
+                                        } else {
+                                            let now = now_ns();
+                                            let venue_time_ms = f.ts_ns / 1_000_000;
+                                            let judged = drv.feed_clock.judge(venue_time_ms, now);
+                                            let flags = (judged.stale as u8) * TICK_FLAG_STALE;
+                                            let mine = drv.own[coin_idx];
+                                            let c = compose_outcome(&mine, &other);
+                                            tick = Tick::new_stamped(
+                                                now,
+                                                VenueId::Hyperliquid,
+                                                sym,
+                                                drv.coin_seq[coin_idx].next(venue_time_ms),
+                                                Price::from_raw(c.bid_px_1e6),
+                                                Qty::from_raw(c.bid_qty_1e6),
+                                                Price::from_raw(c.ask_px_1e6),
+                                                Qty::from_raw(c.ask_qty_1e6),
+                                                venue_time_ms,
+                                                flags,
+                                            );
+                                            let mut paired = false;
+                                            if let Some((o, osym)) = pair {
+                                                if other.seen != 0 && o < HL_MAX_COINS {
+                                                    let c2 = compose_outcome(&other, &mine);
+                                                    tick2 = Tick::new_stamped(
+                                                        now,
+                                                        VenueId::Hyperliquid,
+                                                        osym,
+                                                        drv.coin_seq[o].next(venue_time_ms),
+                                                        Price::from_raw(c2.bid_px_1e6),
+                                                        Qty::from_raw(c2.bid_qty_1e6),
+                                                        Price::from_raw(c2.ask_px_1e6),
+                                                        Qty::from_raw(c2.ask_qty_1e6),
+                                                        venue_time_ms,
+                                                        flags,
+                                                    );
+                                                    paired = true;
+                                                }
+                                            }
+                                            Dispatch::OutcomeBbo { one_sided, paired }
+                                        }
+                                    }
                                     // BIN15 O8: the venue sends a HIP-4
                                     // outcome leg's ask as `null`, so a
                                     // bbo touch here would pin `ask = 0`
@@ -1835,9 +1946,15 @@ fn handle_data_frame<C: Capture>(
                                     // two-sided touch the venue
                                     // publishes. Same stamp + staleness
                                     // judgement the bbo arm applies.
+                                    // O8b: an EMPTY side is news too — the venue removed
+                                    // the last order on it, and a touch that kept its old
+                                    // price would be a ghost. Both sides empty, or a
+                                    // crossed book (a settling instance), stays out.
                                     let touch = outcome
-                                        && f.best_bid_px_1e6 > 0
-                                        && f.best_ask_px_1e6 > f.best_bid_px_1e6;
+                                        && (f.best_bid_px_1e6 > 0 || f.best_ask_px_1e6 > 0)
+                                        && (f.best_bid_px_1e6 == 0
+                                            || f.best_ask_px_1e6 == 0
+                                            || f.best_ask_px_1e6 > f.best_bid_px_1e6);
                                     if touch {
                                         let now = now_ns();
                                         let venue_time_ms = f.ts_ns / 1_000_000;
@@ -1991,6 +2108,29 @@ fn handle_data_frame<C: Capture>(
             status.add_msgs(1);
             drv.roll_status.inc_outcome_bbo_one_sided();
         }
+        Dispatch::OutcomeBbo { one_sided, paired } => {
+            status.add_msgs(1);
+            if one_sided {
+                drv.roll_status.inc_outcome_bbo_one_sided();
+            }
+            // The same road as a bbo tick: capture BEFORE the push, ring
+            // drops counted, never blocking — once per leg it composed.
+            let mut k = 0u8;
+            while k < 1 + u8::from(paired) {
+                let t = if k == 0 { &tick } else { &tick2 };
+                status.add_ticks(1);
+                if t.is_stale() {
+                    status.inc_stale_ticks();
+                }
+                status.note_arrival_seq(t.venue_seq);
+                capture.tick(t);
+                if !producer.try_push_ref(t) {
+                    status.inc_ring_drops();
+                }
+                k += 1;
+            }
+            status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
+        }
         Dispatch::TradesEmpty => {
             status.add_msgs(1);
             drv.roll_status.inc_trades_empty();
@@ -2121,6 +2261,107 @@ fn handle_data_frame<C: Capture>(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------
+// BIN15 O8b — an outcome leg's touch from both legs' own books
+// ---------------------------------------------------------------
+
+/// One outcome leg's OWN top of book, as its last `bbo` said it (`0` =
+/// that side empty). 40 B, one per coin slot ([`Driver`]'s `own`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub(crate) struct OwnBbo {
+    bid_px_1e6: i64,
+    bid_qty_1e6: i64,
+    ask_px_1e6: i64,
+    ask_qty_1e6: i64,
+    /// `1` once a `bbo` named this row on this connection.
+    seen: u8,
+    _pad: [u8; 7],
+}
+
+const _: () = assert!(::core::mem::size_of::<OwnBbo>() == 40);
+
+impl OwnBbo {
+    /// No push seen.
+    pub(crate) const NONE: Self = Self {
+        bid_px_1e6: 0,
+        bid_qty_1e6: 0,
+        ask_px_1e6: 0,
+        ask_qty_1e6: 0,
+        seen: 0,
+        _pad: [0; 7],
+    };
+
+    #[inline]
+    fn of(f: &crate::HlBboFrame) -> Self {
+        Self {
+            bid_px_1e6: f.bid_px_1e6,
+            bid_qty_1e6: f.bid_qty_1e6,
+            ask_px_1e6: f.ask_px_1e6,
+            ask_qty_1e6: f.ask_qty_1e6,
+            seen: 1,
+            _pad: [0; 7],
+        }
+    }
+}
+
+/// A composed outcome touch ×1e6 (`0` = side empty).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutcomeTouch {
+    pub(crate) bid_px_1e6: i64,
+    pub(crate) bid_qty_1e6: i64,
+    pub(crate) ask_px_1e6: i64,
+    pub(crate) ask_qty_1e6: i64,
+}
+
+/// One outcome unit ×1e6: a Yes and a No together pay 1.
+const OUTCOME_ONE_1E6: i64 = 1_000_000;
+
+/// BIN15 O8b: leg X's touch from X's own book and the other leg Y's.
+///
+/// Buying X at `1 − b` fills against Y's bid `b` (the venue mints the
+/// pair), and selling X at `1 − a` against Y's ask `a`; so Y's best bid is
+/// an ask of X and Y's best ask a bid of X. Each side takes the better of
+/// own and mirrored; sizes add where the two tie. A side neither book has
+/// is 0 — empty, which no arm can act on. Matches the venue's own merged
+/// `l2Book` (the 2026-10-23 probe: `#163150` ask 0.9979 × 26 = 1 −
+/// `#163151` bid 0.0021 × 26).
+#[inline]
+pub(crate) fn compose_outcome(own: &OwnBbo, other: &OwnBbo) -> OutcomeTouch {
+    let (mb, mbq) = if other.ask_px_1e6 > 0 {
+        (OUTCOME_ONE_1E6 - other.ask_px_1e6, other.ask_qty_1e6)
+    } else {
+        (0, 0)
+    };
+    let (ma, maq) = if other.bid_px_1e6 > 0 {
+        (OUTCOME_ONE_1E6 - other.bid_px_1e6, other.bid_qty_1e6)
+    } else {
+        (0, 0)
+    };
+    let (bid, bq) = if own.bid_px_1e6 == mb {
+        (mb, own.bid_qty_1e6 + mbq)
+    } else if own.bid_px_1e6 > mb {
+        (own.bid_px_1e6, own.bid_qty_1e6)
+    } else {
+        (mb, mbq)
+    };
+    let (ask, aq) = if own.ask_px_1e6 == 0 {
+        (ma, maq)
+    } else if ma == 0 || own.ask_px_1e6 < ma {
+        (own.ask_px_1e6, own.ask_qty_1e6)
+    } else if own.ask_px_1e6 == ma {
+        (ma, own.ask_qty_1e6 + maq)
+    } else {
+        (ma, maq)
+    };
+    OutcomeTouch {
+        bid_px_1e6: bid,
+        bid_qty_1e6: bq,
+        ask_px_1e6: ask,
+        ask_qty_1e6: aq,
+    }
 }
 
 // ---------------------------------------------------------------
@@ -4630,5 +4871,144 @@ mod tests {
         let body = unmask_client_frames(&scratch[..n]);
         assert!(memchr::memmem::find(&body, b"#2649").is_none());
         assert!(memchr::memmem::find(&body, br##"{"type":"bbo","coin":"#26500"}"##).is_some());
+    }
+
+    // ---- BIN15 O8b: both legs' own books make each leg's touch ----------
+
+    /// `family_driver` at 06:29 (2649 live, rows 1–2 `#26490` / `#26491`),
+    /// in the steady shape.
+    fn o8b_rig() -> SeqRig {
+        let mut d = family_driver(WallAnchor::new(now_ns(), T_0629));
+        d.set_state(State::Steady);
+        d.subscribed = true;
+        let (e, g) = expected_mask(&d.coins);
+        d.expected = e;
+        d.expected_global = g;
+        d.steady_since_ns = now_ns();
+        SeqRig::with_driver(d)
+    }
+
+    /// One outcome `bbo` push: each side `Some((px, sz))` or `null`.
+    fn own_bbo(coin: &str, ms: u64, bid: Option<(&str, &str)>, ask: Option<(&str, &str)>) -> String {
+        let side = |v: Option<(&str, &str)>| {
+            v.map_or_else(
+                || "null".to_owned(),
+                |(px, sz)| format!(r#"{{"px":"{px}","sz":"{sz}","n":1}}"#),
+            )
+        };
+        format!(
+            r#"{{"channel":"bbo","data":{{"coin":"{coin}","time":{ms},"bbo":[{},{}]}}}}"#,
+            side(bid),
+            side(ask)
+        )
+    }
+
+    fn touch_of(t: &Tick) -> (i64, i64, i64, i64) {
+        (t.bid_px.raw(), t.bid_qty.raw(), t.ask_px.raw(), t.ask_qty.raw())
+    }
+
+    /// The live 2026-10-23 probe of `#163150` / `#163151` (BTC 15 m, 19:28Z),
+    /// retyped onto `#26490` / `#26491`: each leg's `bbo` carried its own
+    /// bid and a `null` ask, while each leg's `l2Book` showed the OTHER
+    /// leg's bid mirrored as its ask.
+    #[test]
+    fn o8b_a_legs_ask_is_the_other_legs_bid_mirrored() {
+        use crate::family::rolling_sym;
+        let mut r = o8b_rig();
+        // The pair's first one-sided push: its ask is unknown, not empty —
+        // still O8's drop, and `l2Book` carries the touch until the other
+        // leg speaks.
+        assert!(r.feed(&own_bbo("#26490", T0, Some(("0.0102", "99.0")), None)).is_empty());
+        assert_eq!(r.d.roll_status.outcome_bbo_one_sided(), 1);
+        // The No leg's first push composes BOTH legs.
+        let t = r.feed(&own_bbo("#26491", T0 + 1, Some(("0.0021", "477.0")), None));
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].sym, rolling_sym(0, 1));
+        assert_eq!(touch_of(&t[0]), (2_100, 477_000_000, 989_800, 99_000_000));
+        assert_eq!(t[1].sym, rolling_sym(0, 0));
+        assert_eq!(touch_of(&t[1]), (10_200, 99_000_000, 997_900, 477_000_000));
+        assert_eq!(r.d.roll_status.outcome_bbo_one_sided(), 2, "still counted");
+        // A size change on No's bid moves Yes's ask at once — no 5.3 s wait
+        // for the next `l2Book`.
+        let t = r.feed(&own_bbo("#26491", T0 + 2, Some(("0.0021", "26.0")), None));
+        assert_eq!(touch_of(&t[1]), (10_200, 99_000_000, 997_900, 26_000_000));
+    }
+
+    /// The 10-22 19:14Z ghost: No's ask was the mirror of Yes's 0.05411 bid;
+    /// that bid went at 19:14:26.996 and the venue's snapshots showed no
+    /// ask for 25 s, while O8's book kept 0.94589 × 20 and the member sent
+    /// 23 IoCs at it. Now the emptied side reaches the ring as 0.
+    #[test]
+    fn o8b_an_emptied_side_is_zero_never_a_ghost() {
+        use crate::family::rolling_sym;
+        let mut r = o8b_rig();
+        r.feed(&own_bbo("#26490", T0, Some(("0.05411", "20.0")), None));
+        let t = r.feed(&own_bbo("#26491", T0 + 1, Some(("0.81", "25.0")), None));
+        assert_eq!(touch_of(&t[0]), (810_000, 25_000_000, 945_890, 20_000_000));
+        // Yes's own book empties on both sides: a both-`null` push, which a
+        // perp's parse refuses but a family leg reads.
+        let t = r.feed(&own_bbo("#26490", T0 + 2, None, None));
+        let no = t.iter().find(|x| x.sym == rolling_sym(0, 1)).expect("No re-composed");
+        assert_eq!(no.ask_px.raw(), 0, "the side is EMPTY, never the old price");
+        assert_eq!(no.ask_qty.raw(), 0);
+        assert_eq!(no.bid_px.raw(), 810_000, "its own bid stands");
+        let yes = t.iter().find(|x| x.sym == rolling_sym(0, 0)).expect("Yes composed");
+        assert_eq!(touch_of(yes), (0, 0, 190_000, 25_000_000));
+        assert_eq!(r.status.parse_errors_total(), 0);
+    }
+
+    /// Own and mirrored liquidity: the better price wins each side; a tie
+    /// adds sizes (two different resting orders).
+    #[test]
+    fn o8b_compose_takes_the_better_side_and_adds_a_tie() {
+        let own = OwnBbo {
+            bid_px_1e6: 400_000,
+            bid_qty_1e6: 5_000_000,
+            ask_px_1e6: 620_000,
+            ask_qty_1e6: 7_000_000,
+            seen: 1,
+            _pad: [0; 7],
+        };
+        let other = OwnBbo {
+            bid_px_1e6: 380_000,
+            bid_qty_1e6: 9_000_000,
+            ask_px_1e6: 600_000,
+            ask_qty_1e6: 3_000_000,
+            seen: 1,
+            _pad: [0; 7],
+        };
+        let c = compose_outcome(&own, &other);
+        assert_eq!(
+            (c.bid_px_1e6, c.bid_qty_1e6, c.ask_px_1e6, c.ask_qty_1e6),
+            (400_000, 8_000_000, 620_000, 16_000_000)
+        );
+        let c = compose_outcome(&OwnBbo::NONE, &OwnBbo::NONE);
+        assert_eq!((c.bid_px_1e6, c.ask_px_1e6), (0, 0));
+    }
+
+    /// A reconnect zeroes the rows: the first one-sided push after it is
+    /// O8's drop again, never composed against the old connection's book.
+    #[test]
+    fn o8b_a_reconnect_forgets_the_old_books() {
+        let mut r = o8b_rig();
+        r.feed(&own_bbo("#26490", T0, Some(("0.0102", "99.0")), None));
+        assert_eq!(r.feed(&own_bbo("#26491", T0 + 1, Some(("0.0021", "477.0")), None)).len(), 2);
+        r.reconnect();
+        assert!(r.feed(&own_bbo("#26491", T0 + 2, Some(("0.0021", "477.0")), None)).is_empty());
+    }
+
+    /// An outcome `l2Book` whose ask side is empty is a touch with ask 0 —
+    /// before O8b it yielded nothing and the last ask stood.
+    #[test]
+    fn o8b_an_l2book_with_no_asks_empties_the_touch() {
+        use crate::family::rolling_sym;
+        let mut r = o8b_rig();
+        let t = r.feed(r##"{"channel":"l2Book","data":{"coin":"#26491","time":1792068605360,"levels":[[{"px":"0.81","sz":"25.0","n":1}],[]]}}"##);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].sym, rolling_sym(0, 1));
+        assert_eq!(touch_of(&t[0]), (810_000, 25_000_000, 0, 0));
+        // Both sides empty: nothing to say.
+        let t = r.feed(r##"{"channel":"l2Book","data":{"coin":"#26491","time":1792068605361,"levels":[[],[]]}}"##);
+        assert!(t.is_empty());
     }
 }

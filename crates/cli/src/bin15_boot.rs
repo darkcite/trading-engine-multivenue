@@ -275,13 +275,16 @@ pub fn load_bin15_boot(
     params.late = strategy_bin15::late::LateParams {
         enabled: file.late_enabled,
         persist_polls: file.late_persist_polls,
-        _pad: [0; 6],
+        refire_fresh: file.late_refire_fresh,
+        limit_bound: file.late_limit_bound,
+        _pad: [0; 4],
         tau_min_ns: file.late_tau_min_ns,
         tau_max_ns: file.late_tau_max_ns,
         p_min_1e6: file.late_p_min_1e6,
         e_1e6: file.late_e_1e6,
         usd_1e6: file.late_usd_1e6,
         sigma_k_1e3: file.late_sigma_k_1e3,
+        max_quote_age_ns: file.late_max_quote_age_ns,
     };
     let late_lut = if file.late_phi_lut.len() == core_config::bin15::LATE_PHI_POINTS {
         let mut l = Box::new(strategy_bin15::late::LateLut::flat());
@@ -416,7 +419,9 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
 
 /// BIN15 H90: the LATE law as the boot line spells it — `off`, or the
 /// window, the belief floor, the margin, the persistence, the spend and
-/// the σ scale: `2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`.
+/// the σ scale: `2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`. The
+/// BIN15-fills keys follow only when stated: `:fresh` (B-1), `:age{ms}ms`
+/// (B-2), `:bound` (B-3).
 #[must_use]
 pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
     let l = &p.late;
@@ -424,7 +429,7 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
         return String::from("off");
     }
     format!(
-        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}",
+        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}{}{}{}",
         l.tau_min_ns / 1_000_000_000,
         l.tau_max_ns / 1_000_000_000,
         l.p_min_1e6 / 1_000_000,
@@ -433,7 +438,14 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
         l.persist_polls,
         l.usd_1e6 / 1_000_000,
         l.sigma_k_1e3 / 1_000,
-        l.sigma_k_1e3 % 1_000
+        l.sigma_k_1e3 % 1_000,
+        if l.refire_fresh == 1 { ":fresh" } else { "" },
+        if l.max_quote_age_ns == 0 {
+            String::new()
+        } else {
+            format!(":age{}ms", l.max_quote_age_ns / 1_000_000)
+        },
+        if l.limit_bound == 1 { ":bound" } else { "" },
     )
 }
 
@@ -641,6 +653,15 @@ mod tests {
         p.late.p_min_1e6 = 925_000;
         p.late.e_1e6 = 10_000;
         assert_eq!(late_law(&p), "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550");
+        // BIN15 fills: each stated key is spelled, in a fixed order.
+        p.late.refire_fresh = 1;
+        assert_eq!(late_law(&p), "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550:fresh");
+        p.late.max_quote_age_ns = 1_500_000_000;
+        p.late.limit_bound = 1;
+        assert_eq!(
+            late_law(&p),
+            "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550:fresh:age1500ms:bound"
+        );
     }
 
     #[test]

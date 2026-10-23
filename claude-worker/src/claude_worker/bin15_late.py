@@ -180,14 +180,27 @@ def late_fires_path(path: str | None = None) -> pathlib.Path:
 
 def law_of(block: dict | None) -> str | None:
     """The late law of a sidecar's ``bin15_late_law`` block as one key --
-    ``None`` when the member ran without it (no block, or ``enabled`` 0)."""
+    ``None`` when the member ran without it (no block, or ``enabled`` 0).
+
+    The BIN15-fills keys (2026-10-23) follow only when stated, so a block
+    written before them and one that states them at 0 are the same law:
+    ``_rf`` (re-fire only on a fresh touch), ``_age<ms>ms`` (the oldest
+    quote it fires on), ``_bound`` (the IoC priced at p - e)."""
     if not block or int(block.get("enabled", 0)) != 1:
         return None
-    return (
+    law = (
         f"tau{int(block['tau_min_ns']) / 1e9:g}-{int(block['tau_max_ns']) / 1e9:g}s"
         f"_p{int(block['p_min_1e6'])}_e{int(block['e_1e6'])}"
         f"_n{int(block['persist_polls'])}_k{int(block['sigma_k_1e3'])}"
     )
+    if int(block.get("refire_fresh", 0)) == 1:
+        law += "_rf"
+    age_ns = int(block.get("max_quote_age_ns", 0))
+    if age_ns != 0:
+        law += f"_age{age_ns // 1_000_000}ms"
+    if int(block.get("limit_bound", 0)) == 1:
+        law += "_bound"
+    return law
 
 
 def _int_or(v: typing.Any, default: int) -> int:

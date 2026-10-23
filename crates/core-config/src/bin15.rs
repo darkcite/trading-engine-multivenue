@@ -73,7 +73,7 @@ fn err(msg: impl Into<String>) -> Bin15Error {
 /// Every key the grammar accepts. An unknown key is a REFUSAL: a
 /// typo'd `e_take_1e6` that silently took the default is a member
 /// trading an edge nobody chose.
-const BIN15_KEYS: [&str; 23] = [
+const BIN15_KEYS: [&str; 26] = [
     "families",
     "underlying",
     "tau_ns",
@@ -110,6 +110,10 @@ const BIN15_KEYS: [&str; 23] = [
     "late_usd_1e6",
     "late_sigma_k_1e3",
     "late_phi_lut",
+    // BIN15 fills (2026-10-23): absent = 0 = the law as it was.
+    "late_refire_fresh",
+    "late_limit_bound",
+    "late_max_quote_age_ms",
 ];
 
 /// BIN15 H90 G3 (2026-10-16, ruling O-GL-2): the keys of the retired arms
@@ -191,6 +195,16 @@ pub struct Bin15File {
     /// pricer's Gaussian table, cut by `claude_worker.bin15_fit late`.
     /// Empty when absent, which `late_enabled = 1` refuses.
     pub late_phi_lut: Vec<u32>,
+    /// BIN15 fills B-1: `1` = after an unfilled late IoC, fire again only
+    /// on another touch of the leg it bought on. Absent = 0.
+    pub late_refire_fresh: u8,
+    /// BIN15 fills B-3: `1` = the IoC's limit is the law's bound `p − e`
+    /// on the grid, sweeping every level up to it. Absent = 0 (the touch).
+    pub late_limit_bound: u8,
+    /// BIN15 fills B-2: the oldest favoured-leg touch the law fires on,
+    /// ns, from `late_max_quote_age_ms` in `[0, LATE_MAX_QUOTE_AGE_MS_LIMIT]`.
+    /// Absent = 0 = no limit.
+    pub late_max_quote_age_ns: u64,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES so the
@@ -304,6 +318,10 @@ pub const LATE_SIGMA_K_1E3_DEFAULT: i64 = 1_550;
 /// short-horizon RMS.
 pub const LATE_SIGMA_K_1E3_RANGE: (i64, i64) = (250, 4_000);
 
+/// BIN15 fills B-2: the largest stated `late_max_quote_age_ms` — the
+/// late window's own ceiling ([`LATE_TAU_MAX_NS_LIMIT`]).
+pub const LATE_MAX_QUOTE_AGE_MS_LIMIT: i64 = 60_000;
+
 /// One optional 0/1 flag; absent = 0.
 fn opt_flag(kv: &[(String, Value, usize)], key: &str) -> Result<u8, Bin15Error> {
     match opt_int(kv, key, 0)? {
@@ -381,6 +399,16 @@ fn late_keys(kv: &[(String, Value, usize)], file: &mut Bin15File) -> Result<(), 
             file.late_sigma_k_1e3
         )));
     }
+    file.late_refire_fresh = opt_flag(kv, "late_refire_fresh")?;
+    file.late_limit_bound = opt_flag(kv, "late_limit_bound")?;
+    let age_ms = opt_int(kv, "late_max_quote_age_ms", 0)?;
+    if !(0..=LATE_MAX_QUOTE_AGE_MS_LIMIT).contains(&age_ms) {
+        return Err(err(format!(
+            "`late_max_quote_age_ms` must be in [0, {LATE_MAX_QUOTE_AGE_MS_LIMIT}] (got {age_ms}) \
+             — 0 is no limit"
+        )));
+    }
+    file.late_max_quote_age_ns = age_ms as u64 * 1_000_000;
     if kv.iter().any(|(k, _, _)| k == "late_phi_lut") {
         file.late_phi_lut = table(
             kv,
@@ -572,6 +600,9 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         late_usd_1e6: LATE_USD_1E6_DEFAULT,
         late_sigma_k_1e3: LATE_SIGMA_K_1E3_DEFAULT,
         late_phi_lut: Vec::new(),
+        late_refire_fresh: 0,
+        late_limit_bound: 0,
+        late_max_quote_age_ns: 0,
     };
 
     if file.families.is_empty() || file.families.len() > BIN15_MAX_FAMILIES {
@@ -1025,6 +1056,8 @@ mod tests {
         assert_eq!(f.late_usd_1e6, 100_000_000);
         assert_eq!(f.late_sigma_k_1e3, 1_550);
         assert!(f.late_phi_lut.is_empty());
+        assert_eq!((f.late_refire_fresh, f.late_limit_bound), (0, 0), "the fills keys");
+        assert_eq!(f.late_max_quote_age_ns, 0);
         // The committed example carries none of them, so it is off too.
         let ex = parse(EXAMPLE).expect("example");
         assert_eq!(ex.late_enabled, 0);
@@ -1049,6 +1082,28 @@ mod tests {
         assert_eq!(f.late_sigma_k_1e3, 1_250);
         assert_eq!(f.late_phi_lut.len(), LATE_PHI_POINTS);
         assert_eq!(f.late_phi_lut[LATE_PHI_POINTS - 1], 1_000_000);
+    }
+
+    /// BIN15 fills (2026-10-23): the re-fire, bound and age keys round-trip
+    /// and are bounded.
+    #[test]
+    fn the_late_fills_keys_round_trip_and_are_bounded() {
+        let src = format!(
+            "{}late_refire_fresh = 1\nlate_limit_bound = 1\nlate_max_quote_age_ms = 1500\n",
+            artifact()
+        );
+        let f = parse(&src).expect("the fills keys parse");
+        assert_eq!((f.late_refire_fresh, f.late_limit_bound), (1, 1));
+        assert_eq!(f.late_max_quote_age_ns, 1_500_000_000);
+        for (line, want) in [
+            ("late_refire_fresh = 2", "0 or 1"),
+            ("late_limit_bound = -1", "0 or 1"),
+            ("late_max_quote_age_ms = -1", "[0, 60000]"),
+            ("late_max_quote_age_ms = 60001", "[0, 60000]"),
+        ] {
+            let e = parse(&format!("{}{line}\n", artifact())).expect_err(line);
+            assert!(e.0.contains(want), "{line}: {}", e.0);
+        }
     }
 
     /// BIN15 H90: on without a table is a refusal, and every bound holds

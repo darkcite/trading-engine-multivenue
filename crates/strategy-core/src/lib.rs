@@ -1744,6 +1744,12 @@ pub struct Bin15Counters {
     /// BIN15 H90: late entries refused for size — the caps or the resting
     /// size left under one contract.
     pub late_skipped_cap: u64,
+    /// BIN15 fills B-1: late re-prices whose test held but whose next IoC
+    /// waits for another touch on the leg a refused IoC bought on.
+    pub late_skipped_refire: u64,
+    /// BIN15 fills B-2: late re-prices held because the favoured leg's
+    /// touch is older than `late_max_quote_age_ms`.
+    pub late_skipped_age: u64,
 }
 
 /// Families one BIN15 view carries. Mirrors

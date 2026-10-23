@@ -524,8 +524,13 @@ pub struct LateState {
     /// The production-pricer counterfactual's side (valid while
     /// `ctl_ts != 0`).
     pub ctl_yes: u8,
+    /// BIN15 fills B-1: `1` while a refused late IoC holds the next one
+    /// until the leg it bought on shows another touch.
+    pub refire: u8,
+    /// The side the last late IoC bought, `1` Yes / `0` No.
+    pub take_yes: u8,
     /// Explicit padding — always zero.
-    pub _pad: [u8; 3],
+    pub _pad: [u8; 1],
     /// The favoured leg's snapshot (`TouchState::ts_ns`) the run last
     /// counted.
     pub last_touch_ts: u64,
@@ -549,11 +554,38 @@ pub struct LateState {
     /// The production p̂ on that side at the entry ×1e6, or `-1` when it
     /// did not price at that reprice.
     pub entry_ctl_p_1e6: i32,
-    /// Explicit padding — always zero.
-    pub _pad2: [u8; 4],
+    /// The touch that IoC was priced on, as [`touch_key`] of its ask.
+    pub take_touch_key: u32,
 }
 
 const _: () = assert!(::core::mem::size_of::<LateState>() == 64);
+
+/// BIN15 fills B-1: one leg's touch as a 32-bit key — the ask ×1e6 in the
+/// low 20 bits (every price under one fits), its whole contracts mod 4 096
+/// above. Two touches with one key are the same quote to the re-fire test;
+/// an emptied side (ask 0, size 0) is key 0.
+#[inline(always)]
+#[must_use]
+pub const fn touch_key(ask_1e6: i64, ask_qty_1e6: i64) -> u32 {
+    let px = (ask_1e6 as u32) & 0x000F_FFFF;
+    let lots = ((ask_qty_1e6 / GRID_LOT_1E6) as u32) & 0x0FFF;
+    px | (lots << 20)
+}
+
+/// BIN15 fills B-3: the highest grid price at or under `px_1e6` — a step
+/// of 10 ×1e-6 from 0.1 up (the five-figure law), 1 under it — and never
+/// above the grid's top.
+#[inline(always)]
+#[must_use]
+pub const fn grid_floor_1e6(px_1e6: i64) -> i64 {
+    let step = if px_1e6 >= PX_SIX_DIGITS_1E6 { 10 } else { 1 };
+    let f = px_1e6 - px_1e6.rem_euclid(step);
+    if f > GRID_PX_MAX_1E6 {
+        GRID_PX_MAX_1E6
+    } else {
+        f
+    }
+}
 
 /// The BIN15 member.
 #[repr(C, align(64))]
@@ -1448,6 +1480,15 @@ impl Bin15Strategy {
         if st.covered != 0 || self.fam[idx].pend_take.live() {
             return;
         }
+        // B-1: a refused IoC holds the next one until the leg it bought on
+        // shows another quote — an emptied side included — so the law never
+        // fires twice into one touch (the 10-22 19:14Z ghost took 23).
+        if st.refire != 0 {
+            let t = if st.take_yes == 1 { self.fam[idx].touch_yes } else { self.fam[idx].touch_no };
+            if touch_key(t.touch.ask_1e6, t.touch.ask_qty_1e6) != st.take_touch_key {
+                st.refire = 0;
+            }
+        }
         if !book_ok {
             self.counters.late_skipped_book = self.counters.late_skipped_book.wrapping_add(1);
             return;
@@ -1480,20 +1521,41 @@ impl Bin15Strategy {
                 self.counters.late_skipped_persist.wrapping_add(1);
             return;
         }
-        let want = (lp.usd_1e6 as i128 * 1_000_000) / px as i128;
+        if st.refire != 0 && st.take_yes == yes {
+            self.counters.late_skipped_refire = self.counters.late_skipped_refire.wrapping_add(1);
+            return;
+        }
+        // B-2: never on a quote the leg has not refreshed for longer than
+        // the stated age.
+        if lp.max_quote_age_ns != 0 && now.saturating_sub(touch.ts_ns) > lp.max_quote_age_ns {
+            self.counters.late_skipped_age = self.counters.late_skipped_age.wrapping_add(1);
+            return;
+        }
+        // B-3: at the bound the IoC takes every level up to it, so the
+        // spend and the caps size it; at the touch, the touch's size too.
+        // The touch is on the grid and at or under the bound, so the
+        // floored bound is never under it.
+        let bound = lp.limit_bound == 1;
+        let limit = if bound { grid_floor_1e6(p_side - lp.e_1e6) } else { px };
+        debug_assert!(limit >= px, "the bound {limit} under the touch {px}");
+        let shown = if bound { i64::MAX } else { touch.touch.ask_qty_1e6 };
+        let want = (lp.usd_1e6 as i128 * 1_000_000) / limit as i128;
         let want = i64::try_from(want).unwrap_or(i64::MAX);
-        let qty = want.min(touch.touch.ask_qty_1e6).min(self.cap_room_1e6(idx, px));
+        let qty = want.min(shown).min(self.cap_room_1e6(idx, limit));
         if qty < GRID_LOT_1E6 {
             self.counters.late_skipped_cap = self.counters.late_skipped_cap.wrapping_add(1);
             return;
         }
         let before = self.counters.takes_submitted;
-        self.emit_take(ctx, idx, want_yes, px, qty, now);
+        self.emit_take(ctx, idx, want_yes, limit, qty, now);
         if self.counters.takes_submitted != before {
             let oid = self.fam[idx].pend_take.oid;
             let st = &mut self.late_fam[idx];
             st.covered = 1;
             st.oid = oid;
+            st.refire = 0;
+            st.take_yes = yes;
+            st.take_touch_key = touch_key(px, touch.touch.ask_qty_1e6);
             st.entry_p_1e6 = p_side as i32;
             st.entry_sigma_1e9 = u32::try_from(fair.sigma_1e9).unwrap_or(u32::MAX);
             st.entry_ctl_p_1e6 = ctl_side_p as i32;
@@ -1734,6 +1796,7 @@ impl Bin15Strategy {
                 if self.late_fam[i].oid == oid {
                     self.late_fam[i].oid = 0;
                     self.late_fam[i].covered = 0;
+                    self.late_fam[i].refire = self.params.late.refire_fresh;
                 }
                 return;
             }
@@ -2902,6 +2965,124 @@ mod tests {
         // The successor instance starts clean.
         m.on_venue_event(&roll_event(0, 7002, 60, 79_000_000_000, expiry(1_500), false), &mut c);
         assert_eq!(*m.late_state(0).expect("f"), LateState::default());
+    }
+
+    /// A late IoC refused by the venue (a gateway's REJECTED) at `secs`.
+    fn late_refuse(m: &mut Bin15Strategy, c: &mut RecCtx, oid: u64, secs: u64) {
+        let mut ev = core_types::OrderEvent::ZERO;
+        ev.client_oid = oid;
+        ev.kind = core_types::ORDER_EVENT_REJECTED;
+        ev.ts_ns = at(secs);
+        m.on_order_event(&ev, c);
+    }
+
+    /// BIN15 fills B-1: with `refire_fresh` a refused entry waits for
+    /// another touch on its leg; a changed ask fires at once, and the first
+    /// quote seen again after a change fires too.
+    #[test]
+    fn with_refire_fresh_a_refused_entry_waits_for_another_touch() {
+        let mut m = late_member(1);
+        m.params.late.refire_fresh = 1;
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 585);
+        late_poll(&mut m, &mut c, 585, 800_000, 850_000);
+        assert_eq!(c.orders.len(), 1);
+        let oid = c.orders[0].client_oid;
+        late_refuse(&mut m, &mut c, oid, 586);
+        let st = *m.late_state(0).expect("f");
+        assert_eq!((st.covered, st.refire, st.take_yes), (0, 1, 1));
+        assert_eq!(st.take_touch_key, touch_key(850_000, 1_000_000_000));
+        // Marks and the same touch again: held, counted.
+        late_feed(&mut m, &mut c, 586, 588);
+        late_poll(&mut m, &mut c, 588, 800_000, 850_000);
+        assert_eq!(c.orders.len(), 1, "never twice into one touch");
+        assert!(m.counters().late_skipped_refire > 0);
+        // Another ask on the leg: it fires there.
+        late_feed(&mut m, &mut c, 589, 590);
+        late_poll(&mut m, &mut c, 589, 800_000, 860_000);
+        assert_eq!(c.orders.len(), 2, "a new quote frees it");
+        assert_eq!(c.orders[1].px.raw(), 860_000);
+        assert_eq!(m.late_state(0).expect("f").refire, 0);
+        // Refused again; the first quote back after that change is a new one.
+        let oid = c.orders[1].client_oid;
+        late_refuse(&mut m, &mut c, oid, 590);
+        late_feed(&mut m, &mut c, 590, 591);
+        late_poll(&mut m, &mut c, 590, 800_000, 850_000);
+        assert_eq!(c.orders.len(), 3, "a changed touch, even to an old price, fires");
+        assert_eq!(c.orders[2].px.raw(), 850_000);
+    }
+
+    /// BIN15 fills B-2: a touch older than `max_quote_age_ns` holds; with no
+    /// limit the same tape fires on the first mark inside the window.
+    #[test]
+    fn the_late_law_refuses_a_touch_older_than_its_age() {
+        let run = |age_ns: u64| {
+            let mut m = late_member(1);
+            m.params.late.max_quote_age_ns = age_ns;
+            let mut c = ctx();
+            late_bind(&mut m, &mut c);
+            late_feed(&mut m, &mut c, 0, 560);
+            // The book's one snapshot, at τ ≈ 39.6 s — before the window.
+            late_poll(&mut m, &mut c, 560, 800_000, 850_000);
+            late_feed(&mut m, &mut c, 560, 585);
+            (c.orders.len(), m.counters().late_skipped_age)
+        };
+        let (n, aged) = run(1_000_000_000);
+        assert!(n == 0 && aged > 0, "a 10 s old ask is never bought: {n} {aged}");
+        let (n, aged) = run(0);
+        assert_eq!((n, aged), (1, 0), "no limit: the first mark in the window fires");
+    }
+
+    /// BIN15 fills B-3: at the bound the IoC's limit is `p − e` on the grid,
+    /// sized by the spend and not by the touch's own quantity.
+    #[test]
+    fn at_the_bound_the_late_ioc_sweeps_to_p_minus_e() {
+        let thin = |m: &mut Bin15Strategy, c: &mut RecCtx, secs: u64| {
+            let t = at(secs) + 400_000_000;
+            m.on_tick(&tick(yes_sym(0), 800_000, 850_000, 5_000_000, t, false), c);
+            m.on_tick(&tick(no_sym(0), 150_000, 200_000, 5_000_000, t, false), c);
+        };
+        let mut m = late_member(1);
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 585);
+        thin(&mut m, &mut c, 585);
+        assert_eq!(c.orders.len(), 1);
+        assert_eq!((c.orders[0].px.raw(), c.orders[0].qty.raw()), (850_000, 5_000_000), "the touch");
+        let mut m = late_member(1);
+        m.params.late.limit_bound = 1;
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 585);
+        thin(&mut m, &mut c, 585);
+        assert_eq!(c.orders.len(), 1);
+        let o = c.orders[0];
+        let p = i64::from(m.late_state(0).expect("f").entry_p_1e6);
+        let limit = grid_floor_1e6(p - 20_000);
+        assert!(limit > 850_000 && limit % 10 == 0, "{limit}");
+        assert_eq!(o.px.raw(), limit);
+        let lots = 100_000_000 * 1_000_000 / limit / GRID_LOT_1E6;
+        assert_eq!(o.qty.raw(), lots * GRID_LOT_1E6, "the spend, not the 5 shown");
+        assert_eq!(m.late_state(0).expect("f").take_touch_key, touch_key(850_000, 5_000_000));
+    }
+
+    #[test]
+    fn the_touch_key_and_the_grid_floor() {
+        assert_eq!(touch_key(0, 0), 0, "an emptied side");
+        assert_ne!(touch_key(850_000, 5_000_000), touch_key(850_000, 6_000_000));
+        assert_ne!(touch_key(850_000, 5_000_000), touch_key(850_010, 5_000_000));
+        assert_eq!(touch_key(999_990, 0), 999_990);
+        assert_eq!(grid_floor_1e6(978_437), 978_430);
+        assert_eq!(grid_floor_1e6(978_430), 978_430);
+        assert_eq!(grid_floor_1e6(99_999), 99_999, "under 0.1 the step is one");
+        assert_eq!(grid_floor_1e6(999_999), GRID_PX_MAX_1E6);
+        let mut px = 100_000i64;
+        while px < 1_000_000 {
+            let f = grid_floor_1e6(px);
+            assert!(f <= px && px - f < 10 && Bin15Strategy::on_grid(f, 1_000_000_000), "{px}");
+            px += 7;
+        }
     }
 
     /// One late entry on the decided Yes side at 0.85 (persist 1); its oid.

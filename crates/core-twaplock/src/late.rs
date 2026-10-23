@@ -94,8 +94,18 @@ pub struct LateParams {
     /// Consecutive distinct snapshots of the favoured leg the test must
     /// hold on (the S5 poll), in `[1, 8]`.
     pub persist_polls: u8,
+    /// BIN15 fills B-1 (ruling F-5): `1` = after an UNFILLED late IoC the
+    /// instance fires again only once the leg it bought on shows another
+    /// touch (its ask price or size, an emptied side included); `0` = on
+    /// the next passing reprice, the law to 2026-10-23.
+    pub refire_fresh: u8,
+    /// BIN15 fills B-3 (ruling F-2): `1` = the IoC's limit is the law's
+    /// bound `p − e` floored to the grid, sized `usd / limit` under the
+    /// caps, so it takes every resting level up to the bound; `0` = the
+    /// seen touch ask, sized to the touch's own quantity.
+    pub limit_bound: u8,
     /// Explicit padding — always zero.
-    pub _pad: [u8; 6],
+    pub _pad: [u8; 4],
     /// The window's floor: no late entry with less than this to expiry, ns.
     pub tau_min_ns: u64,
     /// The window's ceiling: the late law prices from this far out, ns.
@@ -108,7 +118,13 @@ pub struct LateParams {
     pub usd_1e6: i64,
     /// The σ scale ×1e3.
     pub sigma_k_1e3: i64,
+    /// BIN15 fills B-2 (ruling F-5): the oldest favoured-leg touch the law
+    /// fires on — engine ns from that leg's last snapshot
+    /// (`TouchState::ts_ns`) to the reprice; `0` = no limit.
+    pub max_quote_age_ns: u64,
 }
+
+const _: () = assert!(::core::mem::size_of::<LateParams>() == 64);
 
 impl Default for LateParams {
     /// The ruled values (O-H90-5..7) with the law OFF.
@@ -116,13 +132,16 @@ impl Default for LateParams {
         Self {
             enabled: 0,
             persist_polls: 2,
-            _pad: [0; 6],
+            refire_fresh: 0,
+            limit_bound: 0,
+            _pad: [0; 4],
             tau_min_ns: 2_000_000_000,
             tau_max_ns: 30_000_000_000,
             p_min_1e6: 900_000,
             e_1e6: 20_000,
             usd_1e6: 100_000_000,
             sigma_k_1e3: 1_550,
+            max_quote_age_ns: 0,
         }
     }
 }

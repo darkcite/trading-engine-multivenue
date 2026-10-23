@@ -8349,6 +8349,10 @@ pub struct Bin15MetricIds {
     pub late_skipped_persist: core_metrics::CounterId,
     /// `engine_bin15_late_skipped_cap_total` (BIN15 H90)
     pub late_skipped_cap: core_metrics::CounterId,
+    /// `engine_bin15_late_skipped_refire_total` (BIN15 fills B-1)
+    pub late_skipped_refire: core_metrics::CounterId,
+    /// `engine_bin15_late_skipped_age_total` (BIN15 fills B-2)
+    pub late_skipped_age: core_metrics::CounterId,
     /// Per family: `p_hat_1e6`, `pos_yes_1e6`, `pos_no_1e6`,
     /// `live_outcome`, in that order.
     pub families: [[core_metrics::GaugeId; BIN15_FAMILY_GAUGES]; BIN15_METRIC_FAMILIES],
@@ -8505,6 +8509,8 @@ fn register_bin15_metrics(
     let late_skipped_price = one("engine_bin15_late_skipped_price_total")?;
     let late_skipped_persist = one("engine_bin15_late_skipped_persist_total")?;
     let late_skipped_cap = one("engine_bin15_late_skipped_cap_total")?;
+    let late_skipped_refire = one("engine_bin15_late_skipped_refire_total")?;
+    let late_skipped_age = one("engine_bin15_late_skipped_age_total")?;
     let mut families = [[core_metrics::GaugeId::default(); BIN15_FAMILY_GAUGES];
         BIN15_METRIC_FAMILIES];
     let mut f = 0usize;
@@ -8544,6 +8550,8 @@ fn register_bin15_metrics(
         late_skipped_price,
         late_skipped_persist,
         late_skipped_cap,
+        late_skipped_refire,
+        late_skipped_age,
         families,
     })
 }
@@ -8745,6 +8753,10 @@ fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.late_skipped_persist.saturating_sub(last.late_skipped_persist));
     reg.counter(ids.late_skipped_cap)
         .inc(cur.late_skipped_cap.saturating_sub(last.late_skipped_cap));
+    reg.counter(ids.late_skipped_refire)
+        .inc(cur.late_skipped_refire.saturating_sub(last.late_skipped_refire));
+    reg.counter(ids.late_skipped_age)
+        .inc(cur.late_skipped_age.saturating_sub(last.late_skipped_age));
     *last = cur;
     // The levels. A family the member does not configure keeps its row
     // at zero rather than disappearing: a missing series reads as a
@@ -14162,12 +14174,16 @@ mod tests {
     }
 
     #[test]
-    fn the_bin15_family_is_25_counters_and_80_gauges() {
+    fn the_bin15_family_is_27_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let before_c = reg.counters_len();
         let before_g = reg.gauges_len();
         let ids = register_bin15_metrics(&mut reg).expect("register bin15");
-        assert_eq!(reg.counters_len() - before_c, 25, "the counter block");
+        assert_eq!(reg.counters_len() - before_c, 27, "the counter block");
+        assert!(
+            reg.counters_len() <= core_metrics::MAX_COUNTERS,
+            "the block must fit the fixed registry"
+        );
         assert_eq!(reg.gauges_len() - before_g, 80, "8 families x 10 levels");
         assert!(
             reg.gauges_len() <= core_metrics::MAX_GAUGES,
