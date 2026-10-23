@@ -632,6 +632,11 @@ pub struct Bin15Strategy {
     late_fam: [LateState; BIN15_MAX_FAMILIES],
     /// BIN15 H90: per-underlying 1-s grids (≈ 9.4 KiB each), boxed at boot.
     late_grid: Box<[late::LateGrid; BIN15_MAX_UNDERLYINGS]>,
+    /// BIN15 fills B-4 guard (G26): the pre-B-4 grids — marks and the HL
+    /// perp, exactly as `late_grid` is fed without a lead — boxed at boot
+    /// beside them. Fed and read only on an underlying with a lead while
+    /// `late.lead_guard_1e6 > 0`; otherwise never touched.
+    late_grid_hl: Box<[late::LateGrid; BIN15_MAX_UNDERLYINGS]>,
     /// BIN15 H90: the late Φ table, boxed at boot.
     late_lut: Box<late::LateLut>,
     /// `1` once [`Bin15Strategy::configure_late`] installed the table.
@@ -667,6 +672,7 @@ impl Bin15Strategy {
             regime_label: core_types::RegimeLabelSet::default(),
             late_fam: [LateState::default(); BIN15_MAX_FAMILIES],
             late_grid: Box::new(core::array::from_fn(|_| late::LateGrid::new())),
+            late_grid_hl: Box::new(core::array::from_fn(|_| late::LateGrid::new())),
             late_lut: Box::new(late::LateLut::flat()),
             late_lut_set: 0,
         }
@@ -1143,6 +1149,9 @@ impl Bin15Strategy {
         // the one it replaces, then takes it. Off = untouched.
         if self.params.late.enabled == 1 {
             self.late_grid[u].on_mark(wall_now, mark_1e6);
+            if self.late_guarded(u) {
+                self.late_grid_hl[u].on_mark(wall_now, mark_1e6);
+            }
         }
         // BIN15 S3: the mark being replaced has been the mark since its
         // own stamp; fold that interval into every live window on this
@@ -1444,6 +1453,41 @@ impl Bin15Strategy {
     /// `persist_polls` consecutive snapshots of that leg (the S5 poll),
     /// sized at the whole resting ask up to `usd` and the caps. Not held
     /// by `tail_refuse_ns`: the window floor is its own. Everything else binds: one pending take, the grid, the caps.
+    /// G26: the lead guard is on for underlying `u` — a lead book is named
+    /// and `late.lead_guard_1e6 > 0`.
+    #[inline]
+    fn late_guarded(&self, u: usize) -> bool {
+        self.params.late.lead_guard_1e6 > 0 && self.params.lead_sym[u] != SYMBOL_ID_NONE
+    }
+
+    /// G26: the HL-perp nowcast (the pre-B-4 grid, advanced to `wall`'s
+    /// second) favours `want_yes`'s side with at least the guard on it. An
+    /// unpriceable HL grid holds nothing: the guard refuses.
+    fn late_guard_holds(
+        &mut self,
+        idx: usize,
+        u: usize,
+        expiry: u64,
+        wall: u64,
+        want_yes: bool,
+    ) -> bool {
+        let lp = self.params.late;
+        self.late_grid_hl[u].advance_to(wall / late::SEC_NS);
+        let Ok(f) = late::late_fair(
+            &self.late_grid_hl[u],
+            &self.late_lut,
+            self.fam[idx].live.strike_1e6,
+            expiry,
+            wall,
+            lp.sigma_k_1e3,
+        ) else {
+            return false;
+        };
+        let hl_yes = f.p_yes_1e6 >= ONE_1E6 / 2;
+        let hl_side = if hl_yes { f.p_yes_1e6 } else { ONE_1E6 - f.p_yes_1e6 };
+        hl_yes == want_yes && hl_side >= i64::from(lp.lead_guard_1e6)
+    }
+
     fn late_reprice<C: Ctx>(&mut self, ctx: &mut C, idx: usize, now: NsTs) {
         let lp = self.params.late;
         if self.fam[idx].kind != FAMILY_OUT_15M || !self.fam[idx].is_live() {
@@ -1480,7 +1524,13 @@ impl Bin15Strategy {
         let touch = if want_yes { self.fam[idx].touch_yes } else { self.fam[idx].touch_no };
         let px = touch.touch.ask_1e6;
         let book_ok = touch.stale == 0 && px > 0 && px < ONE_1E6 && touch.touch.ask_qty_1e6 > 0;
-        let ok = book_ok && p_side >= lp.p_min_1e6 && px <= p_side - lp.e_1e6;
+        // G26: with a lead and a guard, the HL-perp nowcast must agree on
+        // the side and hold at least the guard on it; a refusal is a price
+        // skip. No guard or no lead: not evaluated (B-4 bit for bit).
+        let ok = book_ok
+            && p_side >= lp.p_min_1e6
+            && px <= p_side - lp.e_1e6
+            && (!self.late_guarded(u) || self.late_guard_holds(idx, u, expiry, wall, want_yes));
         // The production pricer's counterfactual, where it priced at THIS
         // reprice (inside the tail it does not).
         let ctl_p = if self.fam[idx].p_ts_ns == now { self.fam[idx].p_hat_1e6 } else { -1 };
@@ -1973,6 +2023,10 @@ impl Strategy for Bin15Strategy {
                         if self.params.lead_sym[u] == SYMBOL_ID_NONE {
                             let wall = self.bar.anchor.wall_of(tick.ts_ns);
                             self.late_grid[u].on_perp(wall, bid + ask);
+                        } else if self.params.late.lead_guard_1e6 > 0 {
+                            // G26: the guard's pre-B-4 grid keeps the HL perp.
+                            let wall = self.bar.anchor.wall_of(tick.ts_ns);
+                            self.late_grid_hl[u].on_perp(wall, bid + ask);
                         }
                     } else if let Some(u) = self.lead_of_sym(tick.sym) {
                         let wall = self.bar.anchor.wall_of(tick.ts_ns);
@@ -3198,6 +3252,116 @@ let (n, aged) = run(1_000_000_000);
         assert_eq!(m.counters().late_reprices, 20, "a mark and a lead tick each second");
         late_poll(&mut m, &mut c, 580, 800_000, 850_000);
         assert_eq!(c.orders.len(), 1, "the lead's nowcast prices the entry");
+    }
+
+    /// G26: the marks, the HL perp (offset `hl_off_1e6` from the mark) and
+    /// the lead book (on the mark), each a dollar wide, once a second over
+    /// `[from, to)`.
+    fn guard_feed(m: &mut Bin15Strategy, c: &mut RecCtx, from: u64, to: u64, hl_off_1e6: i64) {
+        let mut s = from;
+        while s < to {
+            let mark = 79_000_000_000 + if s % 2 == 0 { 1_000_000 } else { -1_000_000 };
+            let t = at(s) + 300_000_000;
+            m.on_venue_event(&mark_event(mark, at(s) + 200_000_000), c);
+            let hl = mark + hl_off_1e6;
+            m.on_tick(&tick(btc_sym(), hl - 500_000, hl + 500_000, 1_000_000_000, t, false), c);
+            m.on_tick(&tick(BN_BTC, mark - 500_000, mark + 500_000, 1_000_000_000, t, false), c);
+            s += 1;
+        }
+    }
+
+    /// G26: a B-4 member (lead on underlying 0, persist 1) with `guard`.
+    fn guard_member(guard: u32) -> Bin15Strategy {
+        let mut m = late_member(1);
+        m.params.lead_sym[0] = BN_BTC;
+        m.params.late.lead_guard_1e6 = guard;
+        m
+    }
+
+    /// G26: one run — bind, `guard_feed` to 575 s on the mark, then to
+    /// 585 s with the HL perp `hl_drop_1e6` under it, then the 0.85 poll.
+    fn guard_run(guard: u32, hl_drop_1e6: i64) -> (Bin15Strategy, RecCtx) {
+        let mut m = guard_member(guard);
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        guard_feed(&mut m, &mut c, 0, 575, 0);
+        guard_feed(&mut m, &mut c, 575, 585, -hl_drop_1e6);
+        late_poll(&mut m, &mut c, 585, 800_000, 850_000);
+        (m, c)
+    }
+
+    /// G26 (a): guard on, the lead and the HL perp agree — the law fires.
+    #[test]
+    fn with_a_guard_the_lead_fires_when_the_hl_nowcast_agrees() {
+        let (m, c) = guard_run(800_000, 0);
+        assert_eq!(c.orders.len(), 1, "both nowcasts favour Yes past the guard");
+        assert_eq!(c.orders[0].sym, yes_sym(0));
+        assert_eq!(m.counters().late_skipped_price, 0);
+    }
+
+    /// G26 (b): guard on, the HL perp drops $2 000 under the mark for the
+    /// last ten seconds — its nowcast favours No while the lead's still
+    /// favours Yes — no order, a price skip.
+    #[test]
+    fn with_a_guard_the_lead_is_refused_when_the_hl_nowcast_takes_the_other_side() {
+        let (m, c) = guard_run(800_000, 2_000_000_000);
+        assert!(c.orders.is_empty(), "the HL nowcast disagrees on the side");
+        assert!(m.counters().late_skipped_price > 0);
+        // No HL perp at all: the guard's grid cannot price — refused too.
+        let mut m = guard_member(800_000);
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        lead_feed(&mut m, &mut c, 0, 585);
+        late_poll(&mut m, &mut c, 585, 800_000, 850_000);
+        assert!(c.orders.is_empty(), "an unpriceable HL grid holds nothing");
+        assert!(m.counters().late_skipped_price > 0);
+    }
+
+    /// G26: the HL nowcast's belief on Yes at the 585 s poll of a
+    /// `guard_run` (its grid advanced there by the guard itself).
+    fn hl_belief(m: &Bin15Strategy) -> Result<i64, late::LateHold> {
+        late::late_fair(
+            &m.late_grid_hl[0],
+            &m.late_lut,
+            m.fam[0].live.strike_1e6,
+            m.fam[0].live.expiry_ns,
+            m.bar.anchor.wall_of(at(585) + 400_000_000),
+            m.params.late.sigma_k_1e3,
+        )
+        .map(|f| f.p_yes_1e6)
+    }
+
+    /// G26 (b): the guard is a floor on the HL belief on the favoured side:
+    /// at that belief the law fires, one ppm over it the law refuses. The
+    /// HL perp is dropped (in $50 steps) until its nowcast still favours
+    /// Yes but short of certainty.
+    #[test]
+    fn the_guard_is_a_floor_on_the_hl_belief() {
+        let mut drop = 0i64;
+        let p_hl = loop {
+            let (m, _) = guard_run(1, drop);
+            let p = hl_belief(&m).expect("the HL grid prices");
+            if (ONE_1E6 / 2..ONE_1E6).contains(&p) {
+                break u32::try_from(p).expect("p");
+            }
+            drop += 50_000_000;
+            assert!(drop <= 2_000_000_000, "a drop leaves Yes short of certain");
+        };
+        let (_, c) = guard_run(p_hl, drop);
+        assert_eq!(c.orders.len(), 1, "at the HL belief {p_hl} (drop {drop}): fires");
+        let (m, c) = guard_run(p_hl + 1, drop);
+        assert!(c.orders.is_empty(), "one ppm over the HL belief: refused");
+        assert!(m.counters().late_skipped_price > 0);
+    }
+
+    /// G26 (c): guard 0 is B-4 as it was — the HL perp's drop moves
+    /// nothing, the lead alone fires, and the guard's grid is never fed.
+    #[test]
+    fn without_a_guard_the_hl_perp_is_ignored_as_in_b4() {
+        let (m, c) = guard_run(0, 2_000_000_000);
+        assert_eq!(c.orders.len(), 1, "the lead alone decides");
+        assert_eq!(m.counters().late_skipped_price, 0);
+        assert!(hl_belief(&m).is_err(), "guard 0: the HL grid is never fed");
     }
 
     /// One late entry on the decided Yes side at 0.85 (persist 1); its oid.

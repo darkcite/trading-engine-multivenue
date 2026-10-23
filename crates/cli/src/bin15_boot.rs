@@ -299,7 +299,7 @@ pub fn load_bin15_boot(
         persist_polls: file.late_persist_polls,
         refire_fresh: file.late_refire_fresh,
         limit_bound: file.late_limit_bound,
-        _pad: [0; 4],
+        lead_guard_1e6: file.late_lead_guard_1e6,
         tau_min_ns: file.late_tau_min_ns,
         tau_max_ns: file.late_tau_max_ns,
         p_min_1e6: file.late_p_min_1e6,
@@ -451,7 +451,7 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
         return String::from("off");
     }
     format!(
-        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}{}{}{}{}",
+        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}{}{}{}{}{}",
         l.tau_min_ns / 1_000_000_000,
         l.tau_max_ns / 1_000_000_000,
         l.p_min_1e6 / 1_000_000,
@@ -472,6 +472,16 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
             ":lead"
         } else {
             ""
+        },
+        // G26: the lead's guard, two decimals, only when set.
+        if l.lead_guard_1e6 == 0 {
+            String::new()
+        } else {
+            format!(
+                ":guard{}.{:02}",
+                l.lead_guard_1e6 / 1_000_000,
+                (l.lead_guard_1e6 % 1_000_000) / 10_000
+            )
         },
     )
 }
@@ -692,6 +702,11 @@ mod tests {
         p.n_underlyings = 1;
         p.lead_sym[0] = 16_777_729;
         assert!(late_law(&p).ends_with(":bound:lead"), "{}", late_law(&p));
+        // G26: the guard follows the lead, two decimals.
+        p.late.lead_guard_1e6 = 800_000;
+        assert!(late_law(&p).ends_with(":bound:lead:guard0.80"), "{}", late_law(&p));
+        p.late.lead_guard_1e6 = 955_000;
+        assert!(late_law(&p).ends_with(":lead:guard0.95"), "{}", late_law(&p));
     }
 
     #[test]

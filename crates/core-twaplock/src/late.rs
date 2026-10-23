@@ -104,8 +104,11 @@ pub struct LateParams {
     /// caps, so it takes every resting level up to the bound; `0` = the
     /// seen touch ask, sized to the touch's own quantity.
     pub limit_bound: u8,
-    /// Explicit padding — always zero.
-    pub _pad: [u8; 4],
+    /// BIN15 fills B-4 guard (G26): with a lead book on the underlying,
+    /// the law fires only if the HL-perp nowcast (the pre-B-4 grid) favours
+    /// the same side with at least this belief ×1e6; `0` = no guard (the
+    /// lead alone decides, B-4 as it was). Ignored without a lead.
+    pub lead_guard_1e6: u32,
     /// The window's floor: no late entry with less than this to expiry, ns.
     pub tau_min_ns: u64,
     /// The window's ceiling: the late law prices from this far out, ns.
@@ -134,7 +137,7 @@ impl Default for LateParams {
             persist_polls: 2,
             refire_fresh: 0,
             limit_bound: 0,
-            _pad: [0; 4],
+            lead_guard_1e6: 0,
             tau_min_ns: 2_000_000_000,
             tau_max_ns: 30_000_000_000,
             p_min_1e6: 900_000,
