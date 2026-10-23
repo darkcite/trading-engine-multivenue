@@ -218,6 +218,12 @@ pub fn load_bin15_boot(
     let mut u = 0usize;
     while u < file.late_lead.len() {
         let d = &file.late_lead[u];
+        // `"none"`: no lead for this underlying — its lead sym stays
+        // `SYMBOL_ID_NONE` and the HL perp drives it.
+        if d == core_config::bin15::LATE_LEAD_NONE {
+            u += 1;
+            continue;
+        }
         let Some(sym) = resolve(d) else {
             return Err(format!(
                 "bin15.toml `late_lead`[{u}] = `{d}` does not resolve against the \

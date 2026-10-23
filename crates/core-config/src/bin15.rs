@@ -211,7 +211,9 @@ pub struct Bin15File {
     /// `underlying`'s order — a descriptor the engine subscribes to
     /// (`binance-usdm:btcusdt`). Its mid, through a 60 s basis onto the
     /// mark, replaces the HL perp in the late nowcast. Empty when absent:
-    /// no lead, the law as it was.
+    /// no lead, the law as it was. An entry may be [`LATE_LEAD_NONE`]
+    /// (`"none"`): that underlying has no lead and keeps the HL perp; an
+    /// empty string is still refused.
     pub late_lead: Vec<String>,
 }
 
@@ -329,6 +331,11 @@ pub const LATE_SIGMA_K_1E3_RANGE: (i64, i64) = (250, 4_000);
 /// BIN15 fills B-2: the largest stated `late_max_quote_age_ms` — the
 /// late window's own ceiling ([`LATE_TAU_MAX_NS_LIMIT`]).
 pub const LATE_MAX_QUOTE_AGE_MS_LIMIT: i64 = 60_000;
+
+/// BIN15 fills B-4: the `late_lead` entry that names NO lead for its
+/// underlying — the boot leaves that underlying's lead sym `SYMBOL_ID_NONE`
+/// (the HL perp drives its late nowcast, the law as it was).
+pub const LATE_LEAD_NONE: &str = "none";
 
 /// One optional 0/1 flag; absent = 0.
 fn opt_flag(kv: &[(String, Value, usize)], key: &str) -> Result<u8, Bin15Error> {
@@ -1122,6 +1129,9 @@ mod tests {
         let leads = vec!["\"binance-usdm:btcusdt\""; n].join(", ");
         let g = parse(&format!("{}late_lead = [{leads}]\n", artifact())).expect("a lead per underlying");
         assert_eq!(g.late_lead.len(), n);
+        let all_none = vec!["\"none\""; n].join(", ");
+        let h = parse(&format!("{}late_lead = [{all_none}]\n", artifact())).expect("all `none` parses");
+        assert!(h.late_lead.iter().all(|l| l == LATE_LEAD_NONE));
         let empty = vec!["\"\""; n].join(", ");
         let e = parse(&format!("{}late_lead = [{empty}]\n", artifact())).expect_err("an empty lead");
         assert!(e.0.contains("one lead book per"), "{}", e.0);
