@@ -118,9 +118,9 @@ pub struct LateParams {
     pub usd_1e6: i64,
     /// The σ scale ×1e3.
     pub sigma_k_1e3: i64,
-    /// BIN15 fills B-2 (ruling F-5): the oldest favoured-leg touch the law
-    /// fires on — engine ns from that leg's last snapshot
-    /// (`TouchState::ts_ns`) to the reprice; `0` = no limit.
+    /// BIN15 fills B-2 (ruling F-5): the oldest favoured-leg ask the law
+    /// fires on — engine ns since that leg's ask moved to its current price
+    /// (the member's `TouchState::ask_since_ms`); `0` = no limit.
     pub max_quote_age_ns: u64,
 }
 

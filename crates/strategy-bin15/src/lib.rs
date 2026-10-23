@@ -191,8 +191,14 @@ pub struct TouchState {
     /// `1` once a stale tick arrived; cleared by the next fresh one.
     pub stale: u8,
     /// Explicit padding — always zero.
-    pub _pad: [u8; 7],
+    pub _pad: [u8; 3],
+    /// BIN15 fills B-2: when the ask moved to its current price — the
+    /// engine ms of the first tick at that price, truncated to 32 bits (an
+    /// age is a wrapping difference, good for 49 days).
+    pub ask_since_ms: u32,
 }
+
+const _: () = assert!(::core::mem::size_of::<TouchState>() == 48);
 
 impl TouchState {
     /// Whether this touch may be acted on: fresh and two-sided.
@@ -1525,9 +1531,13 @@ impl Bin15Strategy {
             self.counters.late_skipped_refire = self.counters.late_skipped_refire.wrapping_add(1);
             return;
         }
-        // B-2: never on a quote the leg has not refreshed for longer than
-        // the stated age.
-        if lp.max_quote_age_ns != 0 && now.saturating_sub(touch.ts_ns) > lp.max_quote_age_ns {
+        // B-2: never on an ask that has stood at its price longer than the
+        // stated age — a race the feed's delay and the venue's ~0.9 s have
+        // already lost (10-20..10-23: no live IoC filled more than 1.6 s
+        // after the snapshot it fired on).
+        let age_ns =
+            u64::from(((now / 1_000_000) as u32).wrapping_sub(touch.ask_since_ms)) * 1_000_000;
+        if lp.max_quote_age_ns != 0 && age_ns > lp.max_quote_age_ns {
             self.counters.late_skipped_age = self.counters.late_skipped_age.wrapping_add(1);
             return;
         }
@@ -1934,10 +1944,19 @@ impl Strategy for Bin15Strategy {
             }
             return;
         };
+        // B-2: a re-tick at the same ask keeps that price's age; a new
+        // price (or the first tick of an instance) starts it.
+        let prev = if is_yes { self.fam[idx].touch_yes } else { self.fam[idx].touch_no };
+        let ask = tick.ask_px.raw();
+        let ask_since_ms = if prev.ts_ns != 0 && prev.touch.ask_1e6 == ask {
+            prev.ask_since_ms
+        } else {
+            (tick.ts_ns / 1_000_000) as u32
+        };
         let state = TouchState {
             touch: Touch {
                 bid_1e6: tick.bid_px.raw(),
-                ask_1e6: tick.ask_px.raw(),
+                ask_1e6: ask,
                 bid_qty_1e6: tick.bid_qty.raw(),
                 ask_qty_1e6: tick.ask_qty.raw(),
             },
@@ -1946,7 +1965,8 @@ impl Strategy for Bin15Strategy {
             // prices (they are the last thing the venue said) but the
             // flag keeps the late law off them.
             stale: u8::from(tick.is_stale()),
-            _pad: [0; 7],
+            _pad: [0; 3],
+            ask_since_ms,
         };
         if is_yes {
             self.fam[idx].touch_yes = state;
@@ -3028,10 +3048,25 @@ mod tests {
             late_feed(&mut m, &mut c, 560, 585);
             (c.orders.len(), m.counters().late_skipped_age)
         };
-        let (n, aged) = run(1_000_000_000);
+let (n, aged) = run(1_000_000_000);
         assert!(n == 0 && aged > 0, "a 10 s old ask is never bought: {n} {aged}");
         let (n, aged) = run(0);
         assert_eq!((n, aged), (1, 0), "no limit: the first mark in the window fires");
+        // A re-tick at the same ask keeps its age; a new price starts it.
+        let mut m = late_member(1);
+        m.params.late.max_quote_age_ns = 1_000_000_000;
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 560);
+        late_poll(&mut m, &mut c, 560, 800_000, 850_000);
+        late_feed(&mut m, &mut c, 560, 580);
+        late_poll(&mut m, &mut c, 580, 800_000, 850_000);
+        assert!(c.orders.is_empty(), "the same ask, 20 s on, is 20 s old");
+        assert_eq!(m.family(0).expect("f").touch_yes.ask_since_ms, (at(560) / 1_000_000 + 400) as u32);
+        late_feed(&mut m, &mut c, 581, 582);
+        late_poll(&mut m, &mut c, 581, 800_000, 860_000);
+        assert_eq!(c.orders.len(), 1, "a new ask is a new quote");
+        assert_eq!(c.orders[0].px.raw(), 860_000);
     }
 
     /// BIN15 fills B-3: at the bound the IoC's limit is `p − e` on the grid,

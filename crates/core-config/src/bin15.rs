@@ -201,8 +201,9 @@ pub struct Bin15File {
     /// BIN15 fills B-3: `1` = the IoC's limit is the law's bound `p − e`
     /// on the grid, sweeping every level up to it. Absent = 0 (the touch).
     pub late_limit_bound: u8,
-    /// BIN15 fills B-2: the oldest favoured-leg touch the law fires on,
-    /// ns, from `late_max_quote_age_ms` in `[0, LATE_MAX_QUOTE_AGE_MS_LIMIT]`.
+    /// BIN15 fills B-2: the oldest favoured-leg ask (since it moved to its
+    /// price) the law fires on, ns, from `late_max_quote_age_ms` in
+    /// `[0, LATE_MAX_QUOTE_AGE_MS_LIMIT]`.
     /// Absent = 0 = no limit.
     pub late_max_quote_age_ns: u64,
 }
