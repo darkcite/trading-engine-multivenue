@@ -18349,3 +18349,23 @@ HEAD.
     inside the 15 % gate). It read the same at J8 and J10 on 10-19 (5.10–5.11
     ns), so J12 did not move it, and it is left as it is.
 
+### J13 — the same-side family cap per window, default off (2026-10-24, rulings R-PMJ-S66, S67)
+
+- **Why.** Slots 9 and 11 each trade 7 families on one window clock, so several families can buy the same side of one window. Their outcomes are not independent.
+  - F4's 11 682 windows put the median correlation of the late price surprise across families at about 0.71.
+  - With three same-side fills, all three losing is about 10× likelier than under independence.
+  - In 4½ days of our own takes a cap of 3 never bound, and tighter caps removed only winners: every loss was the only take on its side in its window.
+  - The cap is tail protection, not an edge. The research is in the vault, `docs/research/pmj/corr/corr-2026-10-24.md`; it recommends 3.
+- **The key.** `max_side_families` in `pm15.toml` / `pmj.toml`. Absent or 0 means off, the default; otherwise 1 up to the family count.
+- **The law** (`strategy-pm15`, `strategy-pmj`, a gate in `take` after the per-market IoC gate):
+  - a family counts on a side of a window while its market holds that leg, or has an IoC in flight on it;
+  - first come, first served;
+  - a family already on the side is never stopped by the cap;
+  - other windows do not count;
+  - each member counts its own slot only (no cross-slot exposure).
+- **Known limits.**
+  - An unfilled IoC holds its place until the member writes it off at its deadline (2 × `order_ttl_ns`: 2 s on slot 9, 10 s on slot 11). The research freed it at the judge delay, so the live cap binds slightly more than modelled.
+  - A late fill booked after the write-off can put a family back on a side whose place another family has since taken. Under late fills the cap is soft by one.
+- **Observability.** The new tally `skip_side` (`engine_pm15_skip_side_total`, `engine_pmj_skip_side_total`; `Pm15Counters` 31 → 32 tallies) is on the dashboard's skip row. The boot tell gains `:side<=N` only when on; off, the tell, the artifact hash and every decision are unchanged.
+- **Hot path.** The gate runs on the take path only. It reads at most 8 markets in a while loop, with no allocation and no float. Alloc gates 136b and 114b run with the cap on, at 1 over one family, so they prove the loop allocation-free but never count another family.
+- **Deploy.** Config only, at a scheduled restart, on Anton's word. Turning it on changes the entry law, so a J9 `SEGMENTS` row goes in the same change. It is not on anywhere.

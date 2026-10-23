@@ -121,8 +121,11 @@ pub struct PmjParams {
     /// [`STRIKE_LAW_TRAP62`], law (iii) — which reads the reports ×1e9 and
     /// keeps the market's strike in that scale.
     pub strike_law: u8,
+    /// The same-side family cap per window (PMJ J13): at most this many
+    /// families hold, or are buying, one side of one window; 0 = off.
+    pub max_side_families: u8,
     /// Explicit padding — always zero.
-    pub _pad: [u8; 5],
+    pub _pad: [u8; 4],
     /// The pricer's σ scale ×1e3.
     pub sigma_k_1e3: i64,
     /// The favourite's ask must be at least this ×1e6 (module docs).
@@ -161,7 +164,8 @@ impl Default for PmjParams {
             persist: 2,
             max_orders_market: 4,
             strike_law: STRIKE_LAW_MEAN60,
-            _pad: [0; 5],
+            max_side_families: 0,
+            _pad: [0; 4],
             sigma_k_1e3: 1_550,
             price_floor_1e6: 900_000,
             min_tau_ns: 3_000_000_000,
@@ -297,6 +301,14 @@ impl Market {
     fn is_bound(&self) -> bool {
         self.instance != 0
     }
+
+    /// PMJ J13: whether this market holds `leg` or has an IoC in flight on
+    /// it — its family counts against the side cap. An IoC that ended
+    /// unfilled (its pending cleared, no shares) frees the family.
+    #[inline(always)]
+    fn on_side(&self, leg: usize) -> bool {
+        self.pos_1e6[leg & 1] > 0 || (self.pending.oid != 0 && usize::from(self.pending.leg) == leg)
+    }
 }
 
 /// The member (module docs).
@@ -397,7 +409,8 @@ impl PmjStrategy {
             && params.usd_market_1e6 >= params.deposit_usd_1e6
             && params.session_loss_1e6 > 0
             && params.order_ttl_ns > 0
-            && strike_law_ok(&params);
+            && strike_law_ok(&params)
+            && usize::from(params.max_side_families) <= params.n_families.min(PMJ_MAX_FAMILIES);
         if !ok {
             return Err(PmjConfigErr::Bound);
         }
@@ -753,6 +766,34 @@ impl PmjStrategy {
         self.take(f, pair, if up { 0 } else { 1 }, p_side, now, ctx);
     }
 
+    /// PMJ J13: whether `leg` of the window `markets[f][pair]` rides has room
+    /// under `max_side_families`. Every family of one window rides the same
+    /// pair, so the other families' markets of that pair with the same open
+    /// are the window's. The room is there while the families other than
+    /// `f` on that side are fewer than the cap; a family already on the side
+    /// is never stopped by it (a second IoC of its own adds no family).
+    /// Bounded: at most [`PMJ_MAX_FAMILIES`] markets read, no allocation.
+    #[inline]
+    fn side_room(&self, f: usize, pair: usize, leg: usize) -> bool {
+        let own = &self.markets[f][pair];
+        if own.on_side(leg) {
+            return true;
+        }
+        let cap = usize::from(self.params.max_side_families);
+        let mut n = 0usize;
+        let mut g = 0usize;
+        while g < self.params.n_families && g < PMJ_MAX_FAMILIES {
+            if g != f {
+                let o = &self.markets[g][pair];
+                if o.is_bound() && o.open_ns == own.open_ns && o.on_side(leg) {
+                    n += 1;
+                }
+            }
+            g += 1;
+        }
+        n < cap
+    }
+
     /// The take: one IoC BUY of `leg` at `p_side − e` on its tick, if the
     /// ask allows and the caps leave room.
     fn take<C: Ctx>(
@@ -793,6 +834,11 @@ impl PmjStrategy {
         }
         if m.pending.oid != 0 || m.orders >= p.max_orders_market {
             self.counters.skip_cap += 1;
+            return;
+        }
+        // PMJ J13: the same-side family cap (off at 0).
+        if p.max_side_families != 0 && !self.side_room(f, pair, leg) {
+            self.counters.skip_side += 1;
             return;
         }
         // The deposit, inside the market cap, never under the venue's $5:

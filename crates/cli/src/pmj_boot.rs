@@ -132,6 +132,7 @@ fn resolve_file(
     params.order_ttl_ns = file.order_ttl_ns;
     // PMJ J12: the strike law and law (iii)'s residual.
     params.strike_law = file.strike_law.law;
+    params.max_side_families = file.max_side_families;
     params.res_ratio_1e3 = file.strike_law.sigma_res_ratio_1e3;
     let mut f = 0usize;
     while f < file.strike_law.sigma_res_min_ppm.len() {
@@ -155,6 +156,16 @@ fn resolve_file(
         hash,
         path,
     })
+}
+
+/// PMJ J13: the side cap's tail of the boot tell — empty when off (so the
+/// tell is unchanged), `:side<=3` when on.
+fn side_tell(cap: u8) -> String {
+    if cap == 0 {
+        String::new()
+    } else {
+        format!(":side<={cap}")
+    }
 }
 
 /// PMJ J12: the law's tail of the boot tell — empty under the first law (so
@@ -188,7 +199,7 @@ pub fn render_boot_tell(boot: &PmjBoot) -> String {
     let p = &boot.params;
     let tau_floor = p.tau_min_ns.max(p.min_tau_ns);
     format!(
-        "pmj: artifact configured (PAPER) hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:floor{:.3}:persist{}:k{:.3}{} \
+        "pmj: artifact configured (PAPER) hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:floor{:.3}:persist{}:k{:.3}{}{} \
          frame=${}/order:${}/market:-${}/session max=${}.{:02}/order paper=+{}ms guard={}p/{}alt/acct-{} live={}",
         boot.families.join("+"),
         tau_floor / 1_000_000_000,
@@ -199,6 +210,7 @@ pub fn render_boot_tell(boot: &PmjBoot) -> String {
         p.persist,
         p.sigma_k_1e3 as f64 / 1e3,
         strike_tell(p.strike_law, p.res_ratio_1e3, &p.res_min_ppm[..p.n_families]),
+        side_tell(p.max_side_families),
         p.deposit_usd_1e6 / 1_000_000,
         p.usd_market_1e6 / 1_000_000,
         p.session_loss_1e6 / 1_000_000,
@@ -267,6 +279,7 @@ mod tests {
     fn file() -> core_config::pmj::PmjFile {
         core_config::pmj::PmjFile {
             strike_law: core_config::strike_law::StrikeLaw::default(),
+            max_side_families: 0,
             families: vec!["btc".into(), "eth".into()],
             perp: vec!["hyperliquid:BTC".into(), "hyperliquid:ETH".into()],
             tau_min_ns: 2_000_000_000,
@@ -344,5 +357,31 @@ mod tests {
         );
         assert_eq!(super::strike_tell(0, 0, &[]), "", "the first law's tell is unchanged");
         assert_eq!(super::strike_tell(1, 130, &[3, 5, 6]), ":strike=trap62:res=130/3,5,6");
+    }
+
+    #[test]
+    fn the_side_cap_tells_itself_only_when_on() {
+        assert_eq!(super::side_tell(0), "", "off: the tell is unchanged");
+        assert_eq!(super::side_tell(3), ":side<=3");
+        let rolling = vec!["updown:btc:5m".to_string(), "updown:eth:5m".to_string()];
+        let mut f = file();
+        f.max_side_families = 2;
+        let b = resolve_file(f, [0; 32], PathBuf::from("x"), &resolve, &rolling).expect("valid");
+        assert_eq!(b.params.max_side_families, 2);
+        assert!(render_boot_tell(&b).contains(":k1.550:side<=2 "), "{}", render_boot_tell(&b));
+        // Under law (iii) the cap's tail follows the strike's.
+        let mut f = file();
+        f.max_side_families = 2;
+        f.strike_law = core_config::strike_law::StrikeLaw {
+            law: core_config::strike_law::STRIKE_LAW_TRAP62,
+            sigma_res_ratio_1e3: 130,
+            sigma_res_min_ppm: vec![3, 5],
+        };
+        let b = resolve_file(f, [0; 32], PathBuf::from("x"), &resolve, &rolling).expect("valid");
+        assert!(
+            render_boot_tell(&b).contains(":k1.550:strike=trap62:res=130/3,5:side<=2 "),
+            "{}",
+            render_boot_tell(&b)
+        );
     }
 }

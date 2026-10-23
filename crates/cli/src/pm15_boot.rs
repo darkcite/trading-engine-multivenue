@@ -120,6 +120,7 @@ fn resolve_file(
     params.order_ttl_ns = file.order_ttl_ns;
     // PMJ J12: the strike law and law (iii)'s residual.
     params.strike_law = file.strike_law.law;
+    params.max_side_families = file.max_side_families;
     params.res_ratio_1e3 = file.strike_law.sigma_res_ratio_1e3;
     let mut f = 0usize;
     while f < file.strike_law.sigma_res_min_ppm.len() {
@@ -141,6 +142,16 @@ fn resolve_file(
         hash,
         path,
     })
+}
+
+/// PMJ J13: the side cap's tail of the boot tell — empty when off (so the
+/// tell is unchanged), `:side<=3` when on.
+fn side_tell(cap: u8) -> String {
+    if cap == 0 {
+        String::new()
+    } else {
+        format!(":side<={cap}")
+    }
 }
 
 /// PMJ J12: the law's tail of the boot tell — empty under the first law (so
@@ -171,7 +182,7 @@ pub fn render_boot_tell(boot: &Pm15Boot) -> String {
     }
     let p = &boot.params;
     format!(
-        "pm15: artifact configured hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:floor{:.3}:persist{}:k{:.3}{} \
+        "pm15: artifact configured hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:floor{:.3}:persist{}:k{:.3}{}{} \
          frame=${}/order:${}/market:-${}/session live={}",
         boot.families.join("+"),
         p.tau_min_ns / 1_000_000_000,
@@ -182,6 +193,7 @@ pub fn render_boot_tell(boot: &Pm15Boot) -> String {
         p.persist,
         p.sigma_k_1e3 as f64 / 1e3,
         strike_tell(p.strike_law, p.res_ratio_1e3, &p.res_min_ppm[..p.n_families]),
+        side_tell(p.max_side_families),
         p.usd_order_1e6 / 1_000_000,
         p.usd_market_1e6 / 1_000_000,
         p.session_loss_1e6 / 1_000_000,
@@ -252,6 +264,7 @@ mod tests {
     fn file() -> core_config::pm15::Pm15File {
         core_config::pm15::Pm15File {
             strike_law: core_config::strike_law::StrikeLaw::default(),
+            max_side_families: 0,
             families: vec!["btc".into(), "eth".into()],
             perp: vec!["hyperliquid:BTC".into(), "hyperliquid:ETH".into()],
             tau_min_ns: 2_000_000_000,
@@ -306,5 +319,20 @@ mod tests {
         let mut bad = file();
         bad.perp[1] = "hyperliquid:XRP".into();
         assert!(resolve_file(bad, [0; 32], PathBuf::from("x"), &resolve, &rolling).is_err());
+    }
+
+    #[test]
+    fn the_side_cap_tells_itself_only_when_on() {
+        assert_eq!(super::side_tell(0), "", "off: the tell is unchanged");
+        assert_eq!(super::side_tell(2), ":side<=2");
+        let rolling = vec!["updown:btc:15m".to_string(), "updown:eth:15m".to_string()];
+        let mut f = file();
+        f.max_side_families = 2;
+        let b = resolve_file(f, [0; 32], PathBuf::from("x"), &resolve, &rolling).expect("valid");
+        assert_eq!(b.params.max_side_families, 2);
+        assert!(render_boot_tell(&b).contains(":k1.550:side<=2 "), "{}", render_boot_tell(&b));
+        assert!(!render_boot_tell(&resolve_file(file(), [0; 32], PathBuf::from("x"), &resolve, &rolling)
+            .expect("valid"))
+        .contains("side<="));
     }
 }

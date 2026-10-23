@@ -20479,7 +20479,8 @@ fn pm15_ingress_driver_and_member_are_zero_alloc() {
 
 /// PMJ J12 gate 114b: gate 114 with slot 9's member under law (iii)
 /// (`strike_law` trap62: the trapezoid strike, `report_fair_trap`, the fine
-/// ×1e9 scale from the ingress's v1). Zero bytes per operation.
+/// ×1e9 scale from the ingress's v1), with the J13 side cap on
+/// (`max_side_families` 1). Zero bytes per operation.
 #[test]
 fn pm15_member_under_law_iii_is_zero_alloc() {
     pm15_ingress_and_member(core_twaplock::report::STRIKE_LAW_TRAP62);
@@ -20623,6 +20624,8 @@ fn pm15_ingress_and_member(strike_law: u8) {
         perp_sym,
         strike_law,
         res_ratio_1e3: if trap { 130 } else { 0 },
+        // PMJ J13: the b gates run the side cap on too (its gate in the take).
+        max_side_families: if trap { 1 } else { 0 },
         res_min_ppm: if trap { res_min_ppm } else { [0; strategy_pm15::PM15_MAX_FAMILIES] },
         ..strategy_pm15::Pm15Params::default()
     };
@@ -21498,8 +21501,8 @@ fn pmj_member_steady_state_is_zero_alloc() {
 }
 
 /// PMJ J12 gate 136b: gate 136 under law (iii) (`strike_law` trap62: the
-/// trapezoid strike, `report_fair_trap`, the fine ×1e9 scale). Zero bytes
-/// per operation.
+/// trapezoid strike, `report_fair_trap`, the fine ×1e9 scale), with the J13
+/// side cap on (`max_side_families` 1). Zero bytes per operation.
 #[test]
 fn pmj_member_under_law_iii_steady_state_is_zero_alloc() {
     pmj_member_steady_state(core_twaplock::report::STRIKE_LAW_TRAP62);
@@ -21555,6 +21558,8 @@ fn pmj_member_steady_state(strike_law: u8) {
         perp_sym,
         strike_law,
         res_ratio_1e3: if trap { 130 } else { 0 },
+        // PMJ J13: the b gates run the side cap on too (its gate in the take).
+        max_side_families: if trap { 1 } else { 0 },
         res_min_ppm: if trap { res_min_ppm } else { [0; strategy_pmj::PMJ_MAX_FAMILIES] },
         ..strategy_pmj::PmjParams::default()
     };

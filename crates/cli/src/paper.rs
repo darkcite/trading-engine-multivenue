@@ -13702,17 +13702,18 @@ mod tests {
     }
 
     /// PMJ J4: slot 11's member family is pm15's shape under its own
-    /// prefix — 31 counters and 6 gauges, every name within `NAME_MAX`, none
+    /// prefix — 32 counters (31, and J13's `skip_side`) and 6 gauges, every
+    /// name within `NAME_MAX`, none
     /// shared with slot 9's — and both families register in one registry
     /// (the worst-case boot below counts them in the budget).
     #[test]
-    fn the_pmj_member_family_is_31_counters_and_6_gauges_beside_pm15s() {
+    fn the_pmj_member_family_is_32_counters_and_6_gauges_beside_pm15s() {
         let mut reg = core_metrics::MetricsRegistry::new();
         register_pm15_member_metrics(&mut reg).expect("register pm15");
         let (c0, g0) = (reg.counters_len(), reg.gauges_len());
         let ids = register_pmj_member_metrics(&mut reg).expect("register pmj");
         assert_eq!((reg.counters_len() - c0, reg.gauges_len() - g0), (strategy_core::PM15_TALLIES, PM15_LEVELS));
-        assert_eq!((ids.tallies.len(), ids.levels.len()), (31, 6));
+        assert_eq!((ids.tallies.len(), ids.levels.len()), (32, 6));
         let mut k = 0usize;
         while k < PM15_LEVELS {
             let n = PMJ_LEVEL_NAMES[k];

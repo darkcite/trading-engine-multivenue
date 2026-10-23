@@ -76,7 +76,7 @@ fn err(msg: impl Into<String>) -> PmjError {
 }
 
 /// Every key the grammar accepts; an unknown key is a refusal.
-const PMJ_KEYS: [&str; 28] = [
+const PMJ_KEYS: [&str; 29] = [
     "families",
     "perp",
     "tau_min_ns",
@@ -106,6 +106,8 @@ const PMJ_KEYS: [&str; 28] = [
     "strike_law",
     "sigma_res_ratio_1e3",
     "sigma_res_min_ppm",
+    // PMJ J13: the same-side family cap per window.
+    "max_side_families",
 ];
 
 /// `pmj.toml` as parsed. Descriptors and keys stay strings: `pmj_boot`
@@ -170,6 +172,9 @@ pub struct PmjFile {
     /// PMJ J12: the strike law and law (iii)'s residual
     /// ([`crate::strike_law`]; absent = the first law).
     pub strike_law: crate::strike_law::StrikeLaw,
+    /// PMJ J13: at most this many families hold, or are buying, one side of
+    /// one window (absent = 0, off; at most the family count).
+    pub max_side_families: u8,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES.
@@ -371,6 +376,12 @@ pub fn parse(src: &str) -> Result<PmjFile, PmjError> {
         b58_key("guard_deposit_account", 0, &guard_deposit_account)?;
     }
     let strike_law = crate::strike_law::parse(&kv, families.len()).map_err(err)?;
+    let max_side_families = in_range(
+        "max_side_families",
+        opt_int(&kv, "max_side_families", 0).map_err(m)?,
+        0,
+        families.len() as i64,
+    )? as u8;
     let guard_max_sol_lamports = in_range(
         "guard_max_sol_lamports",
         opt_int(&kv, "guard_max_sol_lamports", 0).map_err(m)?,
@@ -410,6 +421,7 @@ pub fn parse(src: &str) -> Result<PmjFile, PmjError> {
         guard_max_sol_lamports,
         guard_max_cu_price,
         strike_law,
+        max_side_families,
     })
 }
 
@@ -505,6 +517,17 @@ mod tests {
         assert!(parse(&base.replacen("[pmj]", "[pm15]", 1)).is_err(), "the section");
         assert!(parse(&src("usd_order_1e6 = 250000000\n")).is_err(), "pm15's size key");
         assert!(parse(&base.replacen("deposit_usd_1e6 = 5000000\n", "", 1)).is_err(), "no deposit");
+    }
+
+    #[test]
+    fn the_side_cap_parses_off_by_default_and_within_the_families() {
+        assert_eq!(parse(&src("")).expect("valid").max_side_families, 0, "absent = off");
+        assert_eq!(parse(&src("max_side_families = 0\n")).expect("valid").max_side_families, 0);
+        assert_eq!(parse(&src("max_side_families = 1\n")).expect("valid").max_side_families, 1);
+        assert_eq!(parse(&src("max_side_families = 2\n")).expect("valid").max_side_families, 2);
+        for bad in ["max_side_families = 3\n", "max_side_families = -1\n", "max_side_families = \"2\"\n"] {
+            assert!(parse(&src(bad)).is_err(), "{bad}: more than the two families, negative, or not an int");
+        }
     }
 
     #[test]

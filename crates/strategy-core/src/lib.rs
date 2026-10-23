@@ -1540,6 +1540,9 @@ pub struct Pm15Counters {
     pub skip_cap: u64,
     /// Entries skipped: the session loss bound is spent.
     pub skip_halt: u64,
+    /// Entries skipped: the same-side family cap per window is full (PMJ
+    /// J13, `max_side_families`).
+    pub skip_side: u64,
     /// IoCs submitted.
     pub takes_submitted: u64,
     /// IoCs that filled (any quantity).
@@ -1578,7 +1581,7 @@ pub struct Pm15Counters {
 
 /// How many cumulative tallies [`Pm15Counters`] carries (its fields from
 /// `rolls` through `settled_unknown`, in order).
-pub const PM15_TALLIES: usize = 31;
+pub const PM15_TALLIES: usize = 32;
 
 /// The metric suffix of each tally, in [`Pm15Counters::tallies`] order.
 pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
@@ -1603,6 +1606,7 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
     "skip_price",
     "skip_cap",
     "skip_halt",
+    "skip_side",
     "takes_submitted",
     "takes_filled",
     "takes_unfilled",
@@ -1641,6 +1645,7 @@ impl Pm15Counters {
             self.skip_price,
             self.skip_cap,
             self.skip_halt,
+            self.skip_side,
             self.takes_submitted,
             self.takes_filled,
             self.takes_unfilled,

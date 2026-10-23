@@ -623,3 +623,125 @@ fn law_iii_strikes_at_open_minus_two_and_takes_a_decided_window() {
     assert_eq!(c.orders.len(), 1, "{:?}", m.counters());
     assert_eq!(c.orders[0].sym, pm_rolling_sym(0, pm_pair_of_window(w), PM_LEG_UP));
 }
+
+// ---------------------------------------------------------------------
+// PMJ J13: the same-side family cap per window (`max_side_families`).
+// The markets are crafted in place (four families, one window) and the
+// take is driven directly: the cap is a gate in `take`, after the book
+// and price gates these tests do not exercise.
+// ---------------------------------------------------------------------
+
+fn side_member(cap: u8) -> Pm15Strategy {
+    let mut perp_sym = [SYMBOL_ID_NONE; PM15_MAX_FAMILIES];
+    let mut f = 0usize;
+    while f < 4 {
+        perp_sym[f] = make_symbol_id(VenueId::Hyperliquid, f as u32 + 1);
+        f += 1;
+    }
+    let p = Pm15Params {
+        n_families: 4,
+        perp_sym,
+        max_side_families: cap,
+        ..Pm15Params::default()
+    };
+    let mut m = Pm15Strategy::new();
+    m.configure(p, lut(), WallAnchor::new(0, 0)).expect("valid");
+    m
+}
+
+/// Binds family `f`'s market on `pair` to the window opening at `open`
+/// (seconds), both legs quoted 0.92 / 0.93 on a 0.01 tick at `at`.
+fn side_bind(m: &mut Pm15Strategy, f: usize, pair: usize, open: u64, at: NsTs) {
+    let mk = &mut m.markets[f][pair];
+    mk.instance = 7 + f as u32;
+    mk.open_ns = open * S;
+    mk.end_ns = (open + 900) * S;
+    for book in mk.legs.iter_mut() {
+        book.bid_1e6 = 920_000;
+        book.ask_1e6 = 930_000;
+        book.ask_sz_1e6 = 500_000_000;
+        book.ts_ns = at;
+        book.tick_1e6 = 10_000;
+    }
+}
+
+#[test]
+fn the_side_cap_must_fit_the_families() {
+    let mut m = Pm15Strategy::new();
+    let mut p = Pm15Params { max_side_families: 2, ..Pm15Params::default() };
+    p.n_families = 1;
+    p.perp_sym[0] = perp();
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "2 over 1 family");
+    p.max_side_families = 1;
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Ok(()));
+}
+
+#[test]
+fn the_side_cap_counts_families_holding_or_buying_one_side_of_one_window() {
+    let at = OPEN * S + 280 * S;
+    let mut c = TestCtx { now: at, orders: Vec::new() };
+    let mut m = side_member(2);
+    let pair = 0usize;
+    for f in 0..4 {
+        side_bind(&mut m, f, pair, OPEN, at);
+    }
+    let (up, down) = (0usize, 1usize);
+    m.take(0, pair, up, 970_000, at, &mut c);
+    m.take(1, pair, up, 970_000, at, &mut c);
+    assert_eq!(c.orders.len(), 2, "two families on Up: under the cap");
+    m.take(2, pair, up, 970_000, at, &mut c);
+    assert_eq!((c.orders.len(), m.counters().skip_side), (2, 1), "the third family on Up is capped");
+    m.take(2, pair, down, 970_000, at, &mut c);
+    assert_eq!(c.orders.len(), 3, "Down is its own side");
+    // Family 0's IoC ends unfilled: no shares, no IoC in flight — it frees its place.
+    m.markets[0][pair].pending = Pending::default();
+    m.take(3, pair, up, 970_000, at, &mut c);
+    assert_eq!(c.orders.len(), 4, "the freed place is taken");
+    // Family 1 filled: its shares keep its place. Family 2's Down IoC ended
+    // unfilled (else its market's own IoC gate would hold it first).
+    m.markets[1][pair].pending = Pending::default();
+    m.markets[2][pair].pending = Pending::default();
+    m.markets[1][pair].pos_1e6[up] = 5_000_000;
+    m.take(2, pair, up, 970_000, at, &mut c);
+    assert_eq!((c.orders.len(), m.counters().skip_side), (4, 2), "families 1 (filled) and 3 (in flight)");
+    // A family already on the side adds no family: the cap never stops it.
+    assert!(m.side_room(1, pair, up));
+    // Another window's market does not count, even on the same pair.
+    m.markets[3][pair].open_ns = (OPEN + 2 * 900) * S; // the pair's next window (PM_PAIRS 2)
+    assert!(m.side_room(2, pair, up), "family 3's market is another window's");
+    assert_eq!(m.counters().skip_cap, 0, "no other gate held");
+}
+
+#[test]
+fn the_side_cap_at_zero_is_off() {
+    let at = OPEN * S + 280 * S;
+    let mut c = TestCtx { now: at, orders: Vec::new() };
+    let mut m = side_member(0);
+    for f in 0..4 {
+        side_bind(&mut m, f, 0, OPEN, at);
+        m.take(f, 0, 0, 970_000, at, &mut c);
+    }
+    assert_eq!((c.orders.len(), m.counters().skip_side), (4, 0), "all four families on Up");
+}
+
+#[test]
+fn the_side_cap_frees_a_place_when_the_timer_writes_an_unfilled_ioc_off() {
+    let at = OPEN * S + 280 * S;
+    let mut c = TestCtx { now: at, orders: Vec::new() };
+    let mut m = side_member(1);
+    side_bind(&mut m, 0, 0, OPEN, at);
+    side_bind(&mut m, 1, 0, OPEN, at);
+    m.take(0, 0, 0, 970_000, at, &mut c);
+    m.take(1, 0, 0, 970_000, at, &mut c);
+    assert_eq!((c.orders.len(), m.counters().skip_side), (1, 1), "family 0's IoC holds the one place");
+    // Before its deadline the place stays held; at it, the sweep writes the
+    // IoC off (unfilled) and the place is free.
+    let deadline = at + 2 * m.params.order_ttl_ns;
+    m.on_timer(deadline - 1, &mut c);
+    assert!(!m.side_room(1, 0, 0));
+    m.on_timer(deadline, &mut c);
+    assert_eq!(m.counters().takes_unfilled, 1);
+    assert!(m.side_room(1, 0, 0));
+    m.take(1, 0, 0, 970_000, at, &mut c);
+    assert_eq!(c.orders.len(), 2);
+}
