@@ -17530,6 +17530,9 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S63 | Slot 11 switches to law (iii) at the 10-23 16:05Z restart. The J12 A/B's criterion 2 is read statistically (won ≥ expected − 2 sd): on its letter both laws miss it on slot 11, trap62 by −0.55 sd and mean60, the law running, by −0.64 sd, and wrong-side fills are equal (3 against 3). |
 | R-PMJ-S64 | J12 is one commit, and the release binary is rebuilt once the remaining gates pass. No extra restart: the engine boots it at the 16:05Z restart. |
 | R-PMJ-S65 | `bin15/late_grid_mark_and_perp_1s` is fixed and re-baselined in the J12 commit. Its random-walk mark crossed zero after about 80 M iterations, after which `on_mark` / `on_perp` returned on the rejected input, so the bench timed that return in some runs and the live path in others. The timed loop's walk now reverts to its start; the prefill is unchanged. |
+| R-PMJ-S66 | Overnight 10-23/24, while Anton is away, the PMJ lane does four things: research a per-window cap on same-side families and build the best variant behind a key, default off (J13); research the fills that land under 0.90 (plan only); prepare slot 9's switch to law (iii); and read out slot 11's first night on law (iii). |
+| R-PMJ-S67 | While Anton is away, finished work is committed once every gate is green and a reviewer agent approves: one commit per item, explicit paths. No push, no release rebuild, no restart. |
+| R-PMJ-S68 | Slot 9 switches to law (iii) at the 10-28 0010 restart. `pm15.toml` gets the three keys between 00:00Z and the 0010 drain, so no run boots between 00:00Z and the edit; slot 9's `j12` ledger row starts at 00:00Z. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -18319,6 +18322,12 @@ HEAD.
     Read statistically (R-PMJ-S63), both slots pass the plan's criterion 2.
 - **Deploy.** Config only, per slot, at a scheduled restart, with a J9
   `SEGMENTS` row in the same change. Slot 9 only after 10-28 00:00Z.
+  - Slot 9 (R-PMJ-S68): `~/multivenue/pm15.toml` gets the same three keys
+    between 00:00Z and the 0010 drain on 10-28 (vault runbook
+    `docs/research/pmj/j12/slot9-flip-runbook.md`, run by a scheduled task),
+    so the 0010 restart is its first boot. Its `j12` row (`J12_SLOT9_FROM_NS`,
+    10-28 00:00Z, slot 9 only) is in the worker from 10-23; until then the
+    dashboard shows it as slot 9's current segment, empty.
   - Slot 11 (R-PMJ-S63): `~/multivenue/pmj.toml` gets `strike_law =
     "trap62"`, `sigma_res_ratio_1e3 = 130` and `sigma_res_min_ppm = [3, 5,
     6, 5, 6, 6, 3]` (btc, eth, sol, xrp, hype, doge, bnb) before 16:00Z on

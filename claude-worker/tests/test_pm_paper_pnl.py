@@ -39,7 +39,10 @@ M = claude_worker.pm_paper_pnl
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _S = 1_000_000_000
 _EPOCH = 1_792_368_000 * _S  # a run before J8
-_START = {s[0]: s[1] for s in M.SEGMENTS}
+#: Each law's FIRST row (slot 9's ``j12`` row starts later than slot 11's).
+_START: dict[str, int] = {}
+for _seg in M.SEGMENTS:
+    _START.setdefault(_seg[0], _seg[1])
 _EPOCH_J8 = _START["j8"] + 60 * _S
 _FROM = _EPOCH - 3_600 * _S
 #: SOL 15m (family 2): window 1 991 521 rides pair 1. BTC 5m (family 0):
@@ -223,7 +226,16 @@ def test_descriptors_and_segments() -> None:
     assert M.segment_of(_START["j12"] - 1, 11) == "j11"
     assert M.segment_of(_START["j12"], 9) == "j8"
     assert _START["j12"] == 1_792_771_200 * _S  # 2026-10-23 16:00Z
-    assert [s[0] for s in M.SEGMENTS] == ["touch", "j8", "j11", "j12"]
+    # slot 9 reaches law (iii) at P0's window close (R-PMJ-S68)
+    assert M.J12_SLOT9_FROM_NS == 1_793_145_600 * _S  # 2026-10-28 00:00Z
+    assert M.segment_of(M.J12_SLOT9_FROM_NS, 9) == "j12"
+    assert M.segment_of(M.J12_SLOT9_FROM_NS - 1, 9) == "j8"
+    assert M.segment_of(M.J12_SLOT9_FROM_NS, 11) == "j12"
+    assert [s[0] for s in M.SEGMENTS] == ["touch", "j8", "j11", "j12", "j12"]
+    # The summary lists a slot's segments by NAME: a name appears once per slot.
+    for sid in (9, 11):
+        names = [s[0] for s in M.SEGMENTS if sid in s[3]]
+        assert len(names) == len(set(names)), (sid, names)
 
 
 def test_every_naming_source_must_agree() -> None:
@@ -459,7 +471,8 @@ def test_segments_are_never_summed(tmp_path: pathlib.Path) -> None:
     assert res.settled_new == 4
     slot = _summary(root)["slots"]["9"]
     segs = slot["segments"]
-    assert [g["segment"] for g in segs] == ["touch", "j8"]
+    # j12, slot 9's current segment from 10-28 (R-PMJ-S68), shows empty
+    assert [g["segment"] for g in segs] == ["touch", "j8", "j12"] and segs[2]["settled"] == 0
     assert (segs[0]["net_usd"], segs[1]["settled"], segs[1]["lost"]) == (0.27963, 1, 1)
     assert segs[1]["from_utc"] == M.utc_iso(_START["j8"])
     assert not {"net_usd", "settled", "stake_usd"} & set(slot), "no slot-wide total"
@@ -497,7 +510,8 @@ def test_the_current_segment_shows_even_when_empty(tmp_path: pathlib.Path) -> No
     _run(root)
     M.run_pass(root, _FROM, _now(), None)
     segs = _summary(root)["slots"]["9"]["segments"]
-    assert [g["segment"] for g in segs] == ["touch", "j8"] and segs[1]["settled"] == 0
+    assert [g["segment"] for g in segs] == ["touch", "j12"] and segs[1]["settled"] == 0
+    assert segs[1]["from_utc"] == M.utc_iso(M.J12_SLOT9_FROM_NS)
     segs = _summary(root)["slots"]["11"]["segments"]
     assert [g["segment"] for g in segs] == ["touch", "j12"] and segs[1]["settled"] == 0
 
@@ -517,7 +531,7 @@ def test_j11_splits_slot_11_only(tmp_path: pathlib.Path) -> None:
     assert res.settled_new == 2
     assert set(res.net_usd_1e6[9]) == {"j8"} and set(res.net_usd_1e6[11]) == {"j11"}
     slots = _summary(root)["slots"]
-    assert [g["segment"] for g in slots["9"]["segments"]] == ["j8"]
+    assert [g["segment"] for g in slots["9"]["segments"]] == ["j8", "j12"]
     s11 = slots["11"]["segments"]
     # j12, the current segment of slot 11, shows even while empty
     assert [g["segment"] for g in s11] == ["j11", "j12"] and s11[0]["settled"] == 1
@@ -539,10 +553,29 @@ def test_j12_splits_slot_11_only(tmp_path: pathlib.Path) -> None:
     assert res.settled_new == 2
     assert set(res.net_usd_1e6[9]) == {"j8"} and set(res.net_usd_1e6[11]) == {"j12"}
     slots = _summary(root)["slots"]
-    assert [g["segment"] for g in slots["9"]["segments"]] == ["j8"]
+    assert [g["segment"] for g in slots["9"]["segments"]] == ["j8", "j12"]
     s11 = slots["11"]["segments"]
     assert [g["segment"] for g in s11] == ["j12"] and s11[0]["settled"] == 1
     assert s11[0]["from_utc"] == M.utc_iso(_START["j12"])
+
+
+def test_j12_reaches_slot_9_at_p0s_window_close(tmp_path: pathlib.Path) -> None:
+    root = _root(tmp_path)
+    o15 = o5 = 1_793_147_400  # 15m pair 0, 5m pair 0, after slot 9's first trap62 boot
+    i15, i5 = _inst15(o15, 2), _inst5(o5, 0)
+    _run(
+        root, epoch=M.J12_SLOT9_FROM_NS + 600 * _S,
+        fills=[(5 * _S, _SOL15[0, "up"], 9, 950_000, 20_000_000, _oid(i15, 2, 0)),
+               (6 * _S, _BTC5[0, "up"], 11, 960_000, 10_000_000, _oid(i5, 0, 0))],
+        ev15=[_settled(_SOL15[0, "up"], i15, M.SETTLED_UP)],
+        ev5=[_settled(_BTC5[0, "up"], i5, M.SETTLED_UP)],
+    )
+    res = M.run_pass(root, _FROM, (o15 + 1_000) * _S, None)
+    assert res.settled_new == 2
+    assert set(res.net_usd_1e6[9]) == {"j12"} and set(res.net_usd_1e6[11]) == {"j12"}
+    s9 = _summary(root)["slots"]["9"]["segments"]
+    assert [g["segment"] for g in s9] == ["j12"] and s9[0]["settled"] == 1
+    assert s9[0]["from_utc"] == M.utc_iso(M.J12_SLOT9_FROM_NS)
 
 
 def test_a_fill_that_cannot_be_named_is_reported_not_booked(tmp_path: pathlib.Path) -> None:

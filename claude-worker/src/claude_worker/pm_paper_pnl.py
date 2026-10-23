@@ -60,7 +60,7 @@ alone, capped by its size), ``j8`` (the FAK sweep behind the touch; slot 9's
 0.90 floor) and, for slot 11 only, ``j11`` (the sweep judged 5 s after
 submit, decisions at tau >= 6 s: R-PMJ-S47 / S55) and ``j12`` (law (iii): the
 trapezoid strike and settlement with the vol-scaled residual, R-PMJ-S61 /
-S63). The summary never sums
+S63) -- slot 9 reaches ``j12`` from 10-28 00:00Z (R-PMJ-S68). The summary never sums
 across segments. **Any change to slot 9's or 11's fill
 or entry law -- a rollback included -- adds a row here in the same
 change.**
@@ -114,9 +114,14 @@ J11_FROM_NS: int = 1_792_425_600_000_000_000
 #: The first boot that reads slot 11's law (iii) (J12, R-PMJ-S61 / S63):
 #: ``pmj.toml`` gets ``strike_law = "trap62"`` before 2026-10-23 16:00Z, and
 #: the 16:05Z daily restart is the first boot after it. No run boots between
-#: the edit and 16:00Z (no restart is scheduled then). Slot 9's row lands with
-#: its own flip, after 10-28 00:00Z.
+#: the edit and 16:00Z (no restart is scheduled then).
 J12_FROM_NS: int = 1_792_771_200_000_000_000
+
+#: Slot 9's law (iii) (R-PMJ-S61 / S68): P0's confirmatory window closes at
+#: 2026-10-28 00:00Z; ``pm15.toml`` gets ``strike_law = "trap62"`` between
+#: 00:00Z and the 0010 drain, so the 0010 daily restart is the first boot
+#: after it and no run boots between 00:00Z and the edit.
+J12_SLOT9_FROM_NS: int = 1_793_145_600_000_000_000
 
 #: Both rolling members.
 BOTH_SLOTS: frozenset[int] = frozenset({9, 11})
@@ -151,6 +156,12 @@ SEGMENTS: tuple[tuple[str, int, str, frozenset[int]], ...] = (
         J12_FROM_NS,
         "J11's fill law; law (iii): the trapezoid strike/settlement + vol-scaled residual (J12)",
         frozenset({11}),
+    ),
+    (
+        "j12",
+        J12_SLOT9_FROM_NS,
+        "J8's fill law; law (iii): the trapezoid strike/settlement + vol-scaled residual (J12)",
+        frozenset({9}),
     ),
 )
 
