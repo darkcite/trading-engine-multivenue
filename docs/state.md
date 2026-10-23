@@ -182,6 +182,31 @@ affected paragraph at each lane close; the superseded text goes to
     `claude/bin15-p1-results-2026-10-20.md` (the evidence).
   - **Revert:** `bin15-flip.sh paper`, `late_persist_polls = 2`, then
     `bin15-flip.sh live --gateway`, each at a safe minute.
+- **2026-10-23 16:10Z: the scheduled `1605` restart booted `06c2bcbf` (PMJ
+  J12) with slot 11 on law (iii)** (R-PMJ-S61 / S63 / S64; risk-policy "J12").
+  - **The build.** J12 committed at 12:13Z, release binary rebuilt 12:15Z
+    (no restart then). The previous `c8d7145b` binary is kept in
+    `~/multivenue/rollback-pmj-20261023/`.
+  - **The config.** `~/multivenue/pmj.toml` gained `strike_law = "trap62"`,
+    `sigma_res_ratio_1e3 = 130` and `sigma_res_min_ppm = [3, 5, 6, 5, 6, 6, 3]`
+    at 15:26:32Z (backup `pmj.toml.pre-j12`, also in the rollback kit).
+  - **The boot.** Run `run-1792771848978758000` (epoch 16:10:48Z).
+    - Slot 11's tell: `law=6-20s … k1.550:strike=trap62:res=130/3,5,6,5,6,6,3
+      paper=+5000ms`, artifact hash `4009f98a…`.
+    - Slot 9's tell is unchanged (`law=2-20s … k1.550`, `ef485100…`); it stays
+      on the first law until after 10-28 00:00Z.
+    - `/state`: masks 2815, slots 9 and 11 configured and enabled. Slot 11's
+      member fixed its first trapezoid strikes on the 16:15Z windows.
+  - **Two things this boot did not change.**
+    - `exec.HALT` is present with slot 3 `reject-streak` (written 10-21 14:14Z,
+      adopted at boot). Slot 3 is halted, not trading — the BIN15 / EXEC lane's
+      item.
+    - `vm rows_active` is 0, as since the 08:34Z boot — also that lane's.
+  - **The ledger.** No run booted between the `pmj.toml` edit and J9's
+    `J12_FROM_NS` (16:00Z), so slot 11's `j12` segment starts exactly at this
+    run. The worker's 16:06Z pass already shows it (empty).
+  - **Rollback.** Restore `pmj.toml.pre-j12` and restart (plus a J9 `SEGMENTS`
+    row), or the previous binary.
 
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
