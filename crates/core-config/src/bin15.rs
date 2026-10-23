@@ -73,7 +73,7 @@ fn err(msg: impl Into<String>) -> Bin15Error {
 /// Every key the grammar accepts. An unknown key is a REFUSAL: a
 /// typo'd `e_take_1e6` that silently took the default is a member
 /// trading an edge nobody chose.
-const BIN15_KEYS: [&str; 26] = [
+const BIN15_KEYS: [&str; 27] = [
     "families",
     "underlying",
     "tau_ns",
@@ -114,6 +114,7 @@ const BIN15_KEYS: [&str; 26] = [
     "late_refire_fresh",
     "late_limit_bound",
     "late_max_quote_age_ms",
+    "late_lead",
 ];
 
 /// BIN15 H90 G3 (2026-10-16, ruling O-GL-2): the keys of the retired arms
@@ -206,6 +207,12 @@ pub struct Bin15File {
     /// `[0, LATE_MAX_QUOTE_AGE_MS_LIMIT]`.
     /// Absent = 0 = no limit.
     pub late_max_quote_age_ns: u64,
+    /// BIN15 fills B-4 (ruling F-6): the lead book per underlying, in
+    /// `underlying`'s order — a descriptor the engine subscribes to
+    /// (`binance-usdm:btcusdt`). Its mid, through a 60 s basis onto the
+    /// mark, replaces the HL perp in the late nowcast. Empty when absent:
+    /// no lead, the law as it was.
+    pub late_lead: Vec<String>,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES so the
@@ -410,6 +417,19 @@ fn late_keys(kv: &[(String, Value, usize)], file: &mut Bin15File) -> Result<(), 
         )));
     }
     file.late_max_quote_age_ns = age_ms as u64 * 1_000_000;
+    if kv.iter().any(|(k, _, _)| k == "late_lead") {
+        file.late_lead = strs(kv, "late_lead")?;
+        if file.late_lead.len() != file.underlying.len()
+            || file.late_lead.iter().any(String::is_empty)
+        {
+            return Err(err(format!(
+                "`late_lead` must name one lead book per `underlying` entry, in its order \
+                 (got {} for {})",
+                file.late_lead.len(),
+                file.underlying.len()
+            )));
+        }
+    }
     if kv.iter().any(|(k, _, _)| k == "late_phi_lut") {
         file.late_phi_lut = table(
             kv,
@@ -604,6 +624,7 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         late_refire_fresh: 0,
         late_limit_bound: 0,
         late_max_quote_age_ns: 0,
+        late_lead: Vec::new(),
     };
 
     if file.families.is_empty() || file.families.len() > BIN15_MAX_FAMILIES {
@@ -1059,6 +1080,7 @@ mod tests {
         assert!(f.late_phi_lut.is_empty());
         assert_eq!((f.late_refire_fresh, f.late_limit_bound), (0, 0), "the fills keys");
         assert_eq!(f.late_max_quote_age_ns, 0);
+        assert!(f.late_lead.is_empty(), "no lead");
         // The committed example carries none of them, so it is off too.
         let ex = parse(EXAMPLE).expect("example");
         assert_eq!(ex.late_enabled, 0);
@@ -1096,6 +1118,16 @@ mod tests {
         let f = parse(&src).expect("the fills keys parse");
         assert_eq!((f.late_refire_fresh, f.late_limit_bound), (1, 1));
         assert_eq!(f.late_max_quote_age_ns, 1_500_000_000);
+        let n = f.underlying.len();
+        let leads = vec!["\"binance-usdm:btcusdt\""; n].join(", ");
+        let g = parse(&format!("{}late_lead = [{leads}]\n", artifact())).expect("a lead per underlying");
+        assert_eq!(g.late_lead.len(), n);
+        let empty = vec!["\"\""; n].join(", ");
+        let e = parse(&format!("{}late_lead = [{empty}]\n", artifact())).expect_err("an empty lead");
+        assert!(e.0.contains("one lead book per"), "{}", e.0);
+        let more = vec!["\"binance-usdm:btcusdt\""; n + 1].join(", ");
+        let e = parse(&format!("{}late_lead = [{more}]\n", artifact())).expect_err("a lead too many");
+        assert!(e.0.contains("one lead book per"), "{}", e.0);
         for (line, want) in [
             ("late_refire_fresh = 2", "0 or 1"),
             ("late_limit_bound = -1", "0 or 1"),

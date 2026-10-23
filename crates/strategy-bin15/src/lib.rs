@@ -456,6 +456,10 @@ pub struct Bin15Params {
     pub n_families: usize,
     /// The mark source per distinct underlying.
     pub underlying_sym: [SymbolId; BIN15_MAX_UNDERLYINGS],
+    /// BIN15 fills B-4: the lead book per underlying (`SYMBOL_ID_NONE` =
+    /// none). A lead's mid replaces the HL perp in the late nowcast, and
+    /// each of its ticks re-prices that underlying's late windows.
+    pub lead_sym: [SymbolId; BIN15_MAX_UNDERLYINGS],
     /// Configured underlyings.
     pub n_underlyings: usize,
     /// The last window before expiry in which the S-law pricer does not
@@ -497,6 +501,7 @@ impl Default for Bin15Params {
             family_kind: [FAMILY_OUT_15M; BIN15_MAX_FAMILIES],
             n_families: 0,
             underlying_sym: [SYMBOL_ID_NONE; BIN15_MAX_UNDERLYINGS],
+            lead_sym: [SYMBOL_ID_NONE; BIN15_MAX_UNDERLYINGS],
             n_underlyings: 0,
             tail_refuse_ns: 10_000_000_000,
             requote_ttl_ns: 1_000_000_000,
@@ -892,6 +897,31 @@ impl Bin15Strategy {
             i += 1;
         }
         None
+    }
+
+    /// BIN15 fills B-4: the underlying `sym` is the lead book of.
+    #[inline]
+    fn lead_of_sym(&self, sym: SymbolId) -> Option<usize> {
+        let mut i = 0usize;
+        while i < self.params.n_underlyings {
+            if self.params.lead_sym[i] == sym && sym != SYMBOL_ID_NONE {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// BIN15 fills B-4: a lead tick re-prices the late law of every family
+    /// on its underlying (`late_reprice` keeps its own window and holds).
+    fn late_lead_reprice<C: Ctx>(&mut self, ctx: &mut C, u: usize, now: NsTs) {
+        let mut idx = 0usize;
+        while idx < self.params.n_families {
+            if self.fam[idx].underlying as usize == u {
+                self.late_reprice(ctx, idx, now);
+            }
+            idx += 1;
+        }
     }
 
     /// The family index carrying outcome `outcome`.
@@ -1932,13 +1962,22 @@ impl Strategy for Bin15Strategy {
             // BIN15 H90: the underlying's own book is part of the LATE law
             // (the nowcast), and of nothing else. No reprice: a perp tick is
             // not a poll.
+            // B-4: an underlying with a lead book takes its nowcast from the
+            // lead alone, and a lead tick IS a reprice — the move it carries
+            // is the one the law races the venue's ladder for.
             if self.params.late.enabled == 1 && !tick.is_stale() {
-                if let Some(u) = self.underlying_of_sym(tick.sym) {
-                    let bid = tick.bid_px.raw();
-                    let ask = tick.ask_px.raw();
-                    if bid > 0 && ask > 0 {
+                let bid = tick.bid_px.raw();
+                let ask = tick.ask_px.raw();
+                if bid > 0 && ask > 0 {
+                    if let Some(u) = self.underlying_of_sym(tick.sym) {
+                        if self.params.lead_sym[u] == SYMBOL_ID_NONE {
+                            let wall = self.bar.anchor.wall_of(tick.ts_ns);
+                            self.late_grid[u].on_perp(wall, bid + ask);
+                        }
+                    } else if let Some(u) = self.lead_of_sym(tick.sym) {
                         let wall = self.bar.anchor.wall_of(tick.ts_ns);
                         self.late_grid[u].on_perp(wall, bid + ask);
+                        self.late_lead_reprice(ctx, u, tick.ts_ns);
                     }
                 }
             }
@@ -3118,6 +3157,47 @@ let (n, aged) = run(1_000_000_000);
             assert!(f <= px && px - f < 10 && Bin15Strategy::on_grid(f, 1_000_000_000), "{px}");
             px += 7;
         }
+    }
+
+    /// BIN15 fills B-4: the lead book's id in these tests.
+    const BN_BTC: SymbolId = 16_777_729;
+
+    /// Marks once a second and the LEAD book (not the HL perp) a dollar
+    /// wide around them, over `[from, to)`.
+    fn lead_feed(m: &mut Bin15Strategy, c: &mut RecCtx, from: u64, to: u64) {
+        let mut s = from;
+        while s < to {
+            let mark = 79_000_000_000 + if s % 2 == 0 { 1_000_000 } else { -1_000_000 };
+            m.on_venue_event(&mark_event(mark, at(s) + 200_000_000), c);
+            m.on_tick(&tick(BN_BTC, mark - 500_000, mark + 500_000, 1_000_000_000, at(s) + 300_000_000, false), c);
+            s += 1;
+        }
+    }
+
+    /// BIN15 fills B-4: with a lead, the HL perp no longer feeds the
+    /// nowcast, the lead does, and each lead tick re-prices the window.
+    #[test]
+    fn with_a_lead_the_lead_book_drives_the_nowcast_and_its_ticks_reprice() {
+        // The HL perp alone feeds nothing once a lead is named: no nowcast.
+        let mut m = late_member(1);
+        m.params.lead_sym[0] = BN_BTC;
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        late_feed(&mut m, &mut c, 0, 585);
+        late_poll(&mut m, &mut c, 585, 800_000, 850_000);
+        assert!(c.orders.is_empty(), "no lead book, no nowcast");
+        assert!(m.counters().late_skipped_stale > 0);
+        // The lead book: marks and lead ticks both re-price inside the window.
+        let mut m = late_member(1);
+        m.params.lead_sym[0] = BN_BTC;
+        let mut c = ctx();
+        late_bind(&mut m, &mut c);
+        lead_feed(&mut m, &mut c, 0, 570);
+        assert_eq!(m.counters().late_reprices, 0);
+        lead_feed(&mut m, &mut c, 570, 580);
+        assert_eq!(m.counters().late_reprices, 20, "a mark and a lead tick each second");
+        late_poll(&mut m, &mut c, 580, 800_000, 850_000);
+        assert_eq!(c.orders.len(), 1, "the lead's nowcast prices the entry");
     }
 
     /// One late entry on the decided Yes side at 0.85 (persist 1); its oid.

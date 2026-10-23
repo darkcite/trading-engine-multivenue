@@ -212,6 +212,22 @@ pub fn load_bin15_boot(
         u += 1;
     }
     params.n_underlyings = file.underlying.len();
+    // BIN15 fills B-4: the lead books, resolved like the marks — a lead the
+    // engine does not subscribe to is a refusal, never a silent fallback to
+    // the HL perp.
+    let mut u = 0usize;
+    while u < file.late_lead.len() {
+        let d = &file.late_lead[u];
+        let Some(sym) = resolve(d) else {
+            return Err(format!(
+                "bin15.toml `late_lead`[{u}] = `{d}` does not resolve against the \
+                 instrument manifest — the lead has to be a book the engine \
+                 actually subscribes to"
+            ));
+        };
+        params.lead_sym[u] = sym;
+        u += 1;
+    }
 
     // The families. The Yes slot comes from the UNIVERSE (the rolling
     // ordinals it allocated), not from a descriptor: a rolling slot's
@@ -421,7 +437,7 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
 /// window, the belief floor, the margin, the persistence, the spend and
 /// the σ scale: `2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`. The
 /// BIN15-fills keys follow only when stated: `:fresh` (B-1), `:age{ms}ms`
-/// (B-2), `:bound` (B-3).
+/// (B-2), `:bound` (B-3), `:lead` (B-4, any underlying with a lead book).
 #[must_use]
 pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
     let l = &p.late;
@@ -429,7 +445,7 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
         return String::from("off");
     }
     format!(
-        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}{}{}{}",
+        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}{}{}{}{}",
         l.tau_min_ns / 1_000_000_000,
         l.tau_max_ns / 1_000_000_000,
         l.p_min_1e6 / 1_000_000,
@@ -446,6 +462,11 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
             format!(":age{}ms", l.max_quote_age_ns / 1_000_000)
         },
         if l.limit_bound == 1 { ":bound" } else { "" },
+        if p.lead_sym[..p.n_underlyings].iter().any(|s| *s != core_types::SYMBOL_ID_NONE) {
+            ":lead"
+        } else {
+            ""
+        },
     )
 }
 
@@ -662,6 +683,9 @@ mod tests {
             late_law(&p),
             "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550:fresh:age1500ms:bound"
         );
+        p.n_underlyings = 1;
+        p.lead_sym[0] = 16_777_729;
+        assert!(late_law(&p).ends_with(":bound:lead"), "{}", late_law(&p));
     }
 
     #[test]
