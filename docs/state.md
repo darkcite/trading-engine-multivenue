@@ -301,8 +301,16 @@ affected paragraph at each lane close; the superseded text goes to
     (main's slots stay off until Anton enables them); it relays the AI
     inboxes `~/multivenue/state/notify/inbox` and both repos'
     `.notify-inbox/`. Log `~/multivenue/logs/launchd/notify.log`.
-  - **Nothing leaves the host yet:** both run `dry_run = true` and neither
-    `.env` holds `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`. Going live is
+  - **15:32Z the standalone's notifier SENDS** (Anton's bot @Kittrrbot, his
+    private chat): both TELEGRAM_* keys appended to
+    `~/trading-engine-multivenue-bin15/.env` on his ask (still 0600),
+    `dry_run = false` in `~/bin15/multivenue/notify.toml` (backup
+    `notify.toml.bak-20261024T1532Z-dryrun`), label reloaded. Delivery waits
+    on a LuLu allow rule for its binary → `api.telegram.org:443`; until then
+    the outbox holds the messages and retries every 5 min. Main's notifier
+    stays dry run (no keys in main's `.env`).
+  - **Before 15:32Z nothing left the host:** both ran `dry_run = true` and
+    neither `.env` held `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`. Going live is
     Anton's: paste the two keys into each `.env`, set `dry_run = false`,
     reload the label, and allow `multivenue-notify` → `api.telegram.org:443`
     in LuLu.
