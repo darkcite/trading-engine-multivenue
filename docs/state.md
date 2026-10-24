@@ -261,6 +261,12 @@ affected paragraph at each lane close; the superseded text goes to
   - **Main carries the cap in code** (`5daffac3`), not built. Its paper
     artifact must not name `late_limit_max_1e6` until a build from committed
     state boots, because `300186e5` refuses an unknown key.
+  - **Amendment A1, 05:19:25Z:** the 04:52Z boot sent nothing. The router's
+    clamp 3 counts an outcome contract at its $1 payout, so $250 / limit is
+    over 250 contracts, and 90 IoCs were refused locally. Anton: "Fix sizing,
+    redeploy". The standalone now runs G30 `57bcdf6d` (the member sizes inside
+    the clamp; main `5c0a85ca`, not built), pid 33607, armed 05:19:25Z, with
+    the same artifact and tell. The forward test's window starts at this boot.
 
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
