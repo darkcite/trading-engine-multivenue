@@ -11,6 +11,7 @@
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -188,15 +189,34 @@ impl Bucket {
     }
 }
 
-/// The sender loop: drain the outbox through `t` until `stop` is set.
-pub fn run_sender(outbox: Outbox, mut t: Box<dyn Transport>, stop: Arc<AtomicBool>) {
+/// How long an idle sender waits for a wake before it looks again.
+pub const IDLE_WAIT: Duration = Duration::from_secs(5);
+
+/// The sender loop: drain the outbox through `t` until `stop` is set or
+/// the poll loop's end of `wake` is dropped. It blocks on `wake` while
+/// idle instead of polling the outbox on a short timer (a timer wakeup a
+/// few times a second measurably shifts the house's ns-scale benches).
+pub fn run_sender(
+    outbox: Outbox,
+    mut t: Box<dyn Transport>,
+    stop: Arc<AtomicBool>,
+    wake: Receiver<()>,
+) {
     let mut bucket = Bucket::default();
     let mut paused_until: Option<Instant> = None;
     let mut backoff = 0u64;
     while !stop.load(Ordering::Relaxed) {
-        if paused_until.is_some_and(|p| Instant::now() < p) {
-            std::thread::sleep(Duration::from_millis(250));
-            continue;
+        if let Some(p) = paused_until {
+            let now = Instant::now();
+            if now < p {
+                if let Err(RecvTimeoutError::Disconnected) =
+                    wake.recv_timeout((p - now).min(IDLE_WAIT))
+                {
+                    return;
+                }
+                continue;
+            }
+            paused_until = None;
         }
         let pending = match outbox.pending() {
             Ok(p) => p,
@@ -207,11 +227,13 @@ pub fn run_sender(outbox: Outbox, mut t: Box<dyn Transport>, stop: Arc<AtomicBoo
             }
         };
         let Some((paths, loud, text)) = next_batch(&pending, BACKLOG_FROM) else {
-            std::thread::sleep(Duration::from_millis(250));
+            if let Err(RecvTimeoutError::Disconnected) = wake.recv_timeout(IDLE_WAIT) {
+                return;
+            }
             continue;
         };
         if !bucket.take() {
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(250));
             continue;
         }
         match t.send(&text, loud) {
@@ -312,6 +334,13 @@ mod tests {
         let d = std::env::temp_dir().join(format!("notify-send-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let o = Outbox::open(&d).unwrap();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (o2, s2, g2) = (o.clone(), stop.clone(), got.clone());
+        let h = std::thread::spawn(move || run_sender(o2, Box::new(Fake(g2)), s2, rx));
+        // Idle first: it blocks on the wake, then drains what was queued.
+        std::thread::sleep(Duration::from_millis(50));
         o.push(&Msg {
             loud: true,
             text: "a".into(),
@@ -322,10 +351,7 @@ mod tests {
             text: "b".into(),
         })
         .unwrap();
-        let got = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (o2, s2, g2) = (o.clone(), stop.clone(), got.clone());
-        let h = std::thread::spawn(move || run_sender(o2, Box::new(Fake(g2)), s2));
+        tx.send(()).unwrap();
         for _ in 0..100 {
             if o.pending().unwrap().is_empty() {
                 break;
@@ -333,6 +359,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         stop.store(true, Ordering::Relaxed);
+        drop(tx); // unblocks the idle wait
         h.join().unwrap();
         assert_eq!(
             *got.lock().unwrap(),

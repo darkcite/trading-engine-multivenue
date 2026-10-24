@@ -104,6 +104,7 @@ pub struct Runner {
     last_err: String,
     state_ok: bool,
     polls: u64,
+    wake: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl Runner {
@@ -142,7 +143,13 @@ impl Runner {
             last_err: String::new(),
             state_ok: true,
             polls: 0,
+            wake: None,
         })
+    }
+
+    /// Where to signal the sender thread that the outbox has new messages.
+    pub fn set_wake(&mut self, w: std::sync::mpsc::Sender<()>) {
+        self.wake = Some(w);
     }
 
     /// The outbox (the sender thread's input).
@@ -335,6 +342,11 @@ impl Runner {
                 self.note_err(&format!("outbox write failed: {e}"));
             }
         }
+        if !msgs.is_empty() {
+            if let Some(w) = &self.wake {
+                let _ = w.send(());
+            }
+        }
         self.persist();
         if self.polls % 60 == 0 {
             if let Ok(n) = self.outbox.enforce_cap() {
@@ -423,9 +435,13 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let stop = Arc::new(AtomicBool::new(false));
     let ob = r.outbox().clone();
     let s2 = stop.clone();
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    // Wake once at start: an outbox left over from a previous run drains now.
+    let _ = wake_tx.send(());
+    r.set_wake(wake_tx);
     std::thread::Builder::new()
         .name("notify-sender".into())
-        .spawn(move || telegram::run_sender(ob, transport, s2))
+        .spawn(move || telegram::run_sender(ob, transport, s2, wake_rx))
         .map_err(|e| format!("cannot start the sender thread: {e}"))?;
     log(&format!(
         "running: tag {} · {} slot(s) · {} watch(es) · {} inbox dir(s) · {}",

@@ -18443,6 +18443,17 @@ pauses five minutes on 401/403/404 and drops only a message Telegram
 refuses as malformed (400). At-least-once: a crash between a send and its
 removal repeats one message.
 
+**Cadence and the bench gate.** One poll every five seconds by default
+(`poll_ms`): a fill is reported up to ~6 s after the venue's. A resident
+notifier still shifts the ns-scale hot-path benches on the engine host by
+about one cycle — measured 2026-10-24, `strategy_set/on_timer_all` +9.5 to
++12.6 % over the baseline with the notifiers stopped (3 runs), +15.6 to
++19.7 % with them polling every second (6 runs), +11.7 to +16.5 % every
+five seconds (3 runs) against `make bench-check`'s 15 % — although `notify`
+is in no bench's dependency tree. **So `make bench-check` runs with the
+notifier labels booted out** (`launchctl bootout gui/$UID/<label>` for each
+label below; re-bootstrap after): it restarts no engine.
+
 **Operation.** Main: `com.multivenue.notify`, `~/multivenue/notify.toml`,
 log `~/multivenue/logs/launchd/notify.log`. The standalone:
 `com.multivenue.bin15-notify`, `~/bin15/multivenue/notify.toml`, log

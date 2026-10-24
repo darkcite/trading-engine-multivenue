@@ -238,6 +238,12 @@ pub fn parse_state_url(u: &str) -> Result<StateUrl, ConfigErr> {
     })
 }
 
+/// The default poll period. One poll a second measurably shifted the house's
+/// ns-scale hot-path benches (`make bench-check`, `strategy_set/on_timer_all`
+/// +15–20 % with the notifier running, +10–13 % without, 2026-10-24); one
+/// every five seconds stayed inside the gate. A fill is reported ≤ ~6 s late.
+pub const DEFAULT_POLL_MS: u64 = 5000;
+
 const ROOT_KEYS: &[&str] = &[
     "tag",
     "state_url",
@@ -318,7 +324,7 @@ impl Config {
             return Err(cerr("'env_file' is required unless dry_run = true"));
         }
         let poll_ms = match i(r, "poll_ms")? {
-            None => 1000,
+            None => DEFAULT_POLL_MS,
             Some(v) if (200..=60_000).contains(&v) => v as u64,
             Some(_) => return Err(cerr("'poll_ms' must be 200–60000")),
         };
@@ -572,6 +578,7 @@ mod example {
             (c.dark_after_s, c.hold_loud_s, c.budget_warn),
             (None, None, None)
         );
+        assert_eq!(c.poll_ms, DEFAULT_POLL_MS);
     }
 
     #[test]

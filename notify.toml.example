@@ -37,8 +37,10 @@ state_dir = "~/bin15/multivenue/state/notify"
 # true: every message goes to the log only; nothing leaves the host.
 dry_run = false
 
-# Poll period, ms (200–60000; default 1000).
-# poll_ms = 1000
+# Poll period, ms (200–60000; default 5000). One poll a second measurably
+# shifts the hot-path benches (make bench-check) on the engine host; five
+# seconds does not. A fill is reported up to ~6 s after the venue's.
+# poll_ms = 5000
 
 # --- alerts with a threshold: each is off unless set ---------------------
 # DARK when /state has been silent this long (BACK when it answers again).
