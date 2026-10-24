@@ -53,6 +53,8 @@ pub struct ExecView {
     pub arm_slots: Vec<u8>,
     /// The HL gateway's measured fees this session, ×1e8.
     pub gw_fees_1e8: Option<i64>,
+    /// An `exec.arms.hyperliquid_gw` block is present.
+    pub gw_present: bool,
 }
 
 impl ExecView {
@@ -153,6 +155,8 @@ impl StateView {
             .collect();
         let mut arm_slots = Vec::new();
         let mut gw_fees_1e8 = None;
+        let mut gw_present = false;
+        let mut gw_budget = None;
         if let Some(arms) = j.path("exec.arms") {
             for (name, arm) in arms.members() {
                 if let Some(s) = arm.get("slot").and_then(Json::as_i64) {
@@ -161,7 +165,11 @@ impl StateView {
                     }
                 }
                 if name == "hyperliquid_gw" {
+                    gw_present = true;
                     gw_fees_1e8 = arm.get("fees_1e8").and_then(Json::as_i64);
+                    if arm.get("budget_known").and_then(Json::as_i64) == Some(1) {
+                        gw_budget = arm.get("budget_remaining").and_then(Json::as_i64);
+                    }
                     for k in GW_REFUSED_KEYS {
                         refused.push((
                             format!("gw.{k}"),
@@ -199,7 +207,12 @@ impl StateView {
                 recon_failed: u(j, "exec.arm_recon_failed"),
                 recon_drift_legs: u(j, "exec.arm_recon_drift_legs"),
                 recon_unseen_legs: u(j, "exec.arm_recon_unseen_legs"),
-                budget_remaining: i(j, "exec.arm_budget_remaining"),
+                // The gateway transport keeps the venue budget in its own
+                // block; `arm_budget_remaining` is the blocking arm's.
+                budget_remaining: match (i(j, "exec.arm_budget_remaining"), gw_budget) {
+                    (0, Some(g)) => g,
+                    (b, _) => b,
+                },
                 anchor_1e6: i(j, "exec.arm_pnl_anchor_usd_1e6"),
                 session_pnl_1e6: i(j, "exec.arm_session_pnl_usd_1e6"),
                 halted: words(j, "exec.halted"),
@@ -207,6 +220,7 @@ impl StateView {
                 holds: u(j, "exec.holds"),
                 arm_slots,
                 gw_fees_1e8,
+                gw_present,
             },
         }
     }
@@ -269,11 +283,11 @@ pub fn body_of(buf: &mut [u8]) -> Result<std::ops::Range<usize>, FetchErr> {
     }
 }
 
-/// GET `/state` and decode it.
+/// GET `path` on the `/state` host and return the body.
 ///
 /// # Errors
 /// [`FetchErr`].
-pub fn fetch(url: &StateUrl, timeout: Duration) -> Result<StateView, FetchErr> {
+fn get(url: &StateUrl, path: &str, timeout: Duration) -> Result<Vec<u8>, FetchErr> {
     let addr: SocketAddr = (url.host.as_str(), url.port)
         .to_socket_addrs()
         .map_err(|e| FetchErr::Net(e.to_string()))?
@@ -289,7 +303,7 @@ pub fn fetch(url: &StateUrl, timeout: Duration) -> Result<StateView, FetchErr> {
     let n = http1::write_get_request(
         &mut req,
         url.host.as_bytes(),
-        url.path.as_bytes(),
+        path.as_bytes(),
         b"multivenue-notify",
     )
     .map_err(|_| FetchErr::Http("request does not fit".into()))?;
@@ -321,8 +335,49 @@ pub fn fetch(url: &StateUrl, timeout: Duration) -> Result<StateView, FetchErr> {
         }
     }
     let range = body_of(&mut buf)?;
-    let j = Json::parse(&buf[range]).map_err(|e| FetchErr::Json(e.to_string()))?;
-    Ok(StateView::from_json(&j))
+    buf.truncate(range.end);
+    buf.drain(..range.start);
+    Ok(buf)
+}
+
+/// The `/metrics` gauge `name`, if present.
+#[must_use]
+pub fn metric(text: &str, name: &str) -> Option<i64> {
+    text.lines().find_map(|l| {
+        let (k, v) = l.split_once(' ')?;
+        (k == name).then(|| v.trim().split(['.', 'e', 'E']).next()?.parse().ok())?
+    })
+}
+
+impl StateView {
+    /// The Hyperliquid gateway keeps its session anchor and the account's
+    /// worth in `/metrics` only (`exec.arm_pnl_*` on `/state` are the
+    /// blocking transport's). Fill them in from the metrics text.
+    pub fn apply_metrics(&mut self, text: &str) {
+        let anchor = metric(text, "engine_exec_hlgw_pnl_anchor_usd_1e6").unwrap_or(0);
+        let worth = metric(text, "engine_exec_hlgw_worth_usd_1e6").unwrap_or(0);
+        if self.exec.anchor_1e6 == 0 && anchor > 0 && worth > 0 {
+            self.exec.anchor_1e6 = anchor;
+            self.exec.session_pnl_1e6 = worth - anchor;
+        }
+    }
+}
+
+/// GET `/state` and decode it; with a gateway arm and no anchor on
+/// `/state`, the anchor and worth come from `/metrics` on the same port.
+///
+/// # Errors
+/// [`FetchErr`] (a failed `/metrics` read is not an error).
+pub fn fetch(url: &StateUrl, timeout: Duration) -> Result<StateView, FetchErr> {
+    let body = get(url, &url.path, timeout)?;
+    let j = Json::parse(&body).map_err(|e| FetchErr::Json(e.to_string()))?;
+    let mut sv = StateView::from_json(&j);
+    if sv.exec.configured && sv.exec.gw_present && sv.exec.anchor_1e6 == 0 {
+        if let Ok(m) = get(url, "/metrics", timeout) {
+            sv.apply_metrics(&String::from_utf8_lossy(&m));
+        }
+    }
+    Ok(sv)
 }
 
 #[cfg(test)]
@@ -386,6 +441,39 @@ mod tests {
             s.mono_to_wall_ns(1_792_846_649_000_000_000),
             1_792_846_649_000_000_000
         );
+    }
+
+    #[test]
+    fn the_gateway_budget_and_metrics_anchor_fill_in() {
+        let b = testkit::body(1, "/r", Some(3), "none", "none", 0)
+            .replace(
+                "\"arm_budget_remaining\":9990",
+                "\"arm_budget_remaining\":0",
+            )
+            .replace(
+                "\"arm_pnl_anchor_usd_1e6\":1248830000",
+                "\"arm_pnl_anchor_usd_1e6\":0",
+            )
+            .replace(
+                "\"fees_1e8\":12300000",
+                "\"fees_1e8\":12300000,\"budget_known\":1,\"budget_remaining\":9962",
+            );
+        let mut s = StateView::from_json(&Json::parse(b.as_bytes()).unwrap());
+        assert!(s.exec.gw_present);
+        assert_eq!(s.exec.budget_remaining, 9962);
+        assert_eq!(s.exec.anchor_1e6, 0);
+        let m = "# TYPE engine_exec_hlgw_pnl_anchor_usd_1e6 gauge\nengine_exec_hlgw_pnl_anchor_usd_1e6 1248829952\nengine_exec_hlgw_anchor_kept 1\nengine_exec_hlgw_worth_usd_1e6 1261102712\n";
+        assert_eq!(metric(m, "engine_exec_hlgw_anchor_kept"), Some(1));
+        assert_eq!(metric(m, "missing"), None);
+        s.apply_metrics(m);
+        assert_eq!(s.exec.anchor_1e6, 1_248_829_952);
+        assert_eq!(s.exec.session_pnl_1e6, 12_272_760);
+        // An anchor already on /state (the blocking transport) wins.
+        let mut t = s.clone();
+        t.exec.anchor_1e6 = 5;
+        t.exec.session_pnl_1e6 = 7;
+        t.apply_metrics(m);
+        assert_eq!((t.exec.anchor_1e6, t.exec.session_pnl_1e6), (5, 7));
     }
 
     #[test]

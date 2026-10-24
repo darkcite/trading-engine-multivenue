@@ -6,7 +6,9 @@
 //! `multivenue-notify` is a separate process, one launchd job per engine
 //! instance. It reads, and only reads:
 //!
-//! * `GET http://127.0.0.1:<port>/state` once per poll;
+//! * `GET http://127.0.0.1:<port>/state` once per poll, and `/metrics` on
+//!   the same port when the Hyperliquid gateway holds the session anchor
+//!   and worth (which `/state` does not carry);
 //! * the run's `engine-fills.pmlr`, `engine-orders.pmlr` and
 //!   `engine-events.pmlr` (tailed by record index, never written);
 //! * the `[hyperliquid] rolling = [...]` line of the instance's

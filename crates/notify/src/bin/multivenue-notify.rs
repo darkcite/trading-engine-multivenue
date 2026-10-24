@@ -251,6 +251,14 @@ fn verb_check(path: &Path, cfg: &Config) -> ExitCode {
                         live.join(",")
                     }
                 );
+                if s.exec.anchor_1e6 > 0 {
+                    println!(
+                        "session    net {} (worth {} / anchor {})",
+                        notify::fmt::usd_signed_1e6(s.exec.session_pnl_1e6),
+                        notify::fmt::plain_1e6(s.exec.anchor_1e6 + s.exec.session_pnl_1e6),
+                        notify::fmt::plain_1e6(s.exec.anchor_1e6)
+                    );
+                }
             }
             Err(e) => {
                 println!("state      {e}");

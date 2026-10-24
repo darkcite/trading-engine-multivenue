@@ -5,7 +5,8 @@
 # exits 0. This example is the parser's contract: an unknown key or table
 # is refused at start.
 #
-# The notifier is a separate process. It only reads /state on loopback, the
+# The notifier is a separate process. It only reads /state (and /metrics, for
+# the Hyperliquid gateway's session anchor and worth) on loopback, the
 # run's engine-{fills,orders,events}.pmlr, the [hyperliquid] rolling line of
 # the universe, this file, the two TELEGRAM_* keys of the .env and the inbox
 # directories. It writes only state_dir and its log, and talks to one host:

@@ -284,8 +284,9 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 - **N-DOCTRINE (O-NT-A, 2026-10-24) — the one-way Telegram notifier is
   permitted beside that rule.** `multivenue-notify` (`crates/notify`; launchd
   `com.multivenue.notify`; `~/multivenue/notify.toml` absent = off) runs out of process,
-  is never linked into or reached by the engine, only READS `/state` on
-  loopback and the run's `engine-{fills,orders,events}.pmlr`, takes only
+  is never linked into or reached by the engine, only READS `/state` (and
+  `/metrics`, for the HL gateway's session anchor and worth) on loopback and
+  the run's `engine-{fills,orders,events}.pmlr`, takes only
   `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` from `.env` (launched under
   `env -i`), writes only its own state dir and log, talks only to
   `api.telegram.org` and never reads Telegram updates. Deploying, reloading

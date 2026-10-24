@@ -18379,7 +18379,9 @@ identical on `main` and `bin15-h90-standalone`); R-NT-2 fills + settlements,
 order attempts, safety and digests; R-NT-3 notify-only; R-NT-4 a
 per-instance `notify.toml`, absent = off — the standalone's slot 3 live
 first, main installed with no slot; R-NT-5 gross P&L per instance from the
-captured fills, the session net (fees included) from `/state`; R-NT-6 one
+captured fills, the session net (fees included) from the engine's own
+accounting — `/state`, or for the Hyperliquid gateway transport its anchor
+and worth in `/metrics`, which `/state` does not carry; R-NT-6 one
 chat tagged `[SA]` / `[MAIN]`, settlements and safety ring, the rest silent;
 R-NT-7 a daily digest at 00:00Z and an hourly line while a slot is live;
 R-NT-8 UTC; R-NT-9 the code on both branches. O-NT-A: the CLAUDE.md
@@ -18396,7 +18398,9 @@ sessions, owned by main's notifier.
    and never reached by the engine loop; the engine never waits for it. Its
    failure — a crash, a dark Telegram, a sleeping Mac — cannot affect
    trading.
-2. **Reads only:** `/state` on loopback (the config refuses another host);
+2. **Reads only:** `/state` on loopback (the config refuses another host)
+   and, on the same port, `/metrics` for the gateway's session anchor and
+   worth;
    the run's `engine-fills.pmlr`, `engine-orders.pmlr` and
    `engine-events.pmlr` (tailed by record index); the `[hyperliquid]
    rolling` line of the instance's `universe.toml`; its `notify.toml`; the
