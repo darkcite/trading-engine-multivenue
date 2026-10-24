@@ -240,10 +240,27 @@ affected paragraph at each lane close; the superseded text goes to
   `9b893a2e…` (backup `bin15.toml.bak-20261024T040206Z-fills-v2`). No exec arm
   (`/state` `exec.configured` 0). The slot's retention pass ran with the slot
   (four 10-22 run dirs archived, verified).
-- **The standalone is unchanged and LIVE** (`61d899a7`, `0x66b5…2806`). Its
-  branch carries G20–G24 (the same fixes, plus the Binance USDⓈ-M feed, dark),
-  NOT deployed: ruling F-11 — nothing updated goes live on the money account
-  until Anton confirms.
+- **2026-10-24 04:52Z: the standalone LIVE on PR-BIN15-P2** (Anton confirmed
+  the release, ~04:20Z; this lifts F-11 for this change only). Branch
+  `bin15-h90-standalone` G29 `af27572b` (G20–G28: O8b, B-1..B-4, the Binance
+  feed dark, G27's worker clock-domain fix, G28's cap `late_limit_max_1e6`).
+  - **The law:** `late_refire_fresh = 1`, `late_limit_bound = 1`,
+    `late_e_1e6 = 10000` and `late_limit_max_1e6 = 985000`.
+  - **The boots:** `bin15-flip.sh paper` (boot 04:50:20Z, tell checked), then
+    `bin15-flip.sh live --gateway` (exec-smoke PASS, SIGTERM 04:51:03Z,
+    "LIVE ARM ARMED" 04:52:13Z, pid 25575).
+  - **The tell:** `late=2-30s:p>=0.90:ask<=p-1c:persist1:$250:k1.550:fresh:bound:cap0.985`.
+  - **The artifacts:** live cut `677868c2…`, paper copy `b6d148e8…`, backups
+    `~/bin15/multivenue/bin15{,.paper-s7}.toml.bak-20261024T043654Z-p2`.
+  - **The account:** session anchor 1 248.83 USDC.
+  - **Unchanged:** $250 per order and per instance, −$500 session bound, no
+    day cap.
+  - **The forward test and kill rules:** the standalone branch's
+    docs/risk-policy.md "BIN15 fills — PR-BIN15-P2"; project
+    `claude/bin15-p2-spec-2026-10-24.md`.
+  - **Main carries the cap in code** (`5daffac3`), not built. Its paper
+    artifact must not name `late_limit_max_1e6` until a build from committed
+    state boots, because `300186e5` refuses an unknown key.
 
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
