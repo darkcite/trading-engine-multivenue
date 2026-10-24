@@ -307,7 +307,9 @@ affected paragraph at each lane close; the superseded text goes to
     `dry_run = false` in `~/bin15/multivenue/notify.toml` (backup
     `notify.toml.bak-20261024T1532Z-dryrun`), label reloaded. Delivering since
     17:38Z, after Anton's LuLu allow rule for its binary →
-    `api.telegram.org:443` (a rebuild of the binary may ask LuLu again). Main's notifier
+    `api.telegram.org:443` (a rebuild of the binary may ask LuLu again).
+    Since 18:32Z two chats (main `d79a7b17` / standalone G36 `c7a9165f`:
+    `TELEGRAM_CHAT_ID` takes a list): Anton's and Janna's; a test reached both. Main's notifier
     stays dry run (no keys in main's `.env`).
   - **Before 15:32Z nothing left the host:** both ran `dry_run = true` and
     neither `.env` held `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`. Going live is
