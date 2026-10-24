@@ -65,6 +65,14 @@ SLOT_KIND_DEPTH: int = 7
 DEPTH_SLOT: int = 192
 SLOT: int = 64
 WINDOW_MAX_S: float = 2 * 3600.0
+# A file whose FIRST stamp lies this far from the tick files' first stamp is
+# on another clock and holds no slot of this run's timeline. The live HL
+# lane stamps `engine-fills.pmlr` with the venue's WALL ns (~1.8e18) while
+# every capture file is on the host's monotonic clock (ns since boot): one
+# such fill made a 10-23 run span 57 years and the daily accrual cut 249 k
+# empty windows (2026-10-24). No run lasts 30 days; boot-relative and wall
+# stamps are decades apart.
+CLOCK_DOMAIN_NS: int = 30 * 86_400 * 1_000_000_000
 MANIFESTS: tuple[str, ...] = ("instrument-manifest.tsv", "options-manifest.tsv")
 # AiCmd slot (docs/wire-format.md §3): ts_ns @0, ttl_ns @32, kind @40,
 # param_id @44 — the three fields the carry-over law reads.
@@ -142,9 +150,13 @@ def run_span(run_dir: pathlib.Path) -> tuple[int, int] | None:
     archive push (the 2026-09-22 cycle aborted on a 0-byte ``okx-events.pmlr``
     and stranded every run behind it — and so retention), the window pools and
     the pnl-report windowing. Cutting stays strict (``_cut_file``): a cut is
-    replayed by the harness, and a file it cannot read is an error there."""
-    first = None
-    last = None
+    replayed by the harness, and a file it cannot read is an error there.
+
+    A file on ANOTHER CLOCK (its first stamp more than ``CLOCK_DOMAIN_NS``
+    from the tick files' first) is skipped for the end too: the live lane's
+    wall-ns ``engine-fills.pmlr`` must not stretch a run to decades. Its
+    slots fall outside every window, so cutting leaves it header-only."""
+    spans: list[tuple[bool, int, int]] = []
     for p in sorted(run_dir.glob("*.pmlr")):
         try:
             fl = first_last_ts(p)
@@ -152,10 +164,21 @@ def run_span(run_dir: pathlib.Path) -> tuple[int, int] | None:
             continue
         if fl is None:
             continue
-        if p.name.endswith("-ticks.pmlr"):
-            first = fl[0] if first is None else min(first, fl[0])
-        last = fl[1] if last is None else max(last, fl[1])
-    if first is None or last is None:
+        spans.append((p.name.endswith("-ticks.pmlr"), fl[0], fl[1]))
+    first = None
+    for is_tick, lo, _ in spans:
+        if is_tick:
+            first = lo if first is None else min(first, lo)
+    if first is None:
+        return None
+    last = None
+    for _, lo, hi in spans:
+        # The clock-domain guard (CLOCK_DOMAIN_NS): a file stamped on another
+        # clock cannot end this run's span.
+        if abs(lo - first) > CLOCK_DOMAIN_NS:
+            continue
+        last = hi if last is None else max(last, hi)
+    if last is None:
         return None
     return first, last
 
