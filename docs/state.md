@@ -305,9 +305,9 @@ affected paragraph at each lane close; the superseded text goes to
     private chat): both TELEGRAM_* keys appended to
     `~/trading-engine-multivenue-bin15/.env` on his ask (still 0600),
     `dry_run = false` in `~/bin15/multivenue/notify.toml` (backup
-    `notify.toml.bak-20261024T1532Z-dryrun`), label reloaded. Delivery waits
-    on a LuLu allow rule for its binary → `api.telegram.org:443`; until then
-    the outbox holds the messages and retries every 5 min. Main's notifier
+    `notify.toml.bak-20261024T1532Z-dryrun`), label reloaded. Delivering since
+    17:38Z, after Anton's LuLu allow rule for its binary →
+    `api.telegram.org:443` (a rebuild of the binary may ask LuLu again). Main's notifier
     stays dry run (no keys in main's `.env`).
   - **Before 15:32Z nothing left the host:** both ran `dry_run = true` and
     neither `.env` held `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`. Going live is
