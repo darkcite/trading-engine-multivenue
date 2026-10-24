@@ -1741,7 +1741,7 @@ pub struct Bin15Counters {
     /// BIN15 H90: late re-prices whose favoured leg had no usable ask.
     pub late_skipped_book: u64,
     /// BIN15 H90: late re-prices whose test failed (belief under `p_min`,
-    /// or the ask not `e` under it).
+    /// the ask not `e` under it, or — PR-BIN15-P2 — over `late_limit_max_1e6`).
     pub late_skipped_price: u64,
     /// BIN15 H90: late re-prices whose test held but not yet on
     /// `persist_polls` consecutive snapshots.

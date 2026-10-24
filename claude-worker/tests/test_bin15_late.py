@@ -84,6 +84,8 @@ def test_the_fills_keys_extend_the_law_only_when_stated() -> None:
     assert L.law_of(zero) == LAW, "stated at 0 is the law as it was"
     full = {**LAW_BLOCK, "refire_fresh": 1, "limit_bound": 1, "max_quote_age_ns": 1_500_000_000}
     assert L.law_of(full) == LAW + "_rf_age1500ms_bound"
+    assert L.law_of({**zero, "limit_max_1e6": 0}) == LAW, "no cap is the law as it was"
+    assert L.law_of({**full, "limit_max_1e6": 985_000}) == LAW + "_rf_age1500ms_bound_cap985000"
 
 
 def test_the_blocks_are_read_and_nulls_are_unknown() -> None:

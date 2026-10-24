@@ -122,9 +122,15 @@ pub struct LateParams {
     /// The σ scale ×1e3.
     pub sigma_k_1e3: i64,
     /// BIN15 fills B-2 (ruling F-5): the oldest favoured-leg ask the law
-    /// fires on — engine ns since that leg's ask moved to its current price
+    /// fires on — engine ms since that leg's ask moved to its current price
     /// (the member's `TouchState::ask_since_ms`); `0` = no limit.
-    pub max_quote_age_ns: u64,
+    pub max_quote_age_ms: u32,
+    /// PR-BIN15-P2 (Anton, 2026-10-24): the dearest price ×1e6 the law
+    /// pays. No ask over it is bought, and at the bound the IoC's limit is
+    /// the lower of `p − e` and the cap. `0` = no cap. Below the 1 c margin's
+    /// real discounts sit the maker's standing 0.9898 asks bought at p ≈ 1,
+    /// for under 1 c a contract with the whole stake at risk; 0.985 drops them.
+    pub limit_max_1e6: u32,
 }
 
 const _: () = assert!(::core::mem::size_of::<LateParams>() == 64);
@@ -144,7 +150,8 @@ impl Default for LateParams {
             e_1e6: 20_000,
             usd_1e6: 100_000_000,
             sigma_k_1e3: 1_550,
-            max_quote_age_ns: 0,
+            max_quote_age_ms: 0,
+            limit_max_1e6: 0,
         }
     }
 }

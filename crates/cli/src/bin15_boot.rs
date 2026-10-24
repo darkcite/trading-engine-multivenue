@@ -306,7 +306,9 @@ pub fn load_bin15_boot(
         e_1e6: file.late_e_1e6,
         usd_1e6: file.late_usd_1e6,
         sigma_k_1e3: file.late_sigma_k_1e3,
-        max_quote_age_ns: file.late_max_quote_age_ns,
+        // The parser bounds the age at 60 000 ms.
+        max_quote_age_ms: u32::try_from(file.late_max_quote_age_ns / 1_000_000).unwrap_or(u32::MAX),
+        limit_max_1e6: file.late_limit_max_1e6,
     };
     let late_lut = if file.late_phi_lut.len() == core_config::bin15::LATE_PHI_POINTS {
         let mut l = Box::new(strategy_bin15::late::LateLut::flat());
@@ -443,7 +445,8 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
 /// window, the belief floor, the margin, the persistence, the spend and
 /// the σ scale: `2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`. The
 /// BIN15-fills keys follow only when stated: `:fresh` (B-1), `:age{ms}ms`
-/// (B-2), `:bound` (B-3), `:lead` (B-4, any underlying with a lead book).
+/// (B-2), `:bound` (B-3), `:lead` (B-4, any underlying with a lead book),
+/// `:guard{p}` (G26) and `:cap{px}` (PR-BIN15-P2, three decimals).
 #[must_use]
 pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
     let l = &p.late;
@@ -451,7 +454,7 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
         return String::from("off");
     }
     format!(
-        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}{}{}{}{}{}",
+        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}{}{}{}{}{}{}",
         l.tau_min_ns / 1_000_000_000,
         l.tau_max_ns / 1_000_000_000,
         l.p_min_1e6 / 1_000_000,
@@ -462,10 +465,10 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
         l.sigma_k_1e3 / 1_000,
         l.sigma_k_1e3 % 1_000,
         if l.refire_fresh == 1 { ":fresh" } else { "" },
-        if l.max_quote_age_ns == 0 {
+        if l.max_quote_age_ms == 0 {
             String::new()
         } else {
-            format!(":age{}ms", l.max_quote_age_ns / 1_000_000)
+            format!(":age{}ms", l.max_quote_age_ms)
         },
         if l.limit_bound == 1 { ":bound" } else { "" },
         if p.lead_sym[..p.n_underlyings].iter().any(|s| *s != core_types::SYMBOL_ID_NONE) {
@@ -481,6 +484,16 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
                 ":guard{}.{:02}",
                 l.lead_guard_1e6 / 1_000_000,
                 (l.lead_guard_1e6 % 1_000_000) / 10_000
+            )
+        },
+        // PR-BIN15-P2: the price cap, three decimals, only when set.
+        if l.limit_max_1e6 == 0 {
+            String::new()
+        } else {
+            format!(
+                ":cap{}.{:03}",
+                l.limit_max_1e6 / 1_000_000,
+                (l.limit_max_1e6 % 1_000_000) / 1_000
             )
         },
     )
@@ -693,7 +706,7 @@ mod tests {
         // BIN15 fills: each stated key is spelled, in a fixed order.
         p.late.refire_fresh = 1;
         assert_eq!(late_law(&p), "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550:fresh");
-        p.late.max_quote_age_ns = 1_500_000_000;
+        p.late.max_quote_age_ms = 1_500;
         p.late.limit_bound = 1;
         assert_eq!(
             late_law(&p),
@@ -707,6 +720,9 @@ mod tests {
         assert!(late_law(&p).ends_with(":bound:lead:guard0.80"), "{}", late_law(&p));
         p.late.lead_guard_1e6 = 955_000;
         assert!(late_law(&p).ends_with(":lead:guard0.95"), "{}", late_law(&p));
+        // PR-BIN15-P2: the cap closes the line, three decimals.
+        p.late.limit_max_1e6 = 985_000;
+        assert!(late_law(&p).ends_with(":guard0.95:cap0.985"), "{}", late_law(&p));
     }
 
     #[test]

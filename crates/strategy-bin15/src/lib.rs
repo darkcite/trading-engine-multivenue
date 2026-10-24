@@ -1524,12 +1524,16 @@ impl Bin15Strategy {
         let touch = if want_yes { self.fam[idx].touch_yes } else { self.fam[idx].touch_no };
         let px = touch.touch.ask_1e6;
         let book_ok = touch.stale == 0 && px > 0 && px < ONE_1E6 && touch.touch.ask_qty_1e6 > 0;
+        // PR-BIN15-P2: the dearest ask the law buys (`limit_max_1e6`); no
+        // cap = one, which no ask on the grid reaches.
+        let cap = if lp.limit_max_1e6 == 0 { ONE_1E6 } else { i64::from(lp.limit_max_1e6) };
         // G26: with a lead and a guard, the HL-perp nowcast must agree on
         // the side and hold at least the guard on it; a refusal is a price
         // skip. No guard or no lead: not evaluated (B-4 bit for bit).
         let ok = book_ok
             && p_side >= lp.p_min_1e6
             && px <= p_side - lp.e_1e6
+            && px <= cap
             && (!self.late_guarded(u) || self.late_guard_holds(idx, u, expiry, wall, want_yes));
         // The production pricer's counterfactual, where it priced at THIS
         // reprice (inside the tail it does not).
@@ -1557,6 +1561,7 @@ impl Bin15Strategy {
                 && c_touch.touch.ask_qty_1e6 > 0
                 && c_p >= lp.p_min_1e6
                 && c_px <= c_p - lp.e_1e6
+                && c_px <= cap
             {
                 st.ctl_ts = now;
                 st.ctl_px_1e6 = c_px as i32;
@@ -1615,18 +1620,17 @@ impl Bin15Strategy {
         // stated age — a race the feed's delay and the venue's ~0.9 s have
         // already lost (10-20..10-23: no live IoC filled more than 1.6 s
         // after the snapshot it fired on).
-        let age_ns =
-            u64::from(((now / 1_000_000) as u32).wrapping_sub(touch.ask_since_ms)) * 1_000_000;
-        if lp.max_quote_age_ns != 0 && age_ns > lp.max_quote_age_ns {
+        let age_ms = ((now / 1_000_000) as u32).wrapping_sub(touch.ask_since_ms);
+        if lp.max_quote_age_ms != 0 && age_ms > lp.max_quote_age_ms {
             self.counters.late_skipped_age = self.counters.late_skipped_age.wrapping_add(1);
             return;
         }
         // B-3: at the bound the IoC takes every level up to it, so the
         // spend and the caps size it; at the touch, the touch's size too.
-        // The touch is on the grid and at or under the bound, so the
-        // floored bound is never under it.
+        // The touch is on the grid and at or under the bound and the cap,
+        // so the floored lower of the two is never under it.
         let bound = lp.limit_bound == 1;
-        let limit = if bound { grid_floor_1e6(p_side - lp.e_1e6) } else { px };
+        let limit = if bound { grid_floor_1e6((p_side - lp.e_1e6).min(cap)) } else { px };
         debug_assert!(limit >= px, "the bound {limit} under the touch {px}");
         let shown = if bound { i64::MAX } else { touch.touch.ask_qty_1e6 };
         let want = (lp.usd_1e6 as i128 * 1_000_000) / limit as i128;
@@ -3126,13 +3130,13 @@ mod tests {
         assert_eq!(c.orders[2].px.raw(), 850_000);
     }
 
-    /// BIN15 fills B-2: a touch older than `max_quote_age_ns` holds; with no
+    /// BIN15 fills B-2: a touch older than `max_quote_age_ms` holds; with no
     /// limit the same tape fires on the first mark inside the window.
     #[test]
     fn the_late_law_refuses_a_touch_older_than_its_age() {
-        let run = |age_ns: u64| {
+        let run = |age_ms: u32| {
             let mut m = late_member(1);
-            m.params.late.max_quote_age_ns = age_ns;
+            m.params.late.max_quote_age_ms = age_ms;
             let mut c = ctx();
             late_bind(&mut m, &mut c);
             late_feed(&mut m, &mut c, 0, 560);
@@ -3141,13 +3145,13 @@ mod tests {
             late_feed(&mut m, &mut c, 560, 585);
             (c.orders.len(), m.counters().late_skipped_age)
         };
-let (n, aged) = run(1_000_000_000);
+let (n, aged) = run(1_000);
         assert!(n == 0 && aged > 0, "a 10 s old ask is never bought: {n} {aged}");
         let (n, aged) = run(0);
         assert_eq!((n, aged), (1, 0), "no limit: the first mark in the window fires");
         // A re-tick at the same ask keeps its age; a new price starts it.
         let mut m = late_member(1);
-        m.params.late.max_quote_age_ns = 1_000_000_000;
+        m.params.late.max_quote_age_ms = 1_000;
         let mut c = ctx();
         late_bind(&mut m, &mut c);
         late_feed(&mut m, &mut c, 0, 560);
@@ -3162,20 +3166,22 @@ let (n, aged) = run(1_000_000_000);
         assert_eq!(c.orders[0].px.raw(), 860_000);
     }
 
+    /// A thin touch on both legs at `secs`: Yes asks 0.85 × 5, No 0.20 × 5.
+    fn late_thin(m: &mut Bin15Strategy, c: &mut RecCtx, secs: u64) {
+        let t = at(secs) + 400_000_000;
+        m.on_tick(&tick(yes_sym(0), 800_000, 850_000, 5_000_000, t, false), c);
+        m.on_tick(&tick(no_sym(0), 150_000, 200_000, 5_000_000, t, false), c);
+    }
+
     /// BIN15 fills B-3: at the bound the IoC's limit is `p − e` on the grid,
     /// sized by the spend and not by the touch's own quantity.
     #[test]
     fn at_the_bound_the_late_ioc_sweeps_to_p_minus_e() {
-        let thin = |m: &mut Bin15Strategy, c: &mut RecCtx, secs: u64| {
-            let t = at(secs) + 400_000_000;
-            m.on_tick(&tick(yes_sym(0), 800_000, 850_000, 5_000_000, t, false), c);
-            m.on_tick(&tick(no_sym(0), 150_000, 200_000, 5_000_000, t, false), c);
-        };
         let mut m = late_member(1);
         let mut c = ctx();
         late_bind(&mut m, &mut c);
         late_feed(&mut m, &mut c, 0, 585);
-        thin(&mut m, &mut c, 585);
+        late_thin(&mut m, &mut c, 585);
         assert_eq!(c.orders.len(), 1);
         assert_eq!((c.orders[0].px.raw(), c.orders[0].qty.raw()), (850_000, 5_000_000), "the touch");
         let mut m = late_member(1);
@@ -3183,7 +3189,7 @@ let (n, aged) = run(1_000_000_000);
         let mut c = ctx();
         late_bind(&mut m, &mut c);
         late_feed(&mut m, &mut c, 0, 585);
-        thin(&mut m, &mut c, 585);
+        late_thin(&mut m, &mut c, 585);
         assert_eq!(c.orders.len(), 1);
         let o = c.orders[0];
         let p = i64::from(m.late_state(0).expect("f").entry_p_1e6);
@@ -3193,6 +3199,33 @@ let (n, aged) = run(1_000_000_000);
         let lots = 100_000_000 * 1_000_000 / limit / GRID_LOT_1E6;
         assert_eq!(o.qty.raw(), lots * GRID_LOT_1E6, "the spend, not the 5 shown");
         assert_eq!(m.late_state(0).expect("f").take_touch_key, touch_key(850_000, 5_000_000));
+    }
+
+    /// PR-BIN15-P2: no ask over `limit_max_1e6` is bought (a price skip), at
+    /// the touch or at the bound; at the bound the cap is the limit when it
+    /// is the lower; no cap is the law as it was.
+    #[test]
+    fn the_late_law_never_pays_over_its_cap() {
+        let run = |cap: u32, bound: u8| {
+            let mut m = late_member(1);
+            m.params.late.limit_max_1e6 = cap;
+            m.params.late.limit_bound = bound;
+            let mut c = ctx();
+            late_bind(&mut m, &mut c);
+            late_feed(&mut m, &mut c, 0, 585);
+            late_thin(&mut m, &mut c, 585);
+            (c.orders.first().map(|o| o.px.raw()), m.counters().late_skipped_price)
+        };
+        let free = run(0, 1).0.expect("no cap: the bound fires");
+        assert!(free > 850_010, "{free}");
+        let (px, skipped) = run(840_000, 0);
+        assert!(px.is_none() && skipped > 0, "the touch over the cap: {px:?} {skipped}");
+        assert_eq!(run(850_000, 0).0, Some(850_000), "the touch at the cap");
+        assert_eq!(run(840_000, 1).0, None, "the bound over the cap");
+        let cap = grid_floor_1e6((850_000 + free) / 2);
+        assert!(cap > 850_000 && cap < free, "{cap}");
+        assert_eq!(run(cap as u32, 1).0, Some(cap), "the cap is the lower: it is the limit");
+        assert_eq!(run(free as u32 + 10, 1).0, Some(free), "a higher cap changes nothing");
     }
 
     #[test]

@@ -677,7 +677,7 @@ fn render_bin15_late_law(l: &strategy_bin15::late::LateParams) -> String {
         "\"bin15_late_law\":{{\"enabled\":{},\"tau_min_ns\":{},\"tau_max_ns\":{},\
          \"p_min_1e6\":{},\"e_1e6\":{},\"persist_polls\":{},\"usd_1e6\":{},\
          \"sigma_k_1e3\":{},\"refire_fresh\":{},\"limit_bound\":{},\
-         \"max_quote_age_ns\":{}}}",
+         \"max_quote_age_ns\":{},\"limit_max_1e6\":{}}}",
         l.enabled,
         l.tau_min_ns,
         l.tau_max_ns,
@@ -688,7 +688,9 @@ fn render_bin15_late_law(l: &strategy_bin15::late::LateParams) -> String {
         l.sigma_k_1e3,
         l.refire_fresh,
         l.limit_bound,
-        l.max_quote_age_ns
+        // The block keeps B-2's ns key: the stores read it so.
+        u64::from(l.max_quote_age_ms) * 1_000_000,
+        l.limit_max_1e6
     )
 }
 
@@ -2000,7 +2002,9 @@ mod tests {
             "{l}"
         );
         assert!(
-            l.ends_with("\"refire_fresh\":0,\"limit_bound\":0,\"max_quote_age_ns\":0}"),
+            l.ends_with(
+                "\"refire_fresh\":0,\"limit_bound\":0,\"max_quote_age_ns\":0,\"limit_max_1e6\":0}"
+            ),
             "{l}"
         );
     }

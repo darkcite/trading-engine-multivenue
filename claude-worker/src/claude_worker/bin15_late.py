@@ -185,7 +185,8 @@ def law_of(block: dict | None) -> str | None:
     The BIN15-fills keys (2026-10-23) follow only when stated, so a block
     written before them and one that states them at 0 are the same law:
     ``_rf`` (re-fire only on a fresh touch), ``_age<ms>ms`` (the oldest
-    quote it fires on), ``_bound`` (the IoC priced at p - e)."""
+    quote it fires on), ``_bound`` (the IoC priced at p - e), ``_cap<px 1e6>``
+    (PR-BIN15-P2: the dearest price it pays)."""
     if not block or int(block.get("enabled", 0)) != 1:
         return None
     law = (
@@ -200,6 +201,9 @@ def law_of(block: dict | None) -> str | None:
         law += f"_age{age_ns // 1_000_000}ms"
     if int(block.get("limit_bound", 0)) == 1:
         law += "_bound"
+    cap = int(block.get("limit_max_1e6", 0))
+    if cap != 0:
+        law += f"_cap{cap}"
     return law
 
 
