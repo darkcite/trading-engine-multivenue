@@ -18369,3 +18369,81 @@ HEAD.
 - **Observability.** The new tally `skip_side` (`engine_pm15_skip_side_total`, `engine_pmj_skip_side_total`; `Pm15Counters` 31 → 32 tallies) is on the dashboard's skip row. The boot tell gains `:side<=N` only when on; off, the tell, the artifact hash and every decision are unchanged.
 - **Hot path.** The gate runs on the take path only. It reads at most 8 markets in a while loop, with no allocation and no float. Alloc gates 136b and 114b run with the cap on, at 1 over one family, so they prove the loop allocation-free but never count another family.
 - **Deploy.** Config only, at a scheduled restart, on Anton's word. Turning it on changes the entry law, so a J9 `SEGMENTS` row goes in the same change. It is not on anywhere.
+
+## NOTIFY — N-DOCTRINE: the one-way Telegram notifier (2026-10-24)
+
+**Rulings (Anton, 2026-10-24; the plan is the project doc
+`claude/notify-plan-2026-10-24.md`).** R-NT-1 a Rust sidecar out of process;
+R-NT-1a a separate binary `multivenue-notify` (crate `crates/notify`,
+identical on `main` and `bin15-h90-standalone`); R-NT-2 fills + settlements,
+order attempts, safety and digests; R-NT-3 notify-only; R-NT-4 a
+per-instance `notify.toml`, absent = off — the standalone's slot 3 live
+first, main installed with no slot; R-NT-5 gross P&L per instance from the
+captured fills, the session net (fees included) from `/state`; R-NT-6 one
+chat tagged `[SA]` / `[MAIN]`, settlements and safety ring, the rest silent;
+R-NT-7 a daily digest at 00:00Z and an hourly line while a slot is live;
+R-NT-8 UTC; R-NT-9 the code on both branches. O-NT-A: the CLAUDE.md
+"Deployment" amendment. **No alert threshold has a built-in default:** a
+threshold left out of `notify.toml` turns its alert off. A forward-test
+watch (the PR-BIN15-P2 tallies) is configuration in the instance's
+`notify.toml` only, never git. The AI-session inbox: both a state-dir inbox
+for Mac-side processes and a git-ignored `<repo>/.notify-inbox/` for Cowork
+sessions, owned by main's notifier.
+
+**The doctrine.**
+
+1. **Out of process.** `multivenue-notify` is never linked into the engine
+   and never reached by the engine loop; the engine never waits for it. Its
+   failure — a crash, a dark Telegram, a sleeping Mac — cannot affect
+   trading.
+2. **Reads only:** `/state` on loopback (the config refuses another host);
+   the run's `engine-fills.pmlr`, `engine-orders.pmlr` and
+   `engine-events.pmlr` (tailed by record index); the `[hyperliquid]
+   rolling` line of the instance's `universe.toml`; its `notify.toml`; the
+   `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` lines of the instance's
+   `.env`; its inbox directories.
+3. **Writes only** its state directory (cursor, open positions, the settled
+   ledger, keyed values, the outbox) and its log; it removes only inbox
+   files it has relayed.
+4. **One host off the machine:** `api.telegram.org:443`, through
+   `core_net::boot_http` (rustls, the compiled-in webpki roots). It never
+   calls `getUpdates`: nothing reaches the engine through Telegram and it
+   has no write path into live safety (an emergency halt from the phone
+   would be its own ruling).
+5. **Secrets.** `.env` stays the only secrets file. The plists launch it
+   under `env -i`, so no venue key enters its environment; the token is
+   never logged (`Debug` is redacted) and its buffers are overwritten.
+6. **It reports, never acts.** A watch criterion met is a message;
+   disarming stays the operator's (`scripts/bin15-flip.sh paper`,
+   `exec.HALT`).
+7. **No engine restart.** Deploying, reloading or rolling it back relinks
+   no engine binary and needs no exec-smoke or safe minute.
+
+**What it sends** (all times UTC):
+
+| message | tier | from |
+|---|---|---|
+| `FILL` — leg, instance, τ, qty × px, the order's limit | silent | `engine-fills.pmlr` (`origin`, `strategy_id`), the order from `engine-orders.pmlr` |
+| `SETTLED WON/LOST` — the instance's qty, average price, payout, gross; the session net; the watch tallies | ring | the SETTLEMENT fill joined to the instance's own fills (persisted across restarts) |
+| `attempts` — sent / filled / missed (`REASON_IOC_MISS`) / rejected by reason, limits, first τ, per instance | silent | orders + order events, flushed 15 s after the last or 5 s after expiry |
+| `HALT` / `HALT CLEARED`, `exec.HALT file present`, `BOOT`, `REFUSED` bursts, `RECON` | ring | `/state` transitions and counter deltas (none across a boot) |
+| `HOLD` / `RESUMED` (`hold_loud_s`), `ENGINE DARK` / `BACK` (`dark_after_s`), `NOT SEEDED` (`seed_warn_s`), `BUDGET` (`budget_warn`), `SESSION` (`session_warn_usd`), `AGENT` (`agent_warn_days`) | ring, only when the threshold is set | `/state`, the clock |
+| `WATCH … criterion met` | ring, once per criterion | the settled ledger since the watch's start |
+| hourly line (while live), `DAY` digest | silent | the period counters, `/state` |
+| `[AI:SOURCE] …` | as the file asks (`level=loud`) | the inbox, ≤ `inbox_max_per_hour` |
+
+**Delivery.** Every message is a file in the outbox before a send is
+tried; a sender thread posts at most one a second (burst three), joins a
+silent backlog into fewer messages, backs off on 429 / network errors,
+pauses five minutes on 401/403/404 and drops only a message Telegram
+refuses as malformed (400). At-least-once: a crash between a send and its
+removal repeats one message.
+
+**Operation.** Main: `com.multivenue.notify`, `~/multivenue/notify.toml`,
+log `~/multivenue/logs/launchd/notify.log`. The standalone:
+`com.multivenue.bin15-notify`, `~/bin15/multivenue/notify.toml`, log
+`~/bin15/multivenue/logs/launchd/bin15-notify.log`. `multivenue-notify
+check` validates a config (the keys by presence only), `test-send` posts one
+line, `replay --run-dir` renders a capture's fills and settlements. Off:
+remove `notify.toml` (the job exits 0 and stays down) or `launchctl bootout`
+the label.

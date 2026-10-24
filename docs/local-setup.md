@@ -667,3 +667,36 @@ launchctl kickstart -k gui/$UID/com.multivenue.dashboard
 
 Log: `~/multivenue/logs/launchd/pm-pnl.log`. Remove:
 `launchctl bootout gui/$UID/com.multivenue.pm-pnl`.
+
+## Telegram notifications (NOTIFY, optional)
+
+`multivenue-notify` (`crates/notify`) is the one-way Telegram notifier: its
+own launchd job (`com.multivenue.notify`), never linked into the engine,
+off while `~/multivenue/notify.toml` is absent (risk policy "NOTIFY —
+N-DOCTRINE"; the standalone's copy: `docs/bin15-standalone.md` §2.4 on its
+branch).
+
+```sh
+# 1. A bot from Telegram's @BotFather; message it once, then read the chat id
+#    from https://api.telegram.org/bot<token>/getUpdates in a browser.
+# 2. Paste into .env (the notifier reads these two keys only, under env -i):
+#      TELEGRAM_BOT_TOKEN=<digits>:<secret>
+#      TELEGRAM_CHAT_ID=<id>
+# 3. Config from the contract (dry_run = true logs instead of sending):
+cp notify.toml.example ~/multivenue/notify.toml   # then edit tag/paths/slots
+cargo build --release -p notify
+target/release/multivenue-notify check --config ~/multivenue/notify.toml
+target/release/multivenue-notify test-send --config ~/multivenue/notify.toml
+# 4. Load the one label by hand (never re-run install-launchd.sh while an
+#    engine is armed live — it restarts the engine):
+sed -e "s|@REPO@|$PWD|g" -e "s|@HOME@|$HOME|g" \
+  launchd/com.multivenue.notify.plist > ~/Library/LaunchAgents/com.multivenue.notify.plist
+launchctl bootout   "gui/$UID/com.multivenue.notify" 2>/dev/null || true
+launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/com.multivenue.notify.plist
+tail -f ~/multivenue/logs/launchd/notify.log
+```
+
+A LuLu allow rule for `multivenue-notify` → `api.telegram.org:443` is
+needed once. AI sessions push messages with `scripts/notify-send.sh` (or
+`multivenue-notify send`); main's `notify.toml` lists the inboxes it relays
+(`inbox = [...]`).

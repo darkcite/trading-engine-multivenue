@@ -1429,6 +1429,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "notify"
+version = "0.1.0"
+dependencies = [
+ "core-io",
+ "core-net",
+ "core-types",
+ "engine",
+ "engine-snapshot",
+ "exec-hyperliquid",
+ "ingress-hyperliquid",
+ "rustls",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

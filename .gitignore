@@ -109,3 +109,6 @@ claude-worker/tools_*.sh
 # release time. Regenerate it, never hand-edit it.
 
 Claude outputs
+# NOTIFY: the AI-session inbox Cowork sessions drop messages into
+# (scripts/notify-send.sh); main's notifier relays and removes them.
+.notify-inbox/

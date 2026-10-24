@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- NOTIFY: main's one-way Telegram notifier (TEMPLATE — rendered by
+     install-launchd.sh, or by hand as its header shows: this label never
+     touches the engine). It runs `multivenue-notify run` under `env -i`, so
+     no key of the .env enters its environment; it reads only the two
+     TELEGRAM_* keys itself (docs/risk-policy.md "NOTIFY — N-DOCTRINE").
+     An absent ~/multivenue/notify.toml exits 0 and stays down
+     (SuccessfulExit = false); a crash relaunches after 30 s. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.multivenue.notify</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=@HOME@</string>
+    <string>PATH=/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>@REPO@/target/release/multivenue-notify</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>@HOME@/multivenue/notify.toml</string>
+  </array>
+  <key>WorkingDirectory</key><string>@HOME@/multivenue</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/notify.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/notify.log</string>
+</dict>
+</plist>

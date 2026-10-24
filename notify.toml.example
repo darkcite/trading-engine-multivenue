@@ -1,0 +1,99 @@
+# notify.toml — the one-way Telegram notifier (`multivenue-notify`, NOTIFY
+# lane; docs/risk-policy.md "NOTIFY — N-DOCTRINE"). One file per engine
+# instance: main reads ~/multivenue/notify.toml, the bin15 standalone
+# ~/bin15/multivenue/notify.toml. ABSENT FILE = OFF: the job logs that and
+# exits 0. This example is the parser's contract: an unknown key or table
+# is refused at start.
+#
+# The notifier is a separate process. It only reads /state on loopback, the
+# run's engine-{fills,orders,events}.pmlr, the [hyperliquid] rolling line of
+# the universe, this file, the two TELEGRAM_* keys of the .env and the inbox
+# directories. It writes only state_dir and its log, and talks to one host:
+# api.telegram.org. It never reads Telegram updates (notify-only).
+#
+# No alert threshold has a default (ruling 2026-10-24): leave a key out and
+# its alert is off.
+
+# Message prefix: [SA] for the standalone, [MAIN] for main.
+tag = "SA"
+
+# /state of this instance, loopback only. Required when a [[slot]] is set;
+# an inbox-only instance (no slots) needs none.
+state_url = "http://127.0.0.1:9192/state"
+
+# The instance's universe: only `[hyperliquid] rolling = [...]` is read, to
+# name the outcome legs ("BTC 15m Yes") and their 15-minute instances.
+universe = "~/bin15/multivenue/universe.toml"
+
+# The instance's .env: only TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are read.
+# Required unless dry_run = true. Paths starting ~/ expand against the job's
+# HOME (the plists run it with your real home).
+env_file = "~/trading-engine-multivenue-bin15/.env"
+
+# The notifier's own state: cursor, open positions, settled ledger, outbox.
+state_dir = "~/bin15/multivenue/state/notify"
+
+# true: every message goes to the log only; nothing leaves the host.
+dry_run = false
+
+# Poll period, ms (200–60000; default 1000).
+# poll_ms = 1000
+
+# --- alerts with a threshold: each is off unless set ---------------------
+# DARK when /state has been silent this long (BACK when it answers again).
+# dark_after_s = 60
+# A hold (O-WSG: ws-gap / recon-stale) rings once it has lasted this long;
+# shorter holds are counted in the digests only.
+# hold_loud_s = 30
+# A LIVE boot still not seeded after this long rings.
+# seed_warn_s = 180
+# The venue request budget below which a warning rings.
+# budget_warn = 1000
+# Session net (USD, negative) levels that ring once each per boot.
+# session_warn_usd = [-250, -400]
+# The venue API wallet's validity end, and the days-left values that ring.
+# The daily digest always shows the countdown when the end is set.
+# agent_valid_until = "2027-04-18T07:14:00Z"
+# agent_warn_days = [14, 7, 1]
+
+# --- digests (R-NT-7) ------------------------------------------------------
+# An hourly one-liner while a configured slot is live (default true).
+# hourly_when_live = true
+# The daily digest's UTC hour (default 0 = 00:00Z).
+# daily_utc_hour = 0
+
+# --- the AI-session inbox --------------------------------------------------
+# Directories this notifier relays `*.msg` files from (multivenue-notify
+# send, scripts/notify-send.sh). Main's notifier owns them: the state
+# directory for Mac-side processes and each repo's git-ignored .notify-inbox
+# for Cowork sessions, whose shell sees only the repo folder.
+# inbox = ["~/multivenue/state/notify/inbox", "~/trading-engine-multivenue/.notify-inbox"]
+# Inbox messages relayed per hour (default 60); the rest are counted and
+# reported once the hour ends.
+# inbox_max_per_hour = 60
+
+# --- the slots it reports on -----------------------------------------------
+# Fills, settlements (with the instance's gross P&L), order attempts
+# (coalesced per instance) and the safety transitions of these slots.
+[[slot]]
+slot = 3
+# true (default): paper fills are ignored.
+live_only = true
+# Report order attempts (default true).
+attempts = true
+
+# --- forward-test watches (reports, never acts) ----------------------------
+# A watch's thresholds come from the pre-registration it mirrors; they live
+# in the instance's notify.toml only, never in git. Each criterion rings
+# once when met. unit = "fill" counts venue fill rows (default), "instance"
+# counts settled instances.
+# [[watch]]
+# name = "P2"
+# slot = 3
+# start = "2026-10-24T05:19:25Z"
+# unit = "fill"
+# first_n = 20
+# max_losses_in_first = 2
+# hit_after = 30
+# min_hit_pct = 93
+# loss_net_usd = -500

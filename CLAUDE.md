@@ -142,6 +142,13 @@ refused). A binary rollback rolls the wrapper back too.
 - **Detached runs on the Mac:** `launchctl submit` relaunches on exit until
   `launchctl remove` — a wrapper's LAST line removes its own label; nohup
   children of MCP terminals die with the window.
+- **Pushing a message to the operator (any AI session):**
+  `scripts/notify-send.sh [-l] [-s SOURCE] TEXT` (POSIX sh — a Cowork shell or
+  the Mac; stdin when no TEXT) or `multivenue-notify send` drops a file into
+  an inbox that main's notifier relays to Telegram as `[AI:SOURCE]` (`-l`
+  rings, default silent, ≤ 60 an hour). Use it for a finished long run, a
+  gate verdict or a finding the operator must see — not for routine
+  narration; never a secret or a key in a message.
 - **If context runs short:** write interim state + the exact resume point +
   a relaunch prompt to the lane's vault log, then tell the operator.
 
@@ -274,6 +281,16 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 - **No cloud services on the trading path, no observability stack** — TUI +
   log files + `/metrics` and `/state` on `127.0.0.1:9191`. Phase 7 is a plain
   Linux VM.
+- **N-DOCTRINE (O-NT-A, 2026-10-24) — the one-way Telegram notifier is
+  permitted beside that rule.** `multivenue-notify` (`crates/notify`; launchd
+  `com.multivenue.notify`; `~/multivenue/notify.toml` absent = off) runs out of process,
+  is never linked into or reached by the engine, only READS `/state` on
+  loopback and the run's `engine-{fills,orders,events}.pmlr`, takes only
+  `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` from `.env` (launched under
+  `env -i`), writes only its own state dir and log, talks only to
+  `api.telegram.org` and never reads Telegram updates. Deploying, reloading
+  or rolling it back restarts no engine. `docs/risk-policy.md` "NOTIFY —
+  N-DOCTRINE".
 - **Signing keys** load into an `mlock`'d page and zeroize on drop.
 
 ## Directory guide (the full map: `docs/repo-map.md`)
@@ -284,7 +301,8 @@ thread per source (`discovery.rs` = boot REST; `ingress-ai` = UDS+HMAC) ·
 `rule-tree`, `icdp` unlinked) · `crates/engine` the loop · `crates/exec-*`,
 `signer-*`, `clob-dispatcher`, `exec-gateway` the order path · `crates/cli`
 `multivenue-engine` (`exec_boot.rs` = the arming interlock) · `crates/bench`
-· `fuzz/` · `claude-worker/` · `scripts/` + `launchd/` · `.claude/`.
+· `crates/notify` `multivenue-notify` (the one-way Telegram notifier,
+N-DOCTRINE) · `fuzz/` · `claude-worker/` · `scripts/` + `launchd/` · `.claude/`.
 
 ## Common pitfalls — if you're about to do one of these, stop
 
