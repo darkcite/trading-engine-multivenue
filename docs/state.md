@@ -267,6 +267,25 @@ affected paragraph at each lane close; the superseded text goes to
     redeploy". The standalone now runs G30 `57bcdf6d` (the member sizes inside
     the clamp; main `5c0a85ca`, not built), pid 33607, armed 05:19:25Z, with
     the same artifact and tell. The forward test's window starts at this boot.
+- **2026-10-24 05:51Z: main restarted (forced `0010` slot at 05:49:17Z) on
+  `5aab3626`, with slot 3 PAPER on the standalone's P2 config** (Anton: "release
+  the same version on main for paper mode with the identical to standalone
+  config").
+  - **The artifact:** `late_limit_max_1e6 = 985000` added, and the standalone's
+    frame: `late_usd_1e6 = 250000000`, `cap_instance_usd_1e6 = 250000000`,
+    `cap_day_usd_1e6 = 100000000000` (were $100 / $1 000 / $30 000). Every other
+    key was already the standalone's. `families` keeps main's four native 1 d
+    entries, because its universe's `rolling` lists them; the late law prices
+    15 m families only.
+  - **Hash and backup:** artifact `b356bd61…`, backup
+    `bin15.toml.bak-20261024T054526Z-p2`.
+  - **Tell:** `late=2-30s:p>=0.90:ask<=p-1c:persist1:$250:k1.550:fresh:bound:cap0.985`,
+    `cap_instance=$250`, the same as the standalone's.
+  - **Also in this build:** PMJ's committed `61626a59` (J13, `max_side_families`
+    default off; no artifact sets it) and `7b5d2a4f` (slot 9's ledger row
+    from 10-28 00:00Z, date-gated).
+  - **Retention** ran with the slot and stopped at `run-1792703787545938000`
+    (not yet verified in the bucket). Nothing was removed.
 
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
