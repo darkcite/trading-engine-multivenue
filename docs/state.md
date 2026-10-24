@@ -287,6 +287,26 @@ affected paragraph at each lane close; the superseded text goes to
   - **Retention** ran with the slot and stopped at `run-1792703787545938000`
     (not yet verified in the bucket). Nothing was removed.
 
+## Corrections found 2026-10-24 (NOTIFY — the one-way Telegram notifier; verify with `launchctl print`)
+
+- **Installed in DRY RUN on both engines, 13:53Z; neither engine was
+  restarted** (rulings R-NT-1..9, R-NT-1a, O-NT-A; main `9b2cd9ab` +
+  `68a9dc9a`, the standalone G32 `8af27277` + G33 `26ab33fa`; risk policy
+  "NOTIFY — N-DOCTRINE").
+  - `com.multivenue.bin15-notify` reads `~/bin15/multivenue/notify.toml`:
+    slot 3 live-only, the PR-BIN15-P2 watch from 05:19:25Z,
+    `agent_valid_until` 2027-04-18 07:14Z, no alert threshold set (none
+    has a default). Log `~/bin15/multivenue/logs/launchd/bin15-notify.log`.
+  - `com.multivenue.notify` reads `~/multivenue/notify.toml`: no slot
+    (main's slots stay off until Anton enables them); it relays the AI
+    inboxes `~/multivenue/state/notify/inbox` and both repos'
+    `.notify-inbox/`. Log `~/multivenue/logs/launchd/notify.log`.
+  - **Nothing leaves the host yet:** both run `dry_run = true` and neither
+    `.env` holds `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`. Going live is
+    Anton's: paste the two keys into each `.env`, set `dry_run = false`,
+    reload the label, and allow `multivenue-notify` → `api.telegram.org:443`
+    in LuLu.
+
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
