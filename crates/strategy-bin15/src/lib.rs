@@ -1635,7 +1635,14 @@ impl Bin15Strategy {
         let shown = if bound { i64::MAX } else { touch.touch.ask_qty_1e6 };
         let want = (lp.usd_1e6 as i128 * 1_000_000) / limit as i128;
         let want = i64::try_from(want).unwrap_or(i64::MAX);
-        let qty = want.min(shown).min(self.cap_room_1e6(idx, limit));
+        // The live router's exposure clamp counts each contract at its $1
+        // payout (exec-router clamp 3): a take over that room never leaves
+        // the engine (PR-BIN15-P2's first boot: $250 / limit is over 250
+        // contracts, and the router refused every IoC).
+        let qty = want
+            .min(shown)
+            .min(self.cap_room_1e6(idx, limit))
+            .min(self.exposure_room_1e6());
         if qty < GRID_LOT_1E6 {
             self.counters.late_skipped_cap = self.counters.late_skipped_cap.wrapping_add(1);
             return;
@@ -1674,6 +1681,25 @@ impl Bin15Strategy {
         let qty = (usd as i128 * 1_000_000) / px_1e6 as i128;
         let qty = i64::try_from(qty).unwrap_or(i64::MAX);
         qty - qty.rem_euclid(GRID_LOT_1E6)
+    }
+
+    /// Room left under the live router's exposure clamp, contracts ×1e6
+    /// (exec-router clamp 3, `cap_instance_usd`): the cap less the slot's
+    /// net exposure over every family, each contract at its $1 payout,
+    /// `|yes − no|` per family as `core_types::net_exposure_1e8` counts
+    /// it. It reads the member's own fills, so it is the router's number
+    /// for a buy that adds exposure and stricter for one that offsets a
+    /// held leg. Floored to a whole contract; `0` = no room.
+    fn exposure_room_1e6(&self) -> i64 {
+        let mut held = 0i64;
+        let mut i = 0usize;
+        while i < self.params.n_families {
+            let f = &self.fam[i];
+            held = held.saturating_add(core_types::net_exposure_1e8(f.pos_yes_1e6, f.pos_no_1e6));
+            i += 1;
+        }
+        let room = (self.params.cap_instance_usd_1e6 - held).max(0);
+        room - room.rem_euclid(GRID_LOT_1E6)
     }
 
     /// Whether a price and size are on the venue's grid. The harness
@@ -3480,11 +3506,12 @@ let (n, aged) = run(1_000);
             m.configure_late(late_ramp());
             m
         };
-        // $10 at 0.85 is 11 whole contracts ($9.35).
+        // $10 at 0.85 buys 11 whole contracts ($9.35), but the live router
+        // counts each at its $1 payout against the $10 cap: 10.
         let mut m = configured(10_000_000, 100_000_000);
         let mut c = ctx();
         let _ = late_entry(&mut m, &mut c);
-        assert_eq!(c.orders[0].qty.raw(), 11_000_000);
+        assert_eq!(c.orders[0].qty.raw(), 10_000_000);
         // A day with under one contract of room: counted, nothing sent.
         let mut m = configured(10_000_000, 500_000);
         let mut c = ctx();
@@ -3493,6 +3520,40 @@ let (n, aged) = run(1_000);
         late_poll(&mut m, &mut c, 585, 800_000, 850_000);
         assert!(c.orders.is_empty());
         assert!(m.counters().late_skipped_cap > 0);
+    }
+
+    /// PR-BIN15-P2: at the bound a $250 take at a limit under one is over
+    /// 250 contracts, and the live router (each contract at its $1 payout,
+    /// slot-wide) refuses it. The member sizes to the router's room: the
+    /// cap less the net exposure it already holds, and nothing past it.
+    #[test]
+    fn the_late_take_stays_inside_the_routers_exposure_clamp() {
+        let run = |held_yes: i64| {
+            let mut p = params_1(FAMILY_OUT_15M);
+            p.late.enabled = 1;
+            p.late.persist_polls = 1;
+            p.late.limit_bound = 1;
+            p.late.usd_1e6 = 250_000_000;
+            p.cap_instance_usd_1e6 = 250_000_000;
+            let mut m = Bin15Strategy::new();
+            m.configure(p, ramp_luts(), core_time::WallAnchor::new(MONO0, WALL0))
+                .expect("configure");
+            m.configure_late(late_ramp());
+            let mut c = ctx();
+            late_bind(&mut m, &mut c);
+            m.fam[0].pos_yes_1e6 = held_yes;
+            late_feed(&mut m, &mut c, 0, 585);
+            late_thin(&mut m, &mut c, 585);
+            (c.orders.first().map(|o| (o.px.raw(), o.qty.raw())), m.counters().late_skipped_cap)
+        };
+        let (o, _) = run(0);
+        let (px, qty) = o.expect("the bound fires");
+        assert!(px < 1_000_000 && 250_000_000i64 * 1_000_000 / px > 250_000_000, "{px}");
+        assert_eq!(qty, 250_000_000, "250 contracts, not $250 / {px}");
+        let (o, _) = run(100_000_000);
+        assert_eq!(o.map(|x| x.1), Some(150_000_000), "100 held: 150 left");
+        let (o, skipped) = run(250_000_000);
+        assert!(o.is_none() && skipped > 0, "no room: counted, nothing sent");
     }
 
     #[test]
