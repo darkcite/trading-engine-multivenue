@@ -164,22 +164,27 @@ fn verb_test_send(cfg: &Config) -> ExitCode {
             format!(" on {host}")
         }
     );
-    match t.send(&text, false) {
-        Outcome::Sent => {
-            println!(
-                "sent{}",
+    let mut failed = 0;
+    for chat in 0..t.chats() {
+        match t.send(chat, &text, false) {
+            Outcome::Sent => println!(
+                "chat #{chat}: sent{}",
                 if cfg.dry_run {
                     " (dry run: printed above, nothing left the host)"
                 } else {
                     ""
                 }
-            );
-            ExitCode::SUCCESS
+            ),
+            o => {
+                eprintln!("chat #{chat}: test-send failed: {o:?}");
+                failed += 1;
+            }
         }
-        o => {
-            eprintln!("test-send failed: {o:?}");
-            ExitCode::from(1)
-        }
+    }
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 
@@ -202,8 +207,10 @@ fn verb_check(path: &Path, cfg: &Config) -> ExitCode {
     );
     match &cfg.env_file {
         Some(p) => match envfile::read(p) {
-            Ok(_) => println!(
-                "keys       TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID present in {}",
+            Ok(k) => println!(
+                "keys       TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID ({} chat{}) present in {}",
+                k.chat_ids.len(),
+                if k.chat_ids.len() == 1 { "" } else { "s" },
                 p.display()
             ),
             Err(e) => {

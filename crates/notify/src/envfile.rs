@@ -40,8 +40,22 @@ impl Drop for Token {
 pub struct Telegram {
     /// `TELEGRAM_BOT_TOKEN`.
     pub token: Token,
-    /// `TELEGRAM_CHAT_ID` (a number, negative for groups, or `@channel`).
-    pub chat_id: String,
+    /// `TELEGRAM_CHAT_ID`: one chat or a comma-separated list (each a number,
+    /// negative for groups, or `@channel`), in order, without duplicates.
+    pub chat_ids: Vec<String>,
+}
+
+/// At most this many chats in `TELEGRAM_CHAT_ID`.
+pub const MAX_CHATS: usize = 10;
+
+fn chat_ok(c: &str) -> bool {
+    c.strip_prefix('@').map_or_else(
+        || {
+            let d = c.strip_prefix('-').unwrap_or(c);
+            !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
+        },
+        |name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+    )
 }
 
 /// Why the keys could not be read. Never carries a value.
@@ -116,22 +130,27 @@ pub fn parse(text: &str) -> Result<Telegram, EnvErr> {
         v.fill(0);
         return Err(EnvErr::Malformed("TELEGRAM_BOT_TOKEN"));
     }
-    let chat_id = chat
-        .filter(|c| !c.is_empty())
+    let list = chat
+        .filter(|c| !c.trim().is_empty())
         .ok_or(EnvErr::Missing("TELEGRAM_CHAT_ID"))?;
-    let chat_ok = chat_id.strip_prefix('@').map_or_else(
-        || {
-            let d = chat_id.strip_prefix('-').unwrap_or(&chat_id);
-            !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit())
-        },
-        |name| !name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'),
-    );
-    if !chat_ok {
+    let mut chat_ids: Vec<String> = Vec::new();
+    for c in list.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+        if !chat_ok(c) {
+            return Err(EnvErr::Malformed("TELEGRAM_CHAT_ID"));
+        }
+        if !chat_ids.iter().any(|x| x == c) {
+            chat_ids.push(c.to_string());
+        }
+    }
+    if chat_ids.is_empty() {
+        return Err(EnvErr::Missing("TELEGRAM_CHAT_ID"));
+    }
+    if chat_ids.len() > MAX_CHATS {
         return Err(EnvErr::Malformed("TELEGRAM_CHAT_ID"));
     }
     Ok(Telegram {
         token: Token(token),
-        chat_id,
+        chat_ids,
     })
 }
 
@@ -163,7 +182,7 @@ mod tests {
         );
         let t = parse(&text).unwrap();
         assert_eq!(t.token.expose(), TOK);
-        assert_eq!(t.chat_id, "-1001234567890");
+        assert_eq!(t.chat_ids, ["-1001234567890"]);
         assert_eq!(format!("{:?}", t.token), "Token(<redacted>)");
         assert!(!format!("{t:?}").contains("AAHd"));
     }
@@ -174,7 +193,38 @@ mod tests {
             "TELEGRAM_BOT_TOKEN=x\nTELEGRAM_BOT_TOKEN='{TOK}'\nTELEGRAM_CHAT_ID=@my_channel\n"
         );
         let t = parse(&text).unwrap();
-        assert_eq!(t.chat_id, "@my_channel");
+        assert_eq!(t.chat_ids, ["@my_channel"]);
+    }
+
+    #[test]
+    fn a_comma_separated_list_is_several_chats() {
+        let t = parse(&format!(
+            "TELEGRAM_BOT_TOKEN={TOK}\nTELEGRAM_CHAT_ID=112985366, 235939886,112985366,\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            t.chat_ids,
+            ["112985366", "235939886"],
+            "trimmed, de-duplicated, in order"
+        );
+        let e = parse(&format!(
+            "TELEGRAM_BOT_TOKEN={TOK}\nTELEGRAM_CHAT_ID=1,x y\n"
+        ))
+        .unwrap_err();
+        assert_eq!(e, EnvErr::Malformed("TELEGRAM_CHAT_ID"));
+        let many = (1..=11)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let e = parse(&format!(
+            "TELEGRAM_BOT_TOKEN={TOK}\nTELEGRAM_CHAT_ID={many}\n"
+        ))
+        .unwrap_err();
+        assert_eq!(e, EnvErr::Malformed("TELEGRAM_CHAT_ID"));
+        assert_eq!(
+            parse(&format!("TELEGRAM_BOT_TOKEN={TOK}\nTELEGRAM_CHAT_ID= , \n")).unwrap_err(),
+            EnvErr::Missing("TELEGRAM_CHAT_ID")
+        );
     }
 
     #[test]

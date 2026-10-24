@@ -38,14 +38,22 @@ pub enum Outcome {
     Retry(u64),
     /// This message can never go (Telegram refused its content): drop it.
     Drop(String),
-    /// The token or chat is wrong: stop sending for this many seconds.
+    /// The token is wrong: stop sending for this many seconds.
     Pause(u64, String),
+    /// This one chat refuses the bot (403: it blocked the bot, or never
+    /// started it): skip it for this message; the other chats still get it.
+    ChatRefused(String),
 }
 
-/// A way to deliver text.
+/// A way to deliver text to one or more chats.
 pub trait Transport: Send {
-    /// Deliver one message.
-    fn send(&mut self, text: &str, loud: bool) -> Outcome;
+    /// How many chats each message goes to.
+    fn chats(&self) -> usize {
+        1
+    }
+
+    /// Deliver one message to chat `chat` (`0..chats()`).
+    fn send(&mut self, chat: usize, text: &str, loud: bool) -> Outcome;
 }
 
 /// `dry_run = true`: the message goes to the log, nowhere else.
@@ -53,7 +61,7 @@ pub trait Transport: Send {
 pub struct DryRun;
 
 impl Transport for DryRun {
-    fn send(&mut self, text: &str, loud: bool) -> Outcome {
+    fn send(&mut self, _chat: usize, text: &str, loud: bool) -> Outcome {
         crate::run::log(&format!(
             "DRY {} {}",
             if loud { "LOUD" } else { "silent" },
@@ -117,7 +125,8 @@ pub fn request_body(chat_id: &str, text: &str, loud: bool) -> String {
 pub fn classify(res: Result<Range<usize>, BootHttpErr>, out: &[u8]) -> Outcome {
     match res {
         Ok(r) => {
-            let ok = Json::parse(&out[r]).ok().and_then(|j| j.get("ok").cloned()) == Some(Json::Bool(true));
+            let ok = Json::parse(&out[r]).ok().and_then(|j| j.get("ok").cloned())
+                == Some(Json::Bool(true));
             if ok {
                 Outcome::Sent
             } else {
@@ -126,17 +135,30 @@ pub fn classify(res: Result<Range<usize>, BootHttpErr>, out: &[u8]) -> Outcome {
         }
         Err(BootHttpErr::Status(429)) => Outcome::Retry(30),
         Err(BootHttpErr::Status(400)) => Outcome::Drop("Telegram refused the message (400)".into()),
-        Err(BootHttpErr::Status(s @ (401 | 403 | 404))) => {
-            Outcome::Pause(300, format!("Telegram answered {s}: check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (and that the bot may post to the chat)"))
+        Err(BootHttpErr::Status(403)) => Outcome::ChatRefused(
+            "Telegram answered 403: this chat blocked the bot or never started it".into(),
+        ),
+        Err(BootHttpErr::Status(s @ (401 | 404))) => Outcome::Pause(
+            300,
+            format!("Telegram answered {s}: check TELEGRAM_BOT_TOKEN"),
+        ),
+        Err(BootHttpErr::RequestTooLarge) => {
+            Outcome::Drop("message too large for one request".into())
         }
-        Err(BootHttpErr::RequestTooLarge) => Outcome::Drop("message too large for one request".into()),
         Err(_) => Outcome::Retry(10),
     }
 }
 
 impl Transport for Telegram {
-    fn send(&mut self, text: &str, loud: bool) -> Outcome {
-        let body = request_body(&self.keys.chat_id, text, loud);
+    fn chats(&self) -> usize {
+        self.keys.chat_ids.len()
+    }
+
+    fn send(&mut self, chat: usize, text: &str, loud: bool) -> Outcome {
+        let Some(chat_id) = self.keys.chat_ids.get(chat) else {
+            return Outcome::Drop(format!("no chat #{chat}"));
+        };
+        let body = request_body(chat_id, text, loud);
         let path = format!("/bot{}/sendMessage", self.keys.token.expose());
         let res = boot_http::https_post(
             &self.tls,
@@ -192,10 +214,22 @@ impl Bucket {
 /// How long an idle sender waits for a wake before it looks again.
 pub const IDLE_WAIT: Duration = Duration::from_secs(5);
 
-/// The sender loop: drain the outbox through `t` until `stop` is set or
-/// the poll loop's end of `wake` is dropped. It blocks on `wake` while
-/// idle instead of polling the outbox on a short timer (a timer wakeup a
-/// few times a second measurably shifts the house's ns-scale benches).
+/// A batch on its way to several chats: pinned until every chat has it, so
+/// a backlog growing meanwhile never changes what one chat got.
+struct InFlight {
+    paths: Vec<PathBuf>,
+    loud: bool,
+    text: String,
+    done: Vec<bool>,
+}
+
+/// The sender loop: drain the outbox through `t`, every message to every
+/// chat, until `stop` is set or the poll loop's end of `wake` is dropped.
+/// It blocks on `wake` while idle instead of polling the outbox on a short
+/// timer (a timer wakeup a few times a second measurably shifts the house's
+/// ns-scale benches). A chat that refuses the bot (403) or a message
+/// Telegram refuses (400) is skipped for that chat only; a network error or
+/// a 429 backs everything off and resumes with the chats still owed.
 pub fn run_sender(
     outbox: Outbox,
     mut t: Box<dyn Transport>,
@@ -205,6 +239,8 @@ pub fn run_sender(
     let mut bucket = Bucket::default();
     let mut paused_until: Option<Instant> = None;
     let mut backoff = 0u64;
+    let mut inflight: Option<InFlight> = None;
+    let mut refused_logged: Vec<Option<Instant>> = vec![None; t.chats()];
     while !stop.load(Ordering::Relaxed) {
         if let Some(p) = paused_until {
             let now = Instant::now();
@@ -218,32 +254,63 @@ pub fn run_sender(
             }
             paused_until = None;
         }
-        let pending = match outbox.pending() {
-            Ok(p) => p,
-            Err(e) => {
-                crate::run::log(&format!("outbox unreadable: {e}"));
-                std::thread::sleep(Duration::from_secs(5));
+        if inflight.is_none() {
+            let pending = match outbox.pending() {
+                Ok(p) => p,
+                Err(e) => {
+                    crate::run::log(&format!("outbox unreadable: {e}"));
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+            };
+            let Some((paths, loud, text)) = next_batch(&pending, BACKLOG_FROM) else {
+                if let Err(RecvTimeoutError::Disconnected) = wake.recv_timeout(IDLE_WAIT) {
+                    return;
+                }
                 continue;
-            }
+            };
+            inflight = Some(InFlight {
+                paths,
+                loud,
+                text,
+                done: vec![false; t.chats()],
+            });
+        }
+        let Some(f) = inflight.as_mut() else {
+            continue;
         };
-        let Some((paths, loud, text)) = next_batch(&pending, BACKLOG_FROM) else {
-            if let Err(RecvTimeoutError::Disconnected) = wake.recv_timeout(IDLE_WAIT) {
-                return;
-            }
+        let Some(chat) = f.done.iter().position(|d| !d) else {
+            remove_all(&f.paths);
+            inflight = None;
             continue;
         };
         if !bucket.take() {
             std::thread::sleep(Duration::from_millis(250));
             continue;
         }
-        match t.send(&text, loud) {
+        match t.send(chat, &f.text, f.loud) {
             Outcome::Sent => {
                 backoff = 0;
-                remove_all(&paths);
+                f.done[chat] = true;
             }
             Outcome::Drop(why) => {
-                crate::run::log(&format!("dropped a message: {why}"));
-                remove_all(&paths);
+                crate::run::log(&format!("chat #{chat}: dropped a message: {why}"));
+                f.done[chat] = true;
+            }
+            Outcome::ChatRefused(why) => {
+                // Logged at most once an hour per chat.
+                let quiet = refused_logged
+                    .get(chat)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(3600));
+                if !quiet {
+                    crate::run::log(&format!("chat #{chat} skipped: {why}"));
+                    if let Some(slot) = refused_logged.get_mut(chat) {
+                        *slot = Some(Instant::now());
+                    }
+                }
+                f.done[chat] = true;
             }
             Outcome::Retry(s) => {
                 backoff = if backoff == 0 {
@@ -252,8 +319,7 @@ pub fn run_sender(
                     (backoff * 2).min(300)
                 };
                 crate::run::log(&format!(
-                    "send failed, retrying in {backoff} s ({} pending)",
-                    pending.len()
+                    "chat #{chat}: send failed, retrying in {backoff} s"
                 ));
                 paused_until = Some(Instant::now() + Duration::from_secs(backoff));
             }
@@ -308,7 +374,15 @@ mod tests {
             Outcome::Drop(_)
         ));
         assert!(matches!(
+            classify(Err(BootHttpErr::Status(403)), b""),
+            Outcome::ChatRefused(_)
+        ));
+        assert!(matches!(
             classify(Err(BootHttpErr::Status(401)), b""),
+            Outcome::Pause(300, _)
+        ));
+        assert!(matches!(
+            classify(Err(BootHttpErr::Status(404)), b""),
             Outcome::Pause(300, _)
         ));
         assert_eq!(classify(Err(BootHttpErr::Timeout), b""), Outcome::Retry(10));
@@ -321,50 +395,128 @@ mod tests {
         assert!(!b.take());
     }
 
-    struct Fake(Arc<Mutex<Vec<(String, bool)>>>);
+    /// Scripted chats: each send pops the chat's next outcome (`Sent` once
+    /// the script is empty) and records `(chat, text, loud)` when it is Sent.
+    struct Fake {
+        got: Arc<Mutex<Vec<(usize, String, bool)>>>,
+        script: Vec<Vec<Outcome>>,
+    }
     impl Transport for Fake {
-        fn send(&mut self, text: &str, loud: bool) -> Outcome {
-            self.0.lock().unwrap().push((text.to_string(), loud));
-            Outcome::Sent
+        fn chats(&self) -> usize {
+            self.script.len()
+        }
+        fn send(&mut self, chat: usize, text: &str, loud: bool) -> Outcome {
+            let o = if self.script[chat].is_empty() {
+                Outcome::Sent
+            } else {
+                self.script[chat].remove(0)
+            };
+            if o == Outcome::Sent {
+                self.got
+                    .lock()
+                    .unwrap()
+                    .push((chat, text.to_string(), loud));
+            }
+            o
         }
     }
 
-    #[test]
-    fn the_sender_drains_the_outbox() {
-        let d = std::env::temp_dir().join(format!("notify-send-{}", std::process::id()));
+    fn drive(
+        name: &str,
+        script: Vec<Vec<Outcome>>,
+        msgs: &[(&str, bool)],
+        wait_ms: u64,
+    ) -> (Vec<(usize, String, bool)>, usize) {
+        let d = std::env::temp_dir().join(format!("notify-send-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let o = Outbox::open(&d).unwrap();
         let got = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
-        let (o2, s2, g2) = (o.clone(), stop.clone(), got.clone());
-        let h = std::thread::spawn(move || run_sender(o2, Box::new(Fake(g2)), s2, rx));
+        let (o2, s2) = (o.clone(), stop.clone());
+        let fake = Fake {
+            got: got.clone(),
+            script,
+        };
+        let h = std::thread::spawn(move || run_sender(o2, Box::new(fake), s2, rx));
         // Idle first: it blocks on the wake, then drains what was queued.
         std::thread::sleep(Duration::from_millis(50));
-        o.push(&Msg {
-            loud: true,
-            text: "a".into(),
-        })
-        .unwrap();
-        o.push(&Msg {
-            loud: false,
-            text: "b".into(),
-        })
-        .unwrap();
+        for (t, l) in msgs {
+            o.push(&Msg {
+                loud: *l,
+                text: (*t).into(),
+            })
+            .unwrap();
+        }
         tx.send(()).unwrap();
-        for _ in 0..100 {
-            if o.pending().unwrap().is_empty() {
-                break;
-            }
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(wait_ms) && !o.pending().unwrap().is_empty() {
             std::thread::sleep(Duration::from_millis(20));
         }
         stop.store(true, Ordering::Relaxed);
         drop(tx); // unblocks the idle wait
         h.join().unwrap();
+        let left = o.pending().unwrap().len();
+        let v = got.lock().unwrap().clone();
+        (v, left)
+    }
+
+    #[test]
+    fn the_sender_drains_the_outbox() {
+        let (got, left) = drive("one", vec![vec![]], &[("a", true), ("b", false)], 2000);
         assert_eq!(
-            *got.lock().unwrap(),
-            vec![("a".to_string(), true), ("b".to_string(), false)]
+            got,
+            vec![(0, "a".to_string(), true), (0, "b".to_string(), false)]
         );
-        assert!(o.pending().unwrap().is_empty());
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn every_chat_gets_every_message_in_order() {
+        let (got, left) = drive(
+            "two",
+            vec![vec![], vec![]],
+            &[("a", true), ("b", false)],
+            4000,
+        );
+        assert_eq!(
+            got,
+            vec![
+                (0, "a".to_string(), true),
+                (1, "a".to_string(), true),
+                (0, "b".to_string(), false),
+                (1, "b".to_string(), false)
+            ]
+        );
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn a_refusing_chat_never_holds_the_others() {
+        // Chat 1 blocked the bot (403) for the first message only.
+        let script = vec![vec![], vec![Outcome::ChatRefused("blocked".into())]];
+        let (got, left) = drive("refused", script, &[("a", false), ("b", false)], 4000);
+        assert_eq!(
+            got,
+            vec![
+                (0, "a".to_string(), false),
+                (0, "b".to_string(), false),
+                (1, "b".to_string(), false)
+            ]
+        );
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn a_retry_resumes_with_the_chats_still_owed() {
+        // Chat 1 times out once: after the back-off only chat 1 gets "a" again.
+        let script = vec![vec![], vec![Outcome::Retry(1)]];
+        let (got, left) = drive("retry", script, &[("a", true)], 4000);
+        assert_eq!(
+            got,
+            vec![(0, "a".to_string(), true), (1, "a".to_string(), true)],
+            "chat 0 is not sent twice"
+        );
+        assert_eq!(left, 0);
     }
 }

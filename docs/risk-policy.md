@@ -18436,7 +18436,11 @@ sessions, owned by main's notifier.
 | hourly line (while live), `DAY` digest | silent | the period counters, `/state` |
 | `[AI:SOURCE] …` | as the file asks (`level=loud`) | the inbox, ≤ `inbox_max_per_hour` |
 
-**Delivery.** Every message is a file in the outbox before a send is
+**Delivery.** `TELEGRAM_CHAT_ID` is one chat or a comma-separated list
+(at most 10, 2026-10-24 on Anton's ask): every message goes to each chat,
+and a chat that refuses the bot (403: blocked it, or never started it) or
+a message Telegram refuses (400) is skipped for that chat only, never the
+others. Every message is a file in the outbox before a send is
 tried; a sender thread posts at most one a second (burst three), joins a
 silent backlog into fewer messages, backs off on 429 / network errors,
 pauses five minutes on 401/403/404 and drops only a message Telegram

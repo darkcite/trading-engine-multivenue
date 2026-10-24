@@ -27,6 +27,8 @@ state_url = "http://127.0.0.1:9192/state"
 universe = "~/bin15/multivenue/universe.toml"
 
 # The instance's .env: only TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are read.
+# TELEGRAM_CHAT_ID may list several chats, comma-separated (at most 10): every
+# message goes to each; a chat that blocked the bot is skipped, never the rest.
 # Required unless dry_run = true. Paths starting ~/ expand against the job's
 # HOME (the plists run it with your real home).
 env_file = "~/trading-engine-multivenue-bin15/.env"

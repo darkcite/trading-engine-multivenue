@@ -681,7 +681,7 @@ branch).
 #    from https://api.telegram.org/bot<token>/getUpdates in a browser.
 # 2. Paste into .env (the notifier reads these two keys only, under env -i):
 #      TELEGRAM_BOT_TOKEN=<digits>:<secret>
-#      TELEGRAM_CHAT_ID=<id>
+#      TELEGRAM_CHAT_ID=<id>[,<id>…]   (each person must have messaged the bot)
 # 3. Config from the contract (dry_run = true logs instead of sending):
 cp notify.toml.example ~/multivenue/notify.toml   # then edit tag/paths/slots
 cargo build --release -p notify
