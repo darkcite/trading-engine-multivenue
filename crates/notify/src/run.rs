@@ -204,6 +204,23 @@ impl Runner {
         any
     }
 
+    fn fold_fills_quietly(&mut self, t: &mut Tail, now_s: i64) {
+        let mut buf = Vec::new();
+        let mut sink = Vec::new();
+        loop {
+            buf.clear();
+            match t.poll(MAX_RECORDS_PER_POLL, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    for s in &buf {
+                        self.model
+                            .on_fill(&FillRec::decode(s), now_s, true, &mut sink);
+                    }
+                }
+            }
+        }
+    }
+
     /// Fold every run directory beside `run_dir` that may hold fills of a
     /// watch window, then `run_dir` itself — silently (first start only).
     fn backfill(&mut self, run_dir: &str, now_s: i64) {
@@ -227,28 +244,16 @@ impl Runner {
                 }
             }
         }
-        let mut sink = Vec::new();
+        // Only FILLS are history worth folding: orders and events of a run
+        // already over would come back as stale "attempts" messages.
         for r in &runs {
-            let mut t = Tails::new(&r.to_string_lossy(), None);
-            self.drain(&mut t, now_s, true, &mut sink);
+            let mut t = Tail::new(r.join(crate::FILLS_FILE), SlotKind::Fill, 0);
+            self.fold_fills_quietly(&mut t, now_s);
         }
         let mut cur = Tails::new(run_dir, None);
-        // Orders and events: no history needed; skip to their ends.
         let _ = cur.orders.skip_to_end();
         let _ = cur.events.skip_to_end();
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match cur.fills.poll(MAX_RECORDS_PER_POLL, &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    for s in &buf {
-                        self.model
-                            .on_fill(&FillRec::decode(s), now_s, true, &mut sink);
-                    }
-                }
-            }
-        }
+        self.fold_fills_quietly(&mut cur.fills, now_s);
         log(&format!(
             "first start: folded {} earlier run(s) and {} silently ({} open position(s), {} settled on record)",
             runs.len(),
@@ -480,6 +485,80 @@ mod tests {
             "the third is over the cap"
         );
         assert!(inbox::collect(&[inb]).is_empty(), "every file removed");
+    }
+
+    /// First start: earlier runs' fills are folded, their orders and events
+    /// are not replayed as attempts, and nothing of the history is sent.
+    #[test]
+    fn first_start_folds_earlier_fills_silently() {
+        let d = dir("backfill");
+        let runs = d.join("runs");
+        let old = runs.join("run-1792800000000000000");
+        let cur = runs.join("run-1792900000000000000");
+        let hl = core_types::make_symbol_id(VenueId::Hyperliquid, 4096);
+        for r in [&old, &cur] {
+            std::fs::create_dir_all(r).unwrap();
+            write_header(&r.join(crate::FILLS_FILE), SlotKind::Fill);
+            write_header(&r.join(crate::ORDERS_FILE), SlotKind::Order);
+            write_header(&r.join(crate::EVENTS_FILE), SlotKind::OrderEvent);
+        }
+        let t = clock::parse_rfc3339_z("2026-10-22T07:29:41Z").unwrap() as u64 * 1_000_000_000;
+        let mut o = Order::new(
+            1,
+            VenueId::Hyperliquid,
+            hl,
+            Side::Bid,
+            0,
+            Price(700_000),
+            Qty(18_000_000),
+            501,
+        );
+        o.strategy_id = 3;
+        append(&old.join(crate::ORDERS_FILE), &bytes_of(&o));
+        let miss = OrderEvent::new(
+            2,
+            VenueId::Hyperliquid,
+            hl,
+            501,
+            3,
+            core_types::ORDER_EVENT_REJECTED,
+            12,
+            0,
+        );
+        append(&old.join(crate::EVENTS_FILE), &bytes_of(&miss));
+        let buy = Fill::new(t, hl, Side::Bid, Price(700_000), Qty(18_000_000), 501)
+            .with_attribution(3, 0);
+        append(&old.join(crate::FILLS_FILE), &bytes_of(&buy));
+        let settle = Fill::new(
+            t + 30_000_000_000,
+            hl,
+            Side::Ask,
+            Price(1_000_000),
+            Qty(18_000_000),
+            9,
+        )
+        .with_attribution(3, 0)
+        .with_flags(core_types::FILL_FLAG_SETTLEMENT);
+        append(&old.join(crate::FILLS_FILE), &bytes_of(&settle));
+        append(&cur.join(crate::ORDERS_FILE), &bytes_of(&o));
+        let text = format!(
+            "tag = 'SA'\nstate_url = 'http://127.0.0.1:1/state'\nstate_dir = '{}'\ndry_run = true\n[[slot]]\nslot = 3\n[[watch]]\nname = 'P2'\nslot = 3\nstart = '2026-10-01T00:00:00Z'\n",
+            d.join("st").display()
+        );
+        let mut r = Runner::new(Config::parse(&text).unwrap()).unwrap();
+        let now_s = (clock::now_wall_ns() / 1_000_000_000) as i64;
+        r.backfill(&cur.to_string_lossy(), now_s);
+        let mut out = Vec::new();
+        r.model.tick(now_s + 3600, &mut out);
+        assert!(out.iter().all(|m| !m.text.contains("attempts")), "{out:?}");
+        assert_eq!(r.model.settled.len(), 1);
+        assert_eq!(r.model.settled[0].gross, 5_400_000_000_000);
+        assert_eq!(
+            r.tails.as_ref().unwrap().orders.consumed(),
+            1,
+            "the current run's orders skip to their end"
+        );
+        assert!(r.outbox().pending().unwrap().is_empty());
     }
 
     /// A whole BIN15 live instance end to end through the captures: the
