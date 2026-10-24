@@ -231,6 +231,15 @@ affected paragraph at each lane close; the superseded text goes to
     = the ask's age at its price), `1803a652` (B-4 `late_lead`), `c1920c89`
     (`late_lead = "none"`). All three keys are unset; main's next release build
     from committed state carries them with no behaviour change.
+- **2026-10-24 04:06Z: main restarted (forced `0010` slot, 04:04Z) with BIN15
+  fills v2 on slot 3's PAPER artifact** (rulings F-12..F-15, Anton 10-24 ~04:00Z):
+  `late_e_1e6 = 10000` (the 1 c margin) and `late_limit_bound = 1` (the IoC's
+  limit p − 0.01, sweeping every level up to it), beside `late_refire_fresh = 1`.
+  Binary unchanged (`300186e5`). Tell
+  `late=2-30s:p>=0.90:ask<=p-1c:persist1:$100:k1.550:fresh:bound`, artifact
+  `9b893a2e…` (backup `bin15.toml.bak-20261024T040206Z-fills-v2`). No exec arm
+  (`/state` `exec.configured` 0). The slot's retention pass ran with the slot
+  (four 10-22 run dirs archived, verified).
 - **The standalone is unchanged and LIVE** (`61d899a7`, `0x66b5…2806`). Its
   branch carries G20–G24 (the same fixes, plus the Binance USDⓈ-M feed, dark),
   NOT deployed: ruling F-11 — nothing updated goes live on the money account
