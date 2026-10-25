@@ -252,6 +252,9 @@ pub struct Driver {
     /// trigger frame is read the moment it lands, never after a kernel
     /// wake-up. Off until the boot publishes a member's window.
     hot: Option<Arc<core_time::HotCell>>,
+    /// T2T T1-b: this poll iteration is inside the window, so each step
+    /// reads once ([`core_net::fill_rx_once`]) and parses what landed.
+    hot_turn: bool,
 
     /// Boot-built `coin → SymbolId` map (venue-namespaced ids).
     coins: HlCoinTable,
@@ -372,6 +375,7 @@ impl Driver {
             last_activity_ns: 0,
             turn_ns: 0,
             hot: None,
+            hot_turn: false,
             mask_counter: 0,
             coins,
             subs: SubTable::new(),
@@ -697,7 +701,13 @@ pub fn drive_one<T: Transport, C: Capture>(
     // the read (and its TLS decrypt) as well as the deframe and the parse.
     drv.turn_ns = now_ns();
     flush_tx(transport, drv)?;
-    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
+    // T2T T1-b: in the window, one read per step — a burst still arriving
+    // is parsed wave by wave, not after its last byte.
+    let fill = if drv.hot_turn {
+        core_net::fill_rx_once(transport, &mut drv.rx)?
+    } else {
+        core_net::fill_rx(transport, &mut drv.rx)?
+    };
 
     match drv.state {
         State::Connecting => {}
@@ -2439,8 +2449,10 @@ pub fn run<T: Transport, C: Capture>(
     let mut repoll_now = false;
 
     while !stop.load(Ordering::Relaxed) {
-        // T2T T1-b: inside the hot window, never block in the poll.
-        let timeout = core_net::poll_timeout(repoll_now || drv.hot_now());
+        // T2T T1-b: inside the hot window, never block in the poll, and
+        // read once per step.
+        drv.hot_turn = drv.hot_now();
+        let timeout = core_net::poll_timeout(repoll_now || drv.hot_turn);
         if let Err(e) = poll.poll(events, Some(timeout)) {
             return session_err(status, core_metrics::ERR_SITE_POLL, e.kind());
         }
@@ -2954,6 +2966,35 @@ mod tests {
             Some(RunResult::Stale)
         );
         assert_eq!(status.gaps_total(), 1, "staleness counts into gaps_total");
+    }
+
+    /// T2T T1-b: inside the window a step reads once, publishes what
+    /// landed and asks to be driven again (a burst still arriving is parsed
+    /// wave by wave); outside it, a step reads until the transport would
+    /// block, as before. Both publish the same tick.
+    #[test]
+    fn a_hot_step_reads_once_and_asks_to_be_driven_again() {
+        const BBO: &[u8] = br#"{"channel":"bbo","data":{"coin":"BTC","time":1708622398623,"bbo":[{"px":"64437.0","sz":"1.4491","n":2},{"px":"64438.0","sz":"0.541","n":3}]}}"#;
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver();
+        d.hot_turn = true;
+        inject_text(&mut t, BBO);
+        let again = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture);
+        assert!(again.unwrap(), "a hot step that read asks to be driven again");
+        assert_eq!(cons.try_pop_ref().expect("published in the same step").sym, SYM_BTC);
+        let again = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture);
+        assert!(!again.unwrap(), "nothing more landed: the drain stops");
+
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver();
+        inject_text(&mut t, BBO);
+        let again = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture);
+        assert!(!again.unwrap(), "outside the window one step reads to WouldBlock");
+        assert_eq!(cons.try_pop_ref().expect("the same tick").sym, SYM_BTC);
+        assert_eq!(status.msgs_total(), 2);
     }
 
     #[test]

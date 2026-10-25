@@ -70,7 +70,8 @@ pub use backoff::{
     should_reset_backoff, Backoff, BACKOFF_BASE_NS, BACKOFF_CAP_NS, HEALTHY_SESSION_MIN_NS,
 };
 pub use drain::{
-    fill_rx, incomplete_frame, poll_timeout, Drained, RxFill, DRAIN_STEP_CAP, POLL_IDLE,
+    fill_rx, fill_rx_once, incomplete_frame, poll_timeout, Drained, RxFill, DRAIN_STEP_CAP,
+    POLL_IDLE,
 };
 pub use error::{NetworkErr, NetworkErrKind, NetworkSource};
 pub use iobuf::IoBuf;

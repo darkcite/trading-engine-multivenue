@@ -18486,6 +18486,8 @@ Anton, 2026-10-25: "Go do T1", on plan `claude/t2t-plan-2026-10-25.md`. The sign
 ### T1-b — the ingress and the engine stay awake in the same window; QoS
 
 - **The ingress:** the Hyperliquid ingress polls without blocking inside the window. It reads it from a `core_time::HotCell` that the boot fills once slot 3's artifact is read.
+  - **Inside the window each drive step reads once** (`core_net::fill_rx_once`), parses what landed and drives again. Outside it the step still reads until the transport would block.
+  - **Why, from main's first live windows** (`11a3458a`, 10-25): with read-until-block, a thread that never blocks reaches a burst while it is still arriving. Inside the 06:59Z window the first tick of each read turn was stamped 50–90 µs after the turn began, against ~1 µs outside, with the same ticks per turn. One read per step parses each wave as it lands.
 - **The engine:** the engine loop skips its per-iteration `yield_now` inside the window, re-reading it every 100 µs.
 - **QoS:** on macOS the ingress, the engine and the Hyperliquid gateway threads take QoS `USER_INTERACTIVE`, the performance-core hint (`cli::pinning::prefer_performance_cores`). Linux pins instead, so this is a no-op there.
 
