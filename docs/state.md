@@ -317,6 +317,28 @@ affected paragraph at each lane close; the superseded text goes to
     reload the label, and allow `multivenue-notify` → `api.telegram.org:443`
     in LuLu.
 
+## Corrections found 2026-10-25 (T2T — verify on `/state` and `/metrics`)
+
+- **2026-10-25 03:50Z: main restarted (forced `0010` slot at 03:49:07Z) on
+  `e3c97e03`, T2T T0: measurement only** (Anton: "T0 only and measure on main
+  - do not deploy to standalone"; plan `claude/t2t-plan-2026-10-25.md`).
+  pid 11073, run `run-1792900209449915000`.
+  - **New readings:** `engine_latency_<stage>_{p50,p99,p999,max}_ns` for parse,
+    ingest, member, decide, route and ack; `engine-latency.pmlr` (slot kind 10,
+    one record per accepted order) in each run dir; `Tick.rx_lag_ns` on HL
+    ticks. `MAX_GAUGES` 768. `/state` is unchanged.
+  - **No artifact, config or behaviour change.** Slot 3's tell is unchanged
+    (`…:fresh:bound:cap0.985`), every slot paper, `exec.configured` 0.
+  - **The HL gateway's `push_to_write`** now ends after the socket took the
+    frame (~15 µs later than before). The standalone runs G30 `57bcdf6d`
+    (pid 81287), which still stamps before the write; it was not touched.
+  - **The harness:** `cargo bench -p bench --bench t2t` (`T2T_FRAMES` = the
+    vault's `research/t2t/frames-*.bin`). Results: vault `research/t2t/`,
+    project `claude/t2t-results-2026-10-25.md`.
+  - **Retention** ran with the slot: `run-1792800679143780000` and
+    `run-1792800763843085000` verified in the bucket and removed locally; it
+    stopped at `run-1792814738124727000` (< 1 d).
+
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
