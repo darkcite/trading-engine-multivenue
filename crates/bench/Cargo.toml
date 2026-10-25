@@ -22,6 +22,7 @@ dhat       = { workspace = true }
 [dev-dependencies]
 criterion            = { workspace = true }
 memchr               = { workspace = true }
+libc                 = "0.2"
 # Pulled in ONLY by the alloc_assertions integration test so we can
 # round-trip real frames through the zero-alloc path.
 # core-crypto: gate 34 hashes ruleset fixture bytes (§4.2 rule 1).

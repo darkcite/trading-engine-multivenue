@@ -5232,6 +5232,9 @@ fn run(args: RunArgs) -> ExitCode {
 
     // Hyperliquid rides core 7 per the §9 core map.
     let hl_wall_anchor = core_time::WallAnchor::now();
+    // T2T T1-b: the late law's hot window, published once slot 3's artifact
+    // is read (below); the ingress never blocks inside it.
+    let hl_hot = std::sync::Arc::new(core_time::HotCell::new());
     if let Some((mut hl_coins, mut hl_families, hl_ep, hl_info_ep)) = hl_boot {
         // BIN15 O2: adopt each family's LIVE instance out of the
         // discovery body, so the first `Steady` subscribes it instead
@@ -5285,6 +5288,7 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.hl,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hyperliquid)),
+            std::sync::Arc::clone(&hl_hot),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -5820,6 +5824,8 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // T2T T1-b: the engine loop reads the same hot window as the ingress.
+    let obs = obs.with_hot_cell(std::sync::Arc::clone(&hl_hot));
 
     // -- Main thread: real engine loop until SIGINT --
     // HK6: the captures are open — the run directory stays from here on.
@@ -6263,6 +6269,19 @@ fn run(args: RunArgs) -> ExitCode {
             } else {
                 None
             };
+            // T2T T1-b: slot 3's late window keeps the HL ingress awake.
+            if let Some((w, open_ms, close_ms)) = bin15_boot
+                .as_ref()
+                .and_then(|b| cli::bin15_boot::late_hot_window(&b.params.late))
+            {
+                hl_hot.set(w);
+                info!(
+                    open_ms,
+                    close_ms,
+                    duty_ppm = w.duty_ppm(),
+                    "T2T T1-b: the Hyperliquid ingress never blocks inside the late window"
+                );
+            }
             // F19 / the icdp law: requested-but-absent REFUSES. Booting
             // `ai+bin15` silently as `ai` is how an operator comes to
             // watch a member that was never there.

@@ -4037,7 +4037,7 @@ impl OrderDispatch for HlGatewayArm {
             .outcome
             .as_deref()
             .map_or(&OutcomeCounters::ZERO, |st| &st.counters);
-        // COPY: the 1 016 B report written once into the caller's block —
+        // COPY: the 1 040 B report written once into the caller's block —
         // cold, once a second; the out-param keeps it off the return path.
         *out = GatewayArmReport {
             present: 1,
@@ -4110,6 +4110,8 @@ impl OrderDispatch for HlGatewayArm {
             gw_throttled: s.published(pw::THROTTLED),
             gw_ttl_cancels: s.published(pw::TTL_CANCELS),
             gw_ttl_full: s.published(pw::TTL_FULL),
+            gw_signs_pooled: s.published(pw::SIGNS_POOLED),
+            gw_signs_fallback: s.published(pw::SIGNS_FALLBACK),
             // XMM XH4i-5: the outcome mode's (0 on a perps arm).
             outcome_rolls_bound: o.rolls_bound,
             outcome_rolls_settled: o.rolls_settled,
@@ -4180,6 +4182,7 @@ impl OrderDispatch for HlGatewayArm {
             },
             topup_day_used: self.topup.used(),
             topup_cost_usd_1e6: self.topup.cost_1e6(),
+            signer_pool_ready: s.published(pw::POOL_READY),
         };
         true
     }

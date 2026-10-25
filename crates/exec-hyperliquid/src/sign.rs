@@ -140,6 +140,41 @@ pub fn sign_action(
     hl::sign_agent_with_key(sk, network.source(), &cid)
 }
 
+/// [`sign_action`] through the gateway's precomputed-nonce signer (T2T
+/// T1-c): the same connection id and `Agent` digest, the signature from
+/// the pool — RFC 6979 when the pool cannot sign.
+///
+/// Hot path.
+///
+/// # Errors
+/// As [`sign_action`].
+#[inline]
+pub fn sign_action_prenonce(
+    signer: &mut signer_eip712::prenonce::PrenonceSigner,
+    action: &[u8],
+    nonce: u64,
+    vault: Vault,
+    expires_after: Option<u64>,
+    network: Network,
+) -> Result<[u8; 65], SignError> {
+    let cid = connection_id(action, nonce, vault, expires_after)?;
+    signer.sign(&hl::agent_eip712_hash(network.source(), &cid))
+}
+
+/// The keep-hot dry run of [`sign_action_prenonce`] (T2T T1-f): the same
+/// hashing, the pool's arithmetic on its throwaway entry. Nothing is
+/// consumed; the result is discarded.
+#[inline]
+pub fn dry_sign_action(
+    signer: &signer_eip712::prenonce::PrenonceSigner,
+    action: &[u8],
+    nonce: u64,
+    network: Network,
+) -> Option<[u8; 65]> {
+    let cid = connection_id(action, nonce, Vault::None, None).ok()?;
+    signer.dry_sign(&hl::agent_eip712_hash(network.source(), &cid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

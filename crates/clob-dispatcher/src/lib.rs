@@ -899,7 +899,7 @@ pub trait OrderDispatch {
     /// everything else (the default; `out` untouched). `now_ns` is the
     /// engine clock (the heartbeat's age, the slot's health). Cold: the 1 s
     /// `/state` publish and the 5 s `/metrics` mirror; an out-param, so the
-    /// 1 016 B report never crosses by value.
+    /// 1 040 B report never crosses by value.
     #[inline]
     fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
         false
@@ -1434,6 +1434,11 @@ pub struct GatewayArmReport {
     pub gw_ttl_cancels: u64,
     /// Orders whose TTL the full table could not keep.
     pub gw_ttl_full: u64,
+    /// T2T T1-c: actions signed from the precomputed-nonce pool.
+    pub gw_signs_pooled: u64,
+    /// T2T T1-c: actions signed by RFC 6979 (an empty pool, an edge, the
+    /// pool turned off).
+    pub gw_signs_fallback: u64,
     // --- counters: the outcome mode (XMM XH4i-5: slot 3; 0 on a perps arm) ---
     /// Created rolls bound, both legs.
     pub outcome_rolls_bound: u64,
@@ -1568,6 +1573,9 @@ pub struct GatewayArmReport {
     /// The session's top-up spend, USD ×1e6 — added back to its P&L,
     /// bounded by the day's max instead.
     pub topup_cost_usd_1e6: i64,
+    /// T2T T1-c: the signer pool's ready entries (refilled outside the
+    /// late window; 0 means the next action signs by RFC 6979).
+    pub signer_pool_ready: u64,
 }
 
 // XH4f: 94 words — pinned, as the other blocks crossing this boundary are.
@@ -1575,8 +1583,9 @@ pub struct GatewayArmReport {
 // counters and the own account's five levels (102). XMM XH5c-2: + the
 // top-ups' three counters and three levels (108). XMM XH5c-3: + the REST
 // round trips' p99 and maximum (110). XMM XH4i-5: + the outcome mode's
-// seventeen counters (127).
-const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 1_016);
+// seventeen counters (127). T2T T1-c: + the signer's two counters and its
+// pool's level (130).
+const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 1_040);
 
 /// The Binance arm's local refusal reasons ([`BinanceArmReport::refused`]
 /// — `exec_binance::arm::Refusal`, pinned there).

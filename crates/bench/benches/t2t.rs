@@ -12,6 +12,8 @@
 //!   `engine_latency_parse_*` gauges carry the read turn whole.
 //! * `sign` — the gateway's signature: `sign_action` on an encoded order
 //!   action (keccak connection id, EIP-712 agent digest, RFC 6979 ECDSA).
+//! * `sign/prenonce` — the same through T1-c's precomputed-nonce signer
+//!   (`sign_action_prenonce`), its pool refilled between triggers.
 //! * `route` — the exec router's live submit of a bin15 take (every clamp,
 //!   a full ledger table) into an accepting arm.
 //! * `gateway/inline` — the real HL gateway against the scripted loopback
@@ -26,6 +28,20 @@
 //!   spinning; one every 25 ms finds it parked, as a live order does (one
 //!   an hour), so the wake-up is in. Each also reports the gateway's own
 //!   `push_to_write` (bucket bounds) as a cross-check.
+//! * `gateway/hot`, `gateway/hot+qos` — the parked case under a hot window
+//!   that never closes (T1-a): one place every 25 ms, the gateway kept
+//!   awake; then with T1-b's user-interactive QoS on its thread, as
+//!   production's `spawn_gateway` sets it. The pool is not refilled inside
+//!   a window (T1-c), so each gateway takes [`HOT_PER_BOOT`] orders (its
+//!   warm-up's included) and a fresh one, its pool full as each live
+//!   window opens, takes the next: [`HOT_BOOTS`] gateways a row.
+//! * `gateway/parked`, `gateway/hot` **cold** — the caches evicted before
+//!   each take's 25 ms gap, the gap then left to run: in the hot window the
+//!   keep-hot dry run (T1-f) re-warms the order path inside it; parked,
+//!   nothing does. A live take lands on that state.
+//! * `wake/*` — T1-b: a thread woken by one loopback byte, blocked in
+//!   `poll` (the HL ingress today) or spinning, with and without macOS's
+//!   user-interactive QoS: the write's stamp → the poll's return.
 //!
 //! **Cold** evicts the caches before each trigger (a 64 MiB sweep, one
 //! store per line): the order path's state as it is about once an hour.
@@ -33,7 +49,8 @@
 //! table prints n, p50, p99, p99.9 and max in ns. `T2T_OUT=<path>` also
 //! writes the rows as JSON (results belong in the vault, never git).
 //!
-//! Run: `T2T_FRAMES=<file> cargo bench -p bench --bench t2t`.
+//! Run: `T2T_FRAMES=<file> cargo bench -p bench --bench t2t`;
+//! `T2T_ONLY=<group>` (parse, sign, route, gateway, wake) runs one group.
 //!
 //! COPY-DOCTRINE: an offline bench; it allocates and copies outside the
 //! timed spans.
@@ -49,8 +66,8 @@ use core_time::now_ns;
 use core_types::{
     CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, Order, Price, Qty, Side, VenueId,
 };
-use exec_gateway::Idle;
-use exec_hyperliquid::gateway::HlEngineEnd;
+use exec_gateway::{HotWindow, Idle};
+use exec_hyperliquid::gateway::{pw, HlEngineEnd};
 use exec_hyperliquid::testvenue::{Answer, Venue};
 use exec_hyperliquid::{
     hl_duplex, CoinMap, GatewayCfg, HlCmd, HlGateway, Network, NonceStreams, Tif, Vault,
@@ -64,6 +81,13 @@ const N_COLD: usize = 2_000;
 const N_SPINNING: usize = 5_000;
 /// Parked triggers (25 ms apart: ~50 s).
 const N_PARKED: usize = 2_000;
+/// Hot triggers per gateway: its 20 warm-up orders and these stay inside
+/// the signer's 64-entry pool, as a window's few takes do.
+const HOT_PER_BOOT: usize = 40;
+/// Gateways per hot row (25 ms apart: ~38 s).
+const HOT_BOOTS: usize = 25;
+/// Parked triggers in the cold mode (an eviction and 25 ms apart: ~35 s).
+const N_PARKED_COLD: usize = 1_000;
 /// The eviction sweep: past the M4 Pro's L2 and system cache.
 const EVICT_BYTES: usize = 64 << 20;
 /// BIN15's slot.
@@ -306,6 +330,53 @@ fn stage_sign(rows: &mut Vec<Row>, evict_buf: &mut [u8]) {
     rows.push(cold);
 }
 
+/// T1-c: the same action through the precomputed-nonce signer — the pool
+/// refilled between triggers, untimed, as the gateway's idle turns do.
+fn stage_sign_prenonce(rows: &mut Vec<Row>, evict_buf: &mut [u8]) {
+    let sk = signer_eip712::parse_secret_key(&[0x11; 32]).expect("sign: key");
+    let mut signer = signer_eip712::prenonce::PrenonceSigner::new(&sk).expect("sign: pool");
+    let mut action = [0u8; 112];
+    let mut i = 0usize;
+    while i < action.len() {
+        action[i] = (i as u8).wrapping_mul(31).wrapping_add(0x80);
+        i += 1;
+    }
+    let mut warm = Row::new("sign/prenonce", "warm", N_WARM);
+    let mut cold = Row::new("sign/prenonce", "cold", N_COLD);
+    let mut n = 0u64;
+    while (n as usize) < N_WARM + N_COLD {
+        let is_cold = (n as usize) >= N_WARM;
+        if is_cold {
+            evict(evict_buf);
+        }
+        let t = now_ns();
+        let s = exec_hyperliquid::sign::sign_action_prenonce(
+            &mut signer,
+            black_box(&action),
+            1_761_000_000_000 + n,
+            Vault::None,
+            None,
+            Network::Testnet,
+        );
+        let dt = now_ns() - t;
+        black_box(s.expect("sign"));
+        if is_cold {
+            cold.ns.push(dt);
+        } else {
+            warm.ns.push(dt);
+        }
+        while signer.refill_one() {}
+        n += 1;
+    }
+    assert_eq!(
+        signer.counters().fallback,
+        0,
+        "sign/prenonce: every signature from the pool"
+    );
+    rows.push(warm);
+    rows.push(cold);
+}
+
 // -----------------------------------------------------------------
 // route
 // -----------------------------------------------------------------
@@ -514,29 +585,86 @@ fn stage_gateway(rows: &mut Vec<Row>, evict_buf: &mut [u8]) {
     );
     drop(gw);
 
-    rows.push(threaded(
-        &venue,
-        "gateway/spinning",
-        2,
-        N_SPINNING,
-        &mut oid,
-    ));
-    rows.push(threaded(&venue, "gateway/parked", 25, N_PARKED, &mut oid));
+    let prod = Idle::default();
+    let load = |gap_ms, n, idle, qos, cold| Load {
+        gap_ms,
+        n,
+        idle,
+        qos,
+        cold,
+    };
+    let spinning = load(2, N_SPINNING, prod, false, false);
+    rows.push(threaded(&venue, "gateway/spinning", spinning, evict_buf, &mut oid));
+    let parked = load(25, N_PARKED, prod, false, false);
+    rows.push(threaded(&venue, "gateway/parked", parked, evict_buf, &mut oid));
+    let parked_cold = load(25, N_PARKED_COLD, prod, false, true);
+    rows.push(threaded(&venue, "gateway/parked", parked_cold, evict_buf, &mut oid));
+    // T1-a: the production policy under a window that is always hot; then
+    // with T1-b's QoS on the gateway thread, as `spawn_gateway` sets it;
+    // then cold, T1-f's keep-hot against an eviction.
+    let hot = prod.with_hot(HotWindow::new(1_000, 1_000, 0).expect("always hot"));
+    let hot_rows = [
+        ("gateway/hot", false, false),
+        ("gateway/hot+qos", true, false),
+        ("gateway/hot", false, true),
+    ];
+    let mut h = 0;
+    while h < hot_rows.len() {
+        let (name, qos, cold) = hot_rows[h];
+        let mode = if cold { "cold" } else { "warm" };
+        let mut row = Row::new(name, mode, HOT_PER_BOOT * HOT_BOOTS);
+        let mut b = 0;
+        while b < HOT_BOOTS {
+            let l = load(25, HOT_PER_BOOT, hot, qos, cold);
+            row.ns.extend(threaded(&venue, name, l, evict_buf, &mut oid).ns);
+            b += 1;
+        }
+        rows.push(row);
+        h += 1;
+    }
 }
 
-/// A fresh gateway on its own thread under the production idle policy; one
-/// take every `gap_ms`, push → its sent counter moves.
-fn threaded(venue: &Venue, stage: &'static str, gap_ms: u64, n_trig: usize, oid: &mut u64) -> Row {
-    let (mut gw, mut eng) = boot_gateway(venue, Idle::default());
+/// One threaded row's load: a take every `gap_ms` to a gateway under
+/// `idle`, `n` of them measured after 20 warm-up takes.
+#[derive(Clone, Copy)]
+struct Load {
+    gap_ms: u64,
+    n: usize,
+    idle: Idle,
+    /// T1-b's QoS on the gateway thread.
+    qos: bool,
+    /// The caches evicted before each take's gap.
+    cold: bool,
+}
+
+/// A fresh gateway on its own thread under `load.idle`; one take every
+/// `load.gap_ms`, push → its sent counter moves.
+fn threaded(
+    venue: &Venue,
+    stage: &'static str,
+    load: Load,
+    evict_buf: &mut [u8],
+    oid: &mut u64,
+) -> Row {
+    let (mut gw, mut eng) = boot_gateway(venue, load.idle);
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
+    let qos = load.qos;
     let th = std::thread::spawn(move || {
+        if qos {
+            prefer_p_cores();
+        }
         gw.run(&stop2);
     });
-    let mut row = Row::new(stage, "warm", n_trig);
+    let n_trig = load.n;
+    let mode = if load.cold { "cold" } else { "warm" };
+    let mut row = Row::new(stage, mode, n_trig);
     let mut n = 0usize;
     while n < n_trig + 20 {
-        std::thread::sleep(Duration::from_millis(gap_ms));
+        if load.cold {
+            evict(evict_buf);
+        }
+        std::thread::sleep(Duration::from_millis(load.gap_ms));
         let io = eng.stats.io();
         let t = now_ns();
         let cmd = HlCmd::place(SLOT, *oid, LEG, true, PX_1E8, SZ_1E8, Tif::Ioc).at(t);
@@ -561,14 +689,110 @@ fn threaded(venue: &Venue, stage: &'static str, gap_ms: u64, n_trig: usize, oid:
     th.join().expect("gateway thread");
     let p2w = &eng.stats.push_to_write;
     println!(
-        "{stage} cross-check, the gateway's own push_to_write: n={} p50<={} p99<={} p999<={} max={} ns",
+        "{stage} {mode} cross-check, the gateway's own push_to_write: n={} p50<={} p99<={} p999<={} max={} ns; signed pooled/fallback at its last heartbeat {}/{}",
         p2w.count(),
         p2w.quantile_ns(0.50),
         p2w.quantile_ns(0.99),
         p2w.quantile_ns(0.999),
-        p2w.max_ns()
+        p2w.max_ns(),
+        eng.stats.published(pw::SIGNS_POOLED),
+        eng.stats.published(pw::SIGNS_FALLBACK)
     );
     row
+}
+
+// -----------------------------------------------------------------
+// wake (T1-b)
+// -----------------------------------------------------------------
+
+/// Wake-up triggers per variant (3 ms apart).
+const N_WAKE: usize = 1_000;
+
+/// The macOS QoS class that keeps a thread on the performance cores.
+#[cfg(target_os = "macos")]
+fn prefer_p_cores() {
+    // SAFETY: sets the calling thread's own QoS class; no memory is passed.
+    let _ = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prefer_p_cores() {}
+
+/// **T1-b: what the HL ingress pays to be woken.** A loopback TCP pair:
+/// this thread stamps and writes one byte every 3 ms; a reader thread waits
+/// on mio — blocked in `poll` with the ingress's 50 ms timeout (today), or
+/// spinning on a zero timeout (T1-b) — and stamps the poll's return. The
+/// row is that stamp minus the write's (the loopback send included).
+fn stage_wake(rows: &mut Vec<Row>, stage: &'static str, spin: bool, qos: bool) {
+    use std::io::{Read, Write};
+    use std::sync::atomic::AtomicU64;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("wake: bind");
+    let addr = listener.local_addr().expect("wake: addr");
+    let mut tx = std::net::TcpStream::connect(addr).expect("wake: connect");
+    tx.set_nodelay(true).expect("wake: nodelay");
+    let (rx, _) = listener.accept().expect("wake: accept");
+    rx.set_nonblocking(true).expect("wake: nonblocking");
+    let woke = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (woke2, stop2) = (Arc::clone(&woke), Arc::clone(&stop));
+    let th = std::thread::spawn(move || {
+        if qos {
+            prefer_p_cores();
+        }
+        let mut poll = mio::Poll::new().expect("wake: poll");
+        let mut events = mio::Events::with_capacity(4);
+        let mut rx = mio::net::TcpStream::from_std(rx);
+        poll.registry()
+            .register(&mut rx, mio::Token(0), mio::Interest::READABLE)
+            .expect("wake: register");
+        let timeout = if spin {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(50)
+        };
+        let mut buf = [0u8; 64];
+        while !stop2.load(Ordering::Relaxed) {
+            if poll.poll(&mut events, Some(timeout)).is_err() {
+                return;
+            }
+            if events.is_empty() {
+                continue;
+            }
+            let t1 = now_ns();
+            while let Ok(n) = rx.read(&mut buf) {
+                if n == 0 {
+                    return;
+                }
+            }
+            woke2.store(t1, Ordering::Release);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    let mut row = Row::new(stage, "warm", N_WAKE);
+    let mut n = 0usize;
+    while n < N_WAKE + 20 {
+        std::thread::sleep(Duration::from_millis(3));
+        woke.store(0, Ordering::Release);
+        let t0 = now_ns();
+        tx.write_all(&[1u8]).expect("wake: write");
+        let t0w = Instant::now();
+        let mut t1 = woke.load(Ordering::Acquire);
+        while t1 == 0 {
+            assert!(t0w.elapsed() < Duration::from_secs(1), "wake: no wake");
+            std::hint::spin_loop();
+            t1 = woke.load(Ordering::Acquire);
+        }
+        if n >= 20 {
+            row.ns.push(t1.saturating_sub(t0));
+        }
+        n += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    drop(tx);
+    th.join().expect("wake thread");
+    rows.push(row);
 }
 
 // -----------------------------------------------------------------
@@ -578,17 +802,35 @@ fn threaded(venue: &Venue, stage: &'static str, gap_ms: u64, n_trig: usize, oid:
 fn main() {
     let mut evict_buf = vec![0u8; EVICT_BYTES];
     let mut rows: Vec<Row> = Vec::new();
-    match std::env::var("T2T_FRAMES") {
-        Ok(path) => {
-            let frames = load_frames(&path);
-            println!("parse: {} recorded payloads from {path}", frames.len());
-            stage_parse(&mut rows, &frames, &mut evict_buf);
+    // `T2T_ONLY=<group>` runs one group: parse, sign, route, gateway, wake.
+    let only = std::env::var("T2T_ONLY").ok();
+    let on = |group: &str| only.as_deref().is_none_or(|o| o == group);
+    if on("parse") {
+        match std::env::var("T2T_FRAMES") {
+            Ok(path) => {
+                let frames = load_frames(&path);
+                println!("parse: {} recorded payloads from {path}", frames.len());
+                stage_parse(&mut rows, &frames, &mut evict_buf);
+            }
+            Err(_) => println!("parse: skipped (T2T_FRAMES unset)"),
         }
-        Err(_) => println!("parse: skipped (T2T_FRAMES unset)"),
     }
-    stage_sign(&mut rows, &mut evict_buf);
-    stage_route(&mut rows, &mut evict_buf);
-    stage_gateway(&mut rows, &mut evict_buf);
+    if on("sign") {
+        stage_sign(&mut rows, &mut evict_buf);
+        stage_sign_prenonce(&mut rows, &mut evict_buf);
+    }
+    if on("route") {
+        stage_route(&mut rows, &mut evict_buf);
+    }
+    if on("gateway") {
+        stage_gateway(&mut rows, &mut evict_buf);
+    }
+    if on("wake") {
+        stage_wake(&mut rows, "wake/blocked", false, false);
+        stage_wake(&mut rows, "wake/blocked+qos", false, true);
+        stage_wake(&mut rows, "wake/spin", true, false);
+        stage_wake(&mut rows, "wake/spin+qos", true, true);
+    }
 
     println!(
         "{:<22} {:<5} {:>7} {:>9} {:>9} {:>9} {:>10}",

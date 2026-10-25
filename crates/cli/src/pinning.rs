@@ -89,6 +89,31 @@ fn pin_impl(core_id: usize) -> Result<(), PinError> {
 // macOS / other: no-op fallback
 // -----------------------------------------------------------------
 
+/// **T2T T1-b — keep the calling thread on the performance cores.** macOS
+/// has no pinning; its QoS class `USER_INTERACTIVE` is the scheduler's
+/// strongest performance-core hint, and on the Mac it cut a blocked
+/// thread's wake-up tail (the t2t harness, 2026-10-25: p99 184 → 157 µs,
+/// max 976 → 209 µs). For the order path's threads alone: the Hyperliquid
+/// ingress, the engine and the Hyperliquid gateways. `true` when the OS
+/// took the hint; elsewhere a no-op returning `false` (Linux pins).
+pub fn prefer_performance_cores() -> bool {
+    qos_impl()
+}
+
+#[cfg(target_os = "macos")]
+fn qos_impl() -> bool {
+    // SAFETY: sets the calling thread's own QoS class; no memory is passed.
+    let rc = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+    rc == 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn qos_impl() -> bool {
+    false
+}
+
 #[cfg(not(target_os = "linux"))]
 fn pin_impl(_core_id: usize) -> Result<(), PinError> {
     Err(PinError::Unsupported)
@@ -107,6 +132,11 @@ mod tests {
             Err(PinError::Syscall(e)) => panic!("unexpected pin failure: {e}"),
             Err(PinError::Unsupported) => panic!("Linux must support pinning"),
         }
+    }
+
+    #[test]
+    fn the_qos_hint_is_taken_on_macos_only() {
+        assert_eq!(prefer_performance_cores(), cfg!(target_os = "macos"));
     }
 
     #[test]

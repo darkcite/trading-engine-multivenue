@@ -1249,6 +1249,8 @@ pub fn spawn_gateway(
                     Err(e) => info!(thread = name, ?e, "thread not pinned; continuing"),
                 }
             }
+            // T2T T1-b: an order path's gateway stays on the P-cores.
+            crate::paper::log_qos_outcome(name);
             run_gateway(&mut gw, &owner, &mut keeper, &mut topup);
             info!(thread = name, "the gateway stopped");
         })

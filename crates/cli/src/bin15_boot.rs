@@ -96,6 +96,34 @@ pub struct Bin15Boot {
     pub resolved: usize,
 }
 
+/// The 15 m families' period: the late law's instances expire on the
+/// quarter hours.
+const LATE_PERIOD_MS: u64 = 900_000;
+/// How far the hot window reaches past the law's own τ bounds: it opens
+/// 2 s before `tau_max` and closes 1 s after `tau_min`.
+const LATE_HOT_LEAD_MS: u64 = 2_000;
+/// See [`LATE_HOT_LEAD_MS`].
+const LATE_HOT_TAIL_MS: u64 = 1_000;
+
+/// **T2T T1-a/b** — the late law's hot window, for slot 3's gateway and
+/// the Hyperliquid ingress: from `tau_max + 2 s` to `tau_min − 1 s` before
+/// each quarter hour, with its open and close offsets (ms). `None` when the
+/// law is off, or when its window would open more than ~65 s before the
+/// quarter hour (`HotWindow`'s bound; the ruled τ max is 30 s).
+#[must_use]
+pub fn late_hot_window(
+    late: &strategy_bin15::late::LateParams,
+) -> Option<(core_time::HotWindow, u64, u64)> {
+    if late.enabled == 0 {
+        return None;
+    }
+    let open_ms = (late.tau_max_ns / 1_000_000)
+        .saturating_add(LATE_HOT_LEAD_MS)
+        .min(LATE_PERIOD_MS);
+    let close_ms = (late.tau_min_ns / 1_000_000).saturating_sub(LATE_HOT_TAIL_MS);
+    core_time::HotWindow::new(LATE_PERIOD_MS, open_ms, close_ms).map(|w| (w, open_ms, close_ms))
+}
+
 /// Whether the operator asked for the member.
 #[must_use]
 pub fn bin15_wanted(requested: core_types::SlotMask) -> bool {
@@ -502,6 +530,23 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T2T T1-a: the late law at its ruled τ ∈ [2, 30) s keeps the gateway
+    /// awake from 32 s to 1 s before each quarter hour; off, never.
+    #[test]
+    fn the_late_law_s_hot_window_brackets_its_tau_bounds() {
+        let mut late = strategy_bin15::late::LateParams::default();
+        assert!(late_hot_window(&late).is_none(), "the law off: no hot window");
+        late.enabled = 1;
+        late.tau_min_ns = 2_000_000_000;
+        late.tau_max_ns = 30_000_000_000;
+        let (w, open_ms, close_ms) = late_hot_window(&late).expect("on: a window");
+        assert_eq!((open_ms, close_ms), (32_000, 1_000));
+        let q = 1_792_900_800_000u64;
+        assert!(w.contains(q - 30_000) && w.contains(q - 2_000));
+        assert!(!w.contains(q - 33_000) && !w.contains(q - 500));
+    }
+
 
     /// XH4i-3a (risk review r1), H90 G2: BIN15's grid test and the gateway
     /// arm's `OutcomeRules::check` agree on EVERY ×1e6 price from below zero

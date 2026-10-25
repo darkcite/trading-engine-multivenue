@@ -228,7 +228,20 @@ pub fn boot_bin15_arm(
     let sk = hl
         .secret_key()
         .map_err(|e| format!("slot 3's API wallet key: {e}"))?;
-    let gcfg = GatewayCfg::production(hl.host.clone(), tls, network, hl.master_addr, cfg.slot);
+    let mut gcfg = GatewayCfg::production(hl.host.clone(), tls, network, hl.master_addr, cfg.slot);
+    // T2T T1-a: the gateway never parks while a 15 m family is inside the
+    // late window.
+    if let Some((w, open_ms, close_ms)) =
+        member.and_then(|m| crate::bin15_boot::late_hot_window(&m.params.late))
+    {
+        gcfg.idle = gcfg.idle.with_hot(w);
+        let _ = write!(
+            tell,
+            "; the gateway never parks from {open_ms} ms to {close_ms} ms before each quarter \
+             hour ({} ppm of one core, T2T T1-a)",
+            w.duty_ppm()
+        );
+    }
     // COPY: boot, once — the ≤ 8 KiB gateway out of `new`'s `Result` (then
     // into `spawn_gateway`, noted there). Rejected: as there.
     let mut gw = HlGateway::new(gcfg, gw_end, sk, CoinMap::with_outcomes())

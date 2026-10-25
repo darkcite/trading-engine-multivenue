@@ -17374,8 +17374,11 @@ fn gate96_venue_helper() {
 /// alone, one round of the cancel-all word's sweep (XH4d, XG-1): its own
 /// read (answered with one order of ours and a stranger's, scanned in
 /// place, emitting nothing), the cancel of ours by cloid, the cancel's
-/// answer back to the engine — exactly 4 again. The residue goes with the
-/// rustls record-layer pass (TL4/TL5b).
+/// answer back to the engine — exactly 4 again. T2T T1-f, measured
+/// alone: the idle policy made always hot, twenty keep-hot dry seals (a
+/// dummy IoC encoded, signed, rendered and enveloped in place, nothing
+/// sent) — 0 B. The residue goes with the rustls record-layer pass
+/// (TL4/TL5b).
 #[test]
 fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     gate96b(false);
@@ -17857,6 +17860,39 @@ fn gate96b(outcomes: bool) {
         "HL gateway weight purchase: {reserve_allocs} allocations ({reserve_bytes} B) — \
          rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_RESERVE} (one sealed, \
          one opened); anything above is the gateway's"
+    );
+
+    // T2T T1-f, measured alone: the idle policy made always hot, so a
+    // quiet turn past each millisecond runs the keep-hot dry seal — a
+    // dummy IoC encoded, signed on the pool's throwaway entry, rendered
+    // and enveloped in the gateway's own buffers, nothing sent: 0 B.
+    const KEEP_HOT_RUNS: u64 = 20;
+    gw.set_idle(exec_gateway::Idle::default().with_hot(
+        exec_gateway::HotWindow::new(1_000, 1_000, 0).expect("always hot"),
+    ));
+    // Unmeasured first: the last answers of the phases above land (rustls
+    // opens their records), and the first dry runs touch their buffers.
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_millis(50) {
+        gw.turn();
+        while eng.evt.pop().is_some() {}
+    }
+    let (dry0, dry_posts0) = (gw.counters().keep_hot, eng.stats.io()[0]);
+    let g = AllocGuard::new();
+    let t = std::time::Instant::now();
+    while gw.counters().keep_hot - dry0 < KEEP_HOT_RUNS {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "gate 96: the keep-hot dry run never ran"
+        );
+        gw.turn();
+    }
+    let (hot_allocs, hot_bytes, _) = g.delta();
+    assert_eq!(eng.stats.io()[0], dry_posts0, "a dry run sends nothing");
+    assert_eq!(
+        hot_allocs, 0,
+        "HL gateway keep-hot: {hot_allocs} allocations ({hot_bytes} B) over \
+         {KEEP_HOT_RUNS} dry runs"
     );
 }
 

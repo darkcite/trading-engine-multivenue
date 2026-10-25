@@ -6,6 +6,31 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-25 — T2T T1: the hot window, the precomputed-nonce signer, smoke phase C
+
+**What changed** (plan `t2t-plan-2026-10-25` T1; risk policy "T2T T1")
+- `exec-smoke`'s JSON gains `pooled_verified` (phase C: a signature from the
+  gateway's precomputed-nonce pool, verified by the venue), and `passed`
+  now needs it. A phase C failure exits 20, as phase A's does.
+- The HL gateway's halt reasons gain `HALT_SIGNER` (`HALT_VENUE_BASE + 1`):
+  a pooled signature failed its after-the-fact check.
+- `HlGateway::new` refuses with `GatewayErr::Signer` when the signer's page
+  cannot be locked, the OS CSPRNG fails or its self-test does not recover.
+- `exec_gateway::Idle` narrows its fields (spin `u16`, park `u32` ns, both
+  clamped) and carries a `HotWindow` (`core_time::HotWindow`, re-exported);
+  `Idle::new` keeps its signature.
+- `cli::paper::spawn_hyperliquid` takes the HL ingress's `HotCell`.
+- `/metrics`, the hlgw family: `engine_exec_hlgw_gateway_signs_pooled_total`
+  and `engine_exec_hlgw_gateway_signs_fallback_total` (actions signed from
+  the pool, and by RFC 6979), and the level `engine_exec_hlgw_signer_pool_ready`
+  (the pool's ready entries). They ride the gateway's published words
+  (`pw::SIGNS_POOLED`, `pw::SIGNS_FALLBACK`, `pw::POOL_READY`; 22 of 32) and
+  `clob_dispatcher::GatewayArmReport` (1 016 → 1 040 B).
+
+**Readers**
+- Anything parsing the smoke's JSON line sees one more key; `/metrics` gains
+  the three hlgw rows above; nothing in a capture or `/state` changes.
+
 ## 2026-10-25 — T2T T0: `Tick.rx_lag_ns`, `engine-latency.pmlr` and the stage gauges
 
 **What changed** (plan `t2t-plan-2026-10-25`, T0: measure, no behaviour change)

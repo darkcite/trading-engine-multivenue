@@ -248,6 +248,10 @@ pub struct Driver {
     /// ([`drive_one`]); every tick parsed in the turn carries its lag from
     /// here (`Tick::rx_lag_ns`). 0 before the first turn.
     turn_ns: u64,
+    /// T2T T1-b: inside this window the loop polls without blocking, so a
+    /// trigger frame is read the moment it lands, never after a kernel
+    /// wake-up. Off until the boot publishes a member's window.
+    hot: Option<Arc<core_time::HotCell>>,
 
     /// Boot-built `coin → SymbolId` map (venue-namespaced ids).
     coins: HlCoinTable,
@@ -367,6 +371,7 @@ impl Driver {
             expected_accept_val: accept,
             last_activity_ns: 0,
             turn_ns: 0,
+            hot: None,
             mask_counter: 0,
             coins,
             subs: SubTable::new(),
@@ -403,6 +408,21 @@ impl Driver {
     /// so the lane is attached once per process.
     pub fn set_trade_lane(&mut self, tx: Producer<TradePrint, TRADE_RING_SIZE>) {
         self.trade_tx = Some(tx);
+    }
+
+    /// T2T T1-b: read the hot window from `cell` (set by the boot once a
+    /// member's window is known). Boot-time, before the first connect.
+    pub fn set_hot_cell(&mut self, cell: Arc<core_time::HotCell>) {
+        self.hot = Some(cell);
+    }
+
+    /// Whether the loop must not block now (T2T T1-b).
+    #[inline]
+    fn hot_now(&self) -> bool {
+        match self.hot.as_ref() {
+            Some(c) => c.is_hot_now(),
+            None => false,
+        }
     }
 
     /// BIN15 O2: attach the rolling families and the counter slot
@@ -2419,7 +2439,9 @@ pub fn run<T: Transport, C: Capture>(
     let mut repoll_now = false;
 
     while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = poll.poll(events, Some(core_net::poll_timeout(repoll_now))) {
+        // T2T T1-b: inside the hot window, never block in the poll.
+        let timeout = core_net::poll_timeout(repoll_now || drv.hot_now());
+        if let Err(e) = poll.poll(events, Some(timeout)) {
             return session_err(status, core_metrics::ERR_SITE_POLL, e.kind());
         }
 

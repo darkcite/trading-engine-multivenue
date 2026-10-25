@@ -28,10 +28,12 @@
 //! |---|---|---|
 //! | **A. signature verified** | a GOOD signature is accepted by the venue's recovery | an agent wallet |
 //! | **B. signature enforced** | a CORRUPTED signature is REJECTED | an agent wallet |
-//! | **C. lifecycle** | place → modify → cancel round-trips | faucet USDC |
+//! | **C. pooled signature verified** (T2T T1-c) | a signature from the precomputed-nonce pool — the gateway's per-order signer — is accepted by the venue's recovery, as A's is | an agent wallet |
+//! | **lifecycle** (`--lifecycle`) | place → modify → cancel round-trips | faucet USDC |
 //!
-//! Phases A and B are the heart of E3's gate and they cost nothing:
-//! they cancel an order id that does not exist.
+//! Phases A, B and C are the heart of E3's gate and they cost nothing:
+//! they cancel an order id that does not exist. A phase C failure exits
+//! as phase A's does (20): the venue would not verify our signature.
 //!
 //! ## What counts as "the venue verified us"
 //!
@@ -234,6 +236,10 @@ pub struct SmokeReport {
     pub agent_registered: bool,
     /// Phase B: a corrupted signature was rejected by the venue.
     pub corruption_rejected: bool,
+    /// Phase C (T2T T1-c): a signature from the precomputed-nonce pool —
+    /// the gateway's per-order signer — was verified by the venue, as
+    /// phase A's was.
+    pub pooled_verified: bool,
     /// The venue's message on the corrupted attempt, for the log.
     pub corruption_message: String,
     /// SDK vectors the offline self-test reproduced before any packet
@@ -245,7 +251,7 @@ impl SmokeReport {
     /// Both signature phases passed.
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.signature_verified && self.corruption_rejected
+        self.signature_verified && self.corruption_rejected && self.pooled_verified
     }
 
     /// One line of JSON for CI, matching the stdout-purity law the
@@ -283,7 +289,13 @@ impl SmokeReport {
         });
         s.push_str(",\"corruption_message\":\"");
         json_escape(&mut s, &self.corruption_message);
-        s.push_str("\",\"passed\":");
+        s.push_str("\",\"pooled_verified\":");
+        s.push_str(if self.pooled_verified {
+            "true"
+        } else {
+            "false"
+        });
+        s.push_str(",\"passed\":");
         s.push_str(if self.passed() { "true" } else { "false" });
         s.push('}');
         s
@@ -376,31 +388,9 @@ pub fn run(
     let n = envelope(http.body_mut(), &aj[..aj_n], nonce_a, &sig, None, None)
         .map_err(|_| SmokeErr::Encode)?;
     let (_status, range) = http.post(n).map_err(|e| SmokeErr::Http(e.err))?;
-    let resp = http.resp();
-    let slice = &resp[range];
     let agent_hex = crate::config::hex20(&cfg.agent_addr);
-    let mut agent_registered = false;
-    let signature_verified = match scan(slice).map_err(|_| SmokeErr::Unreadable)? {
-        // `status: ok` at all means the venue RECOVERED our signer,
-        // found an account for it and then judged the order. Whether
-        // the (nonexistent) order could be cancelled is beside the
-        // point — the recovery is what phase A asks about.
-        HlResponse::Ok(_) => {
-            agent_registered = true;
-            true
-        }
-        HlResponse::Err { msg } => {
-            let text = String::from_utf8_lossy(msg.of(slice)).to_string();
-            // The venue can only put OUR address in its answer by
-            // having recovered it from OUR signature. An unregistered
-            // agent therefore still proves the whole chain.
-            if contains_ci(text.as_bytes(), agent_hex.as_bytes()) {
-                true
-            } else {
-                return Err(SmokeErr::SignatureNotVerified(text));
-            }
-        }
-    };
+    let agent_registered = recovered_us(&http.resp()[range], &agent_hex)?;
+    let signature_verified = true;
 
     // ---- Phase B: a CORRUPTED signature ----------------------------
     // Flip one bit of `s`. The result is still a well-formed
@@ -431,6 +421,32 @@ pub fn run(
             HlResponse::Ok(_) => return Err(SmokeErr::CorruptSignatureAccepted),
         };
 
+    // ---- Phase C (T2T T1-c): a POOLED signature --------------------
+    // The gateway signs every order from precomputed nonces
+    // (`signer_eip712::prenonce`). The same probe, signed that way by a
+    // pool built from the same key, must recover to us exactly as phase
+    // A's did — and must have come from the pool, not its RFC 6979
+    // fallback.
+    let mut pool = signer_eip712::prenonce::PrenonceSigner::new(&sk).map_err(|_| SmokeErr::Sign)?;
+    let nonce_c = nonces.next(now_ms());
+    let sig_c = crate::sign::sign_action_prenonce(
+        &mut pool,
+        &mp[..mp_n],
+        nonce_c,
+        Vault::None,
+        None,
+        cfg.network,
+    )
+    .map_err(|_| SmokeErr::Sign)?;
+    if pool.counters().pooled != 1 {
+        return Err(SmokeErr::Sign);
+    }
+    let n = envelope(http.body_mut(), &aj[..aj_n], nonce_c, &sig_c, None, None)
+        .map_err(|_| SmokeErr::Encode)?;
+    let (_status, range) = http.post(n).map_err(|e| SmokeErr::Http(e.err))?;
+    recovered_us(&http.resp()[range], &agent_hex)?;
+    let pooled_verified = true;
+
     Ok(SmokeReport {
         host: cfg.host.clone(),
         agent: agent_hex,
@@ -438,8 +454,29 @@ pub fn run(
         agent_registered,
         corruption_rejected,
         corruption_message,
+        pooled_verified,
         selftest_rows: st.rows,
     })
+}
+
+/// Phases A and C: the venue's answer to a GOOD signature. `Ok(true)` =
+/// `status: ok` (it recovered our signer, found an account for it and
+/// judged the order — whether the nonexistent order could be cancelled is
+/// beside the point); `Ok(false)` = an error naming OUR address, which the
+/// venue can only have recovered from our signature, so an unregistered
+/// agent still proves the whole chain. Anything else: not verified.
+fn recovered_us(slice: &[u8], agent_hex: &str) -> Result<bool, SmokeErr> {
+    match scan(slice).map_err(|_| SmokeErr::Unreadable)? {
+        HlResponse::Ok(_) => Ok(true),
+        HlResponse::Err { msg } => {
+            let text = String::from_utf8_lossy(msg.of(slice)).to_string();
+            if contains_ci(text.as_bytes(), agent_hex.as_bytes()) {
+                Ok(false)
+            } else {
+                Err(SmokeErr::SignatureNotVerified(text))
+            }
+        }
+    }
 }
 
 /// The offline half on its own: no network, no credentials, no venue.
@@ -496,6 +533,7 @@ mod tests {
             selftest_rows: 25,
             corruption_rejected: true,
             corruption_message: "he said \"no\"\\ and\nthen \u{1}stopped".to_owned(),
+            pooled_verified: true,
         };
         let j = r.to_json();
         assert!(j.starts_with('{') && j.ends_with('}'), "{j}");
@@ -624,8 +662,17 @@ mod tests {
             selftest_rows: 25,
             corruption_rejected: true,
             corruption_message: String::new(),
+            pooled_verified: true,
         };
         assert!(base.passed());
+        assert!(
+            !SmokeReport {
+                pooled_verified: false,
+                ..base.clone()
+            }
+            .passed(),
+            "a pooled signature the venue did not verify fails the smoke"
+        );
         assert!(!SmokeReport {
             signature_verified: false,
             ..base.clone()

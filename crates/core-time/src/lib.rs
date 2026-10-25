@@ -371,9 +371,198 @@ impl BarClock {
 // Tests.
 // ---------------------------------------------------------------
 
+// ---------------------------------------------------------------
+// T2T T1-a/b: the hot window — a recurring wall-clock window in which a
+// thread never blocks.
+// ---------------------------------------------------------------
+
+/// Wall-clock ms since the Unix epoch; 0 before it. (`SystemTime`: one
+/// vDSO / commpage read, no syscall on Linux or macOS.)
+#[inline]
+#[must_use]
+pub fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// **T2T T1-a/b — a recurring wall-clock window in which a thread never
+/// blocks.** A member whose orders cluster before fixed expiries (BIN15's
+/// 15 m families fire at τ < 30 s) keeps its gateway and its ingress awake
+/// through that window: work then waits for one non-blocking poll, never
+/// for a park or a kernel wake-up. Measured 2026-10-25 on the Mac (the t2t
+/// harness): a parked gateway takes 159 µs p50 from push to the socket
+/// write, an awake one 42 µs; a thread woken from `poll` by one loopback
+/// byte 94 µs p50 / 184 µs p99, a spinning one 65 / 113 µs.
+///
+/// Hot when `wall_ms mod period` lies in `[period − open, period − close)`:
+/// from `open` ms before each period boundary until `close` ms before it.
+/// 8 B, `Copy`; packs into one word ([`HotCell`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HotWindow {
+    period_ms: u32,
+    open_ms: u16,
+    close_ms: u16,
+}
+
+impl HotWindow {
+    /// No window: never hot.
+    pub const OFF: Self = Self {
+        period_ms: 0,
+        open_ms: 0,
+        close_ms: 0,
+    };
+
+    /// `None` unless `close_ms < open_ms ≤ period_ms`, `open_ms ≤ u16::MAX`
+    /// (a window opens at most ~65 s before its boundary) and
+    /// `0 < period_ms ≤ u32::MAX` (~49 days).
+    #[must_use]
+    pub const fn new(period_ms: u64, open_ms: u64, close_ms: u64) -> Option<Self> {
+        if period_ms == 0
+            || period_ms > u32::MAX as u64
+            || open_ms > period_ms
+            || open_ms > u16::MAX as u64
+            || close_ms >= open_ms
+        {
+            return None;
+        }
+        Some(Self {
+            period_ms: period_ms as u32,
+            open_ms: open_ms as u16,
+            close_ms: close_ms as u16,
+        })
+    }
+
+    /// Whether `wall_ms` (Unix ms) is inside the window; never for
+    /// [`Self::OFF`].
+    #[inline]
+    #[must_use]
+    pub const fn contains(&self, wall_ms: u64) -> bool {
+        if self.period_ms == 0 {
+            return false;
+        }
+        let p = self.period_ms as u64;
+        let r = wall_ms % p;
+        r >= p - self.open_ms as u64 && r < p - self.close_ms as u64
+    }
+
+    /// Whether this is [`Self::OFF`].
+    #[inline]
+    #[must_use]
+    pub const fn is_off(&self) -> bool {
+        self.period_ms == 0
+    }
+
+    /// The share of the time the window is hot, in ppm — a spin's CPU cost
+    /// on one core (0 for [`Self::OFF`]).
+    #[must_use]
+    pub const fn duty_ppm(&self) -> u64 {
+        if self.period_ms == 0 {
+            return 0;
+        }
+        (self.open_ms - self.close_ms) as u64 * 1_000_000 / self.period_ms as u64
+    }
+
+    /// The window as one word, for [`HotCell`].
+    #[inline]
+    #[must_use]
+    pub const fn to_word(self) -> u64 {
+        ((self.period_ms as u64) << 32) | ((self.open_ms as u64) << 16) | self.close_ms as u64
+    }
+
+    /// The inverse of [`Self::to_word`].
+    #[inline]
+    #[must_use]
+    pub const fn from_word(w: u64) -> Self {
+        Self {
+            period_ms: (w >> 32) as u32,
+            open_ms: (w >> 16) as u16,
+            close_ms: w as u16,
+        }
+    }
+}
+
+/// **A hot window one thread publishes and another reads** (T2T T1-b): the
+/// boot sets it once a member's window is known — after the ingress it
+/// serves has started — and the ingress reads it every poll. One relaxed
+/// word; [`HotWindow::OFF`] until set.
+#[derive(Debug, Default)]
+pub struct HotCell(std::sync::atomic::AtomicU64);
+
+impl HotCell {
+    /// [`HotWindow::OFF`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// Publish `w`.
+    #[inline]
+    pub fn set(&self, w: HotWindow) {
+        self.0.store(w.to_word(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The window in force.
+    #[inline]
+    #[must_use]
+    pub fn get(&self) -> HotWindow {
+        HotWindow::from_word(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Whether now is inside the window in force (no clock read when off).
+    #[inline]
+    #[must_use]
+    pub fn is_hot_now(&self) -> bool {
+        let w = self.get();
+        !w.is_off() && w.contains(wall_ms())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hot_window_opens_before_each_boundary_and_closes_before_it() {
+        // BIN15's: 15 min, from 32 s before each quarter hour to 1 s before.
+        let w = HotWindow::new(900_000, 32_000, 1_000).expect("valid");
+        let q = 1_792_900_800_000u64; // a quarter-hour boundary (Unix ms)
+        assert_eq!(q % 900_000, 0);
+        assert!(!w.contains(q - 32_001), "before the window");
+        assert!(w.contains(q - 32_000), "its first ms");
+        assert!(w.contains(q - 1_001), "its last ms");
+        assert!(!w.contains(q - 1_000), "closed 1 s before the boundary");
+        assert!(!w.contains(q), "the boundary");
+        assert!(!w.contains(q + 400_000), "mid-period");
+        assert_eq!(w.duty_ppm(), 34_444, "31 s of 900");
+        assert_eq!(HotWindow::OFF.duty_ppm(), 0);
+        assert!(!HotWindow::OFF.contains(q - 10_000));
+        assert_eq!(HotWindow::from_word(w.to_word()), w, "the word round-trips");
+    }
+
+    #[test]
+    fn a_hot_window_must_open_before_it_closes_inside_its_period() {
+        assert!(HotWindow::new(0, 1, 0).is_none());
+        assert!(HotWindow::new(900_000, 900_001, 0).is_none());
+        assert!(HotWindow::new(900_000, 1_000, 1_000).is_none());
+        assert!(HotWindow::new(60_000, 60_000, 0).is_some(), "always hot");
+        assert!(HotWindow::new(900_000, 70_000, 0).is_none(), "opens past u16 ms");
+        assert!(HotWindow::new(u64::from(u32::MAX) + 1, 2, 1).is_none(), "past u32");
+    }
+
+    #[test]
+    fn a_hot_cell_is_off_until_set_and_then_reads_the_window() {
+        let c = HotCell::new();
+        assert!(c.get().is_off());
+        assert!(!c.is_hot_now());
+        let always = HotWindow::new(60_000, 60_000, 0).expect("always hot");
+        c.set(always);
+        assert_eq!(c.get(), always);
+        assert!(c.is_hot_now());
+        c.set(HotWindow::OFF);
+        assert!(!c.is_hot_now());
+    }
 
     const MS: u64 = 1_000_000;
 

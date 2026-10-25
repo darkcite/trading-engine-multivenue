@@ -18466,3 +18466,116 @@ check` validates a config (the keys by presence only), `test-send` posts one
 line, `replay --run-dir` renders a capture's fills and settlements. Off:
 remove `notify.toml` (the job exits 0 and stays down) or `launchctl bootout`
 the label.
+
+## T2T T1 — the order path's quick wins (2026-10-25): main only; the standalone unchanged
+
+Anton, 2026-10-25: "Go do T1", on plan `claude/t2t-plan-2026-10-25.md`. The signer ruling was given earlier: "Precomputed nonces, guarded". **The standalone (live money, slot 3) changes only on Anton's explicit confirmation**, under the HARD RULE. Nothing below changes what an order says, when the law fires, or any cap.
+
+**Main runs T1 on paper, but main has no Hyperliquid gateway**: every slot is paper. So main exercises T1-b only (the ingress, the engine, QoS). T1-a, c and f first run on the standalone. Before that they are covered by the harness, the alloc gate (96b) and testnet `exec-smoke`, whose phase C has the venue verify a pooled signature.
+
+### T1-a — the gateway never parks in the late window; commands before reads
+
+- **The hot window:** `core_time::HotWindow` is a recurring wall-clock window. `exec_gateway::Idle::with_hot` never parks inside it. The window comes from slot 3's artifact (`cli::bin15_boot::late_hot_window`): from `tau_max + 2 s` to `tau_min − 1 s` before each quarter hour.
+  - With P2's τ ∈ [2, 30) s, that is 32 s → 1 s before each quarter hour: 34 444 ppm of one core.
+  - With the late law off there is no window, and the gateway behaves as before.
+  - The boot tell says so: `the gateway never parks from … ms to … ms before each quarter hour`.
+- **Commands first:** `HlGateway::turn` drains the command ring at the start of the turn, before its poll and its reads. It still drains it after them, as before.
+- **Unchanged:** admission, coalescing, the rates, every refusal.
+- **The idle policy's fields narrowed** (spin to `u16`, park to `u32` ns, both clamped), so `Idle` stays 16 B inside the gateway's bounded inline state.
+
+### T1-b — the ingress and the engine stay awake in the same window; QoS
+
+- **The ingress:** the Hyperliquid ingress polls without blocking inside the window. It reads it from a `core_time::HotCell` that the boot fills once slot 3's artifact is read.
+- **The engine:** the engine loop skips its per-iteration `yield_now` inside the window, re-reading it every 100 µs.
+- **QoS:** on macOS the ingress, the engine and the Hyperliquid gateway threads take QoS `USER_INTERACTIVE`, the performance-core hint (`cli::pinning::prefer_performance_cores`). Linux pins instead, so this is a no-op there.
+
+### T1-c — the precomputed-nonce signer (`signer_eip712::prenonce`)
+
+The gateway signs every order from a pool of 64 precomputed ECDSA nonces. Each entry holds `k⁻¹`, `r`, `r·d` and the recovery id. A signature is then one mod-n add, one mod-n multiply and the low-s rule: 0.67 µs warm, where RFC 6979 takes 18.9 µs.
+
+**The laws:**
+
+1. **A k is never reused.**
+   - The gateway thread is the pool's one owner.
+   - An entry is popped once and wiped as it is popped, whether or not it signed.
+2. **k is random and hedged.**
+   - `k = keccak256(tag ‖ d ‖ counter ‖ try ‖ rand)`, with `rand` 32 bytes from the OS CSPRNG (`getrandom`).
+   - With a fixed key, a weak RNG cannot repeat a k, and while the RNG works a broken counter cannot either.
+   - Keccak is a sponge, so a secret prefix makes it a PRF (no length extension).
+3. **No field code of our own.**
+   - Every operation on a secret scalar is libsecp256k1's constant-time scalar arithmetic, the library that already signs every order: `seckey_tweak_add`, `seckey_tweak_mul`, `seckey_negate`, `ec_pubkey_create`.
+   - The inverse is Fermat's `k^(n−2)`, by square-and-multiply over the public exponent.
+   - The plan named `k256`. This uses no new crypto dependency instead: one library, already audited and already on the path.
+4. **The secrets sit in a page of their own.**
+   - The key, every `k⁻¹` and every `r·d` are in one page-aligned, page-sized (16 KiB) `mlock`'d allocation. With `r` public, `r·d` is as secret as `d`.
+   - The page is wiped with volatile writes and `munlock`'d on drop.
+   - No neighbour shares the page, so no `munlock` reaches across it (the BX4 rule).
+   - **This is a third locked-memory implementation**, beside `SecretKeyBytes` and BX4's page. The open BX4 question, whether a page type moves into `core-config`, now covers three.
+5. **Every boot self-tests.** One pooled signature must verify and recover to the key, or the gateway does not build (`GatewayErr::Signer`).
+6. **Every pooled signature is checked after the fact.**
+   - The gateway's quiet turns outside the hot window verify each signature and recover its key, from a ring of the last 16.
+   - A mismatch turns the pool off for the process and halts the gateway: `HALT_SIGNER` = `HALT_VENUE_BASE + 1`.
+7. **Fallback:** an empty pool, or an edge the pool cannot sign (a digest ≥ n, a zero `s`; each about 2⁻¹²⁸), signs by RFC 6979, today's path unchanged.
+
+The plan's first step, dropping `secp256k1`'s `lowmemory` tables, is not taken: the pool takes the signature off the path, and the fallback is rare.
+
+**Refills and checks** run in quiet turns outside the hot window: about 60 µs per entry and 40 µs per check. A command that arrives meanwhile waits that long, as it would for a park.
+
+**Inside the window the pool is not refilled.** It opens each window full: 64 entries against a window's few takes. Past 64 signed actions in one window, the rest sign by RFC 6979 (law 7).
+
+**Observability:** `/metrics` (hlgw family) `engine_exec_hlgw_gateway_signs_pooled_total`, `engine_exec_hlgw_gateway_signs_fallback_total` and `engine_exec_hlgw_signer_pool_ready`. A live take that signed from the pool moves the first.
+
+**Tests:**
+- 2 000 signatures verify, recover and are low-s, and both values of `v` occur.
+- No `r` repeats in 3 000 signatures.
+- The fallback is byte-identical to today's signature.
+- A corrupted check turns the pool off.
+- A proptest runs random keys and digests.
+- **`exec-smoke` gains phase C:** the cancel probe, signed from a pool built from the testnet key, must recover to our address at the venue, as phase A's does. A failure exits 20.
+
+### T1-f — keep-hot
+
+Inside the hot window, every 1 ms, a quiet gateway turn runs the order path dry: a dummy IoC is encoded, hashed, signed with the pool's arithmetic on a throwaway key's fixed entry, then rendered and enveloped into the gateway's own buffers.
+
+Nothing is admitted or sent. No nonce is drawn, and no rate moves; the gateway's own `keep_hot` counter counts the runs. The alloc gate (96b) pins 20 dry runs at 0 B.
+
+**Measured (below):** −4 µs at the median when warm, no p99 cost. Against a cache eviction it measured nothing: the cold part of the path is what a dry run cannot touch (rustls' seal, `write(2)`, the command ring). Kept: it is cheap and does no harm.
+
+**Not done from the plan's T1-f** (to T2): the member and router run dry, the TLS seal into a scratch record (rustls has no dry seal), `mlock` of the other order-path buffers, and the dry runs' timings into the T0 histograms.
+
+### T1-d, T1-e — deferred
+
+- **T1-e, the O(1) router:** the router's clamps measured 0.17 µs p50 and 0.21 µs p99 warm (0.83 / 1.5 µs cold) on a full ledger. O(1) would save under 1 µs, for a change to the ledger's accounting.
+- **T1-d, the one-compare trigger:** the member's stage measured 3.3 µs p50 live (XMM). T2's pre-sealed order needs the precomputed trigger anyway, and T2 carries its own parity test.
+
+### T1-g — one write per post: verified, no change
+
+A post is one `write(2)`:
+1. `GwConn::send` hands the frame to rustls in one `write`.
+2. rustls seals it into one record (frames are under 16 KiB).
+3. The flush is one `write_tls`, which is one `writev`.
+
+`TCP_NODELAY` is set and asserted (`core-net/transport.rs`).
+
+### The measurements
+
+The harness (`cargo bench -p bench --bench t2t`) on the M4 Pro, with both engines running, gives the medians over 2 to 8 runs. The gateway rows run from the command's push to the moment the socket took the frame. The vault holds the JSON: `research/t2t/t2t-bench-20261025-t1-*.json`.
+
+| stage | T0 p50 / p99 | T1 p50 / p99 |
+|---|---|---|
+| signature (RFC 6979) | 18.9 / 21.2 µs | the fallback |
+| signature from the pool, warm / cold | — | 0.67 / 0.80 µs; 1.4 / 2.2 µs |
+| gateway, parked (outside the window) | 159 / 193 µs | 139 / 172 µs |
+| **gateway, hot window: one take every 25 ms** | — | **24 / 58 µs** (p99.9 ≤ 108 µs) |
+| gateway, hot window, caches evicted before each take | — | 38 / 60 µs |
+| gateway, spinning (one take every 2 ms) | 42 / 58 µs | 20 / 38 µs |
+| HL ingress wake-up, blocked `poll` → spinning (loopback) | 133 / 388 µs | 75 / 104 µs |
+
+- **The hot window takes the gateway from 159 µs to 24 µs at the median.** Adding the live in-engine 8.5 / 43 µs (T0) gives a live take ≈ 33 µs p50 and ≤ 101 µs p99 (a sum of p99s), against T0's 170 / 230 µs.
+- **The plan's T1 bar is p50 ≤ 20 µs, p99 ≤ 40 µs.** The gateway meets it spinning (20 / 38 µs). In the hot window it misses: 24 / 58 µs. Keep-hot off reads the same p99 (57 µs), so the dry run is not the cause. What remains against spinning is the 25 ms gap, not isolated further.
+- **QoS** (`USER_INTERACTIVE`) changes neither row: 24 / 55 µs with it.
+- **The ingress wake-up** is new information: a blocked `poll` costs about 58 µs at the median over spinning, before T0's read stamp. The loopback rows include macOS' own loopback delivery, about 75 µs, which a real NIC replaces.
+- **0 B/op:** alloc-assert, including gate 96b's keep-hot phase.
+- **The decisions do not change:** T1-d is deferred, so the member is untouched.
+- **The signer** passes its tests and proptest, and testnet `exec-smoke` phases A, B and C.
+- **The real gateway on testnet:** `exec-smoke --lifecycle --hl-perp` (XH4g: BTC, ETH, SOL; 20 cycles, 3 IoC pairs) exit 0, the bar met. 209 actions signed from the pool, 0 by RFC 6979, and the venue took every one. The pool was full (64) at the end.

@@ -2726,6 +2726,7 @@ pub fn spawn_hyperliquid(
     epoch_ns: u64,
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
+    hot: Arc<core_time::HotCell>,
 ) -> io::Result<JoinHandle<()>> {
     let mut capture = GaugedCapture::new(
         PmlrCapture::open(run_dir, "hl", epoch_ns, tap_cfg)?,
@@ -2739,6 +2740,8 @@ pub fn spawn_hyperliquid(
         "ingress-hyperliquid",
         move || {
             log_pin_outcome("hyperliquid", core_id);
+            // T2T T1-b: the order path's ingress stays on the P-cores.
+            log_qos_outcome("hyperliquid");
             let server_name = match TlsTransport::server_name_from_host(&ep.host) {
                 Ok(n) => n,
                 Err(e) => {
@@ -2763,6 +2766,8 @@ pub fn spawn_hyperliquid(
             // XMM XH1: every parsed `trades` row also reaches the
             // engine's trade lane (the driver outlives reconnects).
             driver.set_trade_lane(trade_tx);
+            // T2T T1-b: never block inside the window the boot publishes.
+            driver.set_hot_cell(hot);
             // VM2 V2: HL funding rides AssetCtx — the lane mask carries
             // both bits (feature-engine law). BIN15 O2: with rolling
             // families configured the lane also carries the roll and the
@@ -5180,6 +5185,9 @@ pub struct Observability {
     /// as `fills_capture` (bin opens, engine loop takes ownership). `None`
     /// in tests and in tools that replay rather than run.
     pub latency_capture: Option<SlotCapture<T2tRecord>>,
+    /// T2T T1-b: the late law's hot window (the same cell the HL ingress
+    /// reads); `None` = never hot, the loop yields every iteration as before.
+    pub hot: Option<Arc<core_time::HotCell>>,
     /// VRP V8a: where the VRP member's persisted state is written.
     /// `None` = no VRP member is configured, and the engine writes
     /// nothing. Set by the set builder from the boot bundle.
@@ -5293,6 +5301,12 @@ impl Observability {
     /// the bin after the per-run capture directory exists.
     pub fn with_latency_capture(mut self, cap: SlotCapture<T2tRecord>) -> Self {
         self.latency_capture = Some(cap);
+        self
+    }
+
+    /// T2T T1-b: the hot window the engine loop reads. Boot-only.
+    pub fn with_hot_cell(mut self, cell: Arc<core_time::HotCell>) -> Self {
+        self.hot = Some(cell);
         self
     }
 
@@ -6816,9 +6830,9 @@ fn mirror_exec_metrics(
 // ---------------------------------------------------------------
 
 /// The hlgw family's counters.
-const HLGW_COUNTERS: usize = 88;
+const HLGW_COUNTERS: usize = 90;
 /// The hlgw family's level gauges (the tell's gauge is registered apart).
-const HLGW_GAUGES: usize = 37;
+const HLGW_GAUGES: usize = 38;
 
 /// The counter rows of the hlgw family, in [`hlgw_counter_values`] order
 /// — which is what pins the two together.
@@ -6891,6 +6905,8 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
     "engine_exec_hlgw_gateway_throttled_total",
     "engine_exec_hlgw_gateway_ttl_cancels_total",
     "engine_exec_hlgw_gateway_ttl_full_total",
+    "engine_exec_hlgw_gateway_signs_pooled_total",
+    "engine_exec_hlgw_gateway_signs_fallback_total",
     "engine_exec_hlgw_outcome_rolls_bound_total",
     "engine_exec_hlgw_outcome_rolls_settled_total",
     "engine_exec_hlgw_outcome_rolls_refused_total",
@@ -6914,7 +6930,7 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
 ];
 
 /// `GatewayArmReport`'s totals in [`HLGW_COUNTER_NAMES`] order.
-// COPY: [u64; 88] (704 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 90] (720 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -6988,6 +7004,8 @@ fn hlgw_counter_values(r: &clob_dispatcher::GatewayArmReport) -> [u64; HLGW_COUN
         r.gw_throttled,
         r.gw_ttl_cancels,
         r.gw_ttl_full,
+        r.gw_signs_pooled,
+        r.gw_signs_fallback,
         r.outcome_rolls_bound,
         r.outcome_rolls_settled,
         r.outcome_rolls_refused,
@@ -7050,12 +7068,13 @@ const HLGW_GAUGE_NAMES: [&str; HLGW_GAUGES] = [
     "engine_exec_hlgw_topup_weight",
     "engine_exec_hlgw_topup_day_used",
     "engine_exec_hlgw_topup_cost_usd_1e6",
+    "engine_exec_hlgw_signer_pool_ready",
 ];
 
 /// `GatewayArmReport`'s levels in [`HLGW_GAUGE_NAMES`] order; an unsigned
 /// level past `i64::MAX` — a heartbeat not yet seen, a top-up day read as
 /// spent (XMM XH5c-2) — reads −1.
-// COPY: [i64; 37] (296 B) returned by value — cold, as above.
+// COPY: [i64; 38] (304 B) returned by value — cold, as above.
 fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES] {
     let g = |v: u64| i64::try_from(v).unwrap_or(-1);
     [
@@ -7096,6 +7115,7 @@ fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES
         g(r.topup_weight),
         g(r.topup_day_used),
         r.topup_cost_usd_1e6,
+        g(r.signer_pool_ready),
     ]
 }
 
@@ -10181,6 +10201,9 @@ fn mirror_ingress_counters(
     *last = cur;
 }
 
+/// T2T T1-b: how often the engine loop re-reads the hot window.
+const HOT_CHECK_NS: u64 = 100_000;
+
 fn run_engine_loop<S, D>(cons: Consumers, disp: D, strat: S, obs: Observability) -> EngineLoopResult
 where
     S: strategy_core::Strategy,
@@ -10464,6 +10487,14 @@ where
 
     // E6: paces the dispatcher's idle moment. See `IdlePacer`.
     let mut idle_pacer = IdlePacer::new();
+
+    // T2T T1-b: the engine thread stays on the P-cores, and never yields
+    // its core inside the late law's hot window (read every
+    // `HOT_CHECK_NS`, not per iteration).
+    log_qos_outcome("engine");
+    let hot_cell = obs.hot.clone();
+    let mut hot = false;
+    let mut next_hot_ns = 0u64;
 
     while !shutdown_requested() {
         let drained = eng.tick(DRAIN_BATCH);
@@ -10942,7 +10973,17 @@ where
         // returns to us promptly. Net effect: tick-to-decide
         // latency tracks the ingress producer cadence, not the
         // kernel HZ.
-        std::thread::yield_now();
+        //
+        // T2T T1-b: except inside the hot window, where a yield would hand
+        // the core away with a take due: the measured pickup was 2.2 µs
+        // p50 / 30 µs p99 against a ~50 ns ring.
+        if now >= next_hot_ns {
+            hot = hot_cell.as_ref().is_some_and(|c| c.is_hot_now());
+            next_hot_ns = now.saturating_add(HOT_CHECK_NS);
+        }
+        if !hot {
+            std::thread::yield_now();
+        }
     }
 
     // F18: THE DRAIN LAW. The restart lane SIGTERMs five times a UTC
@@ -11245,6 +11286,14 @@ fn restart_stamp_age_secs() -> i64 {
     match std::time::SystemTime::now().duration_since(m) {
         Ok(d) => d.as_secs() as i64,
         Err(_) => 0,
+    }
+}
+
+/// T2T T1-b: [`crate::pinning::prefer_performance_cores`] for an order-path
+/// thread, logged once.
+pub(crate) fn log_qos_outcome(thread_label: &str) {
+    if crate::pinning::prefer_performance_cores() {
+        tracing::info!(thread = thread_label, "QoS user-interactive (performance cores)");
     }
 }
 
