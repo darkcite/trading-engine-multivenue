@@ -357,6 +357,19 @@ affected paragraph at each lane close; the superseded text goes to
   - **Retention** ran with the slot: `run-1792814738124727000` and
     `run-1792821034841283000` verified in the bucket and removed locally; it
     stopped at `run-1792830884138812000` (< 1 d).
+- **2026-10-25 07:20Z: main restarted (forced `0010` slot at 07:19Z) on
+  `8e8442e1`, the T1-b fix.** pid 68903, run `run-1792912819718598000`;
+  every slot paper, slot 3's tell unchanged.
+  - **Why.** Inside the 06:59Z and 07:14Z windows on `11a3458a`, the HL read
+    turn → first tick stamp was 63–70 µs at the median, against 1.5 µs
+    outside. The spinning ingress read a burst until its last byte.
+  - **The fix:** inside the window each drive step reads once
+    (`core_net::fill_rx_once`). Branch G38 `df78628d` carries it; it is not
+    deployed.
+  - **After it** (the 07:29Z window): 2.8 µs at the median (1.3 / 8.4 µs at
+    p10 / p90); the engine's pickup in the window 0.29 µs p50, 5.4 µs p99.
+  - **Check:** vault `research/t2t/rx_lag_turns.py <run>/hl-ticks.pmlr
+    <wall−mono ns> HH:MM:28 HH:MM:58`.
 
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
