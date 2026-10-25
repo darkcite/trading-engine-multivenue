@@ -1423,13 +1423,37 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // the build loudly if that drifts.
     const _: () = assert!(NUM_TICK_LANES == 10 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
 
-    struct NoopStrat;
-    impl StrategyCounters for NoopStrat {}
-    impl Strategy for NoopStrat {
+    // T2T T0: the member submits the paper arm's post-only bid from its
+    // tick callback, so the engine's own submit path — the stage stamps,
+    // the per-order record and the intent capture — runs inside the
+    // measured window. The priming ticks (venue_seq < 100) do not bid.
+    struct BidStrat {
+        hl_sym: core_types::SymbolId,
+    }
+    impl StrategyCounters for BidStrat {}
+    impl Strategy for BidStrat {
         fn on_start<C: Ctx>(&mut self, _c: &mut C) -> Result<(), StrategyError> {
             Ok(())
         }
-        fn on_tick<C: Ctx>(&mut self, _t: &core_types::Tick, _c: &mut C) {}
+        fn on_tick<C: Ctx>(&mut self, t: &core_types::Tick, c: &mut C) {
+            if t.venue_seq < 100 {
+                return;
+            }
+            // Stamped 0, as the paper arm's queue law was pinned with.
+            let mut bid = core_types::Order::new(
+                0,
+                VenueId::Hyperliquid,
+                self.hl_sym,
+                core_types::Side::Bid,
+                0,
+                Price::from_raw(100_000_000),
+                Qty::from_raw(1_000_000),
+                u64::from(t.venue_seq - 99),
+            )
+            .with_post_only();
+            bid.strategy_id = 6;
+            assert!(c.submit(bid).is_ok());
+        }
         fn on_signal<C: Ctx>(&mut self, _s: &core_types::Signal, _c: &mut C) {}
         fn on_fill<C: Ctx>(&mut self, _f: &core_types::Fill, _c: &mut C) {}
         fn on_timer<C: Ctx>(&mut self, _n: core_time::NsTs, _c: &mut C) {}
@@ -1524,8 +1548,9 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (mut oe_p, oe_c) =
         Ring::<core_types::OrderEvent, { core_types::ORDER_EVENT_RING_SIZE }>::new().split();
 
+    let hl_sym = core_types::make_symbol_id(VenueId::Hyperliquid, 1);
     let mut eng = Engine::new(
-        NoopStrat,
+        BidStrat { hl_sym },
         PaperDispatcher::new(),
         [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9],
         [e0, e1, e2, e3, e4, e5, e6, e7, e8, e9],
@@ -1552,12 +1577,29 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         )
         .unwrap(),
     );
+    // T2T T0: the per-order latency record and the intent capture ride
+    // the member's submit inside the window.
+    eng.set_latency_capture(
+        core_io::SlotCapture::open(
+            ev_dir.join(engine::ENGINE_LATENCY_FILE),
+            core_io::SlotKind::Latency,
+            1,
+        )
+        .unwrap(),
+    );
+    eng.set_order_capture(
+        core_io::SlotCapture::open(
+            ev_dir.join(engine::ENGINE_ORDERS_FILE),
+            core_io::SlotKind::Order,
+            1,
+        )
+        .unwrap(),
+    );
     // XMM XH2: the paper arm's queue law on a tracked Hyperliquid perp —
     // each iteration a post-only bid lands on the print that goes
     // through it, so the dispatcher's order-event pump runs its `true`
     // arm (RESTING, FILLED) and the fill pump its queue fill, inside the
     // measured window.
-    let hl_sym = core_types::make_symbol_id(VenueId::Hyperliquid, 1);
     eng.dispatcher_mut().track_queue_sym(hl_sym);
     eng.start().unwrap();
 
@@ -1582,16 +1624,21 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         // Push one tick + one funding event, drain both (WS10-A: the
         // event-lane push + `on_venue_event` drain ride the same
         // 0 B/op assertion).
-        assert!(pm_p.try_push_ref(&Tick::new(
-            (i as u64) * 1000,
-            VenueId::Polymarket,
-            1,
-            i + 100,
-            Price::from_raw(0),
-            Qty::from_raw(0),
-            Price::from_raw(0),
-            Qty::from_raw(0),
-        )));
+        // T2T T0: a stamped read turn 250 ns before the tick (none at
+        // i = 0, whose stamp is 0), so the parse stage records too.
+        assert!(pm_p.try_push_ref(
+            &Tick::new(
+                (i as u64) * 1000,
+                VenueId::Polymarket,
+                1,
+                i + 100,
+                Price::from_raw(0),
+                Qty::from_raw(0),
+                Price::from_raw(0),
+                Qty::from_raw(0),
+            )
+            .with_rx_ns(((i as u64) * 1000).saturating_sub(250))
+        ));
         assert!(ev2_p.try_push_ref(&core_types::ChannelEvent::new(
             (i as u64) * 1000,
             VenueId::Okx,
@@ -1603,19 +1650,6 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
             0,
         )));
         assert!(d0_p.try_push_ref(&core_types::DepthTopK::EMPTY));
-        let mut bid = core_types::Order::new(
-            0,
-            VenueId::Hyperliquid,
-            hl_sym,
-            core_types::Side::Bid,
-            0,
-            Price::from_raw(100_000_000),
-            Qty::from_raw(1_000_000),
-            u64::from(i) + 1,
-        )
-        .with_post_only();
-        bid.strategy_id = 6;
-        eng.dispatcher_mut().submit(&bid).unwrap();
         assert!(tr_p.try_push_ref(&core_types::TradePrint::new(
             (i as u64) * 1000,
             VenueId::Hyperliquid,
@@ -1638,7 +1672,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         )));
         // Budget 2: one record per lane, and the paper arm's two events.
         eng.tick(2);
-        acc = acc.wrapping_add(eng.ingest_p50_ns());
+        acc = acc.wrapping_add(eng.stage_lat(engine::LatStage::Ingest).percentile(0.50));
     }
     std::hint::black_box(acc);
     assert_eq!(eng.events_dispatched, 10_000, "event lane drained");
@@ -1662,6 +1696,13 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         "every drained order event staged, once"
     );
     assert_eq!(eng.event_capture_io_errors(), 0);
+    // T2T T0: one record and one intent per bid, every stage sampled.
+    assert_eq!(eng.latency_capture_records(), 10_000);
+    assert_eq!(eng.latency_capture_io_errors(), 0);
+    assert_eq!(eng.order_capture_records(), 10_000);
+    assert_eq!(eng.stage_lat(engine::LatStage::Parse).count(), 9_999);
+    assert_eq!(eng.stage_lat(engine::LatStage::Member).count(), 10_000);
+    assert_eq!(eng.stage_lat(engine::LatStage::Route).count(), 10_000);
     drop(eng);
     let _ = std::fs::remove_dir_all(&ev_dir);
 }

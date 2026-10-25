@@ -20,9 +20,9 @@
 //!
 //! ## Capacity
 //!
-//! `MAX_COUNTERS = 768` / `MAX_GAUGES = 640` (Phase 8a headroom for
+//! `MAX_COUNTERS = 768` / `MAX_GAUGES = 768` (Phase 8a headroom for
 //! five venues' loss-accounting counters and per-bucket gauges, raised
-//! at E7, at XMM XH4f and at PM15-2).
+//! at E7, at XMM XH4f, at PM15-2 and, gauges, at T2T T0).
 //! Still fixed arrays, still lock-free; raising further is a const
 //! change + recompile.
 

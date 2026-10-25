@@ -5811,6 +5811,15 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // T2T T0: the per-order latency capture beside them — the same stance.
+    let obs = match cli::open_latency_capture(&run_dir, epoch_ns) {
+        Ok(cap) => obs.with_latency_capture(cap),
+        Err(e) => {
+            error!(error = ?e, dir = %run_dir.display(), "latency capture open failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
 
     // -- Main thread: real engine loop until SIGINT --
     // HK6: the captures are open — the run directory stays from here on.

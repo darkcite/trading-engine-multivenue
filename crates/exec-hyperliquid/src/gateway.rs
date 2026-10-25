@@ -2733,9 +2733,13 @@ impl HlGateway {
             self.rt.fail_all(id, EV_REJECTED, REASON_LOCAL, now);
             return;
         };
-        let written = now_ns();
         match self.conns[a].send(&self.tx[start..ROOM + s.ws_len]) {
             Ok(()) => {
+                // T2T T0: stamped once the socket took the frame — rustls'
+                // seal and `write(2)` included. It was taken before the
+                // send, so `push_to_write` (and `post_rtt`'s origin) left out
+                // ~15 µs a post on the Mac (the t2t harness, 2026-10-25).
+                let written = now_ns();
                 self.conns[a].note_post();
                 if k != CLASS_READ {
                     self.rt.stats.note_action_sent();

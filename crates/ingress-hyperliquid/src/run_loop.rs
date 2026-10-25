@@ -244,6 +244,10 @@ pub struct Driver {
     expected_accept_val: [u8; 28],
     last_activity_ns: u64,
     mask_counter: u64,
+    /// T2T T0: `now_ns()` at the top of the current read turn
+    /// ([`drive_one`]); every tick parsed in the turn carries its lag from
+    /// here (`Tick::rx_lag_ns`). 0 before the first turn.
+    turn_ns: u64,
 
     /// Boot-built `coin → SymbolId` map (venue-namespaced ids).
     coins: HlCoinTable,
@@ -362,6 +366,7 @@ impl Driver {
             sec_key,
             expected_accept_val: accept,
             last_activity_ns: 0,
+            turn_ns: 0,
             mask_counter: 0,
             coins,
             subs: SubTable::new(),
@@ -668,6 +673,9 @@ pub fn drive_one<T: Transport, C: Capture>(
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<bool> {
+    // T2T T0: the turn's stamp precedes the read, so a tick's lag holds
+    // the read (and its TLS decrypt) as well as the deframe and the parse.
+    drv.turn_ns = now_ns();
     flush_tx(transport, drv)?;
     let fill = core_net::fill_rx(transport, &mut drv.rx)?;
 
@@ -1814,7 +1822,8 @@ fn handle_data_frame<C: Capture>(
                                                 Qty::from_raw(c.ask_qty_1e6),
                                                 venue_time_ms,
                                                 flags,
-                                            );
+                                            )
+                                            .with_rx_ns(drv.turn_ns);
                                             let mut paired = false;
                                             if let Some((o, osym)) = pair {
                                                 if other.seen != 0 && o < HL_MAX_COINS {
@@ -1830,7 +1839,8 @@ fn handle_data_frame<C: Capture>(
                                                         Qty::from_raw(c2.ask_qty_1e6),
                                                         venue_time_ms,
                                                         flags,
-                                                    );
+                                                    )
+                                                    .with_rx_ns(drv.turn_ns);
                                                     paired = true;
                                                 }
                                             }
@@ -1881,7 +1891,8 @@ fn handle_data_frame<C: Capture>(
                                             Qty::from_raw(f.ask_qty_1e6),
                                             venue_time_ms,
                                             (judged.stale as u8) * TICK_FLAG_STALE,
-                                        );
+                                        )
+                                        .with_rx_ns(drv.turn_ns);
                                         Dispatch::Bbo
                                     }
                                     None => Dispatch::Nothing,
@@ -1977,7 +1988,8 @@ fn handle_data_frame<C: Capture>(
                                             Qty::from_raw(f.best_ask_sz_1e6),
                                             venue_time_ms,
                                             (judged.stale as u8) * TICK_FLAG_STALE,
-                                        );
+                                        )
+                                        .with_rx_ns(drv.turn_ns);
                                     }
                                     Dispatch::L2Book {
                                         coin_idx: coin_idx as u8,

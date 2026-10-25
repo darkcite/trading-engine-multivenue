@@ -6,6 +6,43 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-25 — T2T T0: `Tick.rx_lag_ns`, `engine-latency.pmlr` and the stage gauges
+
+**What changed** (plan `t2t-plan-2026-10-25`, T0: measure, no behaviour change)
+- `Tick` bytes 52..56 (explicit zeroed pad until now) carry `rx_lag_ns`: ns
+  from the Hyperliquid ingress read turn that delivered the frame to the
+  tick's `ts_ns` (decrypt, deframe, parse). Every other venue writes 0. The
+  pad shrinks to bytes 50..52. The PMLR header version stays 3: a reader
+  that ignores the field is unaffected, and every older capture reads 0
+  (not measured).
+- A new engine-thread capture `engine-latency.pmlr`, PMLR `slot_kind = 10`
+  (`T2tRecord`, docs/wire-format.md): one record per accepted order, with
+  `submit_ns` at offset 0 like every slot kind, so `window_root` cuts it by
+  time as it does every file.
+- `/metrics`: `engine_latency_<stage>_{p50,p99,p999,max}_ns` for the stages
+  parse, ingest, member, decide, route and ack (24 gauges); the six
+  existing `engine_latency_{ingest,decide,ack}_{p50,p99}_ns` keep their
+  names and meaning. New `engine_latency_capture_{io_errors,records}`.
+  `member` (the engine's pop → `ctx.submit`) is the member alone; `decide`
+  starts at the order's own stamp, which bin15 takes from the tick, so for
+  it `decide` spans the ring as well.
+- `core_metrics::MAX_GAUGES` 640 → 768: the worst-case registry (every
+  slot live, both gateway arms) sat at 638 and the stage family adds 20.
+  The registry grows 16 KiB (196 672 B).
+- The HL gateway's `push_to_write` (`engine_exec_hlgw_push_to_write_p99_ns`)
+  and the origin of its `post_rtt` are now stamped after the socket took the
+  frame. They were stamped before rustls' seal and `write(2)`, which the t2t
+  harness measures at ~15 µs a post on the Mac: a reading taken before this
+  binary is that much low.
+- `/state` is unchanged.
+
+**Readers**
+- `claude_worker.pmlr.Reader` refuses kind 10 (it refuses every kind it
+  has no accessor for); the generic tools (`window_root`, `archive`) read
+  any 64 B kind with its stamp at offset 0 and need no change.
+- The hgrm dump (`write_latency_hgrm`) gains `engine.read_to_tick`,
+  `engine.pop_to_submit` and `engine.submit_to_routed`.
+
 ## 2026-10-19 — PMJ J10: `audit-pnl` settles Polymarket's rolling windows and charges their p-dependent fee
 
 **What changed** (ruling R-PMJ-S42; risk-policy "PMJ — slot 11", `### J10`)

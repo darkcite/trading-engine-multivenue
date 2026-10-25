@@ -408,7 +408,13 @@ pub struct Tick {
     pub flags: u8,
     /// Explicit padding — [`AsBytes`] requires every byte of the 64 B
     /// slot to be initialized. Always zero.
-    _pad: [u8; 6],
+    _pad: [u8; 2],
+    /// T2T T0 (2026-10-25): ns from the ingress read turn that delivered
+    /// this quote's frame to `ts_ns` — the read, the TLS decrypt, the
+    /// WebSocket deframe and the parse, plus any frame parsed ahead of it
+    /// in the same turn. 0 = not measured (every venue but Hyperliquid,
+    /// tests, replay). Saturates at `u32::MAX` (~4.3 s).
+    pub rx_lag_ns: u32,
     /// Venue timestamp of the quote in ms (venue clock); 0 = unknown
     /// (v2 captures, and venues whose stream carries no stamp).
     pub venue_time_ms: u64,
@@ -426,7 +432,8 @@ impl Tick {
         ask_qty: Qty::from_raw(0),
         venue: 0,
         flags: 0,
-        _pad: [0; 6],
+        _pad: [0; 2],
+        rx_lag_ns: 0,
         venue_time_ms: 0,
     };
 }
@@ -481,9 +488,23 @@ impl Tick {
             ask_qty,
             venue: venue as u8,
             flags,
-            _pad: [0; 6],
+            _pad: [0; 2],
+            rx_lag_ns: 0,
             venue_time_ms,
         }
+    }
+
+    /// T2T T0: stamp [`Self::rx_lag_ns`] from the read turn's `rx_ns`
+    /// (`ts_ns − rx_ns`, saturating). `rx_ns == 0` (no read turn known)
+    /// leaves it 0, so a caller without a turn never records a lag.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_rx_ns(mut self, rx_ns: NsTs) -> Self {
+        let lag = self.ts_ns.saturating_sub(rx_ns);
+        let keep = (rx_ns != 0) as u64;
+        let lag = lag * keep;
+        self.rx_lag_ns = if lag > u32::MAX as u64 { u32::MAX } else { lag as u32 };
+        self
     }
 
     /// True when the producing ingress flagged this quote stale
@@ -1532,6 +1553,86 @@ const _: () = assert!(core::mem::offset_of!(ExecRecord, slot) == 63);
 // a multiple of its alignment) — no compiler-inserted padding, every byte
 // initialized.
 unsafe impl AsBytes for ExecRecord {}
+
+/// **T2T T0 — one order's in-process path, engine side**
+/// (`engine-latency.pmlr`, slot kind `Latency`). The engine stamps one for
+/// every order a dispatcher takes, in `EngineCtx::submit`. Monotonic ns on
+/// the engine's clock; a 0 stamp was not measured. 64 B, no heap, no
+/// destructor.
+///
+/// The stages, in order: `rx_ns` → `tick_ns` is the ingress parse (the read
+/// turn to the tick's stamp); → `deq_ns` the ring and the engine's pop;
+/// → `submit_ns` the member; → `routed_ns` the dispatcher (live: the
+/// router's clamps and the arm's ring push; paper: the paper book).
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct T2tRecord {
+    /// `EngineCtx::submit` entry — at offset 0, every captured slot's
+    /// ordering key (the engine thread appends in submit order).
+    pub submit_ns: NsTs,
+    /// The order's client id.
+    pub client_oid: u64,
+    /// The ingress read turn that delivered the triggering tick's frame
+    /// (`Tick::ts_ns - Tick::rx_lag_ns`); 0 when the callback was not a
+    /// tick or its venue does not stamp the read.
+    pub rx_ns: NsTs,
+    /// The triggering tick's `ts_ns`; 0 when the callback was not a tick.
+    pub tick_ns: NsTs,
+    /// The engine's clock at the pop of the item the callback ran on.
+    pub deq_ns: NsTs,
+    /// The dispatcher returned, having taken the order.
+    pub routed_ns: NsTs,
+    /// The order's own stamp (`Order::ts_ns`, the member's choice).
+    pub order_ns: NsTs,
+    /// The order's symbol.
+    pub sym: SymbolId,
+    /// The order's venue.
+    pub venue: u8,
+    /// The order's strategy slot.
+    pub strategy_id: u8,
+    /// Explicit padding — [`AsBytes`] needs every byte initialized.
+    /// Always zero.
+    _pad: [u8; 2],
+}
+
+impl T2tRecord {
+    /// The record of `o`, from the five stamps the engine took around it.
+    #[inline(always)]
+    #[must_use]
+    pub const fn of(
+        o: &Order,
+        rx_ns: NsTs,
+        tick_ns: NsTs,
+        deq_ns: NsTs,
+        submit_ns: NsTs,
+        routed_ns: NsTs,
+    ) -> Self {
+        Self {
+            submit_ns,
+            client_oid: o.client_oid,
+            rx_ns,
+            tick_ns,
+            deq_ns,
+            routed_ns,
+            order_ns: o.ts_ns,
+            sym: o.sym,
+            venue: o.venue,
+            strategy_id: o.strategy_id,
+            _pad: [0; 2],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<T2tRecord>() == 64);
+const _: () = assert!(core::mem::align_of::<T2tRecord>() == 64);
+const _: () = assert!(core::mem::offset_of!(T2tRecord, submit_ns) == 0);
+const _: () = assert!(core::mem::offset_of!(T2tRecord, sym) == 56);
+const _: () = assert!(core::mem::offset_of!(T2tRecord, strategy_id) == 61);
+
+// SAFETY: T2tRecord is `#[repr(C, align(64))]`, `#[derive(Copy)]`, plain
+// integers and an explicit `_pad` that together fill all 64 bytes (the
+// asserts above pin the layout), so every byte is initialized.
+unsafe impl AsBytes for T2tRecord {}
 
 // ---------------------------------------------------------------
 // ChannelEvent — non-tick channel capture slot (Phase 8e, §6.5)
@@ -5017,6 +5118,62 @@ mod tests {
         assert_eq!(&bytes[50..56], &[0u8; 6]);
         assert_eq!(&bytes[56..64], &1_700_000_000_123u64.to_le_bytes());
         assert_eq!(bytes[49], 3);
+    }
+
+    #[test]
+    fn rx_lag_sits_in_the_old_pad_and_measures_the_read_turn() {
+        // T2T T0: bytes 52..56 of the v3 pad carry the lag; 50..52 stay pad.
+        let t = Tick::new_stamped(
+            10_000,
+            VenueId::Hyperliquid,
+            2,
+            3,
+            Price::from_raw(4),
+            Qty::from_raw(5),
+            Price::from_raw(6),
+            Qty::from_raw(7),
+            1_700_000_000_123,
+            0,
+        )
+        .with_rx_ns(9_250);
+        let base = &t as *const Tick as usize;
+        assert_eq!(&t.rx_lag_ns as *const _ as usize - base, 52);
+        assert_eq!(t.rx_lag_ns, 750);
+        // SAFETY: Tick is AsBytes (see the v3 layout test above).
+        let bytes: [u8; 64] = unsafe { ::core::mem::transmute(t) };
+        assert_eq!(&bytes[50..52], &[0u8; 2]);
+        assert_eq!(&bytes[52..56], &750u32.to_le_bytes());
+        // An unstamped read turn is "not measured", never a lag of ts_ns.
+        assert_eq!(t.with_rx_ns(0).rx_lag_ns, 0);
+        // A read after the stamp (another clock) cannot go negative.
+        assert_eq!(t.with_rx_ns(20_000).rx_lag_ns, 0);
+        // Past u32 it saturates (~4.3 s).
+        let mut late = t;
+        late.ts_ns = 10_000_000_000;
+        assert_eq!(late.with_rx_ns(1).rx_lag_ns, u32::MAX);
+    }
+
+    #[test]
+    fn a_t2t_record_carries_the_order_and_the_engine_stamps() {
+        let mut o = Order::new(
+            77,
+            VenueId::Hyperliquid,
+            make_symbol_id(VenueId::Hyperliquid, 9),
+            Side::Bid,
+            1,
+            Price::from_raw(950_000),
+            Qty::from_raw(250_000_000),
+            4_242,
+        );
+        o.strategy_id = 3;
+        let r = T2tRecord::of(&o, 10, 20, 30, 40, 50);
+        assert_eq!((r.submit_ns, r.client_oid), (40, 4_242));
+        assert_eq!((r.rx_ns, r.tick_ns, r.deq_ns, r.routed_ns, r.order_ns), (10, 20, 30, 50, 77));
+        assert_eq!((r.sym, r.venue, r.strategy_id), (o.sym, o.venue, 3));
+        // SAFETY: T2tRecord is AsBytes — 64 B, every byte initialized.
+        let bytes: [u8; 64] = unsafe { ::core::mem::transmute(r) };
+        assert_eq!(&bytes[0..8], &40u64.to_le_bytes(), "the ordering key at offset 0");
+        assert_eq!(&bytes[62..64], &[0u8; 2]);
     }
 
     #[test]

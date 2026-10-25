@@ -166,6 +166,7 @@ dependencies = [
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
+ "memchr",
  "mio 0.8.11",
  "opt-registry",
  "rcgen",

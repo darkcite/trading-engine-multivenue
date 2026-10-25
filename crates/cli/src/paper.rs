@@ -48,13 +48,14 @@ use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
     make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, OptSummary, Order,
-    OrderEvent, RuleTableSlot, Signal, SlotMask, SymbolId, Tick, TradePrint, VenueId,
+    OrderEvent, RuleTableSlot, Signal, SlotMask, SymbolId, T2tRecord, Tick, TradePrint, VenueId,
     AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE,
     MAX_STRATEGY_SLOTS, OPT_RING_SIZE, RULE_TABLE_RING_SLOTS, TRADE_RING_SIZE,
 };
 use engine::{
-    Engine, ENGINE_EVENTS_FILE, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE,
-    NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE,
+    Engine, LatStage, ENGINE_EVENTS_FILE, ENGINE_FILLS_FILE, ENGINE_LATENCY_FILE,
+    ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE,
+    TICK_RING_SIZE,
 };
 use engine_snapshot::{BootInfo, EngineSnapshot, SnapshotCell, SNAPSHOT_VENUES};
 use ingress_ai::{AiCmdCapture, AiIngressCfg, RulesetSidePath};
@@ -3285,6 +3286,18 @@ pub fn open_events_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCapt
     )
 }
 
+/// T2T T0: open the engine-thread per-order latency capture
+/// (`<run_dir>/engine-latency.pmlr`, `SlotKind::Latency`). Boot-only; the
+/// bin hands the result to [`Observability::with_latency_capture`] and
+/// the engine loop takes ownership from there.
+pub fn open_latency_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCapture<T2tRecord>> {
+    SlotCapture::open(
+        run_dir.join(ENGINE_LATENCY_FILE),
+        SlotKind::Latency,
+        epoch_ns,
+    )
+}
+
 /// Parse `AI_INGRESS_HMAC_KEY` (64 hex chars) into the 32-byte HMAC
 /// key (Phase 8f §4.1). The error strings deliberately carry **no key
 /// material** — this value must never reach a log. Returns `Err` on
@@ -4593,24 +4606,25 @@ impl Observability {
             let orders_dropped = reg
                 .register_counter("engine_orders_dropped_total")
                 .map_err(|_| "register engine_orders_dropped_total")?;
-            let ingest_p50_ns = reg
-                .register_gauge("engine_latency_ingest_p50_ns")
-                .map_err(|_| "register engine_latency_ingest_p50_ns")?;
-            let ingest_p99_ns = reg
-                .register_gauge("engine_latency_ingest_p99_ns")
-                .map_err(|_| "register engine_latency_ingest_p99_ns")?;
-            let decide_p50_ns = reg
-                .register_gauge("engine_latency_decide_p50_ns")
-                .map_err(|_| "register engine_latency_decide_p50_ns")?;
-            let decide_p99_ns = reg
-                .register_gauge("engine_latency_decide_p99_ns")
-                .map_err(|_| "register engine_latency_decide_p99_ns")?;
-            let ack_p50_ns = reg
-                .register_gauge("engine_latency_ack_p50_ns")
-                .map_err(|_| "register engine_latency_ack_p50_ns")?;
-            let ack_p99_ns = reg
-                .register_gauge("engine_latency_ack_p99_ns")
-                .map_err(|_| "register engine_latency_ack_p99_ns")?;
+            // T2T T0: `engine_latency_<stage>_{p50,p99,p999,max}_ns`, every
+            // stage in path order. Boot-only: the names are formatted here.
+            let mut latency_ns = [[GaugeId::default(); LAT_QUANTILES.len()]; LatStage::ALL.len()];
+            let mut si = 0;
+            while si < LatStage::ALL.len() {
+                let mut qi = 0;
+                while qi < LAT_QUANTILES.len() {
+                    let name = format!(
+                        "engine_latency_{}_{}_ns",
+                        LatStage::ALL[si].name(),
+                        LAT_QUANTILES[qi].0
+                    );
+                    latency_ns[si][qi] = reg
+                        .register_gauge(&name)
+                        .map_err(|_| "register engine_latency_<stage>_<q>_ns")?;
+                    qi += 1;
+                }
+                si += 1;
+            }
             let strategy_hyparb = reg
                 .register_gauge("engine_strategy_hyparb_active")
                 .map_err(|_| "register engine_strategy_hyparb_active")?;
@@ -4891,6 +4905,15 @@ impl Observability {
                     .map_err(|_| "register engine_orders_capture_records")?;
                 CaptureGaugeIds { io_errors, records }
             };
+            let latency_capture = {
+                let io_errors = reg
+                    .register_gauge("engine_latency_capture_io_errors")
+                    .map_err(|_| "register engine_latency_capture_io_errors")?;
+                let records = reg
+                    .register_gauge("engine_latency_capture_records")
+                    .map_err(|_| "register engine_latency_capture_records")?;
+                CaptureGaugeIds { io_errors, records }
+            };
             let events_capture = {
                 let io_errors = reg
                     .register_gauge("engine_events_capture_io_errors")
@@ -4910,12 +4933,7 @@ impl Observability {
                 signals,
                 orders_emitted,
                 orders_dropped,
-                ingest_p50_ns,
-                ingest_p99_ns,
-                decide_p50_ns,
-                decide_p99_ns,
-                ack_p50_ns,
-                ack_p99_ns,
+                latency_ns,
                 strategy_hyparb,
                 strategy_vrp,
                 strategy_rule_tree,
@@ -4991,6 +5009,7 @@ impl Observability {
                 fills_capture,
                 orders_capture,
                 events_capture,
+                latency_capture,
                 strategy_enabled_mask,
                 vm,
                 xmm,
@@ -5157,6 +5176,10 @@ pub struct Observability {
     /// `fills_capture` (bin opens, engine loop takes ownership). `None` in
     /// tests and in tools that replay rather than run.
     pub events_capture: Option<SlotCapture<OrderEvent>>,
+    /// T2T T0: the engine-thread per-order latency capture, same lifecycle
+    /// as `fills_capture` (bin opens, engine loop takes ownership). `None`
+    /// in tests and in tools that replay rather than run.
+    pub latency_capture: Option<SlotCapture<T2tRecord>>,
     /// VRP V8a: where the VRP member's persisted state is written.
     /// `None` = no VRP member is configured, and the engine writes
     /// nothing. Set by the set builder from the boot bundle.
@@ -5266,6 +5289,13 @@ impl Observability {
         self
     }
 
+    /// Attach T2T T0's per-order latency capture. Boot-only; called from
+    /// the bin after the per-run capture directory exists.
+    pub fn with_latency_capture(mut self, cap: SlotCapture<T2tRecord>) -> Self {
+        self.latency_capture = Some(cap);
+        self
+    }
+
     /// RG6: attach the boot identity the `/state` snapshot carries.
     /// Boot-only; the bin fills it once the run directory exists.
     pub fn with_boot_info(mut self, boot: BootInfo) -> Self {
@@ -5280,6 +5310,11 @@ impl Observability {
     }
 }
 
+/// T2T T0: the quantiles every stage gauge exports, by metric suffix. A
+/// quantile of 1.0 reads the histogram's top bucket (`max_bound`).
+pub const LAT_QUANTILES: [(&str, f64); 4] =
+    [("p50", 0.50), ("p99", 0.99), ("p999", 0.999), ("max", 1.0)];
+
 /// CounterId + GaugeId handles for the engine-loop hot path. Built
 /// once at boot inside `Observability::build`.
 #[derive(Copy, Clone, Debug)]
@@ -5292,18 +5327,9 @@ pub struct EngineCounters {
     pub orders_emitted: core_metrics::CounterId,
     /// Orders the dispatcher rejected.
     pub orders_dropped: core_metrics::CounterId,
-    /// p50 ingest→strategy latency (ns).
-    pub ingest_p50_ns: core_metrics::GaugeId,
-    /// p99 ingest→strategy latency (ns).
-    pub ingest_p99_ns: core_metrics::GaugeId,
-    /// p50 strategy→submit latency (ns).
-    pub decide_p50_ns: core_metrics::GaugeId,
-    /// p99 strategy→submit latency (ns).
-    pub decide_p99_ns: core_metrics::GaugeId,
-    /// p50 submit→ack latency (ns).
-    pub ack_p50_ns: core_metrics::GaugeId,
-    /// p99 submit→ack latency (ns).
-    pub ack_p99_ns: core_metrics::GaugeId,
+    /// T2T T0: one gauge per [`LatStage`] (path order) and per
+    /// [`LAT_QUANTILES`] entry, in ns.
+    pub latency_ns: [[core_metrics::GaugeId; LAT_QUANTILES.len()]; LatStage::ALL.len()],
     /// Active-strategy indicator — hyparb (slot 0; was latency-arb
     /// before HYPARB H0).
     pub strategy_hyparb: core_metrics::GaugeId,
@@ -5482,6 +5508,10 @@ pub struct EngineCounters {
     /// (`engine_events_capture_{io_errors,records}`). Mirrored centrally
     /// from the engine loop like the fills pair.
     pub events_capture: CaptureGaugeIds,
+    /// T2T T0 capture-health gauges, the per-order latency capture
+    /// (`engine_latency_capture_{io_errors,records}`). Mirrored centrally
+    /// from the engine loop like the fills pair.
+    pub latency_capture: CaptureGaugeIds,
     /// Phase-8g §9: the set's live enable mask
     /// (`engine_strategy_enabled_mask` — the G0 demo finding: the
     /// flip was only inferable from order-flow deltas). Read via the
@@ -5528,7 +5558,8 @@ pub struct EngineCounters {
 ///
 /// `core-metrics` registers FIXED names — there is no label mechanism
 /// (`MAX_COUNTERS = 768` since PM15-2 — 640 at XMM XH4f, 512 at E7, 256 before —,
-/// `MAX_GAUGES = 640` — 512 at XH4f, 384 before —, `NAME_MAX = 63`), so the
+/// `MAX_GAUGES = 768` since T2T T0 — 640 at PM15-2, 512 at XH4f, 384 before —,
+/// `NAME_MAX = 63`), so the
 /// per-slot names are generated as whole strings at boot, one
 /// `register_counter` call each, and never formatted again. The
 /// per-slot family is registered for LIVE slots ONLY: an all-paper
@@ -9428,8 +9459,13 @@ fn fill_snapshot<S, D>(
     k.ai_dispatched = eng.ai_dispatched;
     k.ai_drain_malformed = eng.ai_drain_malformed;
 
-    out.latency.p50_ns = [eng.ingest_p50_ns(), eng.decide_p50_ns(), eng.ack_p50_ns()];
-    out.latency.p99_ns = [eng.ingest_p99_ns(), eng.decide_p99_ns(), eng.ack_p99_ns()];
+    let (ingest, decide, ack) = (
+        eng.stage_lat(LatStage::Ingest),
+        eng.stage_lat(LatStage::Decide),
+        eng.stage_lat(LatStage::Ack),
+    );
+    out.latency.p50_ns = [ingest.percentile(0.50), decide.percentile(0.50), ack.percentile(0.50)];
+    out.latency.p99_ns = [ingest.percentile(0.99), decide.percentile(0.99), ack.percentile(0.99)];
 
     out.regime = Sc::regime_counters(strat);
     out.regime_rel = Sc::regime_rel_view(strat);
@@ -10202,6 +10238,10 @@ where
     if let Some(cap) = obs.events_capture.take() {
         eng.set_event_capture(cap);
     }
+    // T2T T0: and the per-order latency capture.
+    if let Some(cap) = obs.latency_capture.take() {
+        eng.set_latency_capture(cap);
+    }
     // XMM XH4f (D11): slot 6's gateway-arm tell — what the last run left
     // unconfirmed, read back once (a gauge and an ERROR line); then written
     // anew: it stands until THIS run's shutdown confirms (`gateway_shutdown_
@@ -10507,6 +10547,7 @@ where
             eng.maybe_flush_fill_capture(now);
             eng.maybe_flush_order_capture(now);
             eng.maybe_flush_event_capture(now);
+            eng.maybe_flush_latency_capture(now);
             // F21: and the members' own persisted state, for the same
             // reason. It used to sit inside `if let (Some(reg),
             // Some(ids)) = (obs.metrics, obs.counter_ids)`, which made
@@ -10545,12 +10586,18 @@ where
                 let total_dropped = dropped;
                 let _ = total_dropped;
                 // Latency gauges are full snapshots, not deltas.
-                reg.gauge(ids.ingest_p50_ns).set(eng.ingest_p50_ns() as i64);
-                reg.gauge(ids.ingest_p99_ns).set(eng.ingest_p99_ns() as i64);
-                reg.gauge(ids.decide_p50_ns).set(eng.decide_p50_ns() as i64);
-                reg.gauge(ids.decide_p99_ns).set(eng.decide_p99_ns() as i64);
-                reg.gauge(ids.ack_p50_ns).set(eng.ack_p50_ns() as i64);
-                reg.gauge(ids.ack_p99_ns).set(eng.ack_p99_ns() as i64);
+                let mut si = 0;
+                while si < LatStage::ALL.len() {
+                    let h = eng.stage_lat(LatStage::ALL[si]);
+                    let mut qi = 0;
+                    while qi < LAT_QUANTILES.len() {
+                        let q = LAT_QUANTILES[qi].1;
+                        let v = if q >= 1.0 { h.max_bound() } else { h.percentile(q) };
+                        reg.gauge(ids.latency_ns[si][qi]).set(v as i64);
+                        qi += 1;
+                    }
+                    si += 1;
+                }
 
                 // Active-strategy gauges — flip exactly one to 1.
                 let kind = strategy_core::StrategyCounters::strategy_kind(eng.strategy());
@@ -10845,6 +10892,11 @@ where
                     .set(eng.event_capture_io_errors() as i64);
                 reg.gauge(ids.events_capture.records)
                     .set(eng.event_capture_records() as i64);
+                // T2T T0 latency capture pair — same central mirror.
+                reg.gauge(ids.latency_capture.io_errors)
+                    .set(eng.latency_capture_io_errors() as i64);
+                reg.gauge(ids.latency_capture.records)
+                    .set(eng.latency_capture_records() as i64);
 
                 // Max tick age — surfaces silenced markets.
                 reg.gauge(ids.max_tick_age_ns)
@@ -13869,6 +13921,8 @@ mod tests {
         // HK42 three gauges, the Binance options connections' own
         // (`engine_ingress_binance_options_*`). O-WSG1 two counters and ONE
         // gauge (`engine_exec_held_mask`): a gauge a slot did not fit.
+        // T2T T0 twenty gauges, the engine's stage family: measured 706 /
+        // 658 of 768 / 768 (638 before, MAX_GAUGES 640 → 768).
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");

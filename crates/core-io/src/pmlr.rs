@@ -100,6 +100,9 @@ pub enum SlotKind {
     /// [`core_types::OrderEvent`] — the order-event lane, every slot's
     /// (XMM XH5d, `engine-events.pmlr`).
     OrderEvent = 9,
+    /// [`core_types::T2tRecord`] — one order's in-process stamps, engine
+    /// side (T2T T0, `engine-latency.pmlr`).
+    Latency = 10,
 }
 
 impl SlotKind {
@@ -137,6 +140,7 @@ impl SlotKind {
             7 => Some(Self::Depth),
             8 => Some(Self::Exec),
             9 => Some(Self::OrderEvent),
+            10 => Some(Self::Latency),
             _ => None,
         }
     }
@@ -299,6 +303,8 @@ mod tests {
         // XMM XH5d: the order-event capture.
         assert_eq!(SlotKind::from_u8(9), Some(SlotKind::OrderEvent));
         assert_eq!(SlotKind::OrderEvent.slot_size(), 64);
+        assert_eq!(SlotKind::from_u8(10), Some(SlotKind::Latency));
+        assert_eq!(SlotKind::Latency.slot_size(), 64);
         assert_eq!(SlotKind::from_u8(42), None);
     }
 

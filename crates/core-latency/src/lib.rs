@@ -147,6 +147,20 @@ impl<const ROWS: usize> LatencyTracker<ROWS> {
         bucket_upper_bound::<ROWS>(limit - 1)
     }
 
+    /// T2T T0: the largest sample's bucket bound in ns (the highest
+    /// non-empty bucket's upper bound, within the 1/64 row resolution);
+    /// 0 if no samples. A read-side scan: the record path is unchanged.
+    pub fn max_bound(&self) -> u64 {
+        let mut i = ROWS * COLS_PER_ROW;
+        while i > 0 {
+            i -= 1;
+            if self.buckets[i].load(Ordering::Relaxed) != 0 {
+                return bucket_upper_bound::<ROWS>(i);
+            }
+        }
+        0
+    }
+
     /// Reset all counters. Boot-only; not zero-alloc-friendly
     /// against concurrent recorders, so caller is responsible for
     /// quiescence.
@@ -276,6 +290,20 @@ mod tests {
             "idx={idx}, expected ≥ {}",
             (24 - 1) * COLS_PER_ROW
         );
+    }
+
+    #[test]
+    fn max_bound_is_the_top_samples_bucket() {
+        let t = T::new();
+        assert_eq!(t.max_bound(), 0, "no samples");
+        t.record(1_000);
+        t.record(50);
+        let one = t.max_bound();
+        assert!((1_000..=1_023).contains(&one), "max_bound={one}");
+        t.record(70_000);
+        let top = t.max_bound();
+        assert!((70_000..=71_200).contains(&top), "max_bound={top}");
+        assert_eq!(t.percentile(1.0), top, "the same bucket as the 1.0 quantile");
     }
 
     #[test]
