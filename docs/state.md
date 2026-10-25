@@ -338,6 +338,25 @@ affected paragraph at each lane close; the superseded text goes to
   - **Retention** ran with the slot: `run-1792800679143780000` and
     `run-1792800763843085000` verified in the bucket and removed locally; it
     stopped at `run-1792814738124727000` (< 1 d).
+- **2026-10-25 06:37Z: main restarted (forced `0010` slot at 06:35Z) on
+  `11a3458a`, T2T T1** (Anton: "Go do T1"; risk-policy "T2T T1"). pid 46305,
+  run `run-1792910206673201000`. Every slot paper (`requested_mask` =
+  `enabled_mask` 2815); slot 3's tell is unchanged (`…:fresh:bound:cap0.985`).
+  - **What runs on main:** T1-b only. The HL ingress polls without
+    blocking, and the engine loop skips its yield, from 32 s to 1 s before
+    each quarter hour. The boot logs `T2T T1-b: … open_ms=32000
+    close_ms=1000 duty_ppm=34444`, and the `QoS user-interactive` lines for
+    `hyperliquid` and `engine`.
+  - **Not on main:** main has no HL gateway (0 `engine_exec_hlgw_*` rows),
+    so T1-a (the gateway's hot window), T1-c (the precomputed-nonce signer)
+    and T1-f (keep-hot) run on no engine yet. They were verified on testnet:
+    `exec-smoke` A, B and C, and the XH4g battery with 209 actions signed
+    from the pool.
+  - **The standalone** is unchanged: G30 `57bcdf6d`, pid 81287, slot 3 live.
+    T1 reaches it only on Anton's word.
+  - **Retention** ran with the slot: `run-1792814738124727000` and
+    `run-1792821034841283000` verified in the bucket and removed locally; it
+    stopped at `run-1792830884138812000` (< 1 d).
 
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
