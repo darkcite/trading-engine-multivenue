@@ -50,6 +50,9 @@ pub(crate) struct Picked {
     pub(crate) bound: Vec<Option<u16>>,
     /// The result types (`n_out` of them; empty for void).
     pub(crate) rets: Vec<TypeQ>,
+    /// `pin:02-bound-var-int-to-float` (r40): the arguments (indices into `args`) of a
+    /// type-variable row bound to `float` that are `int` — lowering widens them.
+    pub(crate) widen: Vec<usize>,
 }
 
 /// How far a candidate got (§4.5 steps 3–5).
@@ -206,6 +209,20 @@ fn instantiate(
                 ..t
             });
         }
+        // pin:02-bound-var-int-to-float (r40, CAR-R40-2) — a variable already bound to `float`
+        // (a written type argument, or an earlier argument) takes an `int` argument: the bound
+        // type stands and `conv` widens the argument, as TradingView compiles
+        // `array.new<float>(3, 0)` and `matrix.new<float>(2, 2, 0)`.
+        if let Some(b) = vars[(w - 1) as usize] {
+            if b.ty == Ty::Float && arg.ty == Ty::Int {
+                return Some(TypeQ {
+                    ty: b.ty,
+                    a: b.a,
+                    b: b.b,
+                    ..t
+                });
+            }
+        }
         let got = Bind {
             ty: arg.ty,
             a: arg.a,
@@ -236,6 +253,32 @@ fn instantiate(
         t.b = arg.b;
     }
     Some(t)
+}
+
+/// `pin:02-bound-var-int-to-float` (r40) — the `int` arguments of whole type-variable rows whose
+/// variable bound `float` (lowering converts them; pine-std reads a float element's argument in
+/// the f64 lane).
+fn widened(
+    ov: &Overload,
+    slots: &[Option<u16>],
+    args: &[Arg],
+    vars: &[Option<Bind>; 3],
+) -> Vec<usize> {
+    let ps = pine_spec::params(ov);
+    let mut out = Vec::new();
+    for (k, a) in args.iter().enumerate() {
+        let Some(p) = slots.get(k).copied().flatten() else {
+            continue;
+        };
+        let w = tv::whole(ps[p as usize].sig.tv);
+        if w == tv::NONE || a.tuple || a.t.ty != Ty::Int {
+            continue;
+        }
+        if vars[(w - 1) as usize].is_some_and(|b| b.ty == Ty::Float) {
+            out.push(k);
+        }
+    }
+    out
 }
 
 /// The cost of a conversion (§4.5 step 6, `s0`).
@@ -498,10 +541,12 @@ pub(crate) fn builtin(
             return Err(dg);
         }
         after_pick(e, ov, &b.slots, args, at, syms)?;
+        let widen = widened(ov, &b.slots, args, &vars);
         return Ok(Picked {
             ov: ov.id,
             bound: b.slots,
             rets: results(ov, &vars, j),
+            widen,
         });
     }
     // pin:02-na-v6-non-bool — W13 (contract §3.17, the v6 migration guide: "the na(), nz(), and
@@ -523,10 +568,12 @@ pub(crate) fn builtin(
             // converts the same in both dialects.
             if let Ok((_, b, vars, j)) = try_overload(ov, args, targs, Dialect::V5, rd, syms) {
                 after_pick(e, ov, &b.slots, args, at, syms)?;
+                let widen = widened(ov, &b.slots, args, &vars);
                 return Ok(Picked {
                     ov: ov.id,
                     bound: b.slots,
                     rets: results(ov, &vars, j),
+                    widen,
                 });
             }
         }

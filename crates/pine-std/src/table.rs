@@ -246,16 +246,19 @@ const fn same(a: &[u8], b: &[u8]) -> bool {
 /// entry per row — with `ar::VARIADIC` and the variadic row counted 0 when `d` has one
 /// (pin:04-arity-variadic-min0: sema's binder lets a variadic row bind no argument), and
 /// `ar::ABSENT` where the overload is not in `d`. An `abi: lowered` row's window is impl-04
-/// §3.4's: `request.security` = its synthetic rows, then `gaps`, `lookahead` (5 inputs); any
-/// other lowered row has no window spec and is `ABSENT` (pin:04-arity-lowered; `build` asserts
-/// it has no body). A row that breaks the shape the window relies on is a const-evaluation
-/// panic: the crate does not build (I2).
+/// §3.4's: `request.security` = its synthetic rows, then `gaps`, `lookahead` (5 inputs);
+/// `request.security_lower_tf` (CAR-R40-1, r40) = its synthetic rows `__key __out __ty __cap`
+/// (4 inputs); any other lowered row has no window spec and is `ABSENT` (pin:04-arity-lowered;
+/// `build` asserts it has no body). A row that breaks the shape the window relies on is a
+/// const-evaluation panic: the crate does not build (I2).
 const fn arity_of(i: usize) -> [u8; 2] {
     let s = &OVERLOADS[i];
     let ds = [Dialect::V5, Dialect::V6];
     let mut out = [ar::ABSENT; 2];
     let lowered = matches!(s.abi, Abi::Lowered);
-    if lowered && i != ov::REQUEST_SECURITY.0 as usize {
+    let sec = i == ov::REQUEST_SECURITY.0 as usize;
+    let lower_tf = i == ov::REQUEST_SECURITY_LOWER_TF.0 as usize;
+    if lowered && !sec && !lower_tf {
         return out;
     }
     let mut d = 0;
@@ -268,8 +271,7 @@ const fn arity_of(i: usize) -> [u8; 2] {
             let nm = p.name.as_bytes();
             let in_win = !lowered
                 || p.flags & pf::SYNTHETIC != 0
-                || same(nm, b"gaps")
-                || same(nm, b"lookahead");
+                || (sec && (same(nm, b"gaps") || same(nm, b"lookahead")));
             if p.versions.has(dl) && in_win {
                 assert!(!var, "a variadic row is not the dialect's last parameter");
                 if p.flags & pf::SYNTHETIC != 0 {
@@ -289,8 +291,8 @@ const fn arity_of(i: usize) -> [u8; 2] {
         if s.versions.has(dl) {
             assert!(n < ar::ABSENT as u32, "an input count does not fit 7 bits");
             assert!(
-                !lowered || (n == 5 && !var),
-                "request.security's window differs from impl-04 §3.4"
+                !lowered || (n == if sec { 5 } else { 4 } && !var),
+                "a request's window differs from impl-04 §3.4 / CAR-R40-1"
             );
             out[ar::col(dl)] = n as u8 | if var { ar::VARIADIC } else { 0 };
         } else {
@@ -2603,6 +2605,18 @@ const fn build() -> Built {
             Blk::Fixed(size_of::<crate::request::SecState>() as u32),
         ),
     );
+    // CAR-R40-1 (r40) — `request.security_lower_tf`: a collection creator reading the child.
+    put(
+        &mut b,
+        ov::REQUEST_SECURITY_LOWER_TF,
+        row(
+            ov::REQUEST_SECURITY_LOWER_TF,
+            crate::request::bi_security_lower_tf,
+            8,
+            bf::COLLECTION | bf::NEEDS_CTX | bf::POOL,
+            Blk::Coll,
+        ),
+    );
     put(
         &mut b,
         ov::REQUEST_CURRENCY_RATE,
@@ -3107,6 +3121,94 @@ const fn build() -> Built {
         ov::HLCC4_VAR,
         row(ov::HLCC4_VAR, bv::bi_hlcc4, 1, 0, Blk::None),
     );
+    // CAR-R40-2 (r40, R-P34) — matrix.* (tier 4).
+    {
+        use crate::coll::matrix as mx;
+        put(&mut b, ov::MATRIX_NEW, row(ov::MATRIX_NEW, mx::bi_matrix_new, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_ROWS, row(ov::MATRIX_ROWS, mx::bi_matrix_rows, 1, 0, Blk::None));
+        put(&mut b, ov::MATRIX_COLUMNS, row(ov::MATRIX_COLUMNS, mx::bi_matrix_columns, 1, 0, Blk::None));
+        put(&mut b, ov::MATRIX_ELEMENTS_COUNT, row(ov::MATRIX_ELEMENTS_COUNT, mx::bi_matrix_elements_count, 1, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_SQUARE, row(ov::MATRIX_IS_SQUARE, mx::bi_matrix_is_square, 1, 0, Blk::None));
+        put(&mut b, ov::MATRIX_GET, row(ov::MATRIX_GET, mx::bi_matrix_get, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_SET, row(ov::MATRIX_SET, mx::bi_matrix_set, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_FILL, row(ov::MATRIX_FILL, mx::bi_matrix_fill, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_SWAP_ROWS, row(ov::MATRIX_SWAP_ROWS, mx::bi_matrix_swap_rows, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_SWAP_COLUMNS, row(ov::MATRIX_SWAP_COLUMNS, mx::bi_matrix_swap_columns, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_REVERSE, row(ov::MATRIX_REVERSE, mx::bi_matrix_reverse, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_SORT_F, row(ov::MATRIX_SORT_F, mx::bi_matrix_sort, 4, 0, Blk::None));
+        put(&mut b, ov::MATRIX_SORT_I, row(ov::MATRIX_SORT_I, mx::bi_matrix_sort, 4, 0, Blk::None));
+        put(&mut b, ov::MATRIX_RESHAPE, row(ov::MATRIX_RESHAPE, mx::bi_matrix_reshape, 2, bf::POOL, Blk::None));
+        put(&mut b, ov::MATRIX_ADD_ROW, row(ov::MATRIX_ADD_ROW, mx::bi_matrix_add_row, 2, bf::POOL, Blk::None));
+        put(&mut b, ov::MATRIX_ADD_COL, row(ov::MATRIX_ADD_COL, mx::bi_matrix_add_col, 2, bf::POOL, Blk::None));
+        put(&mut b, ov::MATRIX_CONCAT, row(ov::MATRIX_CONCAT, mx::bi_matrix_concat, 2, bf::POOL, Blk::None));
+        put(&mut b, ov::MATRIX_COPY, row(ov::MATRIX_COPY, mx::bi_matrix_copy, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_SUBMATRIX, row(ov::MATRIX_SUBMATRIX, mx::bi_matrix_submatrix, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_ROW, row(ov::MATRIX_ROW, mx::bi_matrix_row, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_COL, row(ov::MATRIX_COL, mx::bi_matrix_col, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_REMOVE_ROW, row(ov::MATRIX_REMOVE_ROW, mx::bi_matrix_remove_row, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_REMOVE_COL, row(ov::MATRIX_REMOVE_COL, mx::bi_matrix_remove_col, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_TRANSPOSE, row(ov::MATRIX_TRANSPOSE, mx::bi_matrix_transpose, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_MIN_F, row(ov::MATRIX_MIN_F, mx::bi_matrix_min, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_MIN_I, row(ov::MATRIX_MIN_I, mx::bi_matrix_min, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_MAX_F, row(ov::MATRIX_MAX_F, mx::bi_matrix_max, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_MAX_I, row(ov::MATRIX_MAX_I, mx::bi_matrix_max, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_AVG_F, row(ov::MATRIX_AVG_F, mx::bi_matrix_avg, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_AVG_I, row(ov::MATRIX_AVG_I, mx::bi_matrix_avg, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_MEDIAN_F, row(ov::MATRIX_MEDIAN_F, mx::bi_matrix_median, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_MEDIAN_I, row(ov::MATRIX_MEDIAN_I, mx::bi_matrix_median, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_MODE_F, row(ov::MATRIX_MODE_F, mx::bi_matrix_mode, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_MODE_I, row(ov::MATRIX_MODE_I, mx::bi_matrix_mode, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_TRACE_F, row(ov::MATRIX_TRACE_F, mx::bi_matrix_trace, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_TRACE_I, row(ov::MATRIX_TRACE_I, mx::bi_matrix_trace, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_DET_F, row(ov::MATRIX_DET_F, mx::bi_matrix_det, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_DET_I, row(ov::MATRIX_DET_I, mx::bi_matrix_det, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_RANK_F, row(ov::MATRIX_RANK_F, mx::bi_matrix_rank, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_RANK_I, row(ov::MATRIX_RANK_I, mx::bi_matrix_rank, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_INV_F, row(ov::MATRIX_INV_F, mx::bi_matrix_inv, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_INV_I, row(ov::MATRIX_INV_I, mx::bi_matrix_inv, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_PINV_F, row(ov::MATRIX_PINV_F, mx::bi_matrix_pinv, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_PINV_I, row(ov::MATRIX_PINV_I, mx::bi_matrix_pinv, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_EIGENVALUES_F, row(ov::MATRIX_EIGENVALUES_F, mx::bi_matrix_eigenvalues, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_EIGENVALUES_I, row(ov::MATRIX_EIGENVALUES_I, mx::bi_matrix_eigenvalues, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_EIGENVECTORS_F, row(ov::MATRIX_EIGENVECTORS_F, mx::bi_matrix_eigenvectors, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_EIGENVECTORS_I, row(ov::MATRIX_EIGENVECTORS_I, mx::bi_matrix_eigenvectors, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_KRON_F, row(ov::MATRIX_KRON_F, mx::bi_matrix_kron, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_KRON_I, row(ov::MATRIX_KRON_I, mx::bi_matrix_kron, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_POW_F, row(ov::MATRIX_POW_F, mx::bi_matrix_pow, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_POW_I, row(ov::MATRIX_POW_I, mx::bi_matrix_pow, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_SUM_MF, row(ov::MATRIX_SUM_MF, mx::bi_matrix_sum_m, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_SUM_MI, row(ov::MATRIX_SUM_MI, mx::bi_matrix_sum_m, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_SUM_SF, row(ov::MATRIX_SUM_SF, mx::bi_matrix_sum_s, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_SUM_SI, row(ov::MATRIX_SUM_SI, mx::bi_matrix_sum_s, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_DIFF_MF, row(ov::MATRIX_DIFF_MF, mx::bi_matrix_diff_m, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_DIFF_MI, row(ov::MATRIX_DIFF_MI, mx::bi_matrix_diff_m, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_DIFF_SF, row(ov::MATRIX_DIFF_SF, mx::bi_matrix_diff_s, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_DIFF_SI, row(ov::MATRIX_DIFF_SI, mx::bi_matrix_diff_s, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_MULT_MF, row(ov::MATRIX_MULT_MF, mx::bi_matrix_mult_m, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_MULT_MI, row(ov::MATRIX_MULT_MI, mx::bi_matrix_mult_m, 8, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_MULT_SF, row(ov::MATRIX_MULT_SF, mx::bi_matrix_mult_s, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_MULT_SI, row(ov::MATRIX_MULT_SI, mx::bi_matrix_mult_s, 2, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_MULT_AF, row(ov::MATRIX_MULT_AF, mx::bi_matrix_mult_a, 4, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_MULT_AI, row(ov::MATRIX_MULT_AI, mx::bi_matrix_mult_a, 4, bf::COLLECTION | bf::POOL, Blk::Coll));
+        put(&mut b, ov::MATRIX_IS_ZERO_F, row(ov::MATRIX_IS_ZERO_F, mx::bi_matrix_is_zero, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_ZERO_I, row(ov::MATRIX_IS_ZERO_I, mx::bi_matrix_is_zero, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_BINARY_F, row(ov::MATRIX_IS_BINARY_F, mx::bi_matrix_is_binary, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_BINARY_I, row(ov::MATRIX_IS_BINARY_I, mx::bi_matrix_is_binary, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_IDENTITY_F, row(ov::MATRIX_IS_IDENTITY_F, mx::bi_matrix_is_identity, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_IDENTITY_I, row(ov::MATRIX_IS_IDENTITY_I, mx::bi_matrix_is_identity, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_DIAGONAL_F, row(ov::MATRIX_IS_DIAGONAL_F, mx::bi_matrix_is_diagonal, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_DIAGONAL_I, row(ov::MATRIX_IS_DIAGONAL_I, mx::bi_matrix_is_diagonal, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_ANTIDIAGONAL_F, row(ov::MATRIX_IS_ANTIDIAGONAL_F, mx::bi_matrix_is_antidiagonal, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_ANTIDIAGONAL_I, row(ov::MATRIX_IS_ANTIDIAGONAL_I, mx::bi_matrix_is_antidiagonal, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_SYMMETRIC_F, row(ov::MATRIX_IS_SYMMETRIC_F, mx::bi_matrix_is_symmetric, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_SYMMETRIC_I, row(ov::MATRIX_IS_SYMMETRIC_I, mx::bi_matrix_is_symmetric, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_ANTISYMMETRIC_F, row(ov::MATRIX_IS_ANTISYMMETRIC_F, mx::bi_matrix_is_antisymmetric, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_ANTISYMMETRIC_I, row(ov::MATRIX_IS_ANTISYMMETRIC_I, mx::bi_matrix_is_antisymmetric, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_TRIANGULAR_F, row(ov::MATRIX_IS_TRIANGULAR_F, mx::bi_matrix_is_triangular, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_TRIANGULAR_I, row(ov::MATRIX_IS_TRIANGULAR_I, mx::bi_matrix_is_triangular, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_STOCHASTIC_F, row(ov::MATRIX_IS_STOCHASTIC_F, mx::bi_matrix_is_stochastic, 2, 0, Blk::None));
+        put(&mut b, ov::MATRIX_IS_STOCHASTIC_I, row(ov::MATRIX_IS_STOCHASTIC_I, mx::bi_matrix_is_stochastic, 2, 0, Blk::None));
+    }
     let mut i = 0;
     while i < OVERLOAD_COUNT {
         let none = b.arity[i][0] == ar::ABSENT && b.arity[i][1] == ar::ABSENT;
@@ -3180,7 +3282,8 @@ mod tests {
         assert_eq!(a(ov::STRATEGY_ENTRY), [11, 10]);
         // impl-04 §3.4: `__key`, `__out`, `__ty`, `gaps`, `lookahead`.
         assert_eq!(a(ov::REQUEST_SECURITY), [5, 5]);
-        assert_eq!(a(ov::REQUEST_SECURITY_LOWER_TF), [ar::ABSENT; 2]);
+        // CAR-R40-1: `__key`, `__out`, `__ty`, `__cap`.
+        assert_eq!(a(ov::REQUEST_SECURITY_LOWER_TF), [4, 4]);
         assert_eq!(a(ov::TA_HIGHEST), [1, ar::ABSENT]);
         // `str.format`: its trailing arguments are variadic.
         assert_eq!(a(ov::STR_FORMAT_F)[1] & ar::VARIADIC, ar::VARIADIC);

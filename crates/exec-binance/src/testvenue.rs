@@ -888,6 +888,9 @@ pub struct VState {
     pub orders: Vec<VOrder>,
     /// The USDⓈ-M (BTCUSDT) position ×1e6.
     pub pos_1e6: i64,
+    /// RB-2 (r40): the held BTCUSDT row's `entryPrice` ×1e6 in `v2/account.status`; 0 = the
+    /// read names none (the `/fapi/v3/account` shape the WS read matches, pin:cli-pb4-entry-optional).
+    pub pos_entry_px_1e6: i64,
     /// USDⓈ-M's user-stream frames waiting to be sent.
     pub user_q: VecDeque<Vec<u8>>,
     /// COIN-M (BX7, C1): the position in contracts ×1e6, the dstream's
@@ -1311,6 +1314,7 @@ impl VState {
             hmac: None,
             orders,
             pos_1e6: 0,
+            pos_entry_px_1e6: 0,
             user_q: VecDeque::new(),
             cm_pos_1e6: 0,
             cm_user_q: VecDeque::new(),
@@ -2500,8 +2504,13 @@ impl VState {
                     String::new()
                 } else {
                     let notional = (self.pos_1e6 as i128 * PX_MARK as i128 / 1_000_000) as i64;
+                    let entry = if self.pos_entry_px_1e6 == 0 {
+                        String::new()
+                    } else {
+                        format!(r#","entryPrice":"{}""#, fx(self.pos_entry_px_1e6, 2))
+                    };
                     format!(
-                        r#"{{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"{}","unrealizedProfit":"0.00","isolatedMargin":"0","notional":"{}","isolatedWallet":"0","initialMargin":"1.00","maintMargin":"0.52","updateTime":{now}}}"#,
+                        r#"{{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"{}"{entry},"unrealizedProfit":"0.00","isolatedMargin":"0","notional":"{}","isolatedWallet":"0","initialMargin":"1.00","maintMargin":"0.52","updateTime":{now}}}"#,
                         fx(self.pos_1e6, 3),
                         fx(notional, 2)
                     )

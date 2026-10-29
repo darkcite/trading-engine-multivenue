@@ -318,11 +318,32 @@ fn synthetic_family(full: &str) -> Option<&'static [&'static str]> {
         "plot" | "plotshape" | "plotchar" | "plotarrow" | "hline" | "bgcolor" | "barcolor"
         | "fill" | "plotcandle" | "plotbar" => Some(PLOT),
         "request.security" => Some(&["__key", "__out", "__ty"]),
+        // CAR-R40-1 (r40): the request's three, then the collection capacity.
+        "request.security_lower_tf" => Some(&["__key", "__out", "__ty", "__cap"]),
         "array.new" | "array.from" | "array.copy" | "array.slice" | "array.sort_indices"
         | "map.new" | "map.copy" | "map.keys" | "map.values" | "str.split" => Some(COLL),
         // r33c (B112): an 11-level `array<float>` collection creator (impl-04 amendment, r34).
         "ta.pivot_point_levels" => Some(COLL),
         f if f.starts_with("array.new_") => Some(COLL),
+        // CAR-R40-2 (r40): the matrix creators (det / rank use their block as scratch, no
+        // synthetics).
+        "matrix.new"
+        | "matrix.copy"
+        | "matrix.submatrix"
+        | "matrix.row"
+        | "matrix.col"
+        | "matrix.remove_row"
+        | "matrix.remove_col"
+        | "matrix.transpose"
+        | "matrix.inv"
+        | "matrix.pinv"
+        | "matrix.eigenvalues"
+        | "matrix.eigenvectors"
+        | "matrix.kron"
+        | "matrix.pow"
+        | "matrix.sum"
+        | "matrix.diff"
+        | "matrix.mult" => Some(COLL),
         "str.format" | "log.info" | "log.warning" | "log.error" => Some(&["__types"]),
         _ => None,
     }

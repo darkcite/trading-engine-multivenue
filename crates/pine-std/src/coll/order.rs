@@ -162,11 +162,18 @@ fn median(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     }
     let (o, float) = numeric(f, args[0], args[1])?;
     let (_, words) = f.coll(o.owner)?;
-    let w = words_of(words, &o);
+    let v = median_words(words_of(words, &o), float, argwin::is_i64(args[1]));
+    out(f, args[1], v);
+    Ok(())
+}
+
+/// The median of element words `w` as [`median`] computes it (`int_lane`: an int on the i64
+/// lane takes the lower middle) — shared with `matrix.median` (CAR-R40-2).
+pub(super) fn median_words(w: &[u64], float: bool, int_lane: bool) -> f64 {
     let (n, lo, hi) = scan(w, float);
-    let v = if n == 0 {
+    if n == 0 {
         f64::NAN
-    } else if !float && argwin::is_i64(args[1]) {
+    } else if !float && int_lane {
         val(select(w, false, (n - 1) / 2, lo, hi), false)
     } else if n % 2 == 1 {
         val(select(w, float, n / 2, lo, hi), float)
@@ -174,9 +181,7 @@ fn median(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
         let a = val(select(w, float, n / 2 - 1, lo, hi), float);
         let b = val(select(w, float, n / 2, lo, hi), float);
         (a + b) / 2.0
-    };
-    out(f, args[1], v);
-    Ok(())
+    }
 }
 
 /// `array.mode(id)` — `[id, out]`: the most frequent non-na value; ties → the smallest (the
@@ -187,7 +192,13 @@ fn mode(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     }
     let (o, float) = numeric(f, args[0], args[1])?;
     let (_, words) = f.coll(o.owner)?;
-    let w = words_of(words, &o);
+    let v = mode_words(words_of(words, &o), float);
+    out(f, args[1], v);
+    Ok(())
+}
+
+/// The mode of element words `w` as [`mode`] computes it — shared with `matrix.mode` (CAR-R40-2).
+pub(super) fn mode_words(w: &[u64], float: bool) -> f64 {
     let (n, _, _) = scan(w, float);
     let mut seen = 0u64;
     let (mut best, mut best_c) = (0u64, 0u64);
@@ -222,13 +233,11 @@ fn mode(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
         seen += c;
         below = Some(cur);
     }
-    let v = if n == 0 {
+    if n == 0 {
         f64::NAN
     } else {
         val(unkey(best, float), float)
-    };
-    out(f, args[1], v);
-    Ok(())
+    }
 }
 
 /// `array.percentile_nearest_rank(id, percentage)` — `[id, p, out]`: the value of ordinal rank

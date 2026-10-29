@@ -543,12 +543,13 @@ fn operators_exist() {
 
 const PLOT: &[&str] = &["__plot"];
 const REQUEST: &[&str] = &["__key", "__out", "__ty"];
+const REQUEST_LOWER_TF: &[&str] = &["__key", "__out", "__ty", "__cap"];
 const COLL: &[&str] = &["__elem", "__key", "__cap"];
 const TYPES: &[&str] = &["__types"];
 
 /// impl-04 §3.4's families: (namespace, name, synthetic parameters in order). `new_*` stands for
 /// every `array.new_<type>` entry.
-const FAMILIES: [(&str, &str, &[&str]); 27] = [
+const FAMILIES: [(&str, &str, &[&str]); 45] = [
     ("", "plot", PLOT),
     ("", "plotshape", PLOT),
     ("", "plotchar", PLOT),
@@ -560,6 +561,8 @@ const FAMILIES: [(&str, &str, &[&str]); 27] = [
     ("", "plotcandle", PLOT),
     ("", "plotbar", PLOT),
     ("request", "security", REQUEST),
+    // CAR-R40-1 (r40): a request that is also a collection creator.
+    ("request", "security_lower_tf", REQUEST_LOWER_TF),
     ("array", "new", COLL),
     ("array", "new_*", COLL),
     ("array", "from", COLL),
@@ -573,6 +576,24 @@ const FAMILIES: [(&str, &str, &[&str]); 27] = [
     ("str", "split", COLL),
     // r33c (B112): `ta.pivot_point_levels` returns a new `array<float>` — a collection creator.
     ("ta", "pivot_point_levels", COLL),
+    // CAR-R40-2 (r40): the matrix creators.
+    ("matrix", "new", COLL),
+    ("matrix", "copy", COLL),
+    ("matrix", "submatrix", COLL),
+    ("matrix", "row", COLL),
+    ("matrix", "col", COLL),
+    ("matrix", "remove_row", COLL),
+    ("matrix", "remove_col", COLL),
+    ("matrix", "transpose", COLL),
+    ("matrix", "inv", COLL),
+    ("matrix", "pinv", COLL),
+    ("matrix", "eigenvalues", COLL),
+    ("matrix", "eigenvectors", COLL),
+    ("matrix", "kron", COLL),
+    ("matrix", "pow", COLL),
+    ("matrix", "sum", COLL),
+    ("matrix", "diff", COLL),
+    ("matrix", "mult", COLL),
     ("str", "format", TYPES),
     ("log", "info", TYPES),
     ("log", "warning", TYPES),

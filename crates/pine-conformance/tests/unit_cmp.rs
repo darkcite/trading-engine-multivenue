@@ -598,3 +598,80 @@ fn trades_trimmed_list_compares_the_kept_end() {
         })
     ));
 }
+
+// R-P34 (r40, 2026-10-29) — the 2-decimal fallback for trade-list money cells.
+
+#[test]
+fn money_near_is_one_printed_cent_inclusive() {
+    use pine_conformance::dec::{money_near, FALLBACK_UNIT_1E12};
+    // E133 n=8 drawdown: TV -33092.36, ours -33092.354 (0.006 off: not money_ok, money_near).
+    let tv = d("-33092.36");
+    let ours = -33_092_354_000_000_000i128;
+    assert!(!money_ok(ours, tv));
+    assert!(money_near(ours, tv));
+    // Exactly one cent is within; one 1e-12 more is not.
+    let p = -33_092_360_000_000_000i128;
+    assert!(money_near(p + FALLBACK_UNIT_1E12, tv));
+    assert!(money_near(p - FALLBACK_UNIT_1E12, tv));
+    assert!(!money_near(p + FALLBACK_UNIT_1E12 + 1, tv));
+    assert!(!money_near(p - FALLBACK_UNIT_1E12 - 1, tv));
+    // A printed `0` is `0.00`: the unit is a cent, not 1.
+    assert!(money_near(10_000_000_000, d("0")));
+    assert!(!money_near(10_000_000_001, d("0")));
+    // Overflow fails closed (pin:06-money-overflow).
+    assert!(!money_near(i128::MAX, d("1.00")));
+}
+
+#[test]
+fn trades_fallback_collects_cells_only_when_asked() {
+    use pine_conformance::trades::{compare_trades_cum, CumPnl, NearCell};
+    let syms = SymTable::new();
+    let s = SignalTable::default();
+    // Ours 1.006 against a printed 1.00: 0.006 off.
+    let a = [rec(0, 100 * 1_000_000, 1_000_000, 1_006_000_000_000, 0)];
+    let e = [row(1, 0, "100", "1.00")];
+    // Strict (`compare_trades`, or `near = None`): a divergence.
+    assert!(matches!(
+        compare_trades(&e, &a, &syms, &s, PnlBasis::Net),
+        Some(TradeDiv::Field { field: "pnl", .. })
+    ));
+    // With a collector: a pass, the cell recorded.
+    let mut near = Vec::new();
+    let got = compare_trades_cum(
+        &e,
+        &a,
+        0,
+        CumPnl::Running(0),
+        &syms,
+        &s,
+        PnlBasis::Net,
+        Some(&mut near),
+    );
+    assert_eq!(got, None);
+    assert_eq!(
+        near,
+        vec![NearCell {
+            n: 1,
+            field: "pnl",
+            expected: "1.00".into(),
+            actual: "1.006".into(),
+        }]
+    );
+    // Two cents off is a divergence even with the collector, and nothing is recorded for it.
+    let far = [rec(0, 100 * 1_000_000, 1_000_000, 1_020_000_000_000, 0)];
+    let mut near2 = Vec::new();
+    assert!(matches!(
+        compare_trades_cum(
+            &e,
+            &far,
+            0,
+            CumPnl::Running(0),
+            &syms,
+            &s,
+            PnlBasis::Net,
+            Some(&mut near2),
+        ),
+        Some(TradeDiv::Field { field: "pnl", .. })
+    ));
+    assert!(near2.is_empty());
+}

@@ -23,8 +23,10 @@ const C4_JSONL: [&str; 9] = [
     "fetchlog",
 ];
 
-/// C1–C4 over a workspace-relative `/`-separated path (§4.10): C1 a component named `corpus`
-/// (`(^|/)corpus/`), C2 `*.html.zst`, C3 `endpoints.json` / `lib.lock`, C4 the nine `.jsonl` names.
+/// C1–C5 over a workspace-relative `/`-separated path (§4.10): C1 a component named `corpus`
+/// (`(^|/)corpus/`), C2 `*.html.zst`, C3 `endpoints.json` / `lib.lock`, C4 the nine `.jsonl` names,
+/// C5 `manual.tsv` — the harvest's provenance ledger (AMEND-harvest 2026-10-29, R-P33: a ledger
+/// copied into the repo is research).
 fn is_corpus_container(rel: &str) -> bool {
     let comps: Vec<&str> = rel.split('/').collect();
     let (dirs, name) = comps.split_at(comps.len() - 1);
@@ -33,6 +35,7 @@ fn is_corpus_container(rel: &str) -> bool {
         || name.ends_with(".html.zst")
         || name == "endpoints.json"
         || name == "lib.lock"
+        || name == "manual.tsv"
         || name
             .strip_suffix(".jsonl")
             .is_some_and(|stem| C4_JSONL.contains(&stem))
@@ -134,6 +137,8 @@ fn license_gate_rules_match_the_makefile_regexes() {
         "x/index.jsonl",
         "topn-strategies.jsonl",
         "fetchlog.jsonl",
+        "manual.tsv",
+        "docs/x/harvest/manual.tsv",
     ] {
         assert!(is_corpus_container(c), "{c}");
     }
@@ -142,6 +147,8 @@ fn license_gate_rules_match_the_makefile_regexes() {
         "x/other.jsonl",
         "a.html",
         "x/corpus.rs",
+        "x/manual.tsv.example",
+        "x/libs.tsv",
     ] {
         assert!(!is_corpus_container(n), "{n}");
     }

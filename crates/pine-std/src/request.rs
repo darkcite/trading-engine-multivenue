@@ -8,7 +8,7 @@
 
 use crate::args::out1;
 use crate::sw;
-use pine_ir::{argwin, barflag, elem, FaultKind, SharedSeries, SiteId, Ty};
+use pine_ir::{argwin, barflag, elem, CollKind, FaultKind, SharedSeries, SiteId, Ty, NA_I64};
 use pine_spec::{swr, Sw};
 use pine_vm::{Frame, StateBlock};
 
@@ -182,6 +182,117 @@ pub fn bi_security(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), 
     write_typed(f, out1(args)?, ty, v)
 }
 
+/// CAR-R40-1 (r40) — the chart bar's intrabars in `s`: the index range `[lo, hi)` (oldest first)
+/// of the elements whose `open_ms` lies in `[po, pc)`. Walks back from the newest element; an
+/// element opening at or after `pc` (none on a history bar: the host steps a child only to the
+/// chart bar's close) is skipped. Nothing published → `(0, 0)`.
+///
+/// `pin:04-lower-tf-open-in-bar` — an intrabar belongs to the chart bar its open lies in (TV:
+/// "the intrabars of the chart bar"); with the clock-aligned timeframes the engine admits
+/// (`tf_on_bar_clock`) every lower-TF bar lies wholly inside one chart bar.
+#[must_use]
+pub fn intrabars(s: &SharedSeries<'_>, po: i64, pc: i64) -> (usize, usize) {
+    let n = s.values.len();
+    if n == 0 || s.open_ms.len() != n {
+        return (0, 0);
+    }
+    let mut hi = n;
+    while hi > 0 && s.open_ms[hi - 1] >= pc {
+        hi -= 1;
+    }
+    let mut lo = hi;
+    while lo > 0 && s.open_ms[lo - 1] >= po {
+        lo -= 1;
+    }
+    (lo, hi)
+}
+
+/// The series values bridged per borrow of the `Frame` (8 B each, on the stack).
+const LTF_CHUNK: usize = 64;
+
+/// One element word of an `array<elem>` from a child's plotted f64 (NaN = na): a float as its
+/// bits; int / color / enum truncated, NaN → `NA_I64`; bool `v != 0`, NaN → na (v5) or false
+/// (v6, W13 `never`).
+fn ltf_word(elem: Ty, v: f64, never: bool) -> u64 {
+    match elem {
+        Ty::Float => v.to_bits(),
+        Ty::Bool if v.is_nan() => {
+            if never {
+                0
+            } else {
+                NA_I64 as u64
+            }
+        }
+        Ty::Bool => u64::from(v != 0.0),
+        _ if v.is_nan() => NA_I64 as u64,
+        _ => (v as i64) as u64,
+    }
+}
+
+/// `request.security_lower_tf` (CAR-R40-1, r40) — window `[__key, __out, __ty, __cap, out]`
+/// (`abi: lowered`); `COLLECTION | NEEDS_CTX | POOL`. A new `array<T>` each evaluation (the
+/// site's block, as `array.new*`): element `j`'s values of the child's elements that opened inside
+/// the chart bar ([`intrabars`]), oldest first; on a realtime bar the developing intrabar is the
+/// last element (`pin:04-lower-tf-developing`). None → an empty array. More than `__cap` →
+/// `PoolFull` (§4.16.5). `string` / UDT elements never reach here (sema `3044` / `3024`).
+pub fn bi_security_lower_tf(
+    f: &mut Frame<'_>,
+    site: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    if args.len() != 5 {
+        return Err(FaultKind::Internal);
+    }
+    let key = f.i64_arg(args[0]).ok_or(FaultKind::Internal)? as u64;
+    let out = u16::try_from(f.i64_arg(args[1]).ok_or(FaultKind::Internal)?)
+        .map_err(|_| FaultKind::Internal)?;
+    let elem = f
+        .i64_arg(args[2])
+        .and_then(crate::coll::elem_ty)
+        .ok_or(FaultKind::Internal)?;
+    if matches!(elem, Ty::String | Ty::Udt) {
+        return Err(FaultKind::Internal);
+    }
+    let cap = f.i64_arg(args[3]);
+    let (po, pc) = {
+        let b = f.bar();
+        (b.open_ms, b.close_ms)
+    };
+    let (lo, hi) = match f.ctx().shared_series(key, out) {
+        None => (0, 0),
+        Some(s) => intrabars(&s, po, pc),
+    };
+    let n = u32::try_from(hi - lo).map_err(|_| FaultKind::PoolFull)?;
+    let (r, _) = crate::coll::create(f, site, CollKind::Array, elem, Ty::Void, cap, n)?;
+    let never = sw::pick(BOOL_NA, f.dialect()) == 1;
+    let mut buf = [0f64; LTF_CHUNK];
+    let mut done = 0usize;
+    while done < n as usize {
+        let m = core::cmp::min(LTF_CHUNK, n as usize - done);
+        {
+            let s = f.ctx().shared_series(key, out).ok_or(FaultKind::Internal)?;
+            let src = s
+                .values
+                .get(lo + done..lo + done + m)
+                .ok_or(FaultKind::Internal)?;
+            // COPY: 8 B × ≤ 64 per chunk — the series is lent by `Frame::ctx` and the array's
+            // storage by `Frame::coll_mut`, two borrows of the one `Frame`; the chunk bridges them
+            // — a `Frame` call lending both at once (a pine-vm contract change) rejected.
+            buf[..m].copy_from_slice(src);
+        }
+        let (_, words) = f.coll_mut(r)?;
+        let dst = words.get_mut(done..done + m).ok_or(FaultKind::Internal)?;
+        let mut k = 0usize;
+        while k < m {
+            dst[k] = ltf_word(elem, buf[k], never);
+            k += 1;
+        }
+        done += m;
+    }
+    f.set_i64_arg(args[4], Some(r.0 as i64));
+    Ok(())
+}
+
 /// `request.currency_rate(from, to[, ignore_invalid_currency])` — `[from, to, (ignore,) out]`:
 /// `1.0` when the two strings are byte-equal, else na (no FX source, §4.14.5); a na currency is
 /// na.
@@ -300,5 +411,54 @@ mod tests {
                 assert!(a.confirmed && c[a.idx] <= pc);
             }
         }
+    }
+
+    // CAR-R40-1 (r40): the intrabars of a chart bar.
+    #[test]
+    fn intrabars_are_the_elements_opening_inside_the_bar() {
+        const H: i64 = 3_600_000;
+        const M5: i64 = 300_000;
+        let mut o = [0i64; 30];
+        let mut c = [0i64; 30];
+        let v = [1.0f64; 30];
+        let mut k = 0usize;
+        while k < 30 {
+            o[k] = k as i64 * M5;
+            c[k] = o[k] + M5;
+            k += 1;
+        }
+        let s = ser(&v, &o, &c, true);
+        // The first hour holds elements 0..12, the second 12..24.
+        assert_eq!(intrabars(&s, 0, H), (0, 12));
+        assert_eq!(intrabars(&s, H, 2 * H), (12, 24));
+        // The third hour has 6 so far (a partial last chart bar).
+        assert_eq!(intrabars(&s, 2 * H, 3 * H), (24, 30));
+        // A bar before the series, and one after it: empty.
+        assert_eq!(intrabars(&s, -H, 0), (0, 0));
+        let (lo, hi) = intrabars(&s, 3 * H, 4 * H);
+        assert_eq!(lo, hi);
+        // Nothing published.
+        let e = ser(&[], &[], &[], true);
+        assert_eq!(intrabars(&e, 0, H), (0, 0));
+        // A developing last element counts when it opened inside the bar.
+        let d = ser(&v[..25], &o[..25], &c[..25], false);
+        assert_eq!(intrabars(&d, 2 * H, 3 * H), (24, 25));
+        // Lengths that disagree: nothing (the host never publishes such a series).
+        let bad = ser(&v[..3], &o[..2], &c[..3], true);
+        assert_eq!(intrabars(&bad, 0, H), (0, 0));
+    }
+
+    #[test]
+    fn lower_tf_words_follow_the_element_type() {
+        assert_eq!(ltf_word(Ty::Float, 1.5, false), 1.5f64.to_bits());
+        assert!(f64::from_bits(ltf_word(Ty::Float, f64::NAN, false)).is_nan());
+        assert_eq!(ltf_word(Ty::Int, 7.0, false), 7);
+        assert_eq!(ltf_word(Ty::Int, -3.0, false), (-3i64) as u64);
+        assert_eq!(ltf_word(Ty::Int, f64::NAN, false), NA_I64 as u64);
+        assert_eq!(ltf_word(Ty::Color, f64::NAN, true), NA_I64 as u64);
+        assert_eq!(ltf_word(Ty::Bool, 1.0, false), 1);
+        assert_eq!(ltf_word(Ty::Bool, 0.0, false), 0);
+        assert_eq!(ltf_word(Ty::Bool, f64::NAN, false), NA_I64 as u64);
+        assert_eq!(ltf_word(Ty::Bool, f64::NAN, true), 0);
     }
 }

@@ -166,9 +166,10 @@ pub const SIGNALS_TSV: &str = "tests/conformance/capture/signals.tsv";
 pub const RT_TIMEFRAME_S: u32 = 60;
 
 /// `pin:06-tv-run-tier3` (R-P5, 2026-10-17: tier 3 now) — the TradingView run compiles under
-/// [`DEFAULT_LIMITS`] with tier 3 active (`0b0111`): a tier-3 fixture is judged, never skipped.
+/// [`DEFAULT_LIMITS`] with tiers 3 and (R-P34, 2026-10-29, CAR-R40-2) 4 active (`0b1111`): a
+/// tier-3 or tier-4 fixture is judged, never skipped.
 pub const TV_LIMITS: CompileLimits = CompileLimits {
-    active_tiers: 0b0111,
+    active_tiers: 0b1111,
     ..DEFAULT_LIMITS
 };
 
@@ -1251,15 +1252,17 @@ impl Runner {
                 primary: None,
                 expectation: v,
                 fault_row: None,
+                near: Vec::new(),
             };
         }
         let r0 = self.run(f, d0);
         let fault_key = self.fault_key;
-        let done = |verdict: Verdict, expectation: Verdict, r0| Checked {
+        let done = |verdict: Verdict, expectation: Verdict, r0, near| Checked {
             verdict,
             primary: Some(r0),
             expectation,
             fault_row: fault_key,
+            near,
         };
         // A `Refuse` fixture reaches a bars skip only after it compiled: that is its failure.
         let compiled = matches!(
@@ -1270,13 +1273,19 @@ impl Runner {
         ) && matches!(f.expect, Expect::Refuse { .. });
         if let (Err(RunError::Skip(s)), false) = (&r0, compiled) {
             let v = Verdict::Skipped(s.clone());
-            return done(v.clone(), v, r0);
+            return done(v.clone(), v, r0, Vec::new());
         }
-        let exp = self.expectation(f, &r0, fault_key);
+        let mut near = Vec::new();
+        let exp = self.expectation(f, &r0, fault_key, &mut near);
         if f.dialects == Dialects::BOTH {
             let r5 = self.run(f, Dialect::V5);
             if let Some((first_row, plot)) = dialect_divergence(&r0, &r5) {
-                return done(Verdict::DialectDivergence { first_row, plot }, exp, r0);
+                return done(
+                    Verdict::DialectDivergence { first_row, plot },
+                    exp,
+                    r0,
+                    near,
+                );
             }
         }
         if let Some(code) = f.live_refuse {
@@ -1291,19 +1300,19 @@ impl Runner {
                             "live_refuse {}: v{} refused {e:?}",
                             code.0, d as u8
                         ));
-                        return done(v, exp, r0);
+                        return done(v, exp, r0, near);
                     }
                     Ok(_) => {
                         let v = fail(format!(
                             "live_refuse {}: v{} compiled live-bound",
                             code.0, d as u8
                         ));
-                        return done(v, exp, r0);
+                        return done(v, exp, r0, near);
                     }
                 }
             }
         }
-        done(exp.clone(), exp, r0)
+        done(exp.clone(), exp, r0, near)
     }
 
     fn check_parse(&mut self, f: &Fixture, d: Dialect, accept: bool) -> Verdict {
@@ -1331,11 +1340,14 @@ impl Runner {
         }
     }
 
+    /// R-P34 (r40) — `near` collects the trade-list money cells that passed on the 2-decimal
+    /// fallback (`trades::money_near`).
     fn expectation(
         &self,
         f: &Fixture,
         r: &Result<RunOutcome, RunError>,
         fault_key: Option<i64>,
+        near: &mut Vec<crate::trades::NearCell>,
     ) -> Verdict {
         match (&f.expect, r) {
             (Expect::Pending, Ok(_)) => Verdict::Pending,
@@ -1371,6 +1383,7 @@ impl Runner {
                         &o.syms,
                         &self.signals,
                         crate::trades::PnlBasis::Net,
+                        Some(near),
                     )
                 }
                 .or_else(|| {
@@ -1447,6 +1460,9 @@ pub struct Checked {
     pub expectation: Verdict,
     /// The primary run's fault row key.
     pub fault_row: Option<i64>,
+    /// R-P34 (r40) — the trade-list money cells that passed on the 2-decimal fallback (empty
+    /// unless the expectation compared a trade list).
+    pub near: Vec<crate::trades::NearCell>,
 }
 
 fn fail(what: String) -> Verdict {

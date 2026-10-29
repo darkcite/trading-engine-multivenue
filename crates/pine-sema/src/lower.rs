@@ -1474,6 +1474,25 @@ impl Lower<'_> {
         };
         let tf = text(self, tf_n);
         let (gaps, lookahead) = (flag(self, gaps_n), flag(self, look_n));
+        // CAR-R40-1 (r40): `request.security_lower_tf` — the hints are its `array<T>` results;
+        // the expression is typed by their elements.
+        let lower = crate::security::is_lower_tf(ov);
+        let ehints: Vec<TypeQ> = if lower {
+            hints
+                .iter()
+                .map(|h| match (h.ty, pine_ir::elem::as_scalar(h.a)) {
+                    (Ty::Array, Some(t)) => scalar(t, Qual::Series),
+                    (Ty::Array, None) => TypeQ {
+                        a: h.a & pine_ir::elem::DECL_MASK,
+                        ..scalar(Ty::Enum, Qual::Series)
+                    },
+                    _ => *h,
+                })
+                .collect()
+        } else {
+            hints.to_vec()
+        };
+        let hints = &ehints[..];
         let tuple = matches!(self.ast.node(e_n), Node::Tuple { .. });
         let e_region = self.regions + 1;
         let (rs, e, _) = self.region(|s| {
@@ -1506,22 +1525,37 @@ impl Lower<'_> {
                 bits,
                 valid: true,
             };
-            let out = self.temp(
-                TypeQ {
-                    qual: Qual::Series,
-                    ..t
-                },
-                at,
-            );
+            // CAR-R40-1: `request.security_lower_tf`'s window is `[__key, __out, __ty, __cap]`,
+            // its result the `array<T>` of the chart bar's elements (a collection creator site).
+            let (out_ty, args) = if lower {
+                (
+                    TypeQ::array(code, Qual::Series),
+                    vec![
+                        c(0),
+                        c(j as u64),
+                        c(u64::from(code)),
+                        c(u64::from(self.knobs.cap)),
+                    ],
+                )
+            } else {
+                (
+                    TypeQ {
+                        qual: Qual::Series,
+                        ..t
+                    },
+                    vec![
+                        c(0),
+                        c(j as u64),
+                        c(u64::from(code)),
+                        c(u64::from(gaps)),
+                        c(u64::from(lookahead)),
+                    ],
+                )
+            };
+            let out = self.temp(out_ty, at);
             self.op(Op::Call {
                 ov,
-                args: vec![
-                    c(0),
-                    c(j as u64),
-                    c(u64::from(code)),
-                    c(u64::from(gaps)),
-                    c(u64::from(lookahead)),
-                ],
+                args,
                 outs: vec![out],
                 span: at,
             });
@@ -3014,9 +3048,13 @@ impl Lower<'_> {
             for &(r, v) in given {
                 if r == row {
                     any = true;
-                    // A type-variable row takes the argument as typed.
+                    // A type-variable row takes the argument as typed — an `int` bound to a
+                    // `float` variable widened (`pin:02-bound-var-int-to-float`, r40).
                     let want = if p.sig.tv == 0 {
                         p.sig.ty
+                    } else if self.cur().widen.contains(&v) {
+                        self.ty(v)
+                            .map_or(p.sig.ty, |t| TypeQ { ty: Ty::Float, ..t })
                     } else {
                         self.ty(v).unwrap_or(p.sig.ty)
                     };

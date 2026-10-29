@@ -55,7 +55,9 @@ pub const SCREEN_LIMITS: CompileLimits = CompileLimits {
     str_scratch_bytes: 8_192,
     intent_cap: 32,
     max_frame_bytes: 64 << 20,
-    active_tiers: 0b0111, // Tiers 1–3 (R-P5, 2026-10-17: lane D's tier 3 served by pine-std)
+    // Tiers 1–4 (R-P5, 2026-10-17: lane D's tier 3 served by pine-std; R-P34, 2026-10-29:
+    // tier 4, `matrix.*`, CAR-R40-2).
+    active_tiers: 0b1111,
 };
 
 /// Most candidates one group steps per bar read (L1 interleave, §4.4).

@@ -5,7 +5,7 @@
 //! (impl-06 §3.7, §4.4.3–§4.4.4) — impl-05's conformance gate. Compare-time code: allocates only to
 //! build a divergence's text.
 
-use crate::dec::{money_ok, scaled_half_away, Dec};
+use crate::dec::{money_near, money_ok, scaled_half_away, Dec};
 use crate::fixture::{Summary, TradeRow};
 use pine_ir::{trade_flag, RunRecord, StrKey, Sym, SymTable, TradeRec};
 
@@ -88,6 +88,48 @@ pub enum TradeDiv {
         /// Ours.
         actual: String,
     },
+}
+
+/// R-P34 (r40, 2026-10-29) — a trade-list money cell (`pnl`, `cum_pnl`, `runup`, `drawdown`) that
+/// passed on the 2-decimal fallback ([`crate::dec::money_near`]): off TradingView's printed cell by
+/// more than half a printed unit, by at most one (0.01). The report lists every one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NearCell {
+    /// The export's trade number.
+    pub n: u32,
+    /// The field.
+    pub field: &'static str,
+    /// The export's text.
+    pub expected: String,
+    /// Ours, in TradingView's units.
+    pub actual: String,
+}
+
+/// A money cell: `Ok(())` when within half a printed unit, or within the 2-decimal fallback with a
+/// collector (the cell is recorded); else the divergence.
+fn money_cell(
+    n: u32,
+    name: &'static str,
+    printed: Dec,
+    ours_1e12: i128,
+    ours_text: impl FnOnce() -> String,
+    near: &mut Option<&mut Vec<NearCell>>,
+) -> Option<TradeDiv> {
+    if money_ok(ours_1e12, printed) {
+        return None;
+    }
+    if let Some(v) = near.as_deref_mut() {
+        if money_near(ours_1e12, printed) {
+            v.push(NearCell {
+                n,
+                field: name,
+                expected: printed.render(),
+                actual: ours_text(),
+            });
+            return None;
+        }
+    }
+    field(n, name, printed.render(), ours_text())
 }
 
 fn field(n: u32, field: &'static str, expected: String, actual: String) -> Option<TradeDiv> {
@@ -234,6 +276,7 @@ fn compare_one(
     syms: &SymTable,
     signals: &SignalTable,
     basis: PnlBasis,
+    near: &mut Option<&mut Vec<NearCell>>,
 ) -> Option<TradeDiv> {
     let n = e.n;
     if a.flags & trade_flag::PNL_NET == 0 {
@@ -289,26 +332,26 @@ fn compare_one(
         }
         // An open trade's P&L is marked at export time: compared on closed trades only.
         if let Some(p) = e.pnl {
-            if !money_ok(pnl_on(a, basis), p) {
-                return field(n, "pnl", p.render(), render_scaled(pnl_on(a, basis), 12));
+            let ours = pnl_on(a, basis);
+            if let Some(d) = money_cell(n, "pnl", p, ours, || render_scaled(ours, 12), near) {
+                return Some(d);
             }
         }
         if let Some(c) = e.cum_pnl {
-            if !money_ok(cum, c) {
-                return field(n, "cum_pnl", c.render(), render_scaled(cum, 12));
+            if let Some(d) = money_cell(n, "cum_pnl", c, cum, || render_scaled(cum, 12), near) {
+                return Some(d);
             }
         }
     }
-    let money = |name: &'static str, d: Option<Dec>, ours_1e6: i64| -> Option<TradeDiv> {
+    let mut money = |name: &'static str, d: Option<Dec>, ours_1e6: i64| -> Option<TradeDiv> {
         let d = d?;
-        if money_ok(e6_to_e12(ours_1e6), d) {
-            None
-        } else {
-            field(n, name, d.render(), render_scaled(i128::from(ours_1e6), 6))
-        }
+        let text = || render_scaled(i128::from(ours_1e6), 6);
+        money_cell(n, name, d, e6_to_e12(ours_1e6), text, near)
     };
-    money("runup", e.runup, a.max_runup_1e6)
-        .or_else(|| money("drawdown", e.drawdown, adverse_signed(a.max_drawdown_1e6)))
+    if let Some(d) = money("runup", e.runup, a.max_runup_1e6) {
+        return Some(d);
+    }
+    money("drawdown", e.drawdown, adverse_signed(a.max_drawdown_1e6))
 }
 
 /// The trades TradingView kept after trimming, against the broker's retained ones (CI-029, E109).
@@ -337,11 +380,17 @@ pub fn compare_trades_kept(
         syms,
         signals,
         basis,
+        None,
     )
 }
 
 /// [`compare_trades_kept`] with the expected `cum_pnl` formed as `cum` says: `actual` is
 /// closed-then-open, so closed trade `i` is `actual[i]` and `CumPnl::Recorded(v)[i]`'s.
+///
+/// R-P34 (r40) — with `near = Some(v)` a money cell off by more than half a printed unit and at most
+/// one (0.01) passes and is pushed to `v` (the 2-decimal fallback); `None` is the strict §4.4.4
+/// comparison.
+#[allow(clippy::too_many_arguments)]
 pub fn compare_trades_cum(
     expected: &[TradeRow],
     actual: &[TradeRec],
@@ -350,6 +399,7 @@ pub fn compare_trades_cum(
     syms: &SymTable,
     signals: &SignalTable,
     basis: PnlBasis,
+    mut near: Option<&mut Vec<NearCell>>,
 ) -> Option<TradeDiv> {
     let (cum_seed, recorded) = match cum {
         CumPnl::Running(seed) => (seed, None),
@@ -375,7 +425,7 @@ pub fn compare_trades_cum(
             Some(r) if a.flags & trade_flag::OPEN == 0 => *r,
             _ => cum,
         };
-        if let Some(d) = compare_one(&expected[i], a, at, syms, signals, basis) {
+        if let Some(d) = compare_one(&expected[i], a, at, syms, signals, basis, &mut near) {
             first = Some((i, d));
             break;
         }

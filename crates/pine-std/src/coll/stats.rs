@@ -29,7 +29,7 @@ fn array(f: &Frame<'_>, e: u16) -> Result<Owned, FaultKind> {
 }
 
 /// Floats ascending: na last; `−0.0` before `+0.0` (`total_cmp`, `pin:04-collection-edges`).
-fn f_asc(a: &u64, b: &u64) -> Ordering {
+pub(super) fn f_asc(a: &u64, b: &u64) -> Ordering {
     let (x, y) = (f64::from_bits(*a), f64::from_bits(*b));
     match (x.is_nan(), y.is_nan()) {
         (true, true) => Ordering::Equal,
@@ -40,7 +40,7 @@ fn f_asc(a: &u64, b: &u64) -> Ordering {
 }
 
 /// Floats descending: na first.
-fn f_desc(a: &u64, b: &u64) -> Ordering {
+pub(super) fn f_desc(a: &u64, b: &u64) -> Ordering {
     let (x, y) = (f64::from_bits(*a), f64::from_bits(*b));
     match (x.is_nan(), y.is_nan()) {
         (true, true) => Ordering::Equal,
@@ -53,7 +53,7 @@ fn f_desc(a: &u64, b: &u64) -> Ordering {
 const NA: u64 = NA_I64 as u64;
 
 /// Ints ascending: na last.
-fn i_asc(a: &u64, b: &u64) -> Ordering {
+pub(super) fn i_asc(a: &u64, b: &u64) -> Ordering {
     match (*a == NA, *b == NA) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,
@@ -63,7 +63,7 @@ fn i_asc(a: &u64, b: &u64) -> Ordering {
 }
 
 /// Ints descending: na first.
-fn i_desc(a: &u64, b: &u64) -> Ordering {
+pub(super) fn i_desc(a: &u64, b: &u64) -> Ordering {
     match (*a == NA, *b == NA) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Less,

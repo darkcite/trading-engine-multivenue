@@ -1553,6 +1553,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pine-corpus"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "pine-ir",
+ "pine-lang",
+ "pine-spec",
+ "proptest",
+]
+
+[[package]]
 name = "pine-ir"
 version = "0.1.0"
 

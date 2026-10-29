@@ -28,10 +28,10 @@ use pine_ir::{
 };
 use pine_sema::LibCache;
 
-/// `CompileLimits::active_tiers`: Tiers 1–3 (operator ruling R-P5, 2026-10-17: array, map and
-/// UDT methods incl. the 2026 UDT `sort` / `sort_indices` / `binary_search*` by field; matrix,
-/// Tier 4, stays off until the harvest shows demand). The literal impl-06 uses.
-pub(crate) const ACTIVE_TIERS: u8 = 0b0111;
+/// `CompileLimits::active_tiers`: Tiers 1–4 (operator ruling R-P5, 2026-10-17: array, map and
+/// UDT methods incl. the 2026 UDT `sort` / `sort_indices` / `binary_search*` by field; ruling
+/// R-P34, 2026-10-29: matrix, Tier 4, now — CAR-R40-2). The literal impl-06's TV run uses.
+pub(crate) const ACTIVE_TIERS: u8 = 0b1111;
 
 /// One script after steps 1–8: a verified program and its chart facts.
 pub(crate) struct LoadedScript {

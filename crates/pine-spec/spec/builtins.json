@@ -20516,7 +20516,73 @@
       "decline": "",
       "type_name": false,
       "doc": "Inserts a new column at the `column` index of the `id` matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_ADD_COL",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            },
+            {
+              "name": "array_id",
+              "ty": "array<T>",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "call",
+          "bf": [
+            "pool"
+          ],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20527,7 +20593,73 @@
       "decline": "",
       "type_name": false,
       "doc": "Inserts a new row at the `row` index of the `id` matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_ADD_ROW",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "row",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            },
+            {
+              "name": "array_id",
+              "ty": "array<T>",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "call",
+          "bf": [
+            "pool"
+          ],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20538,7 +20670,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function calculates the average of all elements in the matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_AVG_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_AVG_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20549,7 +20746,86 @@
       "decline": "",
       "type_name": false,
       "doc": "The function creates a one-dimensional array from the elements of a matrix column.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_COL",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "array<T>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20560,7 +20836,49 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns the number of columns in the matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_COLUMNS",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20571,7 +20889,60 @@
       "decline": "",
       "type_name": false,
       "doc": "The function appends the `m2` matrix to the `m1` matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_CONCAT",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id1",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<T>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "pool"
+          ],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20582,7 +20953,79 @@
       "decline": "",
       "type_name": false,
       "doc": "The function creates a new matrix which is a copy of the original.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_COPY",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<T>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20593,7 +21036,78 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns the [determinant](https://en.wikipedia.org/wiki/Determinant) of a square matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_DET_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_DET_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20604,7 +21118,284 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns a new matrix resulting from the subtraction between matrices `id1` and `id2`, or of matrix `id1` and an `id2` scalar (a numerical value).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_DIFF_MF",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_DIFF_MI",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_DIFF_SF",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "float",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_DIFF_SI",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20615,7 +21406,132 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns an array containing the [eigenvalues](https://en.wikipedia.org/wiki/Eigenvalues_and_eigenvectors) of a square matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_EIGENVALUES_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "array<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_EIGENVALUES_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "array<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20626,7 +21542,132 @@
       "decline": "",
       "type_name": false,
       "doc": "Returns a matrix of [eigenvectors](https://en.wikipedia.org/wiki/Eigenvalues_and_eigenvectors), in which each column is an eigenvector of the `id` matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_EIGENVECTORS_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_EIGENVECTORS_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20637,7 +21678,49 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns the total number of all matrix elements.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_ELEMENTS_COUNT",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20648,7 +21731,102 @@
       "decline": "",
       "type_name": false,
       "doc": "The function fills a rectangular area of the `id` matrix defined by the indices `from_column` to `to_column` (not including it) and `from_row` to `to_row`(not including it) with the `value`.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_FILL",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "value",
+              "ty": "T",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "from_row",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "int",
+                "v": 0
+              }
+            },
+            {
+              "name": "to_row",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            },
+            {
+              "name": "from_column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "int",
+                "v": 0
+              }
+            },
+            {
+              "name": "to_column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20659,7 +21837,63 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns the element with the specified index of the matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_GET",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "row",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "T"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20670,7 +21904,132 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns the [inverse](https://en.wikipedia.org/wiki/Invertible_matrix) of a square matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_INV_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_INV_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20681,7 +22040,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function determines if the matrix is [anti-diagonal](https://en.wikipedia.org/wiki/Anti-diagonal_matrix) (all elements outside the secondary diagonal are zero).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_IS_ANTIDIAGONAL_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_IS_ANTIDIAGONAL_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20692,7 +22116,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function determines if a matrix is [antisymmetric](https://en.wikipedia.org/wiki/Skew-symmetric_matrix) (its [transpose](https://en.wikipedia.org/wiki/Transpose) equals its negative).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_IS_ANTISYMMETRIC_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_IS_ANTISYMMETRIC_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20703,7 +22192,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function determines if the matrix is [binary](https://en.wikipedia.org/wiki/Logical_matrix) (when all elements of the matrix are 0 or 1).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_IS_BINARY_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_IS_BINARY_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20714,7 +22268,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function determines if the matrix is [diagonal](https://en.wikipedia.org/wiki/Diagonal_matrix) (all elements outside the main diagonal are zero).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_IS_DIAGONAL_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_IS_DIAGONAL_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20725,7 +22344,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function determines if a matrix is an [identity matrix](https://en.wikipedia.org/wiki/Identity_matrix) (elements with ones on the [main diagonal](https://en.wikipedia.org/wiki/Main_diagonal) and zeros elsewhere).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_IS_IDENTITY_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_IS_IDENTITY_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20736,7 +22420,49 @@
       "decline": "",
       "type_name": false,
       "doc": "The function determines if the matrix is [square](https://en.wikipedia.org/wiki/Square_matrix) (it has the same number of rows and columns).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_IS_SQUARE",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20747,7 +22473,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function determines if the matrix is [stochastic](https://en.wikipedia.org/wiki/Stochastic_matrix).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_IS_STOCHASTIC_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_IS_STOCHASTIC_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20758,7 +22549,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function determines if a [square matrix](https://en.wikipedia.org/wiki/Square_matrix) is [symmetric](https://en.wikipedia.org/wiki/Symmetric_matrix) (elements are symmetric with respect to the [main diagonal](https://en.wikipedia.org/wiki/Main_diagonal)).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_IS_SYMMETRIC_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_IS_SYMMETRIC_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20769,7 +22625,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function determines if the matrix is [triangular](https://en.wikipedia.org/wiki/Triangular_matrix) (if all elements above or below the [main diagonal](https://en.wikipedia.org/wiki/Main_diagonal) are zero).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_IS_TRIANGULAR_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_IS_TRIANGULAR_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20780,7 +22701,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function determines if all elements of the matrix are zero.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_IS_ZERO_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_IS_ZERO_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "bool"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20791,7 +22777,146 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns the [Kronecker product](https://en.wikipedia.org/wiki/Kronecker_product) for the `id1` and `id2` matrices.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_KRON_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_KRON_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20802,7 +22927,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns the largest value from the matrix elements.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_MAX_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_MAX_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20813,7 +23003,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function calculates the [median](https://en.wikipedia.org/wiki/Median) (\"the middle\" value) of matrix elements.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_MEDIAN_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_MEDIAN_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20824,7 +23079,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns the smallest value from the matrix elements.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_MIN_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_MIN_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20835,7 +23155,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function calculates the [mode](https://en.wikipedia.org/wiki/Mode_(statistics)) of the matrix, which is the most frequently occurring value from the matrix elements.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_MODE_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_MODE_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20846,7 +23231,422 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns a new matrix resulting from the [product](https://en.wikipedia.org/wiki/Matrix_multiplication) between the matrices `id1` and `id2`, or between an `id1` matrix and an `id2` scalar (a numerical value), or between an `id1` matrix and an `id2` vector (an array of values).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_MULT_MF",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_MULT_MI",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_MULT_SF",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "float",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_MULT_SI",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_MULT_AF",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "array<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "array<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_MULT_AI",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "array<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "array<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20857,7 +23657,107 @@
       "decline": "",
       "type_name": false,
       "doc": "The function creates a new matrix object.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_NEW",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "rows",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "int",
+                "v": 0
+              }
+            },
+            {
+              "name": "columns",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "int",
+                "v": 0
+              }
+            },
+            {
+              "name": "initial_value",
+              "ty": "T",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            }
+          ],
+          "ret": [
+            "matrix<T>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20868,7 +23768,132 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns the [pseudoinverse](https://en.wikipedia.org/wiki/Moore%E2%80%93Penrose_inverse) of a matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_PINV_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_PINV_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20879,7 +23904,146 @@
       "decline": "",
       "type_name": false,
       "doc": "The function calculates the product of the matrix by itself `power` times.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_POW_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "power",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_POW_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "power",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20890,7 +24054,78 @@
       "decline": "",
       "type_name": false,
       "doc": "The function calculates the [rank](https://en.wikipedia.org/wiki/Rank_(linear_algebra)) of the matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_RANK_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_RANK_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20901,7 +24136,92 @@
       "decline": "",
       "type_name": false,
       "doc": "The function removes the column at `column` index of the `id` matrix and returns an array containing the removed column's values.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_REMOVE_COL",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            }
+          ],
+          "ret": [
+            "array<T>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20912,7 +24232,92 @@
       "decline": "",
       "type_name": false,
       "doc": "The function removes the row at `row` index of the `id` matrix and returns an array containing the removed row's values.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_REMOVE_ROW",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "row",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            }
+          ],
+          "ret": [
+            "array<T>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20923,7 +24328,65 @@
       "decline": "",
       "type_name": false,
       "doc": "The function rebuilds the `id` matrix to `rows` x `cols` dimensions.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_RESHAPE",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "rows",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "columns",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "call",
+          "bf": [
+            "pool"
+          ],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20934,7 +24397,49 @@
       "decline": "",
       "type_name": false,
       "doc": "The function reverses the order of rows and columns in the matrix `id`.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_REVERSE",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20945,7 +24450,86 @@
       "decline": "",
       "type_name": false,
       "doc": "The function creates a one-dimensional array from the elements of a matrix row.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_ROW",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "row",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "array<T>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20956,7 +24540,49 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns the number of rows in the matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_ROWS",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20967,7 +24593,70 @@
       "decline": "",
       "type_name": false,
       "doc": "The function assigns `value` to the element at the `row` and `column` of the `id` matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_SET",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "row",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "value",
+              "ty": "T",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -20978,7 +24667,122 @@
       "decline": "",
       "type_name": false,
       "doc": "The function rearranges the rows in the `id` matrix following the sorted order of the values in the `column`.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_SORT_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "int",
+                "v": 0
+              }
+            },
+            {
+              "name": "order",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional",
+                "unique"
+              ],
+              "default": {
+                "k": "value",
+                "v": "order.ascending"
+              }
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_SORT_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "int",
+                "v": 0
+              }
+            },
+            {
+              "name": "order",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional",
+                "unique"
+              ],
+              "default": {
+                "k": "value",
+                "v": "order.ascending"
+              }
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -20989,7 +24793,125 @@
       "decline": "",
       "type_name": false,
       "doc": "The function extracts a submatrix of the `id` matrix within the specified indices.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_SUBMATRIX",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "from_row",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "int",
+                "v": 0
+              }
+            },
+            {
+              "name": "to_row",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            },
+            {
+              "name": "from_column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "int",
+                "v": 0
+              }
+            },
+            {
+              "name": "to_column",
+              "ty": "int",
+              "qual": "series",
+              "flags": [
+                "optional"
+              ],
+              "default": {
+                "k": "na"
+              }
+            }
+          ],
+          "ret": [
+            "matrix<T>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -21000,7 +24922,284 @@
       "decline": "",
       "type_name": false,
       "doc": "The function returns a new matrix resulting from the [sum](https://en.wikipedia.org/wiki/Matrix_addition) of two matrices `id1` and `id2`, or of an `id1` matrix and an `id2` scalar (a numerical value).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_SUM_MF",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_SUM_MI",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_SUM_SF",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "float",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<float>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_SUM_SI",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id1",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "id2",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<int>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -21011,7 +25210,63 @@
       "decline": "",
       "type_name": false,
       "doc": "The function swaps the columns at the index `column1` and `column2` in the `id` matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_SWAP_COLUMNS",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "column1",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "column2",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -21022,7 +25277,63 @@
       "decline": "",
       "type_name": false,
       "doc": "The function swaps the rows at the index `row1` and `row2` in the `id` matrix.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_SWAP_ROWS",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "row1",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            },
+            {
+              "name": "row2",
+              "ty": "int",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [],
+          "ret_qual": "const",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [
+            "mutates_arg0"
+          ],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -21033,7 +25344,72 @@
       "decline": "",
       "type_name": false,
       "doc": "The function calculates the [trace](https://en.wikipedia.org/wiki/Trace_(linear_algebra)) of a matrix (the sum of the main diagonal's elements).",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_TRACE_F",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<float>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "float"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        },
+        {
+          "id": "MATRIX_TRACE_I",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "id",
+              "ty": "matrix<int>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "int"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [],
+          "state": {
+            "k": "none"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null
+        }
+      ],
       "values": []
     },
     {
@@ -21044,7 +25420,79 @@
       "decline": "",
       "type_name": false,
       "doc": "The function creates a new, [transposed](https://en.wikipedia.org/wiki/Transpose#Transpose_of_a_matrix) version of the `id`.",
-      "overloads": [],
+      "overloads": [
+        {
+          "id": "MATRIX_TRANSPOSE",
+          "versions": [
+            5,
+            6
+          ],
+          "params": [
+            {
+              "name": "__elem",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "id",
+              "ty": "matrix<T>",
+              "qual": "series",
+              "flags": [],
+              "default": null
+            }
+          ],
+          "ret": [
+            "matrix<T>"
+          ],
+          "ret_qual": "series",
+          "abi": "call",
+          "bf": [
+            "collection",
+            "pool"
+          ],
+          "state": {
+            "k": "array"
+          },
+          "warmup": {
+            "k": "none"
+          },
+          "na": "custom",
+          "sx": [],
+          "plot": null,
+          "input": null,
+          "tv": {
+            "T": [
+              "int",
+              "float",
+              "bool",
+              "color",
+              "enum"
+            ]
+          }
+        }
+      ],
       "values": []
     },
     {
@@ -24667,6 +29115,42 @@
             6
           ],
           "params": [
+            {
+              "name": "__key",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__out",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__ty",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
+            {
+              "name": "__cap",
+              "ty": "int",
+              "qual": "const",
+              "flags": [
+                "synthetic"
+              ],
+              "default": null
+            },
             {
               "name": "symbol",
               "ty": "string",

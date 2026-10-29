@@ -1,0 +1,11 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+indicator("RSI Bands", overlay = false)
+len = input.int(14, "Length")
+src = input.source(close, "Source")
+r = ta.rsi(src, len)
+plot(r, "RSI", color = color.purple)
+hline(70, "Upper", color = color.red)
+hline(30, "Lower", color = color.green)

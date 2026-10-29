@@ -541,7 +541,7 @@ pub struct LiveBootRow {
 /// keys are required (`6005`, `core_config::pine::require_live`); `rows` must exist (`6013`);
 /// every traded symbol (each script's chart symbol, pin:08-traded-is-every-chart-symbol) needs a
 /// row read completely and swept (`6013`); a position on a bound row no ENABLED script trades
-/// refuses (`6013`). The member's configuration then holds one `VenueBootState` per traded
+/// refuses (`6013`), and so does a held position whose read named no entry price (RB-2, r40). The member's configuration then holds one `VenueBootState` per traded
 /// symbol and per held row (§3.2), in row order; `configure` judges them again.
 ///
 /// # Errors
@@ -595,6 +595,16 @@ pub fn attach_live_boot(cfg: &mut PineBootCfg, rows: Option<&[LiveBootRow]>) -> 
         }
     }
     for r in rows {
+        // RB-2 (r40 risk review, ruled "Fix now", 2026-10-29) — D19 fails closed: a held
+        // position whose venue read named no entry price (Binance's optional `entryPrice` reads
+        // 0) is never adopted at average price 0, on either venue.
+        if r.position_1e6 != 0 && r.entry_px_1e6 <= 0 {
+            return Err(format!(
+                "pine: 6013 key=boot_state: venue position {} on {} with no entry price (D19 \
+                 fails closed)",
+                r.position_1e6, r.sym
+            ));
+        }
         let managed = traded.iter().any(|t| t.0 == r.sym && t.1);
         if r.position_1e6 != 0 && !managed {
             return Err(format!(

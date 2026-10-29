@@ -1,0 +1,15 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+strategy("MA Cross", overlay = true, pyramiding = 1)
+lenA = input.int(9, "Fast", minval = 1)
+lenB = input.int(21, "Slow", minval = 1)
+aF = ta.sma(close, lenA)
+aS = ta.sma(close, lenB)
+if ta.crossover(aF, aS)
+    strategy.entry("L", strategy.long)
+if ta.crossunder(aF, aS)
+    strategy.close("L")
+plot(aF, "Fast", color = color.green)
+plot(aS, "Slow", color = color.red)

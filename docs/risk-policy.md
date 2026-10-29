@@ -6921,6 +6921,13 @@ are `docs/binance-runbook.md`.
   `prices_and_quantities_are_cut_the_venues_way`; gate 92.
 * **Open.** The risk gate judges the order before quantization: a SELL
   may price one tick above what it judged ("BX6").
+* **As built — slot 8 (PB2, PB3; PB0.2 recorded 2026-10-29, R-P32):** a
+  strict owner (the Pine slot alone, `bn_live::strict_grid_for`) refuses
+  an off-grid price or size (`Refusal::OffGrid`, word `off_grid`) instead
+  of quantizing, so the "Open" above does not apply to it; its USDⓈ-M
+  reduce-only PLACE below MIN_NOTIONAL is exempt from the local minimum
+  (`-4164`), its MODIFY never is (`-5029`); `minQty` binds. Every other
+  owner keeps this section unchanged. Slot 8 stays paper only.
 
 #### BX-6 (clock)
 
@@ -17265,6 +17272,23 @@ paper only" stand unchanged, and the cli never sets the PL2 live permit. The cod
 judges the perp half of a boot; wiring it into a live boot and arming are the operator's acts.
 `risk-reviewer` closes this entry before R2. **OPEN until then.**
 
+**Risk review 2026-10-29 (r40, R-P32 "Paperwork only") — NOT CLOSED.** The laws below (E-4P,
+refuse-never-round, isolated margin, one owner per coin, the three cap laws, recon) hold for the
+code that exists (`exec_hyperliquid::perp`, `perp_recon`, `cli::pine_hl`, `exec_boot::boot_hl_perps`).
+Blocking before it can close (vault `pvm/live/risk-review-2026-10-29.md`,
+`pvm/live/hl-overlap-2026-10-29.md`):
+- **RH-1** T0.6 (the E7 anchor with the perp `accountValue`) is unanswered — arming is blocked by
+  this entry's own text.
+- **RH-2** **The perp-overlap rule does not cover slot 8.** `xmm_live::check_perp_overlap` lists
+  hyparb, vrp and hcv as slot 6's others; no check compares slot 8's perps with slot 6's quotes or
+  the hedges, in either direction. And no in-engine check can see the standalone engines
+  (XMM on EC2, HYPARB on EC2, BIN15 on the Mac) that trade Hyperliquid on their own accounts.
+  Required at the arming change: slot 8 in both directions of the overlap check, and **a Hyperliquid
+  account (master or sub-account) used only by slot 8**, never one another engine or slot trades.
+- **RH-3** The pine perp path is not assembled: `boot_hl_perps`, `pine_hl::hl_perp_boot` /
+  `seed_router_perps` / `live_rows_from_hl` are called by tests only; slot 8 has no gateway arm,
+  no `NonceStreams` stream and no dead-man binding. The review re-runs on the assembled boot.
+
 **LAW E-4P.** A perp asset id is valid only when bound at THIS boot from the venue's own `meta`
 answer, by exact coin name, from an entry that is not delisted; never derived, never carried
 across a boot (`exec_hyperliquid::perp::PerpTable::bind_from_meta`). Refused at boot: a coin
@@ -17342,6 +17366,23 @@ OD-1 USDⓈ-M only; OD-3 cross margin; OD-5 slot 8 sole owner; OD-6, OD-7, OD-8,
 (symbols), OD-4 (caps) and OD-9 / OD-10 (arming) stay the operator's. `risk-reviewer` closes this
 entry before any arming. **OPEN until then.**
 
+**Risk review 2026-10-29 (r40, R-P32 "Paperwork only") — NOT CLOSED.** Reviewed against E-1, E-5,
+E-6, E-7, E-9, O-E4, the two-switch interlock and the code at `c107bde0`: items 1–7 and 9–13 hold
+as written (PB0.2 recorded, item 4). Blocking before it can close (vault
+`pvm/live/risk-review-2026-10-29.md`):
+- **RB-1** item 8's own residual (a script already disabled and flattening when a venue fill
+  arrives keeps its flatten) needs a ruling or a fix.
+- **RB-2** D19 fails open on a missing `entryPrice`: the USDⓈ-M scan reads it as optional (0), and
+  `pine_bn::live_rows_from_bn` → `attach_live_boot` adopts a held position at average 0. A held
+  position without an entry price must refuse `6013` (and PB0.3 — the field on this account's
+  `v2/account.status` — must be read). **FIXED 2026-10-29 (r40, ruled "Fix now"):**
+  `pine_boot::attach_live_boot` refuses `6013` for any held row with `entry_px_1e6 ≤ 0`, on both
+  venues (test `a_held_position_without_an_entry_price_refuses_6013`). Until PB0.3 shows a source
+  for the price, a Binance boot with a held position refuses — flatten before booting. PB0.3
+  stays open.
+- **RB-3** OD-2 (symbols), OD-4 (caps) and the dedicated account do not exist yet; the entry's
+  numbers are reviewed with them, at the arming change.
+
 1. **BX-1…BX-20 apply unchanged**, except where stated here.
 2. **The facts law (I-PB1).** On a Live route, every Pine symbol's tick, step, `minQty` and
    minimum are this boot's bound row in the arm (`BnInstHot`). A difference refuses the boot
@@ -17354,13 +17395,18 @@ entry before any arming. **OPEN until then.**
 3. **BX-5 for slot 8: refuse, never round (I-PB2, OD-7).** A slot-8 order off the bound grid is
    refused and counted (`Refusal::OffGrid`, word `off_grid`); an on-grid order leaves
    byte-identical. Non-Pine owners (the batteries) keep BX-5's rounding.
-4. **The minimum.** Refused locally for opening orders. A USDⓈ-M reduce-only order below it is
-   exempt (OD-6) **only once PB0.2 confirms the venue's `-4164` rule** — until then the refusal
-   stands; `minQty` always binds (I-PB3). In code the exemption is the arm's `ro_min_exempt`
-   knob, off by default and honoured only for a strict (Pine) owner: the cli sets it from
-   `bn_live::PB0_2_RECORDED` (false). Recording PB0.2 is the change that flips it, with this item,
-   BX-5 and runbook §15 amended in the same change; the batteries never take it (r28 risk review
-   B1). BTCUSDT's minimum is **50 USDT** (PB0, 2026-10-17).
+4. **The minimum.** Refused locally for opening orders. A USDⓈ-M reduce-only **place** below it
+   is exempt (OD-6): **PB0.2 RECORDED 2026-10-29** from Binance's docs (R-P32; no Demo drill) —
+   the `-4164` text ("unless you choose reduce only") and the minimum-notional rule
+   announcements ("Reduce-Only orders are not affected"); vault `pvm/live/pb0-2-2026-10-29.md`.
+   A **modify** is never exempt (`-5029` MODIFICATION_MIN_NOTIONAL has no reduce-only clause;
+   `pin:cli-pb3-modify-not-exempt`); `minQty` and the strict grid always bind (I-PB3). In code
+   the exemption is the arm's `ro_min_exempt` knob, off by default and honoured only for a strict
+   (Pine) owner: the cli sets it from `bn_live::PB0_2_RECORDED` (**true** since this change);
+   the batteries never take it (r28 risk review B1). Not proven by the docs (a Demo drill would):
+   today's per-symbol minimums observed live, a reduce-only GTX maker below the minimum, a
+   reduce-only order larger than the venue position. BTCUSDT's minimum is **50 USDT** (PB0,
+   2026-10-17).
 5. **Margin (OD-3, R-P11).** CROSSED margin, one-way, single-asset, on a **dedicated
    sub-account used only by slot 8**; leverage set by `exec-smoke --binance-setup` and asserted
    at boot, **≤ 3** (`max_leverage`: PB9 refuses an artifact above 3 — `pine-verify --check

@@ -1,0 +1,8 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+library("Helpers")
+import alice/Utils/3 as u
+export quad(float x) =>
+    u.double(u.double(x))

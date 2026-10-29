@@ -403,6 +403,15 @@ pub fn render_tv(title: &str, context: &[String], rows: &[(&Fixture, TvTriage)])
         o.push_str(&format!("- {l}\n"));
     }
     let c = tv_counts(rows);
+    let near: Vec<&(&Fixture, TvTriage)> = rows
+        .iter()
+        .filter(|(_, t)| {
+            t.class == TvClass::Pass
+                && t.note
+                    .as_deref()
+                    .is_some_and(|n| n.contains(crate::triage::NEAR_NOTE_PREFIX))
+        })
+        .collect();
     o.push_str(&format!(
         "\n**{} fixtures: pass {} · differ {} · refused-by-us {} · fault-by-us {} · harness-gap {}**\n",
         rows.len(),
@@ -412,6 +421,14 @@ pub fn render_tv(title: &str, context: &[String], rows: &[(&Fixture, TvTriage)])
         c[3],
         c[4]
     ));
+    if !near.is_empty() {
+        o.push_str(&format!(
+            "\nOf the passes, {} rest on the 2-decimal fallback (R-P34: a trade-list money cell within \
+             0.01 of TradingView's printed cell, not within half a cent) — listed in \
+             \"Pass on the 2-decimal fallback\".\n",
+            near.len()
+        ));
+    }
     o.push_str("\n## Totals per group\n\n| group | ran | pass | differ | refused-by-us | fault-by-us | harness-gap |\n|---|---|---|---|---|---|---|\n");
     for g in [
         Group::A,
@@ -570,6 +587,20 @@ pub fn render_tv(title: &str, context: &[String], rows: &[(&Fixture, TvTriage)])
         pass.len(),
         pass.join(" ")
     ));
+    if !near.is_empty() {
+        o.push_str(&format!(
+            "\n## Pass on the 2-decimal fallback ({}, R-P34)\n\n| id | pins | cells |\n|---|---|---|\n",
+            near.len()
+        ));
+        for (f, t) in &near {
+            o.push_str(&format!(
+                "| {} | {} | {} |\n",
+                f.id.as_str(),
+                md_cell(&f.pins.join(" ")),
+                md_cell(t.note.as_deref().unwrap_or(""))
+            ));
+        }
+    }
     let noted: Vec<String> = rows
         .iter()
         .filter(|(_, t)| t.class == TvClass::Pass && t.note.is_some())

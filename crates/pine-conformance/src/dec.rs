@@ -143,6 +143,36 @@ pub fn scaled_half_away(x: Dec, scale: u8) -> i128 {
     }
 }
 
+/// R-P34 (r40, 2026-10-29) — the 2-decimal fallback: one unit of TradingView's printed money cell,
+/// 0.01, at ×1e12. TradingView prints money at two decimals and drops trailing zeros, so the unit is
+/// fixed here, never read from the printed text's own digit count (a printed `0` is `0.00`).
+pub const FALLBACK_UNIT_1E12: i128 = 10_000_000_000;
+
+/// R-P34 (r40) — `|ours_1e12 − printed| ≤ 0.01` ([`FALLBACK_UNIT_1E12`]), inclusive: the 2-decimal
+/// fallback a trade-list money cell may pass on when [`money_ok`] (half a printed unit) does not
+/// hold. A harness tolerance, logged per cell by the report; the engine is unchanged.
+/// `pin:06-money-overflow` holds: an overflow is NOT within.
+pub fn money_near(ours_1e12: i128, printed: Dec) -> bool {
+    let k = core::cmp::max(12u32, u32::from(printed.d));
+    let Ok(m) = i128::try_from(printed.m) else {
+        return false;
+    };
+    let Some(o) = ours_1e12.checked_mul(pow10(k - 12) as i128) else {
+        return false;
+    };
+    let Some(p) = m.checked_mul(pow10(k - u32::from(printed.d)) as i128) else {
+        return false;
+    };
+    let p = if printed.neg { -p } else { p };
+    let Some(diff) = o.checked_sub(p) else {
+        return false;
+    };
+    let Some(unit) = FALLBACK_UNIT_1E12.checked_mul(pow10(k - 12) as i128) else {
+        return false;
+    };
+    diff.unsigned_abs() <= unit.unsigned_abs()
+}
+
 /// `|ours_1e12 − printed| ≤ ½ · 10^(−d)`, at ×1e12, inclusive (§3.16.5 money).
 ///
 /// Compared exactly in units of `10^−K`, `K = max(12, d)`: `2·|O − P| ≤ 10^(K−d)`.

@@ -303,6 +303,34 @@ fn an_untraded_held_symbol_refuses_6013() {
     assert!(e.contains("6013"), "{e}");
 }
 
+/// RB-2 (r40, ruled "Fix now"): D19 fails closed — a held position whose venue read named no
+/// entry price refuses `6013` (it is never adopted at average price 0); flat rows need none.
+#[test]
+fn a_held_position_without_an_entry_price_refuses_6013() {
+    let (_d, mut pb) = paper_boot("noentry", Some(true));
+    make_live(&mut pb, Some(BootExitPolicy::Protective));
+    let mut held = row(eth(), 7_000, true, true);
+    held.entry_px_1e6 = 0;
+    let e = attach_live_boot(&mut pb.cfg, Some(&[row(btc(), 0, true, true), held])).unwrap_err();
+    assert!(e.contains("6013") && e.contains("no entry price"), "{e}");
+    held.entry_px_1e6 = -1;
+    let (_d2, mut pb2) = paper_boot("negentry", Some(true));
+    make_live(&mut pb2, Some(BootExitPolicy::Protective));
+    let e = attach_live_boot(&mut pb2.cfg, Some(&[row(btc(), 0, true, true), held])).unwrap_err();
+    assert!(e.contains("no entry price"), "{e}");
+    // Flat rows with no entry price pass (the Ready snapshot of a flat account).
+    let (_d3, mut pb3) = paper_boot("flat", Some(true));
+    make_live(&mut pb3, Some(BootExitPolicy::Protective));
+    assert_eq!(
+        attach_live_boot(
+            &mut pb3.cfg,
+            Some(&[row(btc(), 0, true, true), row(eth(), 0, true, true)])
+        )
+        .err(),
+        None
+    );
+}
+
 /// PL3 / §4.7.8: the Q1 policy is required on Live — the host refuses `6005` before any venue
 /// row is judged, and the member refuses it too.
 #[test]

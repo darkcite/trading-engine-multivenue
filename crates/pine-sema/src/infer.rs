@@ -79,6 +79,9 @@ pub(crate) struct Inst {
     pub(crate) bound: Vec<(NodeId, Vec<Option<u16>>)>,
     /// Variables and counters declared here, with their `TypeQ`.
     pub(crate) locals: Vec<(u32, TypeQ)>,
+    /// `pin:02-bound-var-int-to-float` (r40): `int` argument nodes of a built-in call that bind a
+    /// type variable resolved to `float`; lowering converts them.
+    pub(crate) widen: Vec<NodeId>,
     /// The result (`Ty::Void` for none; a tuple's types in `ret_tuple`).
     pub(crate) ret: TypeQ,
     /// A tuple result's element types.
@@ -206,6 +209,7 @@ struct Frame {
     bound: Vec<(NodeId, Vec<Option<u16>>)>,
     locals: Vec<(u32, TypeQ)>,
     params: Vec<TypeQ>,
+    widen: Vec<NodeId>,
 }
 
 /// Run pass 3 (§4.4, §4.5). `v5`'s `pin:02-var-qualifier = Join` iterates to a fixpoint.
@@ -380,6 +384,7 @@ impl<'a, 's> Infer<'a, 's> {
             temps: fr.temps,
             bound: fr.bound,
             locals: fr.locals,
+            widen: fr.widen,
             ret: ret.t,
             ret_tuple,
         });
@@ -2167,6 +2172,14 @@ impl<'a, 's> Infer<'a, 's> {
                     None
                 };
                 self.cur.calls.push((n, Callee::Builtin(p.ov)));
+                if !p.widen.is_empty() {
+                    let ba = bound_args(self.ast(), n, &p.bound);
+                    for &k in &p.widen {
+                        if let Some(&(_, v)) = ba.get(k) {
+                            self.cur.widen.push(v);
+                        }
+                    }
+                }
                 self.cur.bound.push((n, p.bound));
                 if let Some(items) = sec_tuple {
                     self.tuples.push(items);
@@ -2204,12 +2217,18 @@ impl<'a, 's> Infer<'a, 's> {
             let Node::Tuple { items } = ast.node(v) else {
                 return None;
             };
+            // CAR-R40-1 (r40): `request.security_lower_tf` returns one `array<T>` per element.
+            let lower = ov.id == pine_spec::ov::REQUEST_SECURITY_LOWER_TF;
             let mut out = Vec::with_capacity(items.len());
             for &it in items {
                 let t = self.cur.ty.get(it.0 as usize).copied().flatten()?;
-                out.push(TypeQ {
-                    qual: Qual::Series,
-                    ..t
+                out.push(if lower {
+                    TypeQ::array(crate::security::elem_code(t), Qual::Series)
+                } else {
+                    TypeQ {
+                        qual: Qual::Series,
+                        ..t
+                    }
                 });
             }
             return Some(out);

@@ -1,0 +1,10 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+strategy("Trend", overlay = true)
+len = input.int(50, "Len", group = "Main", tooltip = "the length")
+t = ta.ema(close, len)
+if close > t
+    strategy.entry("L", strategy.long)
+plot(t)

@@ -1,0 +1,9 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+indicator("Loop")
+s = 0.0
+for i = 0 to 9
+    s := s + close[i]
+plot(s / 10)

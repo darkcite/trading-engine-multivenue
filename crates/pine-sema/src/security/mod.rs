@@ -25,13 +25,28 @@ use crate::limits::MAX_REQUEST_ELEMENTS;
 pub(crate) mod cone;
 pub(crate) mod leak;
 
-/// Whether overload `ov` is `request.security` (§4.11).
+/// Whether overload `ov` is `request.security` or (CAR-R40-1, r40) `request.security_lower_tf`
+/// (§4.11): both lower to a child sub-program and one parent call per element.
 pub(crate) fn is_security(ov: pine_ir::OverloadId) -> bool {
     let o = pine_spec::overload(ov);
     o.sx & pine_spec::sx::REQUEST != 0
         && pine_spec::params(o)
             .iter()
             .any(|p| p.name.as_str() == "expression" && p.flags & pf::TUPLE_OK != 0)
+}
+
+/// CAR-R40-1 (r40): whether `ov` is `request.security_lower_tf` — the parent call collects the
+/// child's elements of the chart bar into an `array<T>` (pine-std `bi_security_lower_tf`).
+pub(crate) fn is_lower_tf(ov: pine_ir::OverloadId) -> bool {
+    ov == pine_spec::ov::REQUEST_SECURITY_LOWER_TF
+}
+
+/// The `pine_ir::elem` code of a request element type (`__ty`; an `array<T>`'s `a`).
+pub(crate) fn elem_code(t: TypeQ) -> u16 {
+    match t.ty {
+        Ty::Enum => pine_ir::elem::enumeration(t.a),
+        other => pine_ir::elem::scalar(other),
+    }
 }
 
 /// One bound argument of a request.
@@ -70,7 +85,7 @@ pub(crate) fn check(
                 continue;
             }
             let args = bound_args(ast, inst, n, ov);
-            let k = one(ast, inst, &args, opts, syms, diags);
+            let k = one(ast, inst, &args, opts, syms, diags, is_lower_tf(ov));
             // The root's top level and each function TypeInst are counted once each: a request
             // in a function called twice is two requests (two call sites, §4.6).
             elements += k;
@@ -158,7 +173,8 @@ fn dynamic(a: &ArgOf, diags: &mut Vec<Diag>) {
     diags.push(diag(ReasonCode::DynamicSecurityTarget, a.span, msg));
 }
 
-/// One request's checks; returns its element count.
+/// One request's checks; returns its element count. `lower` = `request.security_lower_tf`
+/// (CAR-R40-1): its timeframe must not exceed the chart's, `ignore_invalid_timeframe` folds.
 fn one(
     ast: &Ast,
     inst: &Inst,
@@ -166,13 +182,14 @@ fn one(
     opts: &CompileOpts,
     syms: &SymTable,
     diags: &mut Vec<Diag>,
+    lower: bool,
 ) -> usize {
     let mut k = 1usize;
     for a in args {
         match a.name {
             "symbol" => symbol(ast, a, opts, syms, diags),
-            "timeframe" => timeframe(ast, a, syms, diags),
-            "gaps" | "lookahead" | "ignore_invalid_symbol" => {
+            "timeframe" => timeframe(ast, a, syms, diags, lower.then_some(opts.chart.timeframe_s)),
+            "gaps" | "lookahead" | "ignore_invalid_symbol" | "ignore_invalid_timeframe" => {
                 if a.k.is_none() {
                     dynamic(a, diags);
                 }
@@ -235,7 +252,16 @@ fn symbol(ast: &Ast, a: &ArgOf, opts: &CompileOpts, syms: &SymTable, diags: &mut
     }
 }
 
-fn timeframe(ast: &Ast, a: &ArgOf, syms: &SymTable, diags: &mut Vec<Diag>) {
+/// `lower_than` = the chart's timeframe in seconds for `request.security_lower_tf` (CAR-R40-1):
+/// a target above it is TradingView's runtime error (or `na` under `ignore_invalid_timeframe`),
+/// refused here `3024` (`pin:02-lower-tf-above-chart`); 0 = unknown chart, not checked.
+fn timeframe(
+    ast: &Ast,
+    a: &ArgOf,
+    syms: &SymTable,
+    diags: &mut Vec<Diag>,
+    lower_than: Option<u32>,
+) {
     let text = match a.k {
         Some(K::Str(s)) => syms.resolve_bytes(s).to_vec(),
         _ => match path(ast, syms, a.node).as_deref() {
@@ -244,14 +270,24 @@ fn timeframe(ast: &Ast, a: &ArgOf, syms: &SymTable, diags: &mut Vec<Diag>) {
         },
     };
     let r = pine_std::tf_seconds(&text).and_then(|s| match s {
-        Some(sec) => pine_std::tf_on_bar_clock(sec).map(|_| ()),
-        None => Ok(()),
+        Some(sec) => pine_std::tf_on_bar_clock(sec).map(|_| Some(sec)),
+        None => Ok(None),
     });
-    if let Err(le) = r {
-        diags.push(Diag {
+    match r {
+        Err(le) => diags.push(Diag {
             code: le.code,
             ..diag(ReasonCode::Internal, a.span, le.why.to_owned())
-        });
+        }),
+        Ok(Some(sec)) => {
+            if let Some(chart) = lower_than.filter(|&c| c > 0 && sec > c) {
+                let msg = format!(
+                    "request.security_lower_tf at {sec} s above the chart's {chart} s: \
+                     TradingView stops (or returns na under ignore_invalid_timeframe); not served"
+                );
+                diags.push(diag(ReasonCode::DeferredBuiltin, a.span, msg));
+            }
+        }
+        Ok(None) => {}
     }
 }
 
@@ -291,7 +327,7 @@ pub(crate) fn expression_refusal(
     argv: &[crate::overload::Arg],
     syms: &SymTable,
 ) -> Option<Diag> {
-    if full != "request.security" {
+    if full != "request.security" && full != "request.security_lower_tf" {
         return None;
     }
     let e = argv

@@ -219,10 +219,10 @@ fn screen_rows_do_not_depend_on_k_or_grouping_eleven() {
 
 /// R-P5 (2026-10-17): `SCREEN_LIMITS` activates tier 3, so `pvm7_grid_array` — the Tier-3 smoke of
 /// impl-07 §4.0 — compiles and screens without a fault; under the former mask (`0b0011`) sema
-/// refuses it as a deferred builtin.
+/// refuses it as a deferred builtin. R-P34 (2026-10-29, CAR-R40-2): tier 4 is active too.
 #[test]
 fn grid_array_screens_under_tier3() {
-    assert_eq!(pine_screen::SCREEN_LIMITS.active_tiers, 0b0111);
+    assert_eq!(pine_screen::SCREEN_LIMITS.active_tiers, 0b1111);
     let src = read("pvm7_grid_array.pine");
     let t = compile(&src).unwrap_or_else(|e| panic!("tier 3 active: {e:?}"));
     assert_eq!(t.mode(), ExecMode::Realtime);

@@ -122,8 +122,19 @@ license-check:
 	# docs/arch/license-audit-2026-08-27.md G8. Both live in docs/arch
 	# (archived 2026-09-02, operator order) which is exempt wholesale as
 	# closed history; this Makefile is exempt because it holds the patterns.
+	# PVM (00-INDEX v4 §3.16.6, one allow-list; impl-06 v4 §4.10): a tracked .pine is ours only
+	# under tests/conformance/** (TradingView-oracle fixtures) or
+	# crates/*/tests/** (hand-written test scripts), and carries the SPDX pair
+	# like any source; harvested Pine is a runtime artifact and fails anywhere
+	# else. Corpus containers, impl-09 v4 §3.6 C1-C4 (C1 a corpus/ component,
+	# C2 *.html.zst, C3 endpoints.json lib.lock, C4 index libs dedup builtins
+	# buckets topn-strategies topn-indicators libs-want fetchlog .jsonl) and
+	# C5 manual.tsv (the harvest's provenance ledger, AMEND-harvest 2026-10-29)
+	# fail everywhere. Once PVM-6a has landed (tests/conformance/manifest.tsv
+	# is tracked) at least 300 fixture scripts must stay tracked, so the gate
+	# can never be satisfied by untracking our own fixtures.
 	@fail=0; n=0; \
-	for f in $$(git ls-files '*.rs' '*.py' '*.sh'); do \
+	for f in $$(git ls-files '*.rs' '*.py' '*.sh' '*.pine'); do \
 		n=$$((n+1)); \
 		head -3 "$$f" | grep -q 'SPDX-License-Identifier: Apache-2.0' || \
 			{ echo "  missing SPDX header: $$f"; fail=1; }; \
@@ -148,6 +159,33 @@ license-check:
 		echo "     only way one lands, and it must fail loudly here)"; \
 		git ls-files 'docs/research/**' | sed 's/^/    /'; \
 		fail=1; \
+	fi; \
+	bad_pine=$$(git ls-files '*.pine' | grep -Ev '^(tests/conformance/|crates/[^/]+/tests/)'); \
+	if [ -n "$$bad_pine" ]; then \
+		echo "  tracked .pine outside tests/conformance/ and crates/*/tests/ (00-INDEX v4 §3.16.6):"; \
+		echo "$$bad_pine" | sed 's/^/    /'; \
+		echo "    (harvested Pine is a runtime artifact under ~/multivenue/, never tracked)"; \
+		fail=1; \
+	fi; \
+	bad_corpus=$$(git ls-files ':(glob)**/corpus/**' ':(glob)**/*.html.zst' \
+		':(glob)**/endpoints.json' ':(glob)**/lib.lock' \
+		':(glob)**/index.jsonl' ':(glob)**/libs.jsonl' ':(glob)**/dedup.jsonl' \
+		':(glob)**/builtins.jsonl' ':(glob)**/buckets.jsonl' \
+		':(glob)**/topn-strategies.jsonl' ':(glob)**/topn-indicators.jsonl' \
+		':(glob)**/libs-want.jsonl' ':(glob)**/fetchlog.jsonl' \
+		':(glob)**/manual.tsv'); \
+	if [ -n "$$bad_corpus" ]; then \
+		echo "  tracked corpus container(s), impl-09 §3.6 C1-C5 — they fail everywhere (00-INDEX v4 §3.16.6):"; \
+		echo "$$bad_corpus" | sed 's/^/    /'; \
+		fail=1; \
+	fi; \
+	if git ls-files --error-unmatch tests/conformance/manifest.tsv >/dev/null 2>&1; then \
+		n_fix=$$(git ls-files ':(glob)tests/conformance/fixtures/**/*.pine' | wc -l | tr -d ' '); \
+		if [ "$$n_fix" -lt 300 ]; then \
+			echo "  only $$n_fix tracked conformance fixtures under tests/conformance/fixtures/ (PVM-6a requires >= 300)"; \
+			echo "    (the .pine gate must never pass by untracking our own fixtures)"; \
+			fail=1; \
+		fi; \
 	fi; \
 	if git ls-files --error-unmatch 'claude-worker/tools_*.py' >/dev/null 2>&1; then \
 		echo "  tracked research one-shot(s) — must stay git-excluded:"; \

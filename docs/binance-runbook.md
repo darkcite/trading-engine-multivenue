@@ -849,10 +849,12 @@ is yours; arming is your act alone, at R2.
   `[exec.slot.8.pine] fee_taker_ppm / fee_maker_ppm`, flagged modelled until N = 30 (§14).
 - [ ] The key: Ed25519, futures trading on, withdrawals off, IP-restricted (§1, §8).
 - [ ] PB0.3 / 0.4 / 0.6 read on this account (margin and position mode, the boot's trades page).
-- [ ] PB0.2: the venue's `-4164` rule for reduce-only below the minimum confirmed — until then a
-  dust exit stays refused (flatten by tool, §3.2). The code waits on it too:
-  `bn_live::PB0_2_RECORDED = false` keeps the arm's `ro_min_exempt` off; flipping it is the
-  PB0.2 change, with risk-policy item 4 and BX-5 amended.
+- [x] PB0.2: the venue's `-4164` rule for reduce-only below the minimum — RECORDED 2026-10-29
+  from Binance's docs (R-P32; vault `pvm/live/pb0-2-2026-10-29.md`): a reduce-only PLACE is
+  exempt, a MODIFY is not (`-5029`). `bn_live::PB0_2_RECORDED = true` turns the arm's
+  `ro_min_exempt` on for the Pine owner only; risk-policy item 4 and BX-5 amended. Optional
+  before R2: a Demo drill of a sub-minimum reduce-only IoC and GTX on a 50-USDT symbol (the docs
+  predate per-symbol minimums). Until R2 a dust remainder can still be flattened by tool (§3.2).
 
 **The evidence (on the tree and binary you arm):**
 

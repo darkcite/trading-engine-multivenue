@@ -600,3 +600,67 @@ fn leak_admitted_cones_ignore_the_current_bar() {
     let child = &p.subprograms[0].program;
     assert_ne!(last(child, &closes), last(child, &bumped));
 }
+
+// CAR-R40-1 (r40) — `request.security_lower_tf`.
+
+#[test]
+fn lower_tf_becomes_a_child_and_an_array_creator() {
+    let p = prog(
+        "a = request.security_lower_tf(syminfo.tickerid, \"5\", close)\n\
+         plot(array.size(a))\n",
+    );
+    assert_eq!(p.subprograms.len(), 1);
+    let s = &p.subprograms[0];
+    assert_eq!(
+        (s.timeframe_s, s.n_out, s.lookahead, s.gaps),
+        (300, 1, false, false)
+    );
+    verify_tree(&p);
+    assert_eq!(calls_of(&p, pine_spec::ov::REQUEST_SECURITY_LOWER_TF), 1);
+    // The call site is a collection block of the parent.
+    assert!(p
+        .layout
+        .states
+        .iter()
+        .any(|d| d.kind == pine_ir::StateKind::Collection));
+}
+
+#[test]
+fn lower_tf_tuple_returns_one_array_per_element() {
+    let p = prog(
+        "[h, l] = request.security_lower_tf(syminfo.tickerid, \"1\", [high, low])\n\
+         plot(array.size(h) + array.size(l))\n",
+    );
+    assert_eq!(p.subprograms.len(), 1);
+    assert_eq!(p.subprograms[0].n_out, 2);
+    verify_tree(&p);
+    assert_eq!(calls_of(&p, pine_spec::ov::REQUEST_SECURITY_LOWER_TF), 2);
+}
+
+#[test]
+fn lower_tf_above_the_chart_is_refused() {
+    // The test chart is 1 h (`common::default_opts`).
+    for ign in ["true", "false"] {
+        let s = format!(
+            "a = request.security_lower_tf(syminfo.tickerid, \"D\", close, \
+             ignore_invalid_timeframe = {ign})\nplot(array.size(a))\n"
+        );
+        assert_eq!(run(&s), vec![3024], "{ign}");
+    }
+    // At the chart's own timeframe: accepted.
+    let v = run(
+        "a = request.security_lower_tf(syminfo.tickerid, \"60\", close)\nplot(array.size(a))\n",
+    );
+    assert!(accepted(&v), "{v:?}");
+}
+
+#[test]
+fn lower_tf_string_and_dynamic_flags_are_refused() {
+    assert_eq!(
+        run("a = request.security_lower_tf(syminfo.tickerid, \"5\", syminfo.ticker)\n"),
+        vec![3044]
+    );
+    let s = "b = close > open\na = request.security_lower_tf(syminfo.tickerid, \"5\", close, \
+             ignore_invalid_timeframe = b)\nplot(array.size(a))\n";
+    assert_eq!(run(s), vec![3027]);
+}

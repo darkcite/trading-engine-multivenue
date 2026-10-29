@@ -1,0 +1,8 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+indicator("Mom", shorttitle = "M")
+n = input.int(10, "N")
+mom = close - close[n]
+plot(mom)

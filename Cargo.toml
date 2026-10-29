@@ -76,6 +76,8 @@ members = [
     "crates/pine-lang",
     "crates/pine-screen",
     "crates/pine-conformance",
+    # impl-09 (R-P33, 2026-10-29): the offline harvest corpus tool — nothing depends on it (I18)
+    "crates/pine-corpus",
     "crates/pine-sema",
     "crates/pine-spec",
     "crates/pine-std",

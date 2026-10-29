@@ -283,9 +283,9 @@ impl Rig {
         );
         // PB2 (I-PB2): the Pine owner refuses off-grid, never rounds.
         arm.set_strict_grid(true);
-        // PB3 as if PB0.2 were recorded (the boot sets it from
-        // `bn_live::ro_min_exempt_for`, off until then): the dust exit's path.
-        arm.set_ro_min_exempt(true);
+        // PB3, PB0.2 recorded 2026-10-29 (the boot sets it from
+        // `bn_live::ro_min_exempt_for`, true for the Pine owner): the dust exit's path.
+        arm.set_ro_min_exempt(cli::bn_live::ro_min_exempt_for(8));
         let mut route = ExecRoute::all_paper();
         route
             .set_slot(
@@ -817,9 +817,14 @@ fn a_reduce_only_exit_closes_the_position() {
 /// D19 + Q1 `protective` on the real chain: the venue's held long is the broker's at boot (the
 /// gateway's Ready snapshot); with no protective stop in the script the boot guard closes it
 /// reduce-only. The gateway's ADOPTED fill reaches the member: counted, never booked (PB6).
+/// RB-2 (r40): the read names the held row's `entryPrice` — without one the boot refuses `6013`
+/// (`pine_live_boot::a_held_position_without_an_entry_price_refuses_6013`).
 fn held_position_closes(held: i64) -> (Venue, Rig) {
     let venue = Venue::start();
-    venue.with(|v| v.pos_1e6 = held);
+    venue.with(|v| {
+        v.pos_1e6 = held;
+        v.pos_entry_px_1e6 = exec_binance::testvenue::PX_MARK;
+    });
     let mut r = Rig::boot(&venue, Opts::new(HOLD));
     assert_eq!(r.ledger_pos(), held, "the arm adopted the venue's position");
     let k = r.k();

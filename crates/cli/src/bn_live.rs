@@ -700,8 +700,8 @@ pub fn boot_binance_arm(
     // never rounded; every other owner keeps BX-5. Dark: slot 8 cannot be
     // live while its paper-only refusals stand.
     arm.set_strict_grid(strict_grid_for(owner));
-    // PB3 (OD-6 "once confirmed"; r28 risk review B1): off until PB0.2 is
-    // recorded, and only ever for the strict (Pine) owner.
+    // PB3 (OD-6 "once confirmed"; r28 risk review B1): PB0.2 recorded
+    // 2026-10-29 (R-P32), and only ever for the strict (Pine) owner.
     arm.set_ro_min_exempt(ro_min_exempt_for(owner));
     let handle = std::thread::Builder::new()
         .name(String::from("bn-gateway"))
@@ -811,10 +811,12 @@ pub const fn strict_grid_for(owner: u8) -> bool {
 
 /// **PB0.2 — the venue's answer on record**: whether Binance USDⓈ-M sends a
 /// reduce-only order below `MIN_NOTIONAL` (`-4164`: "unless you choose reduce
-/// only"). False until the operator records PB0.2 (the docs, then the Demo
-/// drill if wanted — `pvm-binance-pb0`); flipping it is that ruling's commit,
-/// with risk-policy §4, BX-5 and the runbook amended in the same change.
-pub const PB0_2_RECORDED: bool = false;
+/// only"). RECORDED 2026-10-29 from Binance's docs (R-P32; vault
+/// `pvm/live/pb0-2-2026-10-29.md`: the `-4164` text and the minimum-notional
+/// rule announcements, "Reduce-Only orders are not affected"); no Demo drill.
+/// A place is exempt, a modify never (`-5029`, pin:cli-pb3-modify-not-exempt);
+/// risk-policy item 4, BX-5 and runbook §15 amended in the same change.
+pub const PB0_2_RECORDED: bool = true;
 
 /// **PB3 — the reduce-only minimum exemption's owner** (r28 risk review B1):
 /// the strict (Pine) owner alone, and only once PB0.2 is recorded.
@@ -1174,13 +1176,15 @@ mod tests {
     }
 
     /// r28 risk review B1: the PB3 exemption is off for every owner until
-    /// PB0.2 is recorded; the day it is, the Pine slot alone takes it.
+    /// PB0.2 is recorded; the day it is (2026-10-29, R-P32), the Pine slot
+    /// alone takes it.
     #[test]
     fn the_minimum_exemption_waits_for_pb0_2_and_the_pine_slot() {
         for slot in (0..16u8).filter(|s| *s != 8) {
             assert!(!ro_min_exempt_for(slot), "slot {slot}");
         }
         assert_eq!(ro_min_exempt_for(8), PB0_2_RECORDED);
+        assert!(ro_min_exempt_for(8));
     }
 
     /// **PB7 (R17)** — a Pine client oid (`epoch << 32 | script << 29 |

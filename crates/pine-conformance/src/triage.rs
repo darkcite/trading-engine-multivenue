@@ -546,6 +546,27 @@ fn value_first(f: &Fixture, d: &crate::report::Divergence, o: &RunOutcome) -> St
     format!("row {k} · {title} · ours {ours} vs TV {exp}")
 }
 
+/// R-P34 (r40) — the pass note of a fixture that passed on the 2-decimal fallback: every such cell,
+/// `n=<trade> <field> TV <printed> ours <value>`. The report's "Pass on the 2-decimal fallback"
+/// section keys on [`NEAR_NOTE_PREFIX`].
+fn near_note(near: &[crate::trades::NearCell]) -> Option<String> {
+    if near.is_empty() {
+        return None;
+    }
+    let cells: Vec<String> = near
+        .iter()
+        .map(|c| format!("n={} {} TV {} ours {}", c.n, c.field, c.expected, c.actual))
+        .collect();
+    Some(format!(
+        "{NEAR_NOTE_PREFIX} {} cell(s): {}",
+        near.len(),
+        cells.join("; ")
+    ))
+}
+
+/// R-P34 (r40) — the prefix of a 2-decimal-fallback pass note.
+pub const NEAR_NOTE_PREFIX: &str = "2-dp fallback (R-P34, |ours − TV| ≤ 0.01):";
+
 /// R-P1 triage of one captured fixture from [`crate::run::Runner::check_full`]'s result.
 pub fn classify_tv(f: &Fixture, c: &crate::run::Checked) -> TvTriage {
     let mk = |class, krate, cluster: String, first: String| TvTriage {
@@ -648,7 +669,7 @@ pub fn classify_tv(f: &Fixture, c: &crate::run::Checked) -> TvTriage {
             ),
             None => with_note(
                 mk(TvClass::Pass, Crate::Harness, String::new(), String::new()),
-                None,
+                near_note(&c.near),
             ),
         };
     }

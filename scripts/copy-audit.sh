@@ -94,7 +94,7 @@ if [ "$#" -eq 0 ]; then
            crates/cli/src/hyparb_live.rs \
            crates/cli/src/har_writer.rs \
            crates/cli/src/persist.rs crates/core-settle \
-           crates/pine-broker crates/pine-ir crates/pine-lang crates/pine-screen crates/pine-sema crates/pine-spec crates/pine-std crates/pine-vm crates/strategy-pine
+           crates/pine-broker crates/pine-corpus crates/pine-ir crates/pine-lang crates/pine-screen crates/pine-sema crates/pine-spec crates/pine-std crates/pine-vm crates/strategy-pine
 fi
 
 # Bracket expressions, not backslash escapes: an awk `-v` value has its

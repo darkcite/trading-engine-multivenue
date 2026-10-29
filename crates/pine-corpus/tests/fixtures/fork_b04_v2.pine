@@ -1,0 +1,14 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+strategy("Breakout", overlay = true)
+look = input.int(20, "Lookback")
+hi = ta.highest(high, look)
+lo = ta.lowest(low, look)
+if close > hi[1]
+    strategy.entry("L", strategy.long)
+if close < lo[1]
+    strategy.entry("S", strategy.short)
+plot(hi, color = color.orange, linewidth = 3)
+plot(lo)

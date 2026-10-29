@@ -21,6 +21,7 @@
 
 pub(crate) mod array;
 pub(crate) mod map;
+pub(crate) mod matrix;
 pub(crate) mod order;
 pub(crate) mod part3;
 pub(crate) mod split;
