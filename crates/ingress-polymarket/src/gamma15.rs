@@ -32,6 +32,12 @@
 //! Cold path (the discovery thread, a few calls a window): the spec is a
 //! fixed POD; the token and condition ids are copied once into it.
 //!
+//! PM15-9b: Gamma's law is the first of two. The discovery then reads the
+//! same market's record from the CLOB itself ([`crate::clob_law`]: the
+//! taker hold, the fee, the live tick) and refuses the window on a breach
+//! ([`PmLawErr::ClobShape`] … [`PmLawErr::ClobTick`]); the CLOB's tick
+//! replaces Gamma's in the spec.
+//!
 //! ## PMJ J1b: the 5-minute windows
 //!
 //! [`parse_window_spec_for`] / [`render_slug_for`] take the family's
@@ -52,9 +58,10 @@ pub const PM_ASSET_MAX: usize = 15;
 /// The fee rate the H90 law was measured under, ×1e9 (0.07).
 pub const PM15_FEE_RATE_1E9: i64 = 70_000_000;
 
-/// The two price ticks a 15-minute market quotes on, ×1e9.
-const TICK_01_1E9: i64 = 10_000_000;
-const TICK_001_1E9: i64 = 1_000_000;
+/// The two price ticks a 15-minute market quotes on, ×1e9 (PM15-9b: the
+/// CLOB law ([`crate::clob_law`]) holds `mts` to the same pair).
+pub(crate) const TICK_01_1E9: i64 = 10_000_000;
+pub(crate) const TICK_001_1E9: i64 = 1_000_000;
 
 /// A token id, ASCII decimal, `len` bytes valid.
 #[repr(C)]
@@ -93,7 +100,9 @@ pub struct PmWindowSpec {
     pub _pad: [u8; 2],
     /// The window index (open epoch / the period's length).
     pub window: u32,
-    /// `orderPriceMinTickSize` ×1e6 (10 000 or 1 000).
+    /// The tick ×1e6 (10 000 or 1 000): Gamma's `orderPriceMinTickSize`,
+    /// which the discovery OVERRIDES with the CLOB's `mts` whenever it
+    /// reads the CLOB record (PM15-9b, [`crate::clob_law`]).
     pub tick_1e6: i64,
     /// `orderMinSize`, shares ×1e6.
     pub min_size_1e6: i64,
@@ -150,6 +159,50 @@ pub enum PmLawErr {
     Fee,
     /// A tick the ladder cannot hold, or no minimum size.
     OrderLaw,
+    // PM15-9b: the CLOB's own record ([`crate::clob_law`]). Appended, so
+    // the causes above keep their discriminants (the `last_law_refusal`
+    // encoding, `cause as u8`): 8..=11.
+    /// The CLOB record did not parse, named another condition id, or the
+    /// book is not accepting orders (`ao`).
+    ClobShape,
+    /// The CLOB record carries no crypto taker hold (`itode` missing or
+    /// false) — not the market H90 was measured on.
+    ClobHold,
+    /// The CLOB's fee (`fd`) is not 0.07 / exponent 1 / taker only.
+    ClobFee,
+    /// The CLOB's tick (`mts`) is not 0.01 / 0.001, or its minimum order
+    /// size (`mos`) is not positive.
+    ClobTick,
+}
+
+impl PmLawErr {
+    /// Every cause, in discriminant order (`cause as u8` is the index).
+    pub const ALL: [Self; 12] = [
+        Self::Shape,
+        Self::Slug,
+        Self::Outcomes,
+        Self::NotTradable,
+        Self::NegRisk,
+        Self::Settlement,
+        Self::Fee,
+        Self::OrderLaw,
+        Self::ClobShape,
+        Self::ClobHold,
+        Self::ClobFee,
+        Self::ClobTick,
+    ];
+
+    /// PM15-9b: the cause a `cause as u8` code names (the counters'
+    /// `last_law_refusal` / `last_law_change` encoding); `None` for a code
+    /// no cause has.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<Self> {
+        if (code as usize) < Self::ALL.len() {
+            Some(Self::ALL[code as usize])
+        } else {
+            None
+        }
+    }
 }
 
 impl From<PmDiscoveryErr> for PmLawErr {
@@ -522,6 +575,40 @@ mod tests {
         assert_eq!(spec_of("[]"), Err(PmLawErr::Shape));
         assert_eq!(spec_of(""), Err(PmLawErr::Shape));
         assert_eq!(spec_of(&LIVE[..LIVE.len() / 2]), Err(PmLawErr::Shape));
+    }
+
+    /// PM15-9b: the code of every cause names it back; the CLOB causes
+    /// are appended after Gamma's (8..=11), so the old codes stand.
+    #[test]
+    fn every_cause_code_names_its_cause() {
+        let mut k = 0usize;
+        while k < PmLawErr::ALL.len() {
+            let e = PmLawErr::ALL[k];
+            // Exhaustive: a new cause stops this compiling until it joins
+            // `ALL` (and this list).
+            match e {
+                PmLawErr::Shape
+                | PmLawErr::Slug
+                | PmLawErr::Outcomes
+                | PmLawErr::NotTradable
+                | PmLawErr::NegRisk
+                | PmLawErr::Settlement
+                | PmLawErr::Fee
+                | PmLawErr::OrderLaw
+                | PmLawErr::ClobShape
+                | PmLawErr::ClobHold
+                | PmLawErr::ClobFee
+                | PmLawErr::ClobTick => {}
+            }
+            assert_eq!(e as u8, k as u8);
+            assert_eq!(PmLawErr::from_code(k as u8), Some(e));
+            k += 1;
+        }
+        assert_eq!(PmLawErr::OrderLaw as u8, 7);
+        assert_eq!(PmLawErr::ClobShape as u8, 8);
+        assert_eq!(PmLawErr::ClobTick as u8, 11);
+        assert_eq!(PmLawErr::from_code(12), None);
+        assert_eq!(PmLawErr::from_code(u8::MAX), None);
     }
 
     #[test]

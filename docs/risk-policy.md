@@ -17103,6 +17103,21 @@ section).
 | R-PM-8 | $250 per order and per market, a −$500 session loss bound, no day cap; paper runs the same frame. |
 | R-PM-9 | Slot 9 (the S16-R5 ruling a reserved slot needs); the account arrives when the coding is done. |
 | R-PM-10 | A push notification every 45 min. |
+| R-PM-11 | (2026-10-29, the live-ready round) Eligibility, O-PM-0 / R-PM-7: "Eligible; R-PM-7 stands". |
+| R-PM-12 | Git: "Commit on main (Recommended)" — one commit per work item, explicit paths, `PM15:` / `PMJ:` prefixes, on the Mac, never pushed. |
+| R-PM-13 | Paper restarts of main: "Deploy at safe minutes (Recommended)" — release build, a forced gated restart at a safe minute off the grid through the exec gate, verified on `/state`. |
+| R-PM-14 | The Mac's disk: "Read-only du report (Recommended)". |
+| R-PM-15 | P0: "Run once now (Recommended)". **Scored 2026-10-29 10:47:59Z: KILL** (`### PM15-9`). |
+| R-PM-16 | The gate's evidence: "P0 + law-(iii) pack (Recommended)". Moot after R-PM-15's KILL. |
+| R-PM-17 | The live frame: "S33 stage: $500/$500/−$1000 (Recommended)". Built, then parked by the KILL (`### PM15-9`). |
+| R-PM-18 | Live assets: "All seven" (amends R-PM-4). Not applied: the KILL stopped the lane first. |
+| R-PM-19 | The dust step: "Build `live --dust` (Recommended)". Built, then parked by the KILL. |
+| R-PM-20 | PolyBolt as the mark: "Now, behind a key, off (Recommended)". Not built: the KILL. |
+| R-PM-21 | Redemption: "Relayer, sig type 3 (Recommended)" (R-PM-6 stands). |
+| R-PM-22 | The gate host: "Mac, background QoS (Recommended)" — every cargo gate on the Mac under `taskpolicy -b`, one job at a time. |
+| R-PM-23 | The live host: "One eu-west-1 VM, both slots (Recommended)". After the KILL: slot 11 only. |
+| R-PM-24 | The EC2 deliverable: "Kit + provisioning script (Recommended)". |
+| R-PM-25 | The standalone cut's shape: "First everything missed is need to be implemented on main and on the last stage we will create a separate branch". |
 
 ### Slot 9, the member (`strategy-pm15`, PM15-5)
 
@@ -17448,6 +17463,37 @@ leg was never redeemed.
 - When the account exists: `pm15-exec.sh key-check`, then `miss-probe`,
   then P0's result or a ruling, then `pm15-flip.sh live`.
 
+### PM15-9 — P0's confirmatory score: KILL; the lane stops (2026-10-29)
+
+- **The score (R-PM-15).** The frozen scorer (vault doc 39 §2/§10; scorer
+  `257172b7…4144`, params `p0-params-2026-10-19-floor.json` `66f71dda…1519`,
+  marks and pull tools as registered) ran ONCE at 2026-10-29 10:47:59Z;
+  receipt `p0-conf-receipt.json`, report sha256 `c832939c…804c`. The bars,
+  per R-PMJ-S49 (post-J8 CONF, floored, BTC + ETH pooled, window [2,20),
+  T2, s = 25 %): 1 515 markets, 24 entered, 2 lost, stake $1 963.55,
+  P&L −$12.36, **EV/$ −0.629 %** (CI90 −9.52 … +5.04 %); B1 ✗, B2 ✓ (6/8),
+  B3 ✗ (2/24), B4 ✗, B5 ✓; B6 [2,15) +4.5 % passes, [15,20) −2.3 %.
+  **VERDICT: KILL.** The research record is the project doc
+  `claude/pm15-p0-results-2026-10-29.md` (side tables, caveats).
+- **The kill rule** (plan v2 §6 P0; R-PM-1): confirmatory EV/$ ≤ 0 under T2
+  stops the lane. Slot 9 stays PAPER on main; nothing was ever armed; no
+  `PM15-LIVE-GATE` line exists.
+- **Scope.** The score judges the FROZEN rule (k 1.80, p_min 0.95, e 0.02,
+  floored), not slot 9's running law (iii). Reopening PM is the operator's
+  ruling alone.
+- **Parked (PROVISIONAL P-4, the operator to confirm).** Two PM-only
+  changes finished before the score are kept OUT of the tree, as vault
+  patches under `docs/research/pmj/liveready/`: `pm15-9a-frames.patch`
+  (`pm15-flip.sh` `frame` / `live --dust`: the stage frame of R-PM-17 and the
+  dust frame of R-PM-19 written into both `pm15.toml` and `[exec.slot.9]`
+  from one line, a `PM15-DUST-GATE: ` line for the dust test, the day cap at
+  $1 000 000 for seven families, and the interlock test over both frames)
+  and `pm15-9c-state.patch` (a `/state` `pm15` section). Each re-applies
+  with `patch -p1`. PolyBolt as the mark (R-PM-20) and the law-(iii) gate
+  pack (R-PM-16) were not built.
+- **Kept:** the CLOB venue law (PMJ `### J14`): it is shared code, and
+  slot 11's 5-minute pipeline needs it.
+
 ## PMJ — slot 11 (paper only): H90 on Polymarket's 5-minute up/down markets through Jupiter Predict (2026-10-18)
 
 **Ask (Anton, 2026-10-18):** onboard the PM15 H90 law on Jupiter Predict
@@ -17533,6 +17579,13 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S66 | Overnight 10-23/24, while Anton is away, the PMJ lane does four things: research a per-window cap on same-side families and build the best variant behind a key, default off (J13); research the fills that land under 0.90 (plan only); prepare slot 9's switch to law (iii); and read out slot 11's first night on law (iii). |
 | R-PMJ-S67 | While Anton is away, finished work is committed once every gate is green and a reviewer agent approves: one commit per item, explicit paths. No push, no release rebuild, no restart. |
 | R-PMJ-S68 | Slot 9 switches to law (iii) at the 10-28 0010 restart. `pm15.toml` gets the three keys between 00:00Z and the 0010 drain, so no run boots between 00:00Z and the edit; slot 9's `j12` ledger row starts at 00:00Z. |
+| R-PMJ-S69 | (Ruled 2026-10-24 ~03:55Z, recorded here 10-29.) R5 waits for its pre-registered checkpoint: a scheduled task re-tests it on 10-30 at 00:30Z and asks for a ruling. Slot 11 keeps `tau_max_ns` 20 s. |
+| R-PMJ-S70 | (Ruled 2026-10-24.) J13 stays off for now. |
+| R-PMJ-S71 | (Ruled 2026-10-24.) The 20 S3-pulled run copies in `~/multivenue/research/pmj/loss/runs/` are deleted (each pulled with its files' sha256 verified; scripts, derived tables and the vault kept). |
+| R-PMJ-S72 | (2026-10-29, the live-ready round, verbatim.) PMJ before J0: "Pre-check first (Recommended)" — the binding question tested on public on-chain data before any pre-dust code. |
+| R-PMJ-S73 | The PMJ signing secret: "0600 keypair file (Recommended)" — a 0600 Solana keypair file outside the repo, its path in `.env`. |
+| R-PMJ-S74 | R5 (slot 11 skips τ > 16 s), after the 10-30 checkpoint: "Adopt in paper if it passes (Recommended)". |
+| R-PMJ-S75 | Notifications for slots 9 and 11: "Not now". |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -18369,6 +18422,98 @@ HEAD.
 - **Observability.** The new tally `skip_side` (`engine_pm15_skip_side_total`, `engine_pmj_skip_side_total`; `Pm15Counters` 31 → 32 tallies) is on the dashboard's skip row. The boot tell gains `:side<=N` only when on; off, the tell, the artifact hash and every decision are unchanged.
 - **Hot path.** The gate runs on the take path only. It reads at most 8 markets in a while loop, with no allocation and no float. Alloc gates 136b and 114b run with the cap on, at 1 over one family, so they prove the loop allocation-free but never count another family.
 - **Deploy.** Config only, at a scheduled restart, on Anton's word. Turning it on changes the entry law, so a J9 `SEGMENTS` row goes in the same change. It is not on anywhere.
+
+### J14 — the venue law read from the CLOB, both rolling pipelines (2026-10-29; the code's PM15-9b)
+
+- **Scope.** Every rolling window — pm15 (slot 9's 15-minute families) and
+  pm5 (slot 11's 5-minute families) — is admitted only when Gamma's law
+  (PM15-2, `gamma15`) AND the venue's own market record pass: `GET
+  clob.polymarket.com/clob-markets/{conditionId}`, read by the discovery
+  thread for every window, the boot's first windows included
+  (`ingress_polymarket::clob_law`). Both slots are PAPER; the PM lane is
+  stopped (`### PM15-9`); nothing is armed. This is plan v2's P1/P3 "venue
+  law at every boot". **Cross-reference PM15-6c:** "the per-market half of
+  D-8 is discovery's own law" now includes the CLOB law — a refused window
+  never reaches slot 9's arm (no token; an order for it is refused unsent,
+  `LOCAL_NO_TOKEN`).
+- **The law** (causes appended after Gamma's 0–7, so `last_law_refusal`'s
+  old codes are unchanged):
+
+  | field | wanted | cause (code) |
+  |---|---|---|
+  | `c` | the condition id asked for (hex, any case) | `ClobShape` (8) |
+  | `itode` | present and true (the crypto taker hold, 150 ms since 2026-09-04) | `ClobHold` (9) |
+  | `fd` | `r` 0.07, `e` 1, `to` true | `ClobFee` (10) |
+  | `mts` | 0.01 or 0.001 | `ClobTick` (11) |
+  | `mos` | > 0 | `ClobTick` (11) |
+  | `ao` | true | `ClobShape` (8) |
+
+  An unparsable 200 (a CDN error page) is `ClobShape`. A non-200 or a
+  transport failure is a fetch failure: retried after 10 s, counted
+  `discovery_fetch_errors`, no operator line.
+- **What gets bound.** The window's spec takes the CLOB's tick (`mts`) and
+  minimum size (`mos`) over Gamma's (Gamma's lag behind the venue — the G2
+  lesson). Both reach `OutcomeMeta` at the roll's creation and slot 9's
+  gateway's local floor; `tick_size_change` still governs after creation;
+  both ticks fit the 0.001 ladder and pm-gw's `amount_grain` (`fak_buy`). **This
+  changes inputs of slots 9 and 11's paper law** (limit rounding, the
+  min-size skip): readers of J9's ledger split at the deploying boot,
+  which `docs/state.md` names when it is deployed.
+- **Dormancy, not a halt — PROVISIONAL (P-5, the operator to confirm;
+  plan v2 P1 said "halt the member and alert").** A refusal is per family,
+  per window: no `exec.HALT`, not sticky, nothing cancelled; other families
+  keep trading; the family resumes by itself (re-read every 60 s,
+  `RETRY_LAW_NS`; a refused window waits out its retry even after the law
+  holds again). Windows handed over before a change stay bound and can
+  still trade under the changed law: the current window plus 1 for pm15
+  (≈ 30 min), plus 2 for pm5 (≈ 15 min). The alternative, a sticky member
+  halt, is the operator's ruling.
+- **Where it shows.** `/metrics`: `engine_ingress_{pm15,pm5}_venue_law_changed_total`
+  (new; a family that passed the CLOB law this session and now fails it),
+  `…_discovery_law_refused_total`, `…_slots_bound`. `engine.out.log`: one
+  `WARN … VENUE LAW CHANGED on the CLOB` per rise (the 5 s report block;
+  family index and cause). `engine.err.log`: an unstamped line per family's
+  first CLOB outcome per session and per change, naming the asset, window
+  and record (written so a stderr error can never panic: `say()`). The
+  cause is not on `/metrics` or `/state`; the notifier is not wired
+  (R-PMJ-S75) — the `venue_law_changed` gauge is the surface to alert on. A
+  family that never passes shows only on stderr, `discovery_law_refused`
+  and `slots_bound`.
+- **Boot.** Both pipelines resolve a fourth host, `clob.polymarket.com`,
+  with DNS retried 3 × 200 ms; a persistent failure fails the rolling
+  boot and with it the engine (as J7 recorded for any rolling boot
+  failure); launchd relaunches it.
+- **Run-time bounds.** One fetch can block up to 5 s on Gamma plus 5 s on
+  the CLOB before `stop` is seen (≈ 10 s of the 20 s join grace).
+  Allocation: rustls per TLS record only. One new copy (the request target,
+  ≤ 80 B, `// COPY:`-marked); no new dependency. `with_client` /
+  `with_client_for` are the Gamma-only constructors for tests; production
+  (`new_for`), the miss-probe and `pm15-probe` always read the CLOB.
+- **Rollback.** The previous binary.
+- **Risk review** (an Opus subagent at xhigh, read-only): round 1 **BLOCK**
+  — `eprintln!` on the discovery thread can panic (abort) on a stderr
+  error; no risk-policy entry, and "halt" misnamed a refusal; minors (boot
+  DNS retry, a never-passing family silent, `mos` unused, the Gamma-only
+  constructors fail open, stale strings) → every operator line through a
+  non-panicking `say()`, the engine-log WARN in the 5 s report, DNS retry,
+  `mos` bound, first-outcome lines, docs; round 2 **NEEDS-DOCS** (code
+  approved; nits: the change record and the tally are Relaxed — documented
+  best-effort; one load in the WARN) → this subsection; round 3 **APPROVE**
+  (nits: pm-gw's `amount_grain`, the code's tag, the deploy record — applied).
+
+J14-GATES (2026-10-29 11:18–11:37Z, on the Mac, detached, every cargo under
+`taskpolicy -b` — R-PM-22; the release binary untouched): `make lint` rc 0,
+0 warnings · `cargo nextest run --workspace` 5 122 passed, 1 failed, 10
+skipped — the red is gate 103 (`hl_gateway_outcome_arm_is_zero_alloc`, the HL
+gateway's hot-window wall-clock script, a crate J14 does not touch; "path 1
+fell short of its script in the window" on the background-QoS E-cores), which
+passes alone at normal QoS (0.27 s) and under `make alloc-assert` · `make
+alloc-assert` 139 passed at 0 B (a fresh `Compiling bench`) · `make
+copy-audit` hits 27, baselined 27, new 0 · `make license-check` OK (795
+files) · fuzz `pm_gamma_markets` 60 s clean (2.15 M runs, the CLOB scanner and
+law included) · `make bench-check` not a valid reading under background QoS
+(every group +50 … +330 %, the clock and ring benches included); `hot_path`
+links no crate J14 changes. No worker change: pytest not run.
 
 ## NOTIFY — N-DOCTRINE: the one-way Telegram notifier (2026-10-24)
 

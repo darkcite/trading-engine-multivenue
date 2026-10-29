@@ -349,7 +349,8 @@ pub(crate) fn next_member<'a>(
 }
 
 /// The value at `i` must open an object; returns the position after `{`.
-fn open_object(body: &[u8], i: usize) -> Result<usize, PmDiscoveryErr> {
+/// PM15-9b: shared with [`crate::clob_law`].
+pub(crate) fn open_object(body: &[u8], i: usize) -> Result<usize, PmDiscoveryErr> {
     if body.get(i) != Some(&b'{') {
         return Err(PmDiscoveryErr::BadRow);
     }
@@ -668,7 +669,8 @@ fn raw_quoted_span(body: &[u8], pos: usize) -> Result<(&[u8], usize), PmDiscover
 /// [`raw_quoted_span`] for captured plain-string fields
 /// (`conditionId`): those never contain escapes on this wire, so a
 /// backslash inside the span is rejected rather than unescaped.
-fn quoted_span(body: &[u8], pos: usize) -> Result<(&[u8], usize), PmDiscoveryErr> {
+/// PM15-9b: shared with [`crate::clob_law`].
+pub(crate) fn quoted_span(body: &[u8], pos: usize) -> Result<(&[u8], usize), PmDiscoveryErr> {
     let (span, end) = raw_quoted_span(body, pos)?;
     if span.contains(&b'\\') {
         return Err(PmDiscoveryErr::BadRow);
@@ -678,8 +680,8 @@ fn quoted_span(body: &[u8], pos: usize) -> Result<(&[u8], usize), PmDiscoveryErr
 
 /// Read a bare JSON boolean at `pos`. Anything but exactly `true` /
 /// `false` (including `null` — a captured flag must be a real bool)
-/// is `BadRow`.
-fn bare_bool(body: &[u8], pos: usize) -> Result<(bool, usize), PmDiscoveryErr> {
+/// is `BadRow`. PM15-9b: shared with [`crate::clob_law`].
+pub(crate) fn bare_bool(body: &[u8], pos: usize) -> Result<(bool, usize), PmDiscoveryErr> {
     if body.len() >= pos + 4 && &body[pos..pos + 4] == b"true" {
         return Ok((true, pos + 4));
     }

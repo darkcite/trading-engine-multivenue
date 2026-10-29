@@ -179,10 +179,15 @@ pub enum Pm15Counter {
     DiscoveryRingFull,
     /// PM15-6c: a spec slot 9's gateway's tee could not take.
     DiscoveryTeeFull,
+    /// PM15-9b: a family whose window passed the CLOB law earlier in the
+    /// session failed it (`crate::clob_law`) — the venue changed its law
+    /// mid-session; the family is dormant until it holds again. Counted
+    /// once per change (pass → fail), with one stderr line.
+    VenueLawChanged,
 }
 
 /// How many [`Pm15Counter`]s there are.
-pub const PM15_COUNTERS: usize = Pm15Counter::DiscoveryTeeFull as usize + 1;
+pub const PM15_COUNTERS: usize = Pm15Counter::VenueLawChanged as usize + 1;
 
 /// The metric suffix of each counter, in discriminant order.
 pub const PM15_COUNTER_NAMES: [&str; PM15_COUNTERS] = [
@@ -214,6 +219,7 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_COUNTERS] = [
     "discovery_fetch_errors",
     "discovery_ring_full",
     "discovery_tee_full",
+    "venue_law_changed",
 ];
 
 /// The counters: the ingress and the discovery threads write, the
@@ -225,6 +231,10 @@ pub struct Pm15Counters {
     /// The last venue-law refusal: `family << 8 | cause` (`PmLawErr` as
     /// u8), `u64::MAX` = none yet.
     last_law_refusal: AtomicU64,
+    /// PM15-9b: the last venue-law CHANGE (a `VenueLawChanged` event),
+    /// encoded as `last_law_refusal`; `u64::MAX` = none yet. Its own word,
+    /// so a later refusal of another family cannot overwrite what changed.
+    last_law_change: AtomicU64,
     /// Why each socket last failed: `core_net::WsErr` as u8 + 1 (0 = never),
     /// `[market, rtds]` (PMJ J7: `market` is the last of any shard's).
     last_ws_err: [AtomicU64; 2],
@@ -240,6 +250,7 @@ impl Pm15Counters {
             c: [const { AtomicU64::new(0) }; PM15_COUNTERS],
             slots_bound: AtomicU64::new(0),
             last_law_refusal: AtomicU64::new(u64::MAX),
+            last_law_change: AtomicU64::new(u64::MAX),
             last_ws_err: [const { AtomicU64::new(0) }; 2],
             market_open: AtomicU64::new(0),
         }
@@ -283,11 +294,25 @@ impl Pm15Counters {
     /// The last venue-law refusal, `(family, cause)`.
     #[must_use]
     pub fn last_law_refusal(&self) -> Option<(usize, u8)> {
-        let v = self.last_law_refusal.load(Ordering::Relaxed);
-        if v == u64::MAX {
-            return None;
-        }
-        Some(((v >> 8) as usize, (v & 0xFF) as u8))
+        decode_law(self.last_law_refusal.load(Ordering::Relaxed))
+    }
+
+    /// PM15-9b: record that family `f`'s venue law changed mid-session
+    /// (`cause` is the CLOB check that now fails). Written before the
+    /// [`Pm15Counter::VenueLawChanged`] tally it explains, both Relaxed:
+    /// the pairing is BEST-EFFORT — a reader on another core may see the
+    /// new tally with the previous record (it then names the previous
+    /// change; the tally, the alert itself, is never lost).
+    #[inline]
+    pub fn note_law_change(&self, f: usize, cause: crate::gamma15::PmLawErr) {
+        self.last_law_change
+            .store(((f as u64) << 8) | cause as u64, Ordering::Relaxed);
+    }
+
+    /// PM15-9b: the last venue-law change, `(family, cause)`.
+    #[must_use]
+    pub fn last_law_change(&self) -> Option<(usize, u8)> {
+        decode_law(self.last_law_change.load(Ordering::Relaxed))
     }
 
     /// One more of `c`.
@@ -322,6 +347,15 @@ impl Default for Pm15Counters {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A `family << 8 | cause` word; `u64::MAX` = none.
+#[inline]
+const fn decode_law(v: u64) -> Option<(usize, u8)> {
+    if v == u64::MAX {
+        return None;
+    }
+    Some(((v >> 8) as usize, (v & 0xFF) as u8))
 }
 
 // ---------------------------------------------------------------

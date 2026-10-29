@@ -233,7 +233,7 @@ pub fn miss_probe(tls: Arc<ClientConfig>) -> Result<String, String> {
     }
     let window = (wall_s / PM_WINDOW_S) as u32;
     let mut disc = Pm15Discovery::new(Arc::clone(&tls), &[b"btc"])
-        .map_err(|e| format!("the Gamma client: {e:?}"))?;
+        .map_err(|e| format!("the discovery clients (Gamma, CLOB): {e:?}"))?;
     let mut spec = PmWindowSpec::EMPTY;
     disc.fetch(0, window, &mut spec)
         .map_err(|e| format!("BTC's window {window}: {e:?}"))?;

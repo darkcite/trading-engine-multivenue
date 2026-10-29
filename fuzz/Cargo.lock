@@ -195,6 +195,7 @@ dependencies = [
  "core-latency",
  "core-net",
  "core-ring",
+ "core-time",
 ]
 
 [[package]]
@@ -666,6 +667,8 @@ version = "0.1.0"
 dependencies = [
  "core-time",
  "core-types",
+ "getrandom 0.2.17",
+ "libc",
  "secp256k1",
  "tiny-keccak",
  "zeroize",

@@ -858,7 +858,10 @@ pub const PM15_RTDS_WS: core_net::WsCfg = core_net::WsCfg {
 /// `core_id`), feeding `engine::PM15_LANE` — `tick_tx` and `event_tx` are
 /// that lane's producers. `assets` are the families' assets in
 /// `[polymarket] rolling` order. Opens the `pm15` capture and resolves
-/// all three hosts BEFORE spawning: a failure is a boot error.
+/// all four hosts BEFORE spawning — Gamma (`gamma-api.polymarket.com`),
+/// the CLOB (`clob.polymarket.com`, PM15-9b), the market sockets
+/// (`ws-subscriptions-clob.polymarket.com`) and RTDS
+/// (`ws-live-data.polymarket.com`): a failure is a boot error.
 ///
 /// # Errors
 /// The capture could not be opened, or a host did not resolve.
@@ -1003,7 +1006,7 @@ fn spawn_rolling(
         tls_config.clone(),
         &refs,
     )
-    .map_err(|e| io::Error::other(format!("{label}: gamma client: {e:?}")))?;
+    .map_err(|e| io::Error::other(format!("{label}: discovery clients (gamma, clob): {e:?}")))?;
     // PM15-6c: slot 9's gateway reads every window too, when it is live.
     if let Some(t) = tee {
         discovery.set_tee(t);
@@ -10028,6 +10031,48 @@ pub fn pm15_metric_values(c: &ingress_polymarket::pm15_loop::Pm15Counters) -> [u
     v
 }
 
+/// PM15-9b: one `warn!` when `c`'s `venue_law_changed` tally rose since
+/// `last` (which it then advances) — the pipeline `label`, the new total,
+/// the rise, and the change's family index and cause (`last_law_change`:
+/// the family is its `[polymarket] rolling` index; the asset is named on
+/// the discovery's stderr line). `true` when it warned. The engine's 5 s
+/// report block: cold, and a rise is a rare event.
+fn warn_venue_law_changed(
+    label: &str,
+    c: &ingress_polymarket::pm15_loop::Pm15Counters,
+    last: &mut u64,
+) -> bool {
+    use ingress_polymarket::gamma15::PmLawErr;
+    use ingress_polymarket::pm15_loop::Pm15Counter;
+    let total = c.of(Pm15Counter::VenueLawChanged);
+    if total <= *last {
+        return false;
+    }
+    let rise = total - *last;
+    *last = total;
+    // One load: the family and the cause name come from the same record
+    // (best-effort against the tally, `Pm15Counters::note_law_change`).
+    let change = c.last_law_change();
+    let (family, cause) = match change {
+        Some((f, k)) => (f as i64, i64::from(k)),
+        None => (-1, -1),
+    };
+    let cause_name = change.and_then(|(_, k)| PmLawErr::from_code(k));
+    tracing::warn!(
+        pipeline = label,
+        venue_law_changed_total = total,
+        rise,
+        family,
+        cause,
+        cause_name = ?cause_name,
+        last_law_refusal = ?c.last_law_refusal(),
+        "{label}: VENUE LAW CHANGED on the CLOB — the family's windows are refused \
+         (dormant per window) until the law holds again; the discovery's stderr line \
+         names the asset and the record"
+    );
+    true
+}
+
 /// PM15-8c: slot 9's arm (`engine_pm15_arm_*`) and pm-gw
 /// (`engine_pm15_gw_*`) — one gauge per word of
 /// `exec_polymarket::stats::PmExecStats`, a tally `…_total`, a level
@@ -10476,6 +10521,9 @@ where
         }};
     }
     let mut regime_last = strategy_core::RegimeCounters::default();
+    // PM15-9b: the `venue_law_changed` tallies the 5 s report last saw,
+    // `[pm15, pm5]` (`warn_venue_law_changed`).
+    let mut venue_law_changed_last = [0u64; 2];
     // HAR H3.5: the gauges' row scratch (boot-allocated, reused).
     let mut har_rows = [strategy_core::HarSeriesView::default(); strategy_core::HAR_VIEW_SERIES];
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
@@ -10593,6 +10641,13 @@ where
             // from this thread).
             if let Some(tap) = hyparb_shadow.as_mut() {
                 tap.drain(eng.strategy());
+            }
+            // PM15-9b: a rolling family's venue law changed on the CLOB —
+            // warned HERE, in the engine's own log, on every rise of the
+            // tally, whatever `--metrics` says (the F21 lesson above).
+            if let Some(ing) = obs.ingress.as_ref() {
+                warn_venue_law_changed("pm15", &ing.pm15c, &mut venue_law_changed_last[0]);
+                warn_venue_law_changed("pm5", &ing.pm5c, &mut venue_law_changed_last[1]);
             }
 
             let ticks = eng.ticks_dispatched;
@@ -14275,6 +14330,32 @@ mod tests {
             HYPARB_COUNTER_NAMES[24],
             "engine_hyparb_gas_charged_usd_1e6_total"
         );
+    }
+
+    /// PM15-9b: the 5 s report warns once per rise of a pipeline's
+    /// `venue_law_changed` tally, never on a flat one.
+    #[test]
+    fn a_venue_law_change_is_warned_once_per_rise() {
+        use ingress_polymarket::gamma15::PmLawErr;
+        use ingress_polymarket::pm15_loop::{Pm15Counter, Pm15Counters};
+        let c = Pm15Counters::new();
+        let mut last = 0u64;
+        assert!(!warn_venue_law_changed("pm15", &c, &mut last), "nothing changed");
+        c.note_law_change(2, PmLawErr::ClobFee);
+        c.inc(Pm15Counter::VenueLawChanged);
+        assert!(warn_venue_law_changed("pm15", &c, &mut last));
+        assert_eq!(last, 1);
+        assert!(!warn_venue_law_changed("pm15", &c, &mut last), "the same change");
+        c.inc(Pm15Counter::VenueLawChanged);
+        c.inc(Pm15Counter::VenueLawChanged);
+        assert!(warn_venue_law_changed("pm5", &c, &mut last));
+        assert_eq!(last, 3);
+        // A rise with no change record (never written before its tally in
+        // the discovery, but the mirror must not care) still warns.
+        let bare = Pm15Counters::new();
+        bare.inc(Pm15Counter::VenueLawChanged);
+        let mut l = 0u64;
+        assert!(warn_venue_law_changed("pm5", &bare, &mut l));
     }
 
     #[test]
