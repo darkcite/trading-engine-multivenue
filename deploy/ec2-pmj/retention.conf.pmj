@@ -1,0 +1,21 @@
+# retention.conf.pmj — ~mv/multivenue/retention.conf on the EC2 standalone.
+# KEY=VALUE shell syntax, sourced by pmj-daily.sh's retention pass (the port of
+# scripts/retention.sh) and by scripts/archive-cycle.sh (stage A). Every key:
+# the repo's retention.conf.example.
+#
+# CLAUDE.md "Retention": PROTECT_DAYS 1 — the last 24 h on local disk, older
+# in object storage, pulled on demand; EVERY delete gated on the archiver's
+# `verify` (the bucket holds the run: index present, manifest identical, every
+# object HEADs with its size and ETag). The unreachable thresholds make the
+# sweep run every night; an unverified run stops it and keeps everything after.
+MIN_FREE_GIB=999999
+TARGET_FREE_GIB=999999
+PROTECT_DAYS=1
+ARCHIVE_DIR="$HOME/multivenue/archive"
+# s3 only once ~/multivenue/s3.env enables the archiver (README step 8). Until
+# then `compress` (pressure-free here: every run older than PROTECT_DAYS is
+# tarred into ARCHIVE_DIR, never deleted) — or keep s3 and accept that nothing
+# is freed: an unverifiable run is never deleted.
+ARCHIVE_MODE="compress"
+S3_CYCLE_BUDGET_S=8400
+S3_NICE_NETWORK=0

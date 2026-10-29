@@ -1,0 +1,31 @@
+# multivenue pmj — the engine unit's OnFailure= target: when
+# multivenue-pmj.service ends FAILED (a wrapper refusal, exit 78; a start
+# timeout), write the alarm marker (~mv/multivenue/state/pmj-alert) and a loud
+# page into ~mv/multivenue/.notify-inbox. Nothing relays the inbox from this
+# host yet (R-PMJ-S75 "Not now"); the README makes a relay a prerequisite
+# before any dust line.
+[Unit]
+Description=multivenue pmj engine alarm (marker + inbox page)
+
+[Service]
+Type=oneshot
+User=mv
+Group=mv
+Environment=HOME=/home/mv
+WorkingDirectory=/home/mv/multivenue
+ExecStart=/opt/multivenue/current/deploy/ec2-pmj/pmj-alert.sh on-failure
+TimeoutStartSec=60
+LimitCORE=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/mv/multivenue
+InaccessiblePaths=-/home/mv/keys -/home/mv/multivenue/.env
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+StandardOutput=append:/home/mv/multivenue/logs/systemd/alert.log
+StandardError=append:/home/mv/multivenue/logs/systemd/alert.log

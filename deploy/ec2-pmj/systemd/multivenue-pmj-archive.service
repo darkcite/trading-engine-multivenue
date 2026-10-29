@@ -1,0 +1,39 @@
+# multivenue pmj — the cold archive's stage A (scripts/archive-cycle.sh, the
+# repo's own script, unchanged: it runs on Linux as it does on the Mac):
+# push every CLOSED run dir to the S3-compatible bucket under a wall budget.
+# A no-op unless ~/multivenue/retention.conf says ARCHIVE_MODE="s3" and
+# ~/multivenue/s3.env enables the archiver (S-DOCTRINE: handwritten SigV4,
+# no SDK, no delete verb, entirely outside the engine). Deletion is stage B,
+# pmj-daily.sh's retention, gated on `verify`. launchd counterpart:
+# com.multivenue.archive.
+[Unit]
+Description=multivenue pmj cold archive, stage A (push closed runs)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mv
+Group=mv
+Environment=HOME=/home/mv
+WorkingDirectory=/home/mv/multivenue
+ExecStart=/opt/multivenue/current/scripts/archive-cycle.sh
+# S3_CYCLE_BUDGET_S (8400 s default) plus the stale-upload sweep.
+TimeoutStartSec=9000
+Nice=19
+IOSchedulingClass=idle
+LimitCORE=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/mv/multivenue
+# The archiver needs s3.env and the run dirs; never the wallet or .env.
+InaccessiblePaths=-/home/mv/keys -/home/mv/multivenue/.env
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+StandardOutput=append:/home/mv/multivenue/logs/systemd/archive.log
+StandardError=append:/home/mv/multivenue/logs/systemd/archive.log

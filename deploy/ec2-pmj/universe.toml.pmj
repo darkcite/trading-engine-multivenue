@@ -1,0 +1,54 @@
+# universe.toml.pmj — ~mv/multivenue/universe.toml on the EC2 standalone:
+# only what slot 11 (pmj) reads, plus the two anchors the boot law still
+# demands. Grammar: the repo's universe.toml.example (core-config::universe —
+# a strict TOML subset; an unknown section or key refuses the boot). Read
+# ONCE at boot. APPEND, never reorder (SymbolIds are file-order ordinals).
+# The ordinals here are this engine's own: a capture from this host resolves
+# through its run's instrument-manifest.tsv, never through main's.
+#
+#   sudo -u mv -H install -m 0600 universe.toml.pmj ~mv/multivenue/universe.toml
+#   # then paste ONE live Polymarket token into `markets` (below), and check:
+#   sudo -u mv -H /opt/multivenue/current/target/release/multivenue-engine pmj-check
+
+[polymarket]
+# REQUIRED BY THE BOOT LAW, NOT BY SLOT 11: core_config::universe::assert_bootable
+# refuses a universe with no static Polymarket market ("boot refuses to run
+# venue-blind") — BOOT-AUDIT.md C1. One entry: "<token-id>" or "<yes>:<no>",
+# decimal (M1-R1: a crypto up/down market). Use the LONGEST-DATED ACTIVE one
+# you can find (Gamma): nothing refreshes it here. Once it resolves, every
+# later boot logs it "missing from venue universe" and continues (paper, and
+# an --exec boot: only the legacy --live flag refuses on it) — but Gamma being
+# UNREACHABLE or erroring on it at boot is FATAL (BOOT-AUDIT 4d): this token
+# is a boot dependency slot 11 gains nothing from. Re-paste a current one at a
+# redeploy. Empty, as shipped, REFUSES THE BOOT until filled.
+markets = []
+# Slot 11's families: the 5-minute up/down markets, ALL SEVEN (R-PMJ-S12), in
+# this order — pmj.toml `families` must equal these assets as a sequence
+# (pmj_boot). No 15-minute key: slot 9 is not on this engine (R-PMJ-3).
+rolling = [
+  "updown:btc:5m", "updown:eth:5m", "updown:sol:5m", "updown:xrp:5m",
+  "updown:hype:5m", "updown:doge:5m", "updown:bnb:5m",
+]
+# The depth capture (R-PMJ-S15): one record per leg per second at most.
+rolling_depth = true
+rolling_depth_ms = 1000
+# One market socket per family (R-PMJ-S18; the default, stated).
+rolling_market_sockets = 8
+
+[binance]
+# `spot` is REQUIRED BY THE BOOT LAW, NOT BY SLOT 11: assert_bootable demands
+# one Binance spot symbol (the latency-arb pair anchor, M1) — BOOT-AUDIT.md C1.
+# It costs one socket on BINANCE_WS_HOST and one exchangeInfo at boot.
+spot = ["btcusdt"]
+# The bnb family's nowcast (pmj.toml perp[6] = "binance-usdm:bnbusdt"):
+# bookTicker + markPrice on BINANCE_FUT_WS_HOST.
+usdm = ["bnbusdt"]
+
+[hyperliquid]
+# The nowcasts of the other six families (pmj.toml perp[0..5] =
+# "hyperliquid:BTC" … "hyperliquid:DOGE"): perps on HYPERLIQUID_WS_HOST.
+coins = ["BTC", "ETH", "SOL", "XRP", "HYPE", "DOGE"]
+
+# No [pairs]: with one market and one spot symbol the boot injects the
+# default pair "0:0" (only the unlinked latency-arb reads pairs). No [okx],
+# [deribit], [bybit], [mexc], [hyperevm], [hypercall]: none is dialed.

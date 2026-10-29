@@ -1,0 +1,21 @@
+# exec.toml.pmj.example — ~mv/multivenue/exec.toml on the EC2 standalone.
+# The grammar and every key: the repo's exec.toml.example (its parser's
+# contract). This copy is PAPER: nothing is armed.
+#
+#   sudo -u mv -H install -m 0600 exec.toml.pmj.example ~mv/multivenue/exec.toml
+#
+# A paper boot does not read it (strategy.conf names no EXEC_TOML); it exists
+# because scripts/pmj-flip.sh `live` edits the exec.toml the boot will read
+# and refuses when there is none. The flip WRITES the [exec.slot.11] DUST
+# section below (mode live, venues ["jupiter"], $5.01 an order and an
+# instance, 1 open order, $50 a day, -$50 a session, reject streak 5, recon
+# stale 180 s), after a stamped .bak — never edit it to live by hand, and
+# never add another live slot here: the engine refuses a live slot 11 beside
+# any other (R-PMJ-S77) and so does the flip. The halt file for this engine is
+# exec.HALT beside this file (~mv/multivenue/exec.HALT).
+
+[exec]
+enabled = 1
+
+[exec.slot.11]
+mode = "paper"

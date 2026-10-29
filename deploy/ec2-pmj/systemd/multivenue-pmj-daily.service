@@ -1,0 +1,39 @@
+# multivenue pmj — the daily lane (pmj-daily.sh: the 0020Z slot, the pmj gate,
+# the drain at a safe minute, retention, the read-only claimable listing).
+# Started every minute by multivenue-pmj-daily.timer; a tick that is still
+# running when the next is due makes systemd skip the next (the Mac's
+# StartInterval 60 behaves alike).
+[Unit]
+Description=multivenue pmj daily lane (gate, drain, retention)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mv
+Group=mv
+Environment=HOME=/home/mv
+# The one env file: the pmj gate's scripts/pmj-exec.sh key-check and the
+# claimable listing read it by this name. No release has a .env.
+Environment=MULTIVENUE_ENV_FILE=/home/mv/multivenue/.env
+WorkingDirectory=/home/mv/multivenue
+ExecStart=/opt/multivenue/current/deploy/ec2-pmj/pmj-daily.sh
+# The drain's /state wait (300 s) and a key check fit well inside this.
+TimeoutStartSec=900
+# Niced: never between the engine and a CPU or the disk.
+Nice=19
+IOSchedulingClass=idle
+LimitCORE=0
+LimitNOFILE=8192
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/mv/multivenue
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+StandardOutput=append:/home/mv/multivenue/logs/systemd/daily.log
+StandardError=append:/home/mv/multivenue/logs/systemd/daily.log

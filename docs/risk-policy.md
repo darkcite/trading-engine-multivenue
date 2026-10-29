@@ -17608,6 +17608,7 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S78 | **PROVISIONAL — Anton to confirm** (the session's choice, J16, risk review round 2): a **review trigger** found by the daily restart's key check (`pmj-exec` exit 77: the Predict deploy off its pin, the vault table entry or the mint changed, a pinned account closed) **halts the running slot 11** (`slot=11 reason=operator` appended to `exec.HALT`) and pages (`notify-send.sh -l`); every other key-check failure only defers the restart. |
 | R-PMJ-S79 | **PROVISIONAL — Anton to confirm** (the session's choice, J17): the dust battery lands through Jupiter's `POST /execute` only. The second landing path (our own RPC `sendTransaction`) is built only after J0 shows a build arrives already co-signed; if Jupiter co-signs only at `/execute`, it cannot exist. `--path rpc` refuses. |
 | R-PMJ-S80 | **PROVISIONAL — Anton to confirm** (the session's choice, J17, from J0's public tape 2026-10-19): the dust battery's SOL limits — `DUST_SOL_FALL_MAX_LAMPORTS` 6 619 500 a sent order; `guard_max_sol_lamports` ≤ 6 000 000 (a ceiling only; J0 proposes 0); `guard_max_cu_price` ≤ 100 000 µlamports/CU; ≤ 0.15 SOL at a run's start; SOL ≥ `min_sol_lamports` + 6 619 500 before each order. |
+| R-PMJ-S81 | **PROVISIONAL — Anton to confirm** (the session's choices, J18, the EC2 kit): E3 is replaced on the standalone by the J16 pmj gate (no Hyperliquid or Binance arm exists there); drains at second 30 of an m mod 5 = 1 minute, deferred while an order is in flight; the core map isolates physical core 3; only a git-built release may be current while slot 11 is armed; a tested page relay and a green `host-gates.sh` are prerequisites before any dust line on the host. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -19074,6 +19075,166 @@ the round-2 tree): `cargo build --release -p cli` OK; `cargo test` on
 `exec-router` 1 579 passed; the alloc gates 139 at 0 B; `pmj-exec
 --self-test` PASS. No fuzz target touched; `make bench-check` not run
 (`hot_path` links no crate J17 changes).
+
+### J18 — the slot-11 EC2 standalone kit (`deploy/ec2-pmj/`, the live-ready round's W3) (2026-10-29)
+
+**Why.** R-PM-23 puts the live host in AWS eu-west-1; with P0's KILL it
+carries slot 11 alone (R-PMJ-S77), and R-PM-24 asks for a kit plus a
+provisioning script Anton runs. **The kit is installed PAPER; nothing in
+it arms anything, calls AWS from a session, or holds a secret.** The
+operator's steps, with a check and a rollback each, are
+`deploy/ec2-pmj/README.md`; what the engine dials with `STRATEGY=pmj` is
+`deploy/ec2-pmj/BOOT-AUDIT.md`.
+
+- **Scope.** One engine on one c7i.2xlarge (Ubuntu 24.04, eu-west-1),
+  `STRATEGY=pmj` only (mask 2048): `pmj-wrapper.sh` refuses any other
+  member, `ai`/`all`, and an `ARM_LIVE` part other than 11; it mirrors the
+  Mac wrapper's both-or-neither `EXEC_TOML` / `ARM_LIVE` rule (78); it runs
+  the offline `pmj-check` before exec. Arming further needs a git-built
+  release (below) and the engine's own interlock (J16). `/state` stays on
+  the host's loopback; the operator tunnels it to local port 19191, never
+  9191 (main's). ONE ENGINE holds per host: systemd restarts only after the
+  main process and its cgroup are gone. The region is chosen for latency
+  only; eligibility is R-PM-11, and a VM is never a way around a geoblock
+  (Jupiter refuses US and KR; the key check names `unsupported_region`).
+- **AWS** (`provision.sh`, `az-rtt-probe.sh`; the operator runs them with
+  his own profile; both have a `--dry-run` that calls nothing): the AMI
+  from Canonical's SSM parameter; IMDSv2 required, hop limit 1; an
+  encrypted gp3 root; termination protection; one security group admitting
+  TCP 22 from the operator's /32 only, reconciled rule by rule and checked
+  to be the instance's only group; an Elastic IP; the SSH key made with
+  `ssh-keygen` and a passphrase on the Mac, only its public half imported —
+  **the SSH key is equivalent to the wallet**; nothing in the kit deletes a
+  resource. **No EBS snapshot, AMI or Backup / DLM policy may ever cover the
+  root volume** (it holds the keypair). The probe's instances terminate
+  themselves and carry no key.
+- **The host** (`host-setup.sh`): a non-root `mv`; `~mv/multivenue` 0700;
+  nofile 8192; core dumps off (`core_pattern` `|/bin/false`,
+  `suid_dumpable` 0, `LimitCORE=0` in every unit, systemd-coredump storage
+  none, apport and kdump removed); `ptrace_scope` 2; no swap (the signer's
+  page is mlock'd; the rest of the process is not); SSH without passwords or
+  root; security-only unattended upgrades, no automatic reboot; chrony to
+  AWS Time Sync (169.254.169.123, fd00:ec2::123). **Core map:** physical
+  core 3 (CPUs 3, 7) isolated (`isolcpus`, `nohz_full`, `rcu_nocbs`), IRQs
+  elsewhere; `pmj-pin.sh` moves only the main loop to CPU 3 after `/state`
+  answers; the Hyperliquid ingress keeps its hard pin to 7; slot 11's own
+  feed and jup-gw run on the housekeeping CPUs. `OOMScoreAdjust` −900 on
+  the engine; builds run in a `MemoryMax` scope at nice 19.
+- **Secrets.** One env file, `/home/mv/multivenue/.env`, named by
+  `MULTIVENUE_ENV_FILE` in every unit and script (J17's env-file checks: a
+  0600 regular file owned by `mv`, no strategy switch, else 78); no copy or
+  link of it in any release tree (deploy and rollback delete one; the
+  source and kit tarballs are refused if they hold one); the archive and
+  alert units cannot see it or the keys directory (`InaccessiblePaths`).
+  The keypair file sits in a 0700 directory of `mv`'s (J16's loader checks
+  the file). Limit: any `mv` process can read the engine's
+  `/proc/<pid>/environ` (`JUP_API_KEY`); the seed stays in the locked page.
+- **Build provenance** (`deploy-linux.sh` on the Mac, `install-release.sh`
+  on the host). The host builds from the Mac's `git archive` (paper only:
+  `build.rs` sees no `HEAD`, so no gate line can compile in) or from a
+  one-commit shallow repository (`--with-git`, installed as `<sha>-git`);
+  **only a git-built release can be current while slot 11 is armed, and the
+  wrapper refuses to arm another.** `RUSTFLAGS="-C target-cpu=native"` — the
+  repo's `.cargo/config.toml` targets AMD znver3 for x86_64 Linux, which is
+  wrong for c7i; `BUILD_INFO` records the observed flags (a `znver` flag
+  refuses the install), the build CPU (the wrapper refuses another model),
+  the transport and the hashes. Releases are root-owned and immutable, with
+  `current` / `previous` links and a locked rollback; `LICENSE`, `NOTICE`
+  and `THIRD-PARTY-NOTICES.md` ship in each release tree (the binary never
+  leaves the host). **`host-gates.sh`** runs the Linux battery on the host at
+  the release (tests on `cli`, `exec-jupiter`, `signer-ed25519`,
+  `core-config`, `core-net`, `exec-router`; the alloc gates at 0 B with a
+  fresh `Compiling bench`; the installed self-test; fuzz recorded "not run",
+  it needs nightly) with a scratch `HOME`, and writes its verdicts into
+  `BUILD_INFO`.
+- **The restart law here** (`pmj-daily.sh`, a 1-minute timer). Drains only
+  at second 30 of a minute with m mod 5 = 1 (≥ 90 s from every :00 / :15 /
+  :30 / :45 end; 96 s after the previous window's last possible submit;
+  148 s before the next strike's reports), the clock re-read just before;
+  the daily slot is 00:20Z. **E3 is not ported** — its exec-smoke proves
+  the Hyperliquid signer, and this engine can arm no Hyperliquid or Binance
+  slot; **the J16 pmj gate stands in for it**, unchanged in meaning: an
+  `exec.HALT` naming 11 defers the drain without a check; else the offline
+  self-test, then `pmj-exec.sh key-check` at the slot's day cap; 77 appends
+  `slot=11 reason=operator` once and pages; any other failure defers with
+  the 1 / 5 / 15 / 60-minute backoff and goes RED after three. With slot 11
+  live, a drain also waits while `engine_pmj_arm_submitted_total` −
+  `engine_pmj_arm_done_total` > 0 (an order in flight; jup-gw's landed −
+  done − lost is not exact). The drain is a polkit-allowed `systemctl
+  try-restart` (the rule allows nothing else) and waits up to 300 s for a
+  new boot. Every drain costs the current 5-minute window (the restarted
+  engine never trades a window whose strike it did not see). A crash
+  relaunch skips the gate (as launchd's KeepAlive does) and backs off 15 s
+  → 300 s; a wrapper refusal (78) does not relaunch; reboots, AWS
+  maintenance and OOM kills are ungated restarts. `vm_rows_active` does not
+  apply here; the after-restart check is `boot.strategy` pmj,
+  `slots[11].enabled`, `exec.halted[11]` and `boot.paper` as expected.
+- **Halting.** `pmj-kill.sh <host>` (the Mac) appends the slot-11 halt
+  line over SSH and polls `/state` about 6 s: exit 0 only on a confirmed
+  halt (or a slot not live), else 1 — then `--stop` (a SIGTERM drain). If
+  SSH is refused (the operator's IP changed): `aws ec2 stop-instances` (a
+  SIGTERM drain; termination protection does not block a stop), then
+  `provision.sh --my-ip`; the engine boots as configured, so halt again.
+- **Paging.** `OnFailure=` and `ExecStopPost` run `pmj-alert.sh`: a
+  marker (`state/pmj-alert`) and an inbox page, rate-limited; the daily
+  gate pages on 77, RED and a drain with no boot. **No relay exists**
+  (R-PMJ-S75 "Not now"): those pages land only on the host. **A tested
+  relay is a hard prerequisite before any dust line on this host** —
+  `multivenue-notify` there (N-DOCTRINE; needs R-PMJ-S75 lifted for slot
+  11) or a Mac-side watcher over SSH with a dead-man alarm: Anton's ruling.
+- **Universe and config.** `universe.toml.pmj` holds the static Polymarket
+  market `assert_bootable` forces (use the longest-dated active market: a
+  stale one only warns, but a Gamma failure on it is fatal at boot), the
+  seven 5-minute families, `btcusdt`, `bnbusdt` and six Hyperliquid coins
+  (what slot 11's member reads); its ordinals are this host's own. The
+  forced static market and spot symbol are the only connections slot 11
+  does not need (`BOOT-AUDIT.md` C1–C8 lists the code changes that would
+  drop them; none is required). `pmj.toml` is the Mac's with every `guard_*`
+  and `build_extra*` line stripped (a grep count of 0 is required): the
+  guard keys come only from Anton's own J0 review on this host (LAW PMJ-G).
+  `exec.toml.pmj.example` is paper; the flip writes the dust section.
+- **Retention.** PROTECT_DAYS 1; every local delete follows a passing
+  `multivenue-archive verify`, oldest first, the newest run never touched;
+  the S3 upload (00:40Z) is off until S3 is set up, with its own
+  `MULTIVENUE_S3_HOST_ID`; egress is billed.
+- **Claims** are never sent: the daily lane lists claimable positions with
+  one read-only GET (the API key on stdin, the answer 0600).
+- **Latency.** CLAUDE.md's `latency_probe` runs on the host (per host and
+  location) before any backtest number is trusted for it; `rtt.sh` covers
+  Jupiter, Gamma, the Polymarket sockets, RTDS, Hyperliquid, Binance and
+  Solana RPC, for the AZ choice only.
+- **Proof.** Linux x86_64 in a cloud container (Intel, `target-cpu=native`):
+  the release build, 1 579 tests on the six crates, the alloc gates 139 at
+  0 B and the self-test (J17-GATES). The kit's scripts: shellcheck clean,
+  `bash -n` / `zsh -n` on all 13, `systemd-analyze verify` (systemd 255.4)
+  on all 6 units, both dry runs, and session harnesses (the wrapper 35 / 35,
+  the daily lane 45 / 45 under mawk and gawk, the installer's prune,
+  rollback and env cleanup). **Nothing has run on a real EC2 host:** the
+  first deploy's checks are the README's.
+- **Open before the dust line on this host:** a tested relay (above);
+  `host-gates.sh` GREEN on the `-git` release; J0 run from this host, its
+  guard keys reviewed into this host's `pmj.toml`; `latency_probe`; J16's
+  and J17's lists. R-PMJ-S81 (PROVISIONAL) records the kit's choices.
+- **Risk review** (an Opus subagent, read-only): round 1 **NEEDS-DOCS** —
+  pages reached nobody; the Linux binary passed no gate; the kill switch
+  hung on one /32 and did not verify; thirteen minors (log ownership, the
+  transport, rollback while armed, the safe minute, relaunch backoff, OOM,
+  `.env` handling, the archiver's access, the SG reconcile, the guard keys
+  in a copied `pmj.toml`, the RTT hosts, the SSH key, snapshots) → fixed;
+  round 2 **APPROVE** with three minors (the `.env` hard link replaced by
+  `MULTIVENUE_ENV_FILE`; polkit `try-restart` only; an order in flight at
+  the drain) → fixed.
+
+J18-GATES (2026-10-29, on the Mac unless noted; the release binary
+untouched; no cargo change — the kit is scripts, units and templates):
+`deploy/ec2-pmj/check.sh` — shellcheck 0.11.0 clean (style and up), `bash
+-n` under bash 3.2.57, `zsh -n` on all 13 scripts, `provision.sh --dry-run`
+and `az-rtt-probe.sh --dry-run` without credentials · `systemd-analyze
+verify` on all 6 units (systemd 255.4 and the Linux VM's 249) · `make
+license-check` OK (818 files, the kit's 13 scripts staged) · the session
+harnesses (the wrapper 35 / 35, the daily lane 45 / 45, the installer's
+prune / rollback / env cleanup) · the Linux x86_64 build and tests of
+J17-GATES.
 
 ## NOTIFY — N-DOCTRINE: the one-way Telegram notifier (2026-10-24)
 

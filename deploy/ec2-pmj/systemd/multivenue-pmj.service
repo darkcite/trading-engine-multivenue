@@ -1,0 +1,98 @@
+# multivenue pmj — the EC2 standalone engine: slot 11 (pmj) ALONE
+# (docs/risk-policy.md ### J16, R-PMJ-S77). Installed by host-setup.sh and
+# install-release.sh into /etc/systemd/system/. The launchd counterpart is
+# launchd/com.multivenue.engine.plist (RunAtLoad, KeepAlive, ThrottleInterval
+# 15, ExitTimeOut 60).
+#
+# A SYSTEM unit with User=mv, not a user unit: the sandbox below
+# (ProtectSystem=strict, PrivateTmp, ProtectKernel*) needs the system manager
+# — a user manager can only build it from unprivileged user namespaces, which
+# Ubuntu 24.04's AppArmor restricts — and LimitCORE / CPUAffinity /
+# LimitNOFILE / OOMScoreAdjust are the system manager's to enforce. The daily
+# lane restarts it as `mv` through ONE polkit rule (host-setup.sh:
+# try-restart of this unit only); `mv` has no sudo.
+#
+# The release: /opt/multivenue/current resolves at START, so one boot runs
+# one release's wrapper and binary; a redeploy is picked up at the next drain
+# (pmj-daily.sh) — never by a restart of its own.
+#
+# Requires systemd >= 254 (RestartSteps / RestartMaxDelaySec); Ubuntu 24.04
+# ships 255.
+[Unit]
+Description=multivenue engine — slot 11 (pmj) standalone
+Documentation=file:/opt/multivenue/current/deploy/ec2-pmj/README.md
+Wants=network-online.target
+After=network-online.target time-sync.target chrony.service
+# KeepAlive's semantics: never give up relaunching (a boot refusal loops, as
+# launchd's does — risk-policy J16 "Limits"), but back off (below).
+StartLimitIntervalSec=0
+# A FAILED end (a wrapper refusal, a start timeout): the marker and a page.
+OnFailure=multivenue-pmj-alert.service
+
+[Service]
+Type=simple
+User=mv
+Group=mv
+Environment=HOME=/home/mv
+# The one env file (pmj-wrapper.sh sources it; scripts/pmj-exec.sh,
+# pmj-flip.sh and pmj-dust.sh read it by this name). No release has a .env.
+Environment=MULTIVENUE_ENV_FILE=/home/mv/multivenue/.env
+WorkingDirectory=/opt/multivenue/current
+ExecStart=/opt/multivenue/current/deploy/ec2-pmj/pmj-wrapper.sh
+# The engine loop onto the isolated CPU once /state answers (non-fatal: `-`).
+ExecStartPost=-/opt/multivenue/current/deploy/ec2-pmj/pmj-pin.sh
+# Every end of the engine process: silent on a clean drain, the marker and a
+# (rate-limited) page on anything else.
+ExecStopPost=-/opt/multivenue/current/deploy/ec2-pmj/pmj-alert.sh exit
+Restart=always
+# A relaunch loop backs off 15 s -> 300 s over 6 steps (a slot-11 boot
+# refusal's live reads, Jupiter's and the RPC's budgets). systemd keeps this
+# counter across AUTOMATIC restarts only: the daily drain is a polkit
+# `systemctl try-restart`, a manual job, which resets it — so the daily dark
+# window stays short (pmj-daily.sh).
+RestartSec=15
+RestartSteps=6
+RestartMaxDelaySec=300
+# 78 is the wrapper's refusal: a misconfiguration (STRATEGY, .env, the two
+# switches, a pmj-check refusal, a CPU the binary was not built for, an
+# archive-transport release asked to arm). The unit then ends FAILED instead
+# of relaunching into it (OnFailure pages); fix, then start it. The ENGINE's
+# own boot refusals exit 1 and still relaunch, as launchd's do.
+RestartPreventExitStatus=78
+TimeoutStartSec=300
+# The M1d drain: SIGTERM, then 60 s before SIGKILL.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=60
+# The kernel's OOM killer takes anything before the engine (the build runs
+# in a MemoryMax scope; the daily and archive jobs are niced).
+OOMScoreAdjust=-900
+# The housekeeping CPUs (c7i.2xlarge: physical core 3 = CPUs 3,7 isolated).
+# The drop-in multivenue-pmj.service.d/10-cpus.conf, rendered from
+# /etc/multivenue-pmj/cores.env, replaces this on another topology.
+CPUAffinity=0-2 4-6
+LimitNOFILE=8192
+LimitCORE=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/mv/multivenue
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+UMask=0077
+StandardOutput=append:/home/mv/multivenue/logs/systemd/engine.out.log
+StandardError=append:/home/mv/multivenue/logs/systemd/engine.err.log
+
+[Install]
+WantedBy=multi-user.target

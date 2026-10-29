@@ -428,6 +428,9 @@ affected paragraph at each lane close; the superseded text goes to
   an env file (`MULTIVENUE_ENV_FILE`, else the repo's `.env`) that is not a
   0600 regular file owned by the user, or that sets a strategy switch — the
   repo's `.env` must be 0600 before slot 11 can arm. Provisional R-PMJ-S79, S80.
+- **PMJ J18 (the slot-11 EC2 standalone kit, `deploy/ec2-pmj/`) is committed**
+  (risk-policy `### J18`): nothing provisioned, nothing deployed — Anton runs it.
+  Provisional R-PMJ-S81.
 
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 

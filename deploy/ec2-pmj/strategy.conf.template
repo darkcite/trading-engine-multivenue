@@ -1,0 +1,19 @@
+# strategy.conf.template — ~mv/multivenue/strategy.conf on the EC2 standalone.
+# KEY=VALUE shell syntax, SOURCED by pmj-wrapper.sh as the Mac wrapper sources
+# it (the last assignment wins). This host runs slot 11 ALONE: any STRATEGY but
+# `pmj` refuses the boot (risk-policy J16, R-PMJ-S77).
+STRATEGY=pmj
+
+# PAPER: EXEC_TOML and ARM_LIVE stay UNSET. Only scripts/pmj-flip.sh live
+# writes them (ARM_LIVE=11, EXEC_TOML=~/multivenue/exec.toml), after its gates;
+# one without the other refuses the boot (exit 78). Never by hand.
+# EXEC_TOML=
+# ARM_LIVE=
+
+# The artifact, when not ~/multivenue/pmj.toml:
+# PMJ_TOML=
+
+# The raw tap (HK19): pm, pm5, bn, hl (comma-separated) or all.
+# RAW_TAP=
+# RAW_TAP_MODE=rejects
+# RAW_TAP_BUDGET_MB=64

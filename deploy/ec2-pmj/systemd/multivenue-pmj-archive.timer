@@ -1,0 +1,14 @@
+# multivenue pmj — stage A once a day at 00:40Z: after the 00:20Z drain closed
+# the previous run, long before the next. Persistent=true: an upload missed
+# while the host was down runs at boot (it touches no engine).
+[Unit]
+Description=multivenue pmj cold archive, stage A (daily 00:40 UTC)
+
+[Timer]
+OnCalendar=*-*-* 00:40:00 UTC
+AccuracySec=1s
+Persistent=true
+Unit=multivenue-pmj-archive.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,19 @@
+# multivenue pmj — the daily lane's tick: second 30 of every minute, UTC.
+# pmj-daily.sh decides: the 0020 slot once a UTC day, and a drain only at a
+# safe minute (second 30 of m mod 5 = 1: 90 s into a 5-minute window, 96 s
+# after the last window's last submit, 148 s before the next strike's
+# reports, 90 s or more off the 15-minute grid) with no slot-11 order in
+# flight. Persistent=false: a missed tick is never replayed at an arbitrary
+# moment after a reboot; the slot's stamp catches the day up.
+[Unit]
+Description=multivenue pmj daily lane tick (every minute at :30 UTC)
+
+[Timer]
+OnCalendar=*-*-* *:*:30 UTC
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=multivenue-pmj-daily.service
+
+[Install]
+WantedBy=timers.target

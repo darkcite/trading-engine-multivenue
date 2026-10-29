@@ -1,0 +1,80 @@
+# pmj.toml.example — ~mv/multivenue/pmj.toml on the EC2 standalone: slot 11's
+# artifact (core-config::pmj; one [pmj] section, every bound checked at parse,
+# the engine hashes the BYTES for its boot tell). R-PMJ-S22's PAPER frame.
+#
+# THE RECOMMENDED SOURCE IS THE MAC'S FILE, VERBATIM: main's slot 11 runs the
+# same law on paper, so the same bytes give the same boot-tell hash on both
+# engines (README step 5). Its families and perps match universe.toml.pmj.
+#
+#   scp ~/multivenue/pmj.toml pmj-ec2:/tmp/pmj.toml          # on the Mac
+#   sudo install -o mv -g mv -m 0600 /tmp/pmj.toml ~mv/multivenue/pmj.toml && rm /tmp/pmj.toml
+#
+# This file documents every key and the values the risk policy rules; the
+# researched values (the Φ table, the strike law's residuals, e_1e6, persist)
+# are NOT here — research never enters git — and the file does not parse until
+# they are pasted from the Mac's copy (`phi_lut` alone is 4 097 numbers).
+#
+# LAW PMJ-G — READ BEFORE ADDING ANY guard_* KEY: every guard_* key is ABSENT
+# here, and absent means EMPTY ALLOWLISTS, which REFUSE EVERY TRANSACTION. That
+# is the point: the guard's programs, lookup tables, deposit account, vault,
+# co-signer (R-PMJ-S44, dormant) and build_extra come from Anton's own J0
+# decode and his review, on this host, and from nowhere else. A paper boot
+# reads none of them; a live boot REFUSES while any allowlist is empty or any
+# pin unset (pmj_live::pmj_preboot). Never copy them from a session, a doc or
+# another host's file.
+[pmj]
+# --- the families: the universe's 5-minute keys, as a sequence ---
+families = ["btc", "eth", "sol", "xrp", "hype", "doge", "bnb"]
+# --- each family's nowcast (fast-venue instrument; resolved against this
+#     engine's instrument manifest) ---
+perp = ["hyperliquid:BTC", "hyperliquid:ETH", "hyperliquid:SOL", "hyperliquid:XRP", "hyperliquid:HYPE", "hyperliquid:DOGE", "binance-usdm:bnbusdt"]
+
+# --- the law (H90 on the 5-minute windows) ---
+# The late window, ns before the window's end; slot 11 keeps tau_max 20 s (R-PMJ-S69).
+tau_min_ns = 2000000000
+tau_max_ns = 20000000000
+# The keeper's lead: 6 s, so slot 11 decides at tau in [6, 20) s (R-PMJ-S55).
+min_tau_s = 6
+# p_min 0.90 and k 1.55 (R-PMJ-S60).
+p_min_1e6 = 900000
+sigma_k_1e3 = 1550
+# The favourite's ask floor 0.90 (absent = 0.90; R-PMJ-S24).
+price_floor_1e6 = 900000
+# e_1e6 = <copy from the Mac's pmj.toml>
+# persist = <copy from the Mac's pmj.toml>
+# Law (iii), the trapezoid strike (R-PMJ-S61/S63), and its residual:
+strike_law = "trap62"
+# sigma_res_ratio_1e3 = <copy from the Mac's pmj.toml>
+# sigma_res_min_ppm = <copy from the Mac's pmj.toml: one per family>
+# phi_lut = <copy from the Mac's pmj.toml: 4 097 values, Φ(z) x1e6>
+
+# --- R-PMJ-S22's PAPER frame: $250 deposit, max order $250.01, $250 a
+#     market, -$3 500 a session. scripts/pmj-flip.sh live rewrites these four
+#     lines to the DUST frame ($5 / $5.01 / $5 / -$50, live_assets ["btc"]);
+#     pmj-flip.sh paper restores these. ---
+deposit_usd_1e6 = 250000000
+max_order_usd_1e6 = 250010000
+usd_market_1e6 = 250000000
+session_loss_usd_1e6 = 3500000000
+max_orders_market = 4
+# The keeper's delay paper judges an order at: 5 s (R-PMJ-S47).
+paper_delay_ms = 5000
+
+# --- live only (J16), each absent here ---
+# live_assets — the families that may arm live: absent = NONE. The dust frame
+#   is BTC alone (`live_assets = ["btc"]`, written by the flip); the engine and
+#   the flip refuse anything else at that frame.
+# guard_deposit_mint — the deposit mint, USDC
+#   (EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v) or JupUSD
+#   (JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD), both 6-decimal, so a balance
+#   in base units is micro dollars — the unit requirement (a) compares with
+#   [exec.slot.11] cap_day_usd_1e6. NO DEFAULT (R-PMJ-S46 undecided): absent =
+#   a live boot refuses.
+# min_sol_lamports — the wallet's SOL floor at a live boot (fees); absent =
+#   0 = unset = a live boot refuses. At most 10 SOL (a guard on a slipped scale).
+# guard_program_slot — the Predict program's REVIEWED deploy slot; absent =
+#   unpinned; pmj-exec --key-check compares it with the chain (a new deploy is
+#   a review trigger, exit 77) and pmj-flip.sh live refuses without it.
+# guard_programs, guard_alts, guard_deposit_account, guard_vault,
+#   guard_vault_alt, guard_cosigners, guard_max_sol_lamports,
+#   guard_max_cu_price, build_extra — LAW PMJ-G above: J0's, Anton's, absent.
