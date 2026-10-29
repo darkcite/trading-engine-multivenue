@@ -371,6 +371,33 @@ affected paragraph at each lane close; the superseded text goes to
   - **Check:** vault `research/t2t/rx_lag_turns.py <run>/hl-ticks.pmlr
     <wall−mono ns> HH:MM:28 HH:MM:58`.
 
+## Corrections found 2026-10-28 (PMJ — slot 9 on law (iii); verify on `/state`)
+
+- **2026-10-28 00:11Z: the scheduled `0010` restart booted slot 9 (pm15) on
+  law (iii)** (R-PMJ-S61 / S68; runbook `docs/research/pmj/j12/slot9-flip-runbook.md`
+  in the vault). Slot 9 stays **PAPER**.
+  - **The config.** `~/multivenue/pm15.toml` gained `strike_law = "trap62"`,
+    `sigma_res_ratio_1e3 = 130` and `sigma_res_min_ppm = [3, 5, 6, 5, 6, 6, 3]`
+    at 00:02:57Z, after a run that booted before 00:00Z (backup
+    `pm15.toml.pre-j12`, also in `~/multivenue/rollback-pmj-20261023/`).
+  - **The boot.** Run `run-1793146278957505000` (epoch 00:11:18Z), binary
+    `8e8442e1`, `paper` 1, masks 2815, slots 9 and 11 configured and enabled.
+    - Slot 9's tell: `law=2-20s:p>=0.900:ask<=p-0.020:floor0.900:persist2:k1.550:strike=trap62:res=130/3,5,6,5,6,6,3`,
+      artifact hash `5951549f…` (was `ef485100…`).
+    - Slot 11's tell is unchanged (`…:strike=trap62:res=130/3,5,6,5,6,6,3
+      paper=+5000ms`, `4009f98a…`).
+    - `engine_pm15_strikes_computed_total` 7 → 14 across the 00:15Z and 00:30Z
+      windows.
+  - **The ledger.** No run booted between 00:00Z and the edit, so slot 9's `j12`
+    segment (`J12_SLOT9_FROM_NS`, 10-28 00:00Z) starts exactly at this run. It
+    appears in the worker's summary with slot 9's first settled fill.
+  - **Rollback.** Restore `pm15.toml.pre-j12` and restart at a scheduled slot,
+    with a new slot-9 `SEGMENTS` row (runbook §A.6).
+  - **Seen at this check, not this lane's:** `pm-pnl` passes failed on
+    2026-10-27 between about 22:21Z and 23:51Z with `No space left on device`
+    (and `universe-refresh` writes in `engine.err.log`); the Mac had 22 GiB free
+    at 00:21Z.
+
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
