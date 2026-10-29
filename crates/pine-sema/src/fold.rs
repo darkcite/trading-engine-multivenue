@@ -56,25 +56,48 @@ fn non_finite(r: f64, rd: &Readings) -> f64 {
     }
 }
 
-/// `I_ADD` / `I_SUB` / `I_MUL`: wrapping.
-pub(crate) const fn i_add(a: i64, b: i64) -> i64 {
-    a.wrapping_add(b)
+/// `2^63` as an `f64`: `F_INT`'s clamp, and the one binary64 `int` beyond `i64` a `K::Int` holds
+/// (as `i64::MAX`, whose binary64 is `2^63`).
+const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// CAR-R33-5 (r39, R-P28): an `int` is a binary64 — a `K::Int(v)` stands for `v as f64`. The
+/// representative of the integral binary64 `x`: `x as i64` inside `(−2^63, 2^63)`, `i64::MAX` for
+/// `2^63`, `i64::MIN` for `−2^63`; `None` beyond (and for NaN, ±inf, a fraction) — the fold is then
+/// left to the VM, whose f64 lane holds any binary64 (TradingView F037: `3037000500 *
+/// 3037000500` = 9223372037000249344).
+pub(crate) fn int_rep(x: f64) -> Option<i64> {
+    if !x.is_finite() || x.fract() != 0.0 || !(-TWO_63..=TWO_63).contains(&x) {
+        return None;
+    }
+    Some(if x >= TWO_63 { i64::MAX } else { x as i64 })
 }
 
-/// `I_SUB`.
-pub(crate) const fn i_sub(a: i64, b: i64) -> i64 {
-    a.wrapping_sub(b)
+/// `+` of two `int`s: binary64, round to nearest (F047 F120: `2^53 + 1` is `2^53`), no wrap
+/// (F011: `9223372036854775807 + syni` is `2^63`). `None`: not foldable (beyond `±2^63`).
+pub(crate) fn i_add(a: i64, b: i64) -> Option<i64> {
+    int_rep(a as f64 + b as f64)
 }
 
-/// `I_MUL`.
-pub(crate) const fn i_mul(a: i64, b: i64) -> i64 {
-    a.wrapping_mul(b)
+/// `−` of two `int`s (binary64).
+pub(crate) fn i_sub(a: i64, b: i64) -> Option<i64> {
+    int_rep(a as f64 - b as f64)
+}
+
+/// `*` of two `int`s (binary64).
+pub(crate) fn i_mul(a: i64, b: i64) -> Option<i64> {
+    int_rep(a as f64 * b as f64)
+}
+
+/// Unary `−` of an `int` (binary64: `−(−2^63)` is `2^63`).
+pub(crate) fn i_neg(a: i64) -> Option<i64> {
+    int_rep(-(a as f64))
 }
 
 /// The result of `const int / const int` (W1).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum IntDiv {
-    /// `const_trunc` (v5): `I_DIV`, truncating; zero divisor or `MIN / −1` is `na`.
+    /// `const_trunc` (v5): the binary64 quotient truncated (`F_DIV` + `F_INT`); a zero divisor is
+    /// `na`.
     Int(Option<i64>),
     /// `fraction` (v6): the float quotient, U15 applied.
     Float(f64),
@@ -83,36 +106,35 @@ pub(crate) enum IntDiv {
 /// `a / b` on two `const int`s under `Sw::IntDiv`.
 pub(crate) fn i_div(a: i64, b: i64, rd: &Readings) -> IntDiv {
     if rd.int_div == swr::INT_DIV_CONST_TRUNC {
-        IntDiv::Int(a.checked_div(b))
+        IntDiv::Int(if b == 0 {
+            None
+        } else {
+            int_rep((a as f64 / b as f64).trunc() + 0.0)
+        })
     } else {
         IntDiv::Float(f_div(a as f64, b as f64, rd))
     }
 }
 
-/// Pine's truncated int `%` (CAR-R31-1, as the VM's `I_MOD`; TradingView F004 / F115,
-/// `pin:06-mod-sign`): `b == 0` is `na`; `MIN % −1` is 0; the sign of the dividend.
+/// Pine's truncated int `%` (CAR-R31-1; TradingView F004 / F115, `pin:06-mod-sign`) in binary64:
+/// the exact `fmod` of the two values (`F_MOD`), the sign of the dividend; `b == 0` is `na`.
 /// `i_mod(-1, 100) == Some(-1)`.
-pub(crate) const fn i_mod(a: i64, b: i64) -> Option<i64> {
+pub(crate) fn i_mod(a: i64, b: i64) -> Option<i64> {
     if b == 0 {
         return None;
     }
-    Some(match a.checked_rem(b) {
-        Some(r) => r,
-        None => 0,
-    })
+    int_rep((a as f64) % (b as f64) + 0.0)
 }
 
-/// `2^63` as an `f64`: the first float `I_F2I` cannot represent.
-const TWO_63: f64 = 9_223_372_036_854_775_808.0;
-
-/// `int(x)` of a float per `pin:02-int-cast`; non-finite or out of range is `na` (`I_F2I`).
+/// `int(x)` of a float per `pin:02-int-cast` (`F_INT`, CAR-R33-5): `na` for non-finite, else
+/// clamped to `±2^63` (TradingView F120: `int(1e30)` is 9223372036854775808).
 pub(crate) fn int_of_float(x: f64, rd: &Readings) -> Option<i64> {
     let y = match rd.pins.int_cast {
         IntCast::Trunc => x.trunc(),
         IntCast::RoundHalfAway => x.round(),
     };
-    if y.is_finite() && (-TWO_63..TWO_63).contains(&y) {
-        Some(y as i64)
+    if y.is_finite() {
+        int_rep(y.clamp(-TWO_63, TWO_63))
     } else {
         None
     }
@@ -126,8 +148,8 @@ pub(crate) fn round(x: f64, rd: &Readings) -> Option<i64> {
     } else {
         x.round()
     };
-    if y.is_finite() && (-TWO_63..TWO_63).contains(&y) {
-        Some(y as i64)
+    if y.is_finite() {
+        int_rep(y.clamp(-TWO_63, TWO_63))
     } else {
         None
     }

@@ -57,7 +57,7 @@ fn int(v: i64) -> (Lane, Src) {
     (Lane::I64, Src::Const(v as u64))
 }
 
-const T_IN: (Lane, Src) = (Lane::I64, Src::Reserved(Lane::I64, abi::I_TIME));
+const T_IN: (Lane, Src) = (Lane::I64, Src::ReservedInt(abi::F_TIME));
 
 /// A deterministic stream of opens within ±200 years of the epoch, minute-aligned.
 fn opens(n: usize, seed: u64) -> Vec<i64> {

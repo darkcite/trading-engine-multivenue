@@ -70,8 +70,9 @@ fn series_ring_flags_follow_type_and_dialect() {
         p.layout.rings[0].flags
     };
     assert_eq!(flags(Dialect::V6, "x = close * 2\ny = x[1]"), 0, "float");
+    // CAR-R33-5: an `int` is a binary64 in the f64 lane — its ring tracks `na` as NaN.
     let int = flags(Dialect::V6, "x = bar_index > 2 ? bar_index : na\ny = x[1]");
-    assert_eq!(int, ring_flag::NA_TRACKED, "na-capable int");
+    assert_eq!(int, 0, "na-capable int: an f64 ring");
     let b6 = flags(Dialect::V6, "x = close > open\ny = x[1]");
     assert_eq!(b6, ring_flag::INIT_FALSE, "v6 bool");
     let b5 = flags(Dialect::V5, "x = close > open\ny = x[1]");

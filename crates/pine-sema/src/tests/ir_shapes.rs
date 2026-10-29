@@ -190,8 +190,9 @@ fn ir_shapes_operators_int_division_follows_w1() {
     let Op::Mov { a, .. } = o[0] else {
         panic!("{o:?}")
     };
-    assert_eq!(r.const_of(*a), Some((3, true)));
-    assert_eq!(r.slots[a.0 as usize].lane, Lane::I64);
+    // CAR-R33-5: an `int` constant is a binary64 in the f64 lane.
+    assert_eq!(r.const_of(*a), Some((3f64.to_bits(), true)));
+    assert_eq!(r.slots[a.0 as usize].lane, Lane::F64);
 }
 
 #[test]
@@ -1050,7 +1051,8 @@ fn ir_shapes_history_dynamic_offset_is_guarded() {
                 panic!("no `k > limit`")
             };
             let c = r.const_list.iter().find(|c| c.0 == lim).expect("a const");
-            lims.push(c.1);
+            // An `int` constant: its binary64 (CAR-R33-5).
+            lims.push(f64::from_bits(c.1) as u64);
         }
         lims
     };
@@ -1101,10 +1103,7 @@ plot(0.1 + 0.2)
 ",
         Dialect::V6,
     );
-    assert!(!r
-        .const_list
-        .iter()
-        .any(|c| c.1 == (0.1f64 + 0.2).to_bits()));
+    assert!(!r.const_list.iter().any(|c| c.1 == (0.1f64 + 0.2).to_bits()));
     for want in [0.1f64, 0.0999999999999995, 0.3] {
         assert!(
             r.const_list.iter().any(|c| c.1 == want.to_bits()),
@@ -1171,7 +1170,7 @@ fn ir_shapes_user_calls_bind_named_and_default_arguments() {
     else {
         panic!("{o:?}")
     };
-    assert_eq!(r.const_of(*two), Some((2, true)));
+    assert_eq!(r.const_of(*two), Some((2f64.to_bits(), true)));
 }
 
 #[test]
@@ -1239,7 +1238,11 @@ fn ir_shapes_objects_new_stores_every_field() {
         r.slots[sets[0].1 .0 as usize].kind,
         SlotKind::Reserved { .. }
     ));
-    assert_eq!(r.const_of(sets[1].1), Some((3, true)));
+    assert_eq!(
+        r.const_of(sets[1].1),
+        Some((3f64.to_bits(), true)),
+        "an int: binary64"
+    );
     assert_eq!(
         r.slots[sets[2].1 .0 as usize].kind,
         SlotKind::Stage { site: 0, field: 2 }

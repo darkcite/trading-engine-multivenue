@@ -186,6 +186,13 @@ pub mod op {
     /// `valid[dst] = f[a].is_finite()` (dst a validity index in the i64 range; R-na).
     pub const VLD_FROM_F: u8 = 0x47;
 
+    // ---- family 3b: binary64 int (CAR-R33-5) --------------------------------
+    /// `f[dst] = int(f[a])` as Pine's binary64 `int` (CAR-R33-5, r39): `na` for `na` (NaN or
+    /// ±inf, R-na); else truncated toward zero ([`super::flg::ROUND`]: half away from zero) and
+    /// clamped to `[-2^63, 2^63]` (TradingView F120: `int(1e30)` = 9223372036854775808). The int
+    /// value stays in the f64 lane: `+ − * %` of ints are `F_*` opcodes, no wrap, no range.
+    pub const F_INT: u8 = 0x48;
+
     // ---- family 4: history ---------------------------------------------------
     /// `f[dst] = x[k]` over ring `a`; `k` per [`super::flg::K_CONST`] / [`super::flg::K_DYNAMIC`].
     pub const HIST_F: u8 = 0x50;
@@ -255,7 +262,7 @@ pub mod op {
                 | 0x10..=0x1F
                 | 0x20..=0x2F
                 | 0x30..=0x3B
-                | 0x40..=0x47
+                | 0x40..=0x48
                 | 0x50..=0x51
                 | 0x60..=0x66
                 | 0x70
@@ -276,7 +283,7 @@ pub mod flg {
     pub const NA_ON_NONFINITE: u8 = 1 << 0;
     /// `NA_CHECK` / `NA_SET`: 0 = f64 operand, 1 = i64 operand.
     pub const LANE_I: u8 = 1 << 0;
-    /// `I_F2I`: 0 = truncate toward zero, 1 = round half away from zero.
+    /// `I_F2I`, `F_INT`: 0 = truncate toward zero, 1 = round half away from zero.
     pub const ROUND: u8 = 1 << 0;
     /// `I_LT..I_NE`: false when either operand is `na`.
     pub const NA_AWARE: u8 = 1 << 0;
@@ -357,31 +364,32 @@ pub mod abi {
     pub const F_CLOSE: u16 = 3;
     /// `volume`.
     pub const F_VOLUME: u16 = 4;
-    /// First user f64 slot; also the minimum `f64_len`.
-    pub const RESERVED_F: u16 = 5;
-
-    /// `time` — bar open, UTC **milliseconds** (Pine's unit), i64 lane.
-    pub const I_TIME: u16 = 0;
+    /// `time` — bar open, UTC **milliseconds** (Pine's unit). An `int`, so the f64 lane
+    /// (CAR-R33-5, r39: a Pine `int` is a binary64; exact, `< 2^53`).
+    pub const F_TIME: u16 = 5;
     /// `time_close` — bar close (exclusive end), UTC ms.
-    pub const I_TIME_CLOSE: u16 = 1;
+    pub const F_TIME_CLOSE: u16 = 6;
     /// `bar_index`.
-    pub const I_BAR_INDEX: u16 = 2;
-    /// `barstate.isfirst`.
-    pub const I_BS_ISFIRST: u16 = 3;
+    pub const F_BAR_INDEX: u16 = 7;
+    /// First user f64 slot; also the minimum `f64_len`.
+    pub const RESERVED_F: u16 = 8;
+
+    /// `barstate.isfirst`, i64 lane.
+    pub const I_BS_ISFIRST: u16 = 0;
     /// `barstate.isconfirmed`.
-    pub const I_BS_ISCONFIRMED: u16 = 4;
+    pub const I_BS_ISCONFIRMED: u16 = 1;
     /// `barstate.islast`.
-    pub const I_BS_ISLAST: u16 = 5;
+    pub const I_BS_ISLAST: u16 = 2;
     /// `barstate.isnew`.
-    pub const I_BS_ISNEW: u16 = 6;
+    pub const I_BS_ISNEW: u16 = 3;
     /// `barstate.isrealtime`.
-    pub const I_BS_ISREALTIME: u16 = 7;
+    pub const I_BS_ISREALTIME: u16 = 4;
     /// `barstate.ishistory`.
-    pub const I_BS_ISHISTORY: u16 = 8;
+    pub const I_BS_ISHISTORY: u16 = 5;
     /// `barstate.islastconfirmedhistory`.
-    pub const I_BS_ISLASTCONFHIST: u16 = 9;
+    pub const I_BS_ISLASTCONFHIST: u16 = 6;
     /// First user i64 slot; also the minimum `i64_len`.
-    pub const RESERVED_I: u16 = 10;
+    pub const RESERVED_I: u16 = 7;
 
     /// Operand sentinel meaning "no slot / none".
     pub const NONE: u16 = u16::MAX;

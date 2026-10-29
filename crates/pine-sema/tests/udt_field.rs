@@ -64,7 +64,8 @@ fn udt_field_by_name_or_index_folds_to_selector() {
     let p = v6("array.sort(a, order.descending, \"name\")\n").expect("compiles");
     assert_eq!(selector(&p, ov::ARRAY_SORT_AT, 2), sel(2, Ty::String));
     let p = v6("array.sort(a, order.ascending)\n").expect("compiles");
-    assert_eq!(selector(&p, ov::ARRAY_SORT_AT, 2), sel(0, Ty::Int));
+    // CAR-R33-5: an `int` field holds a binary64, so its key sorts as a `float`.
+    assert_eq!(selector(&p, ov::ARRAY_SORT_AT, 2), sel(0, Ty::Float));
 }
 
 /// A `bool`, `color` or UDT field refuses `3007` for both rows; so does an unknown name and an

@@ -73,6 +73,7 @@ fn roles(o: u8) -> ([R; 3], u8) {
         op::I_SEL => ([Iw, Ir, Ir], vld),
         op::F_LT..=op::F_NE => ([Iw, Fr, Fr], flg::TOL),
         op::I_LT..=op::I_NE => ([Iw, Ir, Ir], flg::NA_AWARE),
+        op::F_INT => ([Fw, Fr, Z], flg::ROUND),
         op::NA_CHECK => ([Iw, Lr, Z], flg::LANE_I),
         op::NA_SET => ([Z, Lw, Z], flg::LANE_I),
         op::NA_CLEAR => ([Z, Iv, Z], 0),

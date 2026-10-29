@@ -119,6 +119,19 @@ fn prep_block(ir: &mut Ir, syms: &mut SymTable, b: &mut Block, d: Dialect) -> Re
                         kind: SlotKind::Temp,
                         ..info(Ty::Int, Lane::I64, SlotKind::Temp)
                     });
+                    // CAR-R33-5: a script `int` offset is in the f64 lane — `I_F2I` into the i64
+                    // lane first (`na` stays `na`).
+                    let v = if ir.slots[v.0 as usize].lane == Lane::F64 {
+                        let t = ir.slot(info(Ty::Int, Lane::I64, SlotKind::Temp));
+                        out.push(Stmt::Op(Op::Un {
+                            op: crate::ir::UnOpK::F2i { round: false },
+                            dst: t,
+                            a: v,
+                        }));
+                        t
+                    } else {
+                        v
+                    };
                     // pin:03-hist-dynamic-offset (CAR-R33-2): `x[na]` is `x[0]`.
                     let z = ir.konst(info(Ty::Int, Lane::I64, SlotKind::Const), 0, true);
                     out.push(Stmt::Op(Op::Nz {
@@ -528,9 +541,18 @@ impl Em<'_, '_> {
                     UnOpK::Not => self.ins(op::B_NOT, f, d, s, 0),
                     UnOpK::Sqrt => self.ins(op::F_SQRT, 0, d, s, 0),
                     UnOpK::Finite => self.ins(op::F_FINITE, 0, d, s, 0),
+                    // CAR-R33-5: an `int` in the f64 lane widens by a move; an i64-lane source
+                    // (a builtin's `int` result, `crate::marshal`) converts.
+                    UnOpK::I2f if !self.i64(*a) => self.ins(op::F_MOV, 0, d, s, 0),
                     UnOpK::I2f => {
                         let f = if self.a(*a) { flg::VLD } else { 0 };
                         self.ins(op::F_I2F, f, d, s, 0)
+                    }
+                    // `int(x)` into the f64 lane is `F_INT`; into the i64 lane (a builtin's
+                    // `int` argument) `I_F2I`.
+                    UnOpK::F2i { round } if !i => {
+                        let f = if *round { flg::ROUND } else { 0 };
+                        self.ins(op::F_INT, f, d, s, 0)
                     }
                     UnOpK::F2i { round } => {
                         let f = if *round { flg::ROUND } else { 0 };
@@ -563,12 +585,15 @@ impl Em<'_, '_> {
                         }
                     }
                 } else {
+                    // CAR-R33-5: an `int` `/` (W1 `const_trunc`) and `%` divide by zero to `na`
+                    // and the quotient truncates (`F_INT` below).
+                    let int = self.info(*dst).ty.ty == Ty::Int;
                     match b {
                         BinOpK::Add => (op::F_ADD, 0),
                         BinOpK::Sub => (op::F_SUB, 0),
                         BinOpK::Mul => (op::F_MUL, 0),
-                        BinOpK::Div { na_on_nonfinite } => (op::F_DIV, nf(*na_on_nonfinite)),
-                        BinOpK::Mod { na_on_nonfinite } => (op::F_MOD, nf(*na_on_nonfinite)),
+                        BinOpK::Div { na_on_nonfinite } => (op::F_DIV, nf(*na_on_nonfinite || int)),
+                        BinOpK::Mod { na_on_nonfinite } => (op::F_MOD, nf(*na_on_nonfinite || int)),
                         BinOpK::Pow { na_on_nonfinite } => (op::F_POW, nf(*na_on_nonfinite)),
                         BinOpK::Min => (op::F_MIN, 0),
                         BinOpK::Max => (op::F_MAX, 0),
@@ -578,6 +603,10 @@ impl Em<'_, '_> {
                     }
                 };
                 self.ins(o, fl, d, x, y);
+                if o == op::F_DIV && self.info(*dst).ty.ty == Ty::Int {
+                    // W1 `const_trunc`: the binary64 quotient truncated, as `fold::i_div`.
+                    self.ins(op::F_INT, 0, d, d, 0);
+                }
             }
             Op::Cmp {
                 op: c,
@@ -795,4 +824,4 @@ impl Em<'_, '_> {
     }
 }
 
-const _: () = assert!(abi::RESERVED_I == 10);
+const _: () = assert!(abi::RESERVED_I == 7);

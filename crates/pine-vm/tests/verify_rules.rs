@@ -73,9 +73,10 @@ fn rule_02_valid_words() {
 #[test]
 fn rule_03_lane_minima() {
     let mut p = reference().build();
-    p.layout.i64_len = 9;
-    p.layout.i64_varip_from = 9;
-    p.layout.valid_words = (p.layout.f64_len + 9).div_ceil(64);
+    let short = u32::from(abi::RESERVED_I) - 1;
+    p.layout.i64_len = short;
+    p.layout.i64_varip_from = short;
+    p.layout.valid_words = (p.layout.f64_len + short).div_ceil(64);
     assert_eq!(rule_of(&p), rule::LANE_MINIMA);
 }
 
@@ -307,9 +308,10 @@ fn rule_22_arg_win() {
     assert_eq!(rule_of(&p), rule::ARG_WIN);
 }
 
-/// One `CONCAT` call (2 inputs, `n_out = 1`) over `entries`. Slots: `i(0)` = i64 10, `i(1)` =
-/// i64 11 is a const slot (written once by `I_CONST`, as sema's init block does), `i(2)` = i64
-/// 12; `f(5)` = f64 10 shares the number of `i(0)` but not its lane.
+/// One `CONCAT` call (2 inputs, `n_out = 1`) over `entries`. Slots: `i(0)` = i64 `RI`, `i(1)` =
+/// i64 `RI + 1` is a const slot (written once by `I_CONST`, as sema's init block does), `i(2)` =
+/// i64 `RI + 2`; `f(0)` = f64 `RESERVED_F` = `RI + 1` shares the number of `i(1)` but not its
+/// lane (`RI` = `abi::RESERVED_I`).
 fn concat_over(entries: &[u16]) -> PineProgram {
     let mut t = Tb::new(ExecMode::BarClose, 6, 3, 0, 0);
     let (k, kz) = (t.i(1), t.k(0));
@@ -320,6 +322,9 @@ fn concat_over(entries: &[u16]) -> PineProgram {
     t.build()
 }
 
+/// The first user i64 slot.
+const RI: u16 = abi::RESERVED_I;
+
 fn arg_win_at_call(detail: u32) -> Option<VerifyError> {
     Some(VerifyError { rule: rule::ARG_WIN, pc: 1, detail })
 }
@@ -329,7 +334,7 @@ fn arg_win_at_call(detail: u32) -> Option<VerifyError> {
 /// output and the body would overwrite the constant.
 #[test]
 fn rule_22_arg_win_output_naming_a_const_input_is_refused() {
-    let (s, k, o) = (argwin::i64(10), argwin::i64(11), argwin::i64(12));
+    let (s, k, o) = (argwin::i64(RI), argwin::i64(RI + 1), argwin::i64(RI + 2));
     assert!(verify(&concat_over(&[s, k, o]), &TABLE).is_ok(), "control: a fresh output");
     assert_eq!(verify(&concat_over(&[s, k, k]), &TABLE).err(), arg_win_at_call(5));
     assert_eq!(verify(&concat_over(&[k, s, k]), &TABLE).err(), arg_win_at_call(5));
@@ -338,10 +343,11 @@ fn rule_22_arg_win_output_naming_a_const_input_is_refused() {
 /// Sub-code 5 for any input, const or not; the check is per lane, and inputs may repeat a slot.
 #[test]
 fn rule_22_arg_win_output_aliasing_an_input_is_refused() {
-    let (s, k, o) = (argwin::i64(10), argwin::i64(11), argwin::i64(12));
+    let (s, k, o) = (argwin::i64(RI), argwin::i64(RI + 1), argwin::i64(RI + 2));
     assert_eq!(verify(&concat_over(&[s, k, s]), &TABLE).err(), arg_win_at_call(5));
-    let f10 = argwin::f64(10); // f64 slot 10 is not i64 slot 10
-    assert!(verify(&concat_over(&[s, k, f10]), &TABLE).is_ok());
+    assert_eq!(abi::RESERVED_F, RI + 1);
+    let fk = argwin::f64(RI + 1); // f64 slot RI + 1 is not i64 slot RI + 1 (`k`)
+    assert!(verify(&concat_over(&[s, k, fk]), &TABLE).is_ok());
     assert!(verify(&concat_over(&[k, k, o]), &TABLE).is_ok(), "a repeated input is no alias");
 }
 
@@ -349,14 +355,14 @@ fn rule_22_arg_win_output_aliasing_an_input_is_refused() {
 /// NOT also read by the window — `CONCAT` has 2 inputs, so `[s, k]` is one input and an output.
 #[test]
 fn rule_22_arg_win_short_window_without_alias_is_refused() {
-    let (s, k) = (argwin::i64(10), argwin::i64(11));
+    let (s, k) = (argwin::i64(RI), argwin::i64(RI + 1));
     assert_eq!(verify(&concat_over(&[s, k]), &TABLE).err(), arg_win_at_call(6));
 }
 
 /// Sub-code 6: the input count must equal the row's arity — one too many or too few is refused.
 #[test]
 fn rule_22_arg_win_input_count_must_equal_the_arity() {
-    let (s, k, o) = (argwin::i64(10), argwin::i64(11), argwin::i64(12));
+    let (s, k, o) = (argwin::i64(RI), argwin::i64(RI + 1), argwin::i64(RI + 2));
     assert!(verify(&concat_over(&[s, k, o]), &TABLE).is_ok(), "control: 2 inputs + 1 output");
     assert_eq!(verify(&concat_over(&[s, k, s, o]), &TABLE).err(), arg_win_at_call(6));
     assert_eq!(verify(&concat_over(&[s, o]), &TABLE).err(), arg_win_at_call(6));
@@ -391,7 +397,7 @@ fn concat_over_in(d: Dialect, entries: &[u16]) -> PineProgram {
 /// Sub-code 6: a variadic row accepts its minimum and more, and refuses fewer.
 #[test]
 fn rule_22_arg_win_variadic_row_is_a_minimum() {
-    let (s, k, o) = (argwin::i64(10), argwin::i64(11), argwin::i64(12));
+    let (s, k, o) = (argwin::i64(RI), argwin::i64(RI + 1), argwin::i64(RI + 2));
     let ok = |w: &[u16]| verify(&concat_over_in(Dialect::V5, w), &TABLE_V).is_ok();
     assert!(ok(&[s, o]), "the minimum");
     assert!(ok(&[s, k, o]) && ok(&[s, k, s, k, o]), "more than the minimum");
@@ -403,7 +409,7 @@ fn rule_22_arg_win_variadic_row_is_a_minimum() {
 /// table whose `arity` column does not cover the row is refused the same way.
 #[test]
 fn rule_22_arg_win_overload_absent_in_the_dialect_is_refused() {
-    let (s, k, o) = (argwin::i64(10), argwin::i64(11), argwin::i64(12));
+    let (s, k, o) = (argwin::i64(RI), argwin::i64(RI + 1), argwin::i64(RI + 2));
     let p = concat_over_in(Dialect::V6, &[s, k, o]);
     assert_eq!(verify(&p, &TABLE_V).err(), arg_win_at_call(6));
     assert_eq!(verify(&concat_over(&[s, k, o]), &TABLE_SHORT).err(), arg_win_at_call(6));

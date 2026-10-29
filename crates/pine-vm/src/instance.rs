@@ -336,16 +336,17 @@ impl<'p> VmInstance<'p> {
             c.f_len >= abi::RESERVED_F as u32 && c.i_len >= abi::RESERVED_I as u32,
             "rule 3: lanes shorter than the reserved-slot ABI"
         );
-        // SAFETY: rule 3 — f64_len >= 5, i64_len >= 10.
+        // SAFETY: rule 3 — f64_len >= 8, i64_len >= 7.
         unsafe {
             *c.f.add(abi::F_OPEN as usize) = scale::from_1e6(bar.open_1e6);
             *c.f.add(abi::F_HIGH as usize) = scale::from_1e6(bar.high_1e6);
             *c.f.add(abi::F_LOW as usize) = scale::from_1e6(bar.low_1e6);
             *c.f.add(abi::F_CLOSE as usize) = scale::from_1e6(bar.close_1e6);
             *c.f.add(abi::F_VOLUME as usize) = scale::from_1e6(bar.volume_1e6);
-            *c.i.add(abi::I_TIME as usize) = bar.open_ms;
-            *c.i.add(abi::I_TIME_CLOSE as usize) = bar.close_ms;
-            *c.i.add(abi::I_BAR_INDEX as usize) = c.bar_index;
+            // CAR-R33-5: `time`, `time_close`, `bar_index` are `int`s — binary64, exact (< 2^53).
+            *c.f.add(abi::F_TIME as usize) = bar.open_ms as f64;
+            *c.f.add(abi::F_TIME_CLOSE as usize) = bar.close_ms as f64;
+            *c.f.add(abi::F_BAR_INDEX as usize) = c.bar_index as f64;
             let mut k = 0usize;
             while k < BARSTATE.len() {
                 let row = &BARSTATE[k];

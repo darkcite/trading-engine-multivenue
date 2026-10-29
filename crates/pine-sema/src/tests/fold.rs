@@ -64,11 +64,40 @@ fn fold_float_rounds_to_16_decimal_places() {
     assert_eq!(fold::dec16(1e-17), 0.0);
 }
 
+/// CAR-R33-5 (TradingView F011 F037 F040 F047 F120): binary64, no wrap; `K::Int(i64::MAX)` stands
+/// for `2^63`; beyond `±2^63` no fold (the VM's f64 lane holds it).
 #[test]
-fn fold_int_arith_wraps() {
-    assert_eq!(fold::i_add(i64::MAX, 1), i64::MIN);
-    assert_eq!(fold::i_sub(i64::MIN, 1), i64::MAX);
-    assert_eq!(fold::i_mul(i64::MAX, 2), -2);
+fn fold_int_arith_is_binary64() {
+    assert_eq!(fold::i_add(i64::MAX, 1), Some(i64::MAX), "2^63 + 1 is 2^63");
+    assert_eq!(
+        fold::i_sub(i64::MIN, 1),
+        Some(i64::MIN),
+        "-2^63 - 1 is -2^63"
+    );
+    assert_eq!(
+        fold::i_mul(i64::MAX, 2),
+        None,
+        "2^64: beyond the representatives"
+    );
+    assert_eq!(
+        fold::i_mul(3_037_000_500, 3_037_000_500),
+        None,
+        "F037: > 2^63"
+    );
+    assert_eq!(
+        fold::i_add(9_007_199_254_740_992, 1),
+        Some(9_007_199_254_740_992)
+    );
+    assert_eq!(fold::i_neg(i64::MIN), Some(i64::MAX), "-(-2^63) is 2^63");
+    assert_eq!(
+        fold::int_rep(9_007_199_254_740_993.0),
+        Some(9_007_199_254_740_992)
+    );
+    assert_eq!(fold::int_rep(0.5), None);
+    assert_eq!(fold::int_rep(f64::NAN), None);
+    assert_eq!(fold::i_mod(-7, 2), Some(-1));
+    assert_eq!(fold::i_mod(i64::MIN, -1), Some(0));
+    assert_eq!(fold::i_mod(1, 0), None);
 }
 
 #[test]
@@ -77,7 +106,11 @@ fn fold_int_div_reads_w1() {
     assert_eq!(fold::i_div(7, 2, &v5), IntDiv::Int(Some(3)));
     assert_eq!(fold::i_div(-7, 2, &v5), IntDiv::Int(Some(-3)));
     assert_eq!(fold::i_div(1, 0, &v5), IntDiv::Int(None));
-    assert_eq!(fold::i_div(i64::MIN, -1, &v5), IntDiv::Int(None));
+    assert_eq!(
+        fold::i_div(i64::MIN, -1, &v5),
+        IntDiv::Int(Some(i64::MAX)),
+        "2^63"
+    );
     let v6 = Readings::of(Dialect::V6);
     assert_eq!(fold::i_div(7, 2, &v6), IntDiv::Float(3.5));
     let IntDiv::Float(q) = fold::i_div(1, 0, &v6) else {
@@ -114,7 +147,10 @@ fn fold_int_cast_reads_the_pin() {
     assert_eq!(fold::int_of_float(2.7, &rd), Some(2));
     assert_eq!(fold::int_of_float(-2.7, &rd), Some(-2));
     assert_eq!(fold::int_of_float(f64::INFINITY, &rd), None);
-    assert_eq!(fold::int_of_float(9.3e18, &rd), None);
+    // CAR-R33-5 (TradingView F120): beyond ±2^63 clamps — `int(1e30)` is 2^63 (`i64::MAX`).
+    assert_eq!(fold::int_of_float(9.3e18, &rd), Some(i64::MAX));
+    assert_eq!(fold::int_of_float(1e30, &rd), Some(i64::MAX));
+    assert_eq!(fold::int_of_float(-1e30, &rd), Some(i64::MIN));
     assert_eq!(
         fold::int_of_float(-9_223_372_036_854_775_808.0, &rd),
         Some(i64::MIN)

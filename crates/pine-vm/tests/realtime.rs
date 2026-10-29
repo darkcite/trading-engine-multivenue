@@ -211,7 +211,8 @@ fn collection_blocks_roll_back_per_tick() {
     let wp = t.win(&[argwin::i64(arr), argwin::f64(abi::F_CLOSE)]);
     t.emit(op::CALL_BUILTIN, 0, SiteId::NONE.0, ARR_PUSH, wp);
     // last = bar_index  (the element index just pushed: one push per confirmed bar + one per tick)
-    t.emit(op::I_MOV, flg::VLD, last, abi::I_BAR_INDEX, 0);
+    // `bar_index` is an `int` in the f64 lane (CAR-R33-5): `I_F2I` into the i64 index.
+    t.emit(op::I_F2I, 0, last, abi::F_BAR_INDEX, 0);
     let wg = t.win(&[argwin::i64(arr), argwin::i64(last), argwin::f64(f0)]);
     t.emit(op::CALL_BUILTIN, 0, SiteId::NONE.0, ARR_GET, wg);
     let kp = t.k(0);

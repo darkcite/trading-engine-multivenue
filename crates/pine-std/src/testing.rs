@@ -36,6 +36,10 @@ pub enum Src {
     Out(u16, u8),
     /// A reserved slot (`pine_ir::abi::*`).
     Reserved(Lane, u16),
+    /// An `int` reserved slot of the f64 lane (`time`, `time_close`, `bar_index`, CAR-R33-5)
+    /// passed as a builtin's i64 `int` input: `I_F2I` into a fresh i64 slot, as sema's call
+    /// boundary does.
+    ReservedInt(u16),
     /// A fresh UDT object (an i64 input: its `CollRef`): an `Object` site of its own, `O_NEW`
     /// with one field per entry, then each field stored from its source in order (`O_SET_F` /
     /// `O_SET_I` with `NA_TRACKED`, by the entry's lane), every evaluation — what sema emits for
@@ -319,6 +323,11 @@ fn load(t: &mut Tb, slots: &mut Slots, e: u16, src: Src, outs: &[Vec<u16>]) -> u
         }
         Src::Reserved(Lane::F64, s) => argwin::f64(s),
         Src::Reserved(Lane::I64, s) => argwin::i64(s),
+        Src::ReservedInt(s) => {
+            assert!(argwin::is_i64(e), "an int input is an i64 entry");
+            t.emit(op::I_F2I, 0, slot, s, 0);
+            e
+        }
         Src::Out(k, j) => outs[k as usize][j as usize],
         Src::Const(bits) if !argwin::is_i64(e) => {
             let k = t.kf(f64::from_bits(bits));

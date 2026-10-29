@@ -98,8 +98,8 @@ unsafe impl StateBlock for SecState {}
 const LOOK_RT: [u8; 2] = sw::both(Sw::LookaheadOffRt);
 const BOOL_NA: [u8; 2] = sw::both(Sw::BoolNa);
 
-/// Write `v` (NaN = na) to `e` in the lane `__ty` names (§4.14.2 "Output lane"): float as is;
-/// int / color / enum as `i64`, NaN → na; bool `v != 0`, NaN → na (v5) / false (v6, W13). A
+/// Write `v` (NaN = na) to `e` in the lane `__ty` names (§4.14.2 "Output lane"): float, and an
+/// int in the f64 lane (CAR-R33-5), as is; int / color / enum as `i64`, NaN → na; bool `v != 0`, NaN → na (v5) / false (v6, W13). A
 /// `__ty` naming any other type, or a lane that disagrees, is `Internal`.
 fn write_typed(f: &mut Frame<'_>, e: u16, ty: i64, v: f64) -> Result<(), FaultKind> {
     let enc = u16::try_from(ty).map_err(|_| FaultKind::Internal)?;
@@ -111,7 +111,8 @@ fn write_typed(f: &mut Frame<'_>, e: u16, ty: i64, v: f64) -> Result<(), FaultKi
         return Err(FaultKind::Internal);
     };
     match t {
-        Ty::Float if !argwin::is_i64(e) => f.set_f64_arg(e, v),
+        // CAR-R33-5 (r39): a script `int` is a binary64 in the f64 lane.
+        Ty::Float | Ty::Int if !argwin::is_i64(e) => f.set_f64_arg(e, v),
         Ty::Int | Ty::Color | Ty::Enum if argwin::is_i64(e) => {
             f.set_i64_arg(e, if v.is_nan() { None } else { Some(v as i64) });
         }

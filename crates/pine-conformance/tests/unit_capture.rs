@@ -827,14 +827,20 @@ fn capture_distil_time_selects_inside_the_chart_window() {
         let w = format!("window\ttime\t{}\t{}", hour(lo), hour(hi));
         std::fs::write(
             &pw,
-            fw.replace(&format!("window\ttime\t{}\t{}", spec::FROM_MS, spec::TO_MS), &w),
+            fw.replace(
+                &format!("window\ttime\t{}\t{}", spec::FROM_MS, spec::TO_MS),
+                &w,
+            ),
         )
         .unwrap();
         let got = distil(&sheet_w, &ee, Some(&[]), None, &stamp(Dialect::V6), false);
         if ok {
             got.unwrap();
             assert_eq!(
-                series(&load(&root_w, "E001")).iter().map(|r| r.key).collect::<Vec<_>>(),
+                series(&load(&root_w, "E001"))
+                    .iter()
+                    .map(|r| r.key)
+                    .collect::<Vec<_>>(),
                 (lo..hi).map(hour).collect::<Vec<_>>()
             );
         } else {

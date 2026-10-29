@@ -314,7 +314,7 @@ fn a7_string_builders_are_zero_alloc() {
         (
             ov::STR_FORMAT_TIME,
             vec![
-                (Lane::I64, Src::Reserved(Lane::I64, abi::I_TIME)),
+                (Lane::I64, Src::ReservedInt(abi::F_TIME)),
                 st("yyyy-MM-dd HH:mm Z"),
                 st("Asia/Tokyo"),
             ],

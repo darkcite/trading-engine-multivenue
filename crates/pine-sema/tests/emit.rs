@@ -578,9 +578,10 @@ fn emit_class_v_slots_are_cleared_in_the_init_block() {
 
 #[test]
 fn emit_mod_keeps_its_opcode() {
+    // CAR-R33-5: an `int` `%` is `F_MOD` too (binary64; by zero `na`), never `I_MOD`.
     let p = v6p("a = bar_index % 3\nb = close % 2.5\nplot(a + b)\n");
-    assert!(p.code.iter().any(|i| i.op == op::I_MOD));
-    assert!(p.code.iter().any(|i| i.op == op::F_MOD));
+    assert!(!p.code.iter().any(|i| i.op == op::I_MOD));
+    assert_eq!(p.code.iter().filter(|i| i.op == op::F_MOD).count(), 2);
 }
 
 #[test]
@@ -817,7 +818,8 @@ fn emit_int_div_follows_w1() {
     let s = "//@version=5\nindicator(\"t\")\na = bar_index + 7\nplot(a / 2)\n";
     let p = compile_src(s, &default_opts(Dialect::V5, ExecMode::BarClose)).expect("compiles");
     assert!(p.code.iter().any(|i| i.op == op::F_DIV));
-    assert!(p.code.iter().any(|i| i.op == op::F_I2F));
+    // CAR-R33-5: the `int` operand is already a binary64 — no `F_I2F`.
+    assert!(!p.code.iter().any(|i| i.op == op::F_I2F));
 }
 
 /// The first bar whose step faults, and the fault (compile and verify must succeed).

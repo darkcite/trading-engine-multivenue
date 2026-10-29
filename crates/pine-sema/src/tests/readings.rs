@@ -203,7 +203,15 @@ fn readings_ta_in_loop_per_iteration_unrolls() {
             ref x => panic!("{x:?}"),
         })
         .collect();
-    assert_eq!(ks, [(0, true), (1, true), (2, true)]);
+    // An `int` counter's constants are binary64s (CAR-R33-5).
+    assert_eq!(
+        ks,
+        [
+            (0f64.to_bits(), true),
+            (1f64.to_bits(), true),
+            (2f64.to_bits(), true)
+        ]
+    );
 }
 
 #[test]

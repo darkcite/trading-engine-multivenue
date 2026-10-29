@@ -6306,7 +6306,7 @@
           "ty": "int",
           "qual": "series",
           "src": "slot",
-          "v": "I_BAR_INDEX"
+          "v": "F_BAR_INDEX"
         }
       ]
     },
@@ -42016,7 +42016,7 @@
           "ty": "int",
           "qual": "series",
           "src": "slot",
-          "v": "I_TIME"
+          "v": "F_TIME"
         }
       ]
     },
@@ -42255,7 +42255,7 @@
           "ty": "int",
           "qual": "series",
           "src": "slot",
-          "v": "I_TIME_CLOSE"
+          "v": "F_TIME_CLOSE"
         }
       ]
     },

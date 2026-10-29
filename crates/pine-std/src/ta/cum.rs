@@ -102,10 +102,9 @@ pub fn bi_ta_vwap_var(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(
         + f.f64_arg(argwin::f64(abi::F_CLOSE)))
         / 3.0;
     let vol = f.f64_arg(argwin::f64(abi::F_VOLUME));
-    let day = f
-        .i64_arg(argwin::i64(abi::I_TIME))
-        .unwrap_or(0)
-        .div_euclid(DAY_MS);
+    // CAR-R33-5: `time` is an `int` in the f64 lane (exact ms, < 2^53).
+    let t = f.f64_arg(argwin::f64(abi::F_TIME));
+    let day = if t.is_finite() { t as i64 } else { 0 }.div_euclid(DAY_MS);
     let s = f.state::<VwapVar>(site);
     if s.started == 0 || s.day != day {
         s.sv = 0.0;

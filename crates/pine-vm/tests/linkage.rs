@@ -9,7 +9,7 @@ use pine_vm::testkit::stub::*;
 use pine_vm::testkit::*;
 use pine_vm::*;
 
-const SLOTS: [u16; 8] = [
+const SLOTS: [u16; 7] = [
     abi::I_BS_ISFIRST,
     abi::I_BS_ISCONFIRMED,
     abi::I_BS_ISLAST,
@@ -17,7 +17,6 @@ const SLOTS: [u16; 8] = [
     abi::I_BS_ISREALTIME,
     abi::I_BS_ISHISTORY,
     abi::I_BS_ISLASTCONFHIST,
-    abi::I_BAR_INDEX,
 ];
 
 /// A Realtime program plotting the seven barstate slots and bar_index (plots 0..8).
@@ -35,6 +34,11 @@ fn barstate_program() -> PineProgram {
         t.emit(op::CALL_BUILTIN, 0, SiteId::NONE.0, PLOT, w);
         k += 1;
     }
+    // `bar_index`: an `int` in the f64 lane (CAR-R33-5), plotted as is.
+    let ki = t.k(7);
+    t.emit(op::I_CONST, flg::VLD, iscratch, ki, 0);
+    let w = t.win(&[argwin::i64(iscratch), argwin::f64(abi::F_BAR_INDEX)]);
+    t.emit(op::CALL_BUILTIN, 0, SiteId::NONE.0, PLOT, w);
     t.emit(op::HALT, 0, 0, 0, 0);
     t.build()
 }

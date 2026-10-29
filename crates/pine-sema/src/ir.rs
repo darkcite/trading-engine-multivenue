@@ -502,8 +502,10 @@ impl Ir {
 
     /// The program-wide `Const` slot of `(lane, bits, valid)`, written once (§4.14.1).
     pub(crate) fn konst(&mut self, info: SlotInfo, bits: u64, valid: bool) -> VSlot {
+        // An `int` and a `float` constant share the f64 lane since CAR-R33-5; `1` is not `1.0`
+        // (the slot's type decides `crate::marshal`'s conversion and the `int` opcodes).
         let key = (
-            info.lane as u8,
+            info.lane as u8 | (u8::from(info.ty.ty == pine_ir::Ty::Int) << 4),
             bits,
             valid,
             valid && info.ty.ty == pine_ir::Ty::String,

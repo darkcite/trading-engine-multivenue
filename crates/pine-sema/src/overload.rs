@@ -985,7 +985,10 @@ pub(crate) fn udt_selector(
             ty_name(fields[i].1)
         ));
     }
-    Ok(i as i64 | (ft as i64) << 32)
+    // CAR-R33-5: an `int` field holds a binary64 (`O_SET_F`), so its key sorts as a `float` (na
+    // is NaN there, not `NA_I64`).
+    let key = if ft == Ty::Int { Ty::Float } else { ft };
+    Ok(i as i64 | (key as i64) << 32)
 }
 
 /// Where an omitted parameter's value comes from (A4.1: pine-sema resolves every `Derived`

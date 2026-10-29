@@ -89,9 +89,10 @@ fn nacap_no_vld_operand_is_class_n() {
     }
 }
 
-/// I10: no slot is class A that cannot be `na` — arithmetic on never-`na` operands, a v6 `bool`,
-/// `nz`, `na()`, a `var` int counter; the slots that can be (`na` literal arms, history reads,
-/// int division) are A. f64 slots are always N.
+/// I10: no slot is class A that cannot be `na`. CAR-R33-5 (r39): an `int` is a binary64 in the f64
+/// lane — its `na` is NaN, never a validity class — so the i64 classes are the `bool` / `string`
+/// / `color` slots' (and the builtins' i64 `int` temporaries, `crate::marshal`). f64 slots are
+/// always N.
 #[test]
 fn na_capability_classes_are_minimal() {
     let vars = |ir: &Ir, na: &NaCap| -> Vec<Class> {
@@ -101,30 +102,21 @@ fn na_capability_classes_are_minimal() {
             .collect()
     };
     for d in [Dialect::V5, Dialect::V6] {
-        // a, b, c: never na.
-        let (ir, na) = classes(SCRIPTS[0], d);
-        assert!(vars(&ir, &na).iter().all(|&c| c != Class::A), "{d:?}");
-        // x (an `na` arm) and y (x + 1) are A; z = nz(y, 0) is not.
-        let (ir, na) = classes(SCRIPTS[1], d);
-        assert_eq!(vars(&ir, &na)[..2], [Class::A, Class::A], "{d:?}");
-        assert_ne!(vars(&ir, &na)[2], Class::A, "{d:?} nz");
-        // n (a var counter) is not A; m = n[1] is.
-        let (ir, na) = classes(SCRIPTS[2], d);
-        let v = vars(&ir, &na);
-        assert_ne!(v[0], Class::A, "{d:?} var counter");
-        assert_eq!(v[1], Class::A, "{d:?} history read");
-        // q = k / 2 (int division can be na, B8) and r = k % 3 are A; k = int(close) too.
-        let (ir, na) = classes(SCRIPTS[5], d);
-        assert!(vars(&ir, &na).iter().all(|&c| c == Class::A), "{d:?}");
-        // Every f64 slot is N.
         for body in SCRIPTS {
             let (ir, na) = classes(body, d);
             for i in 0..ir.slots.len() {
-                if ir.slots[i].lane == Lane::F64 {
+                let s = &ir.slots[i];
+                if s.ty.ty == pine_ir::Ty::Int && s.kind == SlotKind::Var {
+                    assert_eq!(s.lane, Lane::F64, "{d:?} an int variable\n{body}");
+                }
+                if s.lane == Lane::F64 {
                     assert_eq!(na.of(VSlot(i as u32)), Class::N);
                 }
             }
         }
+        // `s` (a string of two literal arms) is not A.
+        let (ir, na) = classes(SCRIPTS[4], d);
+        assert!(vars(&ir, &na).iter().all(|&c| c != Class::A), "{d:?}");
     }
     // A v6 bool is never na; in v5 `u and …` over a comparison is not A either.
     let (ir, na) = classes(SCRIPTS[3], Dialect::V6);

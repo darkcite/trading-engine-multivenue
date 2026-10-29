@@ -10,6 +10,9 @@ use pine_ir::{
 };
 
 use crate::builtin::{bf, BuiltinEntry};
+
+/// `F_INT`'s clamp: 2^63, exact in binary64 (CAR-R33-5).
+const INT_LIM: f64 = 9_223_372_036_854_775_808.0;
 use crate::frame::{Core, Frame};
 use crate::hist::{cell_ptr, hist_k};
 use crate::object::{o_field, o_new};
@@ -311,6 +314,18 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                 op::VLD_MOV => {
                     let ok = c.vget(ins.a as u32);
                     c.vput::<J>(ins.dst as u32, ok)
+                }
+                op::F_INT => {
+                    // CAR-R33-5: Pine `int(x)` in binary64 — na stays na (R-na), clamped to ±2^63.
+                    let a = c.rf(ins.a);
+                    let v = if !a.is_finite() {
+                        f64::NAN
+                    } else {
+                        let r = if ins.flags & flg::ROUND != 0 { a.round() } else { a.trunc() };
+                        // `+ 0.0` keeps an int from being −0 (`int(-0.4)` is 0).
+                        r.clamp(-INT_LIM, INT_LIM) + 0.0
+                    };
+                    c.wf::<J>(ins.dst, v)
                 }
                 op::VLD_FROM_F => {
                     let ok = c.rf(ins.a).is_finite();

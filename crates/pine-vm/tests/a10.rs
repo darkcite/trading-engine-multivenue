@@ -318,7 +318,7 @@ fn random_program(r: &mut Rng) -> Tb {
     while pc + 1 < n {
         let isrc = |r: &mut Rng, t: &Tb| -> u16 {
             match r.below(6) {
-                0 => abi::I_BAR_INDEX,
+                0 => abi::I_BS_ISLAST,
                 1 => abi::I_BS_ISFIRST,
                 2 => abi::I_BS_ISCONFIRMED,
                 3 => abi::I_BS_ISNEW,

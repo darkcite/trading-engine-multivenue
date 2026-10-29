@@ -15,7 +15,7 @@
 //! an op that cannot move, is `3039` naming it. Never hoisted from: a ternary arm, a lazy
 //! `and`/`or` operand, a `var` / `varip` / `once` guard, a loop body (U13).
 
-use pine_ir::{Diag, Lane, Qual, Ty};
+use pine_ir::{Diag, Lane, Qual};
 use pine_spec::swr;
 
 use crate::code::{diag, ReasonCode};
@@ -388,7 +388,9 @@ fn unroll(ir: &mut Ir, b: &mut Block) -> Result<(), Diag> {
 fn counter_const(ir: &mut Ir, c: Ctr, k: u32) -> crate::ir::VSlot {
     let base = ir.slots[c.slot.0 as usize];
     let x = c.from + f64::from(k) * c.delta;
-    let bits = if base.ty.ty == Ty::Float {
+    // CAR-R33-5: an `int` counter is a binary64 in the f64 lane too.
+    let lane = crate::lower::lane_of(base.ty.ty);
+    let bits = if lane == Lane::F64 {
         x.to_bits()
     } else {
         x as i64 as u64
@@ -398,11 +400,7 @@ fn counter_const(ir: &mut Ir, c: Ctr, k: u32) -> crate::ir::VSlot {
             qual: Qual::Const,
             ..base.ty
         },
-        lane: if base.ty.ty == Ty::Float {
-            Lane::F64
-        } else {
-            Lane::I64
-        },
+        lane,
         kind: SlotKind::Const,
         ..base
     };

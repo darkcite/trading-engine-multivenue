@@ -285,9 +285,9 @@ fn opcode_table_defines_exactly_the_v4_set() {
         }
         op += 1;
     }
-    // 4 control + 16 f64 + 16 i64 + 12 compare + 8 na + 2 history
-    // + 7 flow + 1 builtin + 5 object + 1 string.
-    assert_eq!(n, 72);
+    // 4 control + 16 f64 + 16 i64 + 12 compare + 8 na + 1 binary64 int (F_INT, CAR-R33-5)
+    // + 2 history + 7 flow + 1 builtin + 5 object + 1 string.
+    assert_eq!(n, 73);
     for retired in [
         0x3Cu8, 0x3D, 0x52, 0x53, 0x54, 0x85, 0x98, 0x9A, 0x9F, 0xA0, 0xA1, 0xB0, 0xC0, 0xC6,
     ] {
@@ -305,8 +305,9 @@ fn opcode_table_defines_exactly_the_v4_set() {
         1,
         "an f64 entry can never carry the lane bit"
     );
-    assert_eq!(abi::RESERVED_F, 5);
-    assert_eq!(abi::RESERVED_I, 10);
+    // CAR-R33-5 (r39): `time`, `time_close`, `bar_index` moved to the f64 lane.
+    assert_eq!(abi::RESERVED_F, 8);
+    assert_eq!(abi::RESERVED_I, 7);
 }
 
 #[test]

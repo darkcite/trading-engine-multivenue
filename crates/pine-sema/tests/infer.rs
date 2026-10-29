@@ -274,8 +274,10 @@ fn infer_nested_collection_is_refused() {
 
 #[test]
 fn infer_int_literal_beyond_i64_is_type_mismatch() {
+    // CAR-R33-5: a literal is the binary64 it rounds to, up to 2^63 (the clamp of `F_INT`).
     for d in [V5, V6] {
-        refused(d, "x = 9223372036854775808\nplot(close)\n", 3007);
+        refused(d, "x = 18446744073709551615\nplot(close)\n", 3007);
+        accepted(d, "x = 9223372036854775808\nplot(close)\n");
         accepted(d, "x = -9223372036854775808\nplot(close)\n");
     }
 }

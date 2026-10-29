@@ -1102,9 +1102,10 @@ fn slot(name: &str) -> Option<u16> {
         "F_LOW" => argwin::f64(abi::F_LOW),
         "F_CLOSE" => argwin::f64(abi::F_CLOSE),
         "F_VOLUME" => argwin::f64(abi::F_VOLUME),
-        "I_TIME" => argwin::i64(abi::I_TIME),
-        "I_TIME_CLOSE" => argwin::i64(abi::I_TIME_CLOSE),
-        "I_BAR_INDEX" => argwin::i64(abi::I_BAR_INDEX),
+        // CAR-R33-5 (r39): the `int` rows live in the f64 lane.
+        "F_TIME" => argwin::f64(abi::F_TIME),
+        "F_TIME_CLOSE" => argwin::f64(abi::F_TIME_CLOSE),
+        "F_BAR_INDEX" => argwin::f64(abi::F_BAR_INDEX),
         "I_BS_ISFIRST" => argwin::i64(abi::I_BS_ISFIRST),
         "I_BS_ISCONFIRMED" => argwin::i64(abi::I_BS_ISCONFIRMED),
         "I_BS_ISLAST" => argwin::i64(abi::I_BS_ISLAST),

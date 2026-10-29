@@ -77,8 +77,15 @@ fn infer_int_literal_beyond_i64_is_type_mismatch() {
 
 #[test]
 fn infer_folds_wrap_mod_and_concat() {
+    // CAR-R33-5 (TradingView F011): binary64, no wrap — `2^63 + 1` is `2^63` (`i64::MAX`).
     let (_, k, _) = init_of(Dialect::V6, "x = 9223372036854775807 + 1\n", "x");
-    assert_eq!(k, Some(K::Int(i64::MIN)));
+    assert_eq!(k, Some(K::Int(i64::MAX)));
+    // F047: a literal is the binary64 it rounds to.
+    let (_, k, _) = init_of(Dialect::V6, "x = 9007199254740993\n", "x");
+    assert_eq!(k, Some(K::Int(9_007_199_254_740_992)));
+    // F037: beyond 2^63 the fold is the VM's.
+    let (_, k, _) = init_of(Dialect::V6, "x = 3037000500 * 3037000500\n", "x");
+    assert_eq!(k, None);
     // CAR-R31-1: truncated, the dividend's sign (TradingView F004 / F115).
     let (_, k, _) = init_of(Dialect::V6, "x = -1 % 100\n", "x");
     assert_eq!(k, Some(K::Int(-1)));

@@ -381,7 +381,13 @@ fn binary_search<const MODE: u8>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), 
         let lo = bisect::<false>(w, float, v);
         // `abs_1e10`: the element the bisection lands on is "found" within the tolerance (the
         // bisection itself orders exactly; a run of near-equal elements is uncaptured).
-        let hit = |x: f64| if tol { super::array::feq_tol(x, v) } else { x == v };
+        let hit = |x: f64| {
+            if tol {
+                super::array::feq_tol(x, v)
+            } else {
+                x == v
+            }
+        };
         let found = lo < w.len() && hit(key(w[lo], float));
         match (MODE, found) {
             (0, true) | (1, true) => lo as i64,

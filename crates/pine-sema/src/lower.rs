@@ -33,12 +33,20 @@ use crate::resolve::Resolved;
 use crate::scope::Binding;
 use crate::sw::Readings;
 
-/// The IR's lane of a type.
+/// The IR's lane of a type. CAR-R33-5 (r39, R-P28): an `int` is a binary64 (TradingView F011
+/// F037 F040 F047 F120) and lives in the f64 lane — `na` is NaN, `+ − * %` are `F_*`, `int(x)` is
+/// `F_INT`. A builtin still takes and returns its `int` rows in the i64 lane: [`crate::marshal`]
+/// converts at the call (`I_F2I` in, `F_I2F` out).
 pub(crate) const fn lane_of(t: Ty) -> Lane {
     match t {
-        Ty::Float => Lane::F64,
+        Ty::Float | Ty::Int => Lane::F64,
         _ => Lane::I64,
     }
+}
+
+/// An `int` constant's f64 bits (CAR-R33-5): the binary64 the value rounds to.
+pub(crate) fn int_bits(i: i64) -> u64 {
+    (i as f64).to_bits()
 }
 
 const fn scalar(t: Ty, q: Qual) -> TypeQ {
@@ -221,7 +229,8 @@ pub(crate) fn lower(
         let (c, src) = ir.hist_guards[i];
         let own = ir.var_caps.iter().filter(|v| v.0 == src).map(|v| v.1).max();
         if let (Some(n), Some(e)) = (own, ir.const_list.iter_mut().find(|e| e.0 == c)) {
-            e.1 = u64::from(n);
+            // An `int` constant in the f64 lane (CAR-R33-5).
+            e.1 = int_bits(i64::from(n));
         }
     }
     // §4.14.8: every `hline` after every other index — shift their `__plot` past the others.
@@ -565,7 +574,11 @@ impl Lower<'_> {
     /// interns it as a `CONST` `StrRef` (T19).
     fn konst(&mut self, k: K, ty: TypeQ, span: Span) -> VSlot {
         let (lane, bits, valid) = match k {
-            K::Int(i) | K::Color(i) => (Lane::I64, i as u64, true),
+            // CAR-R33-5: an `int` (or `float`) constant is a binary64; an enum ordinal stays an
+            // i64.
+            K::Int(i) if lane_of(ty.ty) == Lane::F64 => (Lane::F64, int_bits(i), true),
+            K::Int(i) => (Lane::I64, i as u64, true),
+            K::Color(i) => (Lane::I64, i as u64, true),
             K::Float(f) => (Lane::F64, f.to_bits(), true),
             K::Bool(b) => (Lane::I64, u64::from(b), true),
             K::Str(s) => (Lane::I64, u64::from(s.0), true),
@@ -880,8 +893,9 @@ impl Lower<'_> {
 
     /// `pin:02-site-const-fold` — `+ − *` over two valid `Const` slots folds at the call site
     /// (an inlined `const` parameter's value, §4.7.2: `ta.sma(src, len * 2)` under `len = 10`
-    /// sizes a 20-sample window). Int: wrapping (`pin:06-int-width`); float: IEEE, as the VM's
-    /// `F_ADD`/`F_SUB`/`F_MUL`. `/` and `%` keep their opcodes (W1, M1, U15).
+    /// sizes a 20-sample window). Both are IEEE, as the VM's `F_ADD`/`F_SUB`/`F_MUL` — an `int`
+    /// is a binary64 (CAR-R33-5, `pin:06-int-width`), folded only while it has a `K::Int`
+    /// representative. `/` and `%` keep their opcodes (W1, M1, U15).
     fn fold_slots(&mut self, k: BinOpK, a: VSlot, b: VSlot, ty: TypeQ, at: Span) -> Option<VSlot> {
         let kind = |s: &Self, v: VSlot| s.ir.slots.get(v.0 as usize).map(|x| (x.kind, x.lane));
         let (Some((SlotKind::Const, la)), Some((SlotKind::Const, lb))) =
@@ -893,14 +907,14 @@ impl Lower<'_> {
             return None;
         };
         let r = match (la, lb, ty.ty) {
-            (Lane::I64, Lane::I64, Ty::Int) => {
-                let (x, y) = (xa as i64, xb as i64);
-                K::Int(match k {
-                    BinOpK::Add => x.wrapping_add(y),
-                    BinOpK::Sub => x.wrapping_sub(y),
-                    BinOpK::Mul => x.wrapping_mul(y),
+            (Lane::F64, Lane::F64, Ty::Int) => {
+                let (x, y) = (f64::from_bits(xa), f64::from_bits(xb));
+                K::Int(crate::fold::int_rep(match k {
+                    BinOpK::Add => x + y,
+                    BinOpK::Sub => x - y,
+                    BinOpK::Mul => x * y,
                     _ => return None,
-                })
+                })?)
             }
             (Lane::F64, Lane::F64, Ty::Float) => {
                 let (x, y) = (f64::from_bits(xa), f64::from_bits(xb));
@@ -2638,7 +2652,7 @@ impl Lower<'_> {
     /// literal, a signed numeric literal, `na`.
     fn literal_k(&self, ast: &Ast, d: NodeId) -> Option<K> {
         match ast.node(d) {
-            Node::IntLit { value } => i64::try_from(value).ok().map(K::Int),
+            Node::IntLit { value } => crate::fold::int_rep(value as f64).map(K::Int),
             Node::FloatLit { value } => Some(K::Float(value)),
             Node::BoolLit { value } => Some(K::Bool(value)),
             Node::StrLit { value, .. } => Some(K::Str(value)),
@@ -2651,7 +2665,7 @@ impl Lower<'_> {
             Node::Ident { sym } if self.syms.resolve(sym) == "na" => Some(K::Na),
             Node::Unary { op, operand } => match (op, self.literal_k(ast, operand)?) {
                 (UnOp::Pos, k) => Some(k),
-                (UnOp::Neg, K::Int(i)) => Some(K::Int(i.wrapping_neg())),
+                (UnOp::Neg, K::Int(i)) => crate::fold::i_neg(i).map(K::Int),
                 (UnOp::Neg, K::Float(f)) => Some(K::Float(-f)),
                 _ => None,
             },
@@ -2907,7 +2921,9 @@ impl Lower<'_> {
             "The requested historical offset is beyond the historical buffer's limit.";
         let z = self.konst(K::Int(0), scalar(Ty::Int, Qual::Const), at);
         let info = self.info(scalar(Ty::Int, Qual::Const), SlotKind::Const, Sym::NONE, at);
-        let lim = self.ir.konst_own(info, u64::from(self.knobs.hist_cap));
+        let lim = self
+            .ir
+            .konst_own(info, int_bits(i64::from(self.knobs.hist_cap)));
         self.ir.hist_guards.push((lim, src));
         let b = scalar(Ty::Bool, Qual::Series);
         let (neg, big, bad) = (self.temp(b, at), self.temp(b, at), self.temp(b, at));

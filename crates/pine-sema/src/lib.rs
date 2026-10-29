@@ -26,6 +26,7 @@ mod layout;
 mod libcache;
 pub mod limits;
 mod lower;
+mod marshal;
 mod meta;
 mod mono;
 mod nacap;
@@ -163,6 +164,8 @@ fn compile_with(
                 ta_restart,
             };
             let r = ir.and_then(|mut ir| {
+                // CAR-R33-5: f64-lane `int`s cross every builtin call in the i64 lane.
+                marshal::run(&mut ir);
                 hoist::run(&mut ir, rd)?;
                 // Pass 5a (§4.11.4–§4.11.7): every request becomes a child program.
                 let scx = security::cone::Cx {

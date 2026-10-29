@@ -822,9 +822,11 @@ impl<'a, 's> Infer<'a, 's> {
         let at = ast.span(n);
         let c = |t: Ty| TypeQ::scalar(t, Qual::Const);
         let e = match ast.node(n) {
-            Node::IntLit { value } => match i64::try_from(value) {
-                Ok(v) => Ex::of(c(Ty::Int), Some(K::Int(v))),
-                Err(_) => {
+            // CAR-R33-5: an integer literal is the binary64 it rounds to (F047:
+            // `9007199254740993` is `9007199254740992`); up to `2^63`.
+            Node::IntLit { value } => match fold::int_rep(value as f64) {
+                Some(v) => Ex::of(c(Ty::Int), Some(K::Int(v))),
+                None => {
                     let msg = format!("integer literal {value} exceeds the int range");
                     self.refuse(ReasonCode::TypeMismatch, at, msg)
                 }
@@ -1502,7 +1504,8 @@ impl<'a, 's> Infer<'a, 's> {
                     return self.refuse(ReasonCode::NoOverload, at, msg);
                 }
                 let k = match (op, e.k) {
-                    (UnOp::Neg, Some(K::Int(i))) => Some(K::Int(i.wrapping_neg())),
+                    // CAR-R33-5: binary64 (`−(−2^63)` is `2^63`); beyond it, left to the VM.
+                    (UnOp::Neg, Some(K::Int(i))) => fold::i_neg(i).map(K::Int),
                     (UnOp::Neg, Some(K::Float(f))) => Some(K::Float(-f)),
                     (_, k) => k,
                 };
@@ -1704,10 +1707,12 @@ impl<'a, 's> Infer<'a, 's> {
                 } else if both_int {
                     let k = match (l.k, r.k) {
                         (Some(K::Int(a)), Some(K::Int(b))) => match op {
-                            BinOp::Add => Some(K::Int(fold::i_add(a, b))),
-                            BinOp::Sub => Some(K::Int(fold::i_sub(a, b))),
-                            BinOp::Mul => Some(K::Int(fold::i_mul(a, b))),
-                            _ => Some(fold::i_mod(a, b).map_or(K::Na, K::Int)),
+                            // CAR-R33-5: binary64; `None` beyond `±2^63` (left to the VM).
+                            BinOp::Add => fold::i_add(a, b).map(K::Int),
+                            BinOp::Sub => fold::i_sub(a, b).map(K::Int),
+                            BinOp::Mul => fold::i_mul(a, b).map(K::Int),
+                            _ if b == 0 => Some(K::Na),
+                            _ => fold::i_mod(a, b).map(K::Int),
                         },
                         _ => None,
                     };
