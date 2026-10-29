@@ -1512,6 +1512,11 @@ impl<'a, 's> Infer<'a, 's> {
     }
 
     fn binary(&mut self, n: NodeId, op: BinOp, lhs: NodeId, rhs: NodeId) -> Ex {
+        if op == BinOp::Add {
+            if let Some(c) = crate::reassoc::chain(self.ast(), n) {
+                return self.chain(&c);
+            }
+        }
         let l = self.expr(lhs);
         if matches!(op, BinOp::And | BinOp::Or) {
             self.cond += 1;
@@ -1521,6 +1526,23 @@ impl<'a, 's> Infer<'a, 's> {
         }
         let r = self.expr(rhs);
         self.arith(n, op, l, r)
+    }
+
+    /// CI-022 (`crate::reassoc`): a flattened additive chain, left to right; every intermediate is
+    /// recorded on its host node for lower, the final value is the caller's (the root's `record`).
+    fn chain(&mut self, c: &crate::reassoc::Chain) -> Ex {
+        let mut acc = self.expr(c.terms[0].1);
+        let last = c.terms.len() - 1;
+        for i in 1..c.terms.len() {
+            let (op, t) = c.terms[i];
+            let r = self.expr(t);
+            let host = c.hosts[i - 1];
+            acc = self.arith(host, op, acc, r);
+            if i < last {
+                acc = self.record(host, acc);
+            }
+        }
+        acc
     }
 
     fn logic(&mut self, n: NodeId, op: BinOp, l: Ex, r: Ex) -> Ex {
@@ -1692,14 +1714,15 @@ impl<'a, 's> Infer<'a, 's> {
                     Ex::of(TypeQ::scalar(Ty::Int, q), k)
                 } else {
                     let k = match (num_k(l.k), num_k(r.k)) {
-                        (Some(a), Some(b)) => Some(float_k(match op {
+                        // CAR-R33-4 (r39): every folded float result is rounded to 16 decimal
+                        // places (TradingView F098, F124).
+                        (Some(a), Some(b)) => Some(float_k(fold::dec16(match op {
                             BinOp::Add => a + b,
                             BinOp::Sub => a - b,
                             BinOp::Mul => a * b,
                             BinOp::Div => fold::f_div(a, b, self.rd),
-                            // CAR-R33-4: the folded `%` is rounded to 15 significant digits.
-                            _ => fold::sig15(fold::f_mod(a, b, self.rd)),
-                        })),
+                            _ => fold::f_mod(a, b, self.rd),
+                        }))),
                         _ => None,
                     };
                     Ex::of(TypeQ::scalar(Ty::Float, q), k)
@@ -1717,13 +1740,20 @@ impl<'a, 's> Infer<'a, 's> {
                 Ex::of(TypeQ::scalar(Ty::String, q), k)
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge if num(lt) && num(rt) => {
+                // U06 `abs_1e10` (CAR-R33-7): a float fold orders only beyond the tolerance, as
+                // `flg::TOL` does at run time.
+                let tol = (lt == Ty::Float || rt == Ty::Float)
+                    && self.rd.float_eq_v6 == swr::FLOAT_EQ_V6_ABS_1E10;
                 let k = match (num_k(l.k), num_k(r.k)) {
-                    (Some(a), Some(b)) => Some(K::Bool(match op {
-                        BinOp::Lt => a < b,
-                        BinOp::Le => a <= b,
-                        BinOp::Gt => a > b,
-                        _ => a >= b,
-                    })),
+                    (Some(a), Some(b)) => {
+                        let eq = tol && ((a == b) || (a - b).abs() <= pine_ir::CMP_TOL);
+                        Some(K::Bool(match op {
+                            BinOp::Lt => !eq && a < b,
+                            BinOp::Le => eq || a <= b,
+                            BinOp::Gt => !eq && a > b,
+                            _ => eq || a >= b,
+                        }))
+                    }
                     _ => None,
                 };
                 Ex::of(TypeQ::scalar(Ty::Bool, q), k)

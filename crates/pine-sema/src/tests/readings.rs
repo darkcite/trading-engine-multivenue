@@ -310,7 +310,8 @@ fn readings_ta_in_loop_restart_flags_and_doubles_the_block() {
 /// CAR-R33-9 scope: every `ta.*` site in a loop body at any depth — nested `for`, `while`,
 /// `for…in`, a function inlined into the body — restarts; a conditional call outside every loop
 /// (`pin:06-cond-call-state`, B023 B041 B047) and a non-`ta` stateful row in a loop
-/// (`pin:02-ta-in-loop-restart-scope`: `math.sum`, `math.random`) do not.
+/// (`pin:02-ta-in-loop-restart-scope`: `math.random`) do not. r39: `math.sum` restarts like `ta.*`
+/// (TradingView F128, capture 08).
 #[test]
 fn readings_ta_in_loop_restart_scope() {
     use pine_ir::state_flag::{IN_LOOP, RESTART};
@@ -338,9 +339,10 @@ fn readings_ta_in_loop_restart_scope() {
     // Outside every loop: unchanged (a conditional call is `pin:06-cond-call-state`'s).
     let cond = "s = 0.0\nif close > open\n    s := ta.sma(close, 3)\nplot(s)\n";
     assert_eq!(one(cond), (0, w3));
-    // Not `ta.*`: `per_call`, the block as before.
+    // `math.sum` (r39, F128): restarted like `ta.*`.
     let sum = "s = 0.0\nfor i = 0 to 2\n    s += math.sum(close, 3)\nplot(s)\n";
-    assert_eq!(one(sum), (IN_LOOP, w3));
+    assert_eq!(one(sum), restarted);
+    // Not `ta.*`: `per_call`, the block as before.
     let rnd = "s = 0.0\nfor i = 0 to 2\n    s += math.random(0, 1, 42)\nplot(s)\n";
     let (f, _) = one(rnd);
     assert_eq!(f, IN_LOOP, "math.random keeps drawing");

@@ -366,10 +366,12 @@ fn binary_search<const MODE: u8>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), 
     if !matches!(o.elem, Ty::Float | Ty::Int) || is_i64(args[1]) || !is_i64(args[2]) {
         return Err(FaultKind::Internal);
     }
-    if crate::sw::pick(FEQ, f.dialect()) != 0 {
+    let tol = match crate::sw::pick(FEQ, f.dialect()) {
+        pine_spec::swr::FLOAT_EQ_V6_EXACT => false,
+        pine_spec::swr::FLOAT_EQ_V6_ABS_1E10 => float,
         // `round9` needs `$op.eq_round9`'s decimal kernel, not landed here (as `indexof`).
-        return Err(FaultKind::Internal);
-    }
+        _ => return Err(FaultKind::Internal),
+    };
     let v = f.f64_arg(args[1]);
     let r = if v.is_nan() {
         -1
@@ -377,7 +379,10 @@ fn binary_search<const MODE: u8>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), 
         let (_, words) = f.coll(o.owner)?;
         let w = &words[o.base as usize..(o.base + o.len) as usize];
         let lo = bisect::<false>(w, float, v);
-        let found = lo < w.len() && key(w[lo], float) == v;
+        // `abs_1e10`: the element the bisection lands on is "found" within the tolerance (the
+        // bisection itself orders exactly; a run of near-equal elements is uncaptured).
+        let hit = |x: f64| if tol { super::array::feq_tol(x, v) } else { x == v };
+        let found = lo < w.len() && hit(key(w[lo], float));
         match (MODE, found) {
             (0, true) | (1, true) => lo as i64,
             (0, false) => -1,

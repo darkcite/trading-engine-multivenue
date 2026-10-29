@@ -6,20 +6,53 @@ pin	pin:04-cog-tv-order
 script	tests/conformance/fixtures/F/F127.pine
 script_sha256	e0cf97a2246c0ddd6964c277d14856938bab9c43eeef136fbba30e640fe600b1
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-29T10:16Z
+tv_build	web:Claude-4.29.0/Chrome-152.0.7977.167;pine:2026-10
+captured_in	56
 driver	syn
 align	step
 dialects	56
 mode	bar_close
-bars	pending
+bars	24778
 window	head	32
 oracle	tv
 tier	1
 plot	f_F127_isna	exact
 plot	f_F127_val	exact
-pending
+series
+0	1	na
+1	1	na
+2	1	na
+3	1	na
+4	1	na
+5	1	na
+6	1	na
+7	1	na
+8	1	na
+9	1	na
+10	1	na
+11	1	na
+12	1	na
+13	0	20301.82
+14	0	20213.62
+15	0	19686.16
+16	0	20008.7
+17	0	19889.41
+18	0	20588.510000000002
+19	0	20901.91
+20	0	21069.5
+21	0	20892.41
+22	0	20290.27
+23	0	20884.75
+24	0	20535.95
+25	0	20863.63
+26	0	20949.7
+27	0	21322.06
+28	0	21760.35
+29	0	22488.67
+30	0	22656.37
+31	0	22417.34
+end
 reading	rolling
 0	1.0	na
 1	1.0	na

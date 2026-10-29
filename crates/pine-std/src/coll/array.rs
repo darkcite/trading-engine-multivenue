@@ -13,7 +13,7 @@ use super::{
 };
 use crate::sw;
 use pine_ir::{argwin, CollKind, CollRef, Dialect, FaultKind, SiteId, Ty, NA_I64};
-use pine_spec::{ov, Sw, OVERLOADS};
+use pine_spec::{ov, swr, Sw, OVERLOADS};
 use pine_vm::{bf, Frame};
 
 const NEG: [u8; 2] = sw::both(Sw::NegIndex);
@@ -459,6 +459,13 @@ const SHIFT_STR: bool = str_alloc(ov::ARRAY_SHIFT);
 const REMOVE_STR: bool = str_alloc(ov::ARRAY_REMOVE);
 const FEQ: [u8; 2] = sw::both(Sw::FloatEqV6);
 
+/// The script's float `==` under U06 `abs_1e10` (`flg::TOL`'s rule, CAR-R33-7): equal, or within
+/// `CMP_TOL`; na equals nothing.
+#[inline(always)]
+pub(crate) fn feq_tol(a: f64, b: f64) -> bool {
+    a == b || (a - b).abs() <= pine_ir::CMP_TOL
+}
+
 /// `array.first(id)` / `array.last(id)` — `[id, out]`: empty is `CollectionBounds`.
 fn first_last<const LAST: bool>(f: &mut Frame<'_>, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 2 {
@@ -575,8 +582,9 @@ fn unshift_insert<const INSERT: bool>(f: &mut Frame<'_>, args: &[u16]) -> Result
 }
 
 /// Whether element word `w` equals the value of argument `e` (`==` of the element type: floats
-/// per `Sw::FloatEqV6` = `exact`, IEEE `==`; ints and strings exactly; na equals nothing — the
-/// na-false comparison).
+/// per `Sw::FloatEqV6` — `exact` IEEE `==`, `abs_1e10` the script's `==` (CAR-R33-7, r39;
+/// uncaptured for collections: the switch's reading, as before); ints and strings exactly; na
+/// equals nothing — the na-false comparison).
 fn equals(
     f: &Frame<'_>,
     o: &Owned,
@@ -587,11 +595,13 @@ fn equals(
 ) -> Result<bool, FaultKind> {
     Ok(match o.elem {
         Ty::Float => {
-            if sw::pick(FEQ, f.dialect()) != 0 {
+            let (a, b) = (f64::from_bits(w), f.f64_arg(e));
+            match sw::pick(FEQ, f.dialect()) {
+                swr::FLOAT_EQ_V6_EXACT => a == b,
+                swr::FLOAT_EQ_V6_ABS_1E10 => feq_tol(a, b),
                 // `round9` needs `$op.eq_round9`'s decimal kernel, not landed here.
-                return Err(FaultKind::Internal);
+                _ => return Err(FaultKind::Internal),
             }
-            f64::from_bits(w) == f.f64_arg(e)
         }
         Ty::String => {
             let Some(b) = f.str_arg(e) else {

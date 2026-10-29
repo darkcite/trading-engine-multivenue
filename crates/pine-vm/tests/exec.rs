@@ -182,6 +182,43 @@ fn f_ne_with_nan_is_false_and_f_min_propagates() {
     assert!(o[0][1].is_nan(), "min(na, 3) is na");
 }
 
+/// CAR-R33-7 (`flg::TOL`, TradingView F122): `close + 5e-11` against `close` is equal under the
+/// tolerance on all six comparisons; without the flag IEEE orders it; `close + 2e-10` is beyond.
+#[test]
+fn f_compare_tol_is_tradingviews_absolute_tolerance() {
+    let mut t = Tb::new(ExecMode::BarClose, 4, 2, 0, 0);
+    t.n_plots = 9;
+    let (f0, f1, f2, f3, i0, i1) = (t.f(0), t.f(1), t.f(2), t.f(3), t.i(0), t.i(1));
+    let (e, e2) = (t.kf(5e-11), t.kf(2e-10));
+    t.emit(op::F_CONST, 0, f0, e, 0);
+    t.emit(op::F_ADD, 0, f1, abi::F_CLOSE, f0);
+    t.emit(op::F_CONST, 0, f0, e2, 0);
+    t.emit(op::F_ADD, 0, f3, abi::F_CLOSE, f0);
+    let rows = [
+        (op::F_EQ, flg::TOL, f1),
+        (op::F_NE, flg::TOL, f1),
+        (op::F_GT, flg::TOL, f1),
+        (op::F_LT, flg::TOL, f1),
+        (op::F_GE, flg::TOL, f1),
+        (op::F_LE, flg::TOL, f1),
+        (op::F_GT, 0, f1),
+        (op::F_EQ, flg::TOL, f3),
+        (op::F_GT, flg::TOL, f3),
+    ];
+    for (n, &(o, fl, x)) in rows.iter().enumerate() {
+        t.emit(o, fl, i0, x, abi::F_CLOSE);
+        t.emit(op::F_I2F, 0, f2, i0, 0);
+        plot_f(&mut t, n as u64, f2, i1);
+    }
+    t.emit(op::HALT, 0, 0, 0, 0);
+    let p = t.build();
+    let v = verify(&p, &TABLE).unwrap();
+    let mut a = Arena::new(p.layout.total_bytes as usize);
+    let mut vm = VmInstance::new(v, a.slice());
+    let o = run_bars(&mut vm, &[1234.56]);
+    assert_eq!(o[0], vec![1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0]);
+}
+
 #[test]
 fn back_edge_charges_and_a_runaway_loop_faults() {
     let mut t = Tb::new(ExecMode::BarClose, 1, 1, 0, 0);

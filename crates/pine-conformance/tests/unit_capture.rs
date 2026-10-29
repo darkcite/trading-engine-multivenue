@@ -751,9 +751,11 @@ fn capture_distil_step_drops_the_open_bar() {
 }
 
 /// §4.1.3 `align time`: only rows opening in `[FROM_MS, TO_MS)` are eligible; `tail n` picks the
-/// last `n` before `TO_MS`; rows before `FROM_MS` never count; a `time` window intersects with the
-/// range. A `mode realtime` fixture on another driver (E105) goes by its alignment
-/// (pin:06-distil-rt-rows).
+/// last `n` before `TO_MS`; rows before `FROM_MS` never count for `head` / `tail`; an explicit
+/// `time` window keeps its own start and is capped at `TO_MS`
+/// (`pin:06-distil-time-window-explicit`, r39 B127), and a selection of no row is refused
+/// (`pin:06-distil-no-empty-selection`). A `mode realtime` fixture on another driver (E105) goes by
+/// its alignment (pin:06-distil-rt-rows).
 #[test]
 fn capture_distil_time_selects_inside_the_chart_window() {
     let root = tree("time", &["D001", "E001", "E105"]);
@@ -792,7 +794,7 @@ fn capture_distil_time_selects_inside_the_chart_window() {
         err.contains("D001") && err.contains("[FROM_MS, TO_MS)"),
         "{err}"
     );
-    // A `time` window wider than the chart window keeps exactly `[FROM_MS, TO_MS)`.
+    // A `time` window wider than the chart window keeps its own start and stops at `TO_MS`.
     let p = root.join("tests/conformance/fixtures/E/E001.fix");
     let fix = std::fs::read_to_string(&p).unwrap();
     let wide = format!(
@@ -810,11 +812,40 @@ fn capture_distil_time_selects_inside_the_chart_window() {
     let ee = export_ms("f_E001_pos", &pos);
     distil(&sheet, &ee, Some(&[]), None, &stamp(Dialect::V6), false).unwrap();
     let r1 = series(&load(&root, "E001")).to_vec();
-    assert_eq!(r1.len() as i64, n_bars);
+    assert_eq!(r1.len() as i64, n_bars + 10);
     assert_eq!(
         (r1[0].key, r1[r1.len() - 1].key),
-        (spec::FROM_MS, spec::TO_MS - spec::TF_MS)
+        (spec::FROM_MS - 10 * spec::TF_MS, spec::TO_MS - spec::TF_MS)
     );
+    // A window wholly before `FROM_MS` (B127's shape) selects its own rows; one the export does not
+    // reach is refused, never written empty (fresh trees: a fixture's rows must fit its window).
+    for (tag, lo, hi, ok) in [("early", -8i64, -3i64, true), ("gone", -500, -400, false)] {
+        let root_w = tree(tag, &["E001"]);
+        let sheet_w = root_w.join("tests/conformance/sheets/v6/sheet-x.pine");
+        let pw = root_w.join("tests/conformance/fixtures/E/E001.fix");
+        let fw = std::fs::read_to_string(&pw).unwrap();
+        let w = format!("window\ttime\t{}\t{}", hour(lo), hour(hi));
+        std::fs::write(
+            &pw,
+            fw.replace(&format!("window\ttime\t{}\t{}", spec::FROM_MS, spec::TO_MS), &w),
+        )
+        .unwrap();
+        let got = distil(&sheet_w, &ee, Some(&[]), None, &stamp(Dialect::V6), false);
+        if ok {
+            got.unwrap();
+            assert_eq!(
+                series(&load(&root_w, "E001")).iter().map(|r| r.key).collect::<Vec<_>>(),
+                (lo..hi).map(hour).collect::<Vec<_>>()
+            );
+        } else {
+            let err = got.unwrap_err();
+            assert!(
+                err.contains("E001") && err.contains("pin:06-distil-no-empty-selection"),
+                "{err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root_w);
+    }
     // E105: mode realtime, driver synsig — by its alignment, no rt / done plots needed.
     let e105 = export_ms("f_E105_pos", &pos);
     distil(&sheet, &e105, Some(&[]), None, &stamp(Dialect::V6), false).unwrap();

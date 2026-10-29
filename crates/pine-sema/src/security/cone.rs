@@ -881,13 +881,14 @@ impl Map<'_> {
                     b,
                 }
             }
-            Op::Cmp { op, dst, a, b } => {
+            Op::Cmp { op, dst, a, b, tol } => {
                 let (a, b) = (self.slot(*a), self.slot(*b));
                 Op::Cmp {
                     op: *op,
                     dst: self.slot(*dst),
                     a,
                     b,
+                    tol: *tol,
                 }
             }
             Op::Mov { dst, a } => {

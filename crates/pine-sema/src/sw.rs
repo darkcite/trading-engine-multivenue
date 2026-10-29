@@ -31,7 +31,8 @@ pub(crate) struct Readings {
     pub(crate) float_div_zero: u8,
     /// `Sw::IntOfNa` (U05) — `swr::INT_OF_NA_*`; §4.14.6 `int(x)`.
     pub(crate) int_of_na: u8,
-    /// `Sw::FloatEqV6` (U06) — `swr::FLOAT_EQ_V6_*`; §4.14.2 float `==` / `!=` (v6 only).
+    /// `Sw::FloatEqV6` (U06) — `swr::FLOAT_EQ_V6_*`; §4.14.2 float `==` / `!=` (`round9`: v6),
+    /// all six float comparisons under `abs_1e10` (CAR-R33-7), and their folds (§4.17).
     pub(crate) float_eq_v6: u8,
     /// `Sw::TaInLoop` (U13) — `swr::TA_IN_LOOP_*`; §4.7.4 `hoist.rs` (`per_iteration`) and
     /// `sites.rs` (`restart`, CAR-R33-9).
@@ -124,7 +125,11 @@ impl Readings {
             (
                 "float_eq_v6",
                 self.float_eq_v6,
-                &[swr::FLOAT_EQ_V6_EXACT, swr::FLOAT_EQ_V6_ROUND9],
+                &[
+                    swr::FLOAT_EQ_V6_EXACT,
+                    swr::FLOAT_EQ_V6_ROUND9,
+                    swr::FLOAT_EQ_V6_ABS_1E10,
+                ],
             ),
         ];
         for &(name, v, codes) in known {

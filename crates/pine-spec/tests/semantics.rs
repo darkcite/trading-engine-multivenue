@@ -119,8 +119,8 @@ const SW: [(Sw, &str, u8, u8); 22] = [
     (
         Sw::FloatEqV6,
         "float_eq_v6",
-        swr::FLOAT_EQ_V6_EXACT,
-        swr::FLOAT_EQ_V6_EXACT,
+        swr::FLOAT_EQ_V6_ABS_1E10,
+        swr::FLOAT_EQ_V6_ABS_1E10,
     ),
     (
         Sw::StrMatchNone,

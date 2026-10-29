@@ -6,20 +6,37 @@ pin	pin:02-ta-in-loop-restart-scope
 script	tests/conformance/fixtures/F/F128.pine
 script_sha256	b20ea1c100c5ea708f1f9bfad857a1b5a2bbefa3db2ae33628cd7de96ae80012
 chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
-captured	pending
-tv_build	pending
-captured_in	pending
+captured	2026-10-29T10:16Z
+tv_build	web:Claude-4.29.0/Chrome-152.0.7977.167;pine:2026-10
+captured_in	56
 driver	syn
 align	step
 dialects	56
 mode	bar_close
-bars	pending
+bars	24778
 window	head	16
 oracle	tv
 tier	1
 plot	f_F128_isna	exact
 plot	f_F128_val	ulp	12
-pending
+series
+0	1	na
+1	1	na
+2	0	13263.869999999999
+3	0	14069.400000000001
+4	0	12079.829999999998
+5	0	10915.8
+6	0	10432.380000000001
+7	0	11690.82
+8	0	13690.349999999999
+9	0	13995.300000000001
+10	0	14402.16
+11	0	13209.420000000002
+12	0	14612.91
+13	0	13970.97
+14	0	13065.630000000001
+15	0	11205.96
+end
 reading	per_call
 0	1.0	na
 1	0.0	14019.150000000001

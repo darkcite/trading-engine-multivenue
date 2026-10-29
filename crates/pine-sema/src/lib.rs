@@ -31,6 +31,7 @@ mod mono;
 mod nacap;
 mod overload;
 mod pins;
+mod reassoc;
 mod refs;
 mod resolve;
 mod scope;

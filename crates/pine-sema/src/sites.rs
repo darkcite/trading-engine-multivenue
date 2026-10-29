@@ -142,16 +142,19 @@ fn walk(ir: &Ir, b: &Block, flags: u8, cx: &SiteCtx<'_>, out: &mut Vec<Site>) ->
 /// U13 `restart` (CAR-R33-9, §4.7.4): a stateful `ta.*` site inside a loop body, at any depth
 /// (`for`, `while`, `for…in`; head, body and step), gets `RESTART`, so every execution on a bar
 /// re-runs from the block committed at the previous bar. `pin:02-ta-in-loop-restart-scope`: the
-/// switch is `ta_in_loop` and its capture (B068 `ta.sma`, B069 `ta.ema`) is of `ta.*`; every other
-/// stateful row in a loop (`math.sum`, `math.random`, `fixnan`, `str.match`, `timeframe.change`,
-/// `request.security`) keeps `per_call` until a fixture decides it — `math.random` restarting would
-/// repeat one draw per bar. A site outside every loop never repeats on a bar and is unchanged
-/// (`pin:06-cond-call-state` governs it).
+/// switch is `ta_in_loop` and its capture (B068 `ta.sma`, B069 `ta.ema`) is of `ta.*`; r39
+/// (TradingView F128, capture 08: rows 0 / 1 na, 2 = 13263.869999999999, 3 = 14069.400000000001 —
+/// `restart`'s values, `per_call` refuted) adds `math.sum`. Every other stateful row in a loop
+/// (`math.random`, `fixnan`, `str.match`, `timeframe.change`, `request.security`) keeps `per_call`
+/// until a fixture decides it — `math.random` restarting would repeat one draw per bar. A site
+/// outside every loop never repeats on a bar and is unchanged (`pin:06-cond-call-state` governs
+/// it).
 fn restarts(o: &pine_spec::Overload, flags: u8, b: u32, cx: &SiteCtx<'_>) -> bool {
+    let e = pine_spec::entry_of(o);
     cx.ta_restart
         && flags & state_flag::IN_LOOP != 0
         && b > 0
-        && pine_spec::entry_of(o).ns.as_str() == "ta"
+        && (e.ns.as_str() == "ta" || (e.ns.as_str() == "math" && e.name.as_str() == "sum"))
 }
 
 /// A collection creator's block bytes (§4.7.1): `array.slice` is a view

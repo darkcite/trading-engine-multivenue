@@ -181,7 +181,7 @@ fn tv_fixtures_refuse_without_the_captured_syminfo() {
 // --tv` writes the same run as the divergence report (vault `conformance/run-r27.md`).
 // ------------------------------------------------------------------------------------------------
 
-/// TradingView passes (r33 part 5, 2026-10-18, no bars root): 343.
+/// TradingView passes (r39, 2026-10-29, no bars root): 359.
 const TV_PASS: &[&str] = &[
     "A001", "A002", "A003", "A004", "A005", "A006", "A007", "A008", "A009", "A010", "A011", "A012",
     "A013", "A014", "A015", "A016", "A017", "A018", "A019", "A020", "A021", "A022", "A023", "A024",
@@ -203,15 +203,16 @@ const TV_PASS: &[&str] = &[
     "C028", "C029", "C031", "C032", "C033", "C034", "C035", "C036", "C037", "C039", "C040", "C041",
     "C042", "C044", "C045", "C046", "D053", "D054", "E056", "E109", "E110", "E122", "E123", "E128",
     "F001", "F002", "F003", "F004", "F005", "F006", "F007", "F008", "F009", "F010", "F012", "F013",
-    "F014", "F015", "F016", "F017", "F018", "F021", "F022", "F023", "F026", "F027", "F028", "F029",
-    "F030", "F031", "F032", "F033", "F034", "F035", "F036", "F038", "F039", "F041", "F042", "F043",
-    "F044", "F045", "F046", "F048", "F049", "F050", "F051", "F052", "F053", "F055", "F056", "F057",
-    "F058", "F060", "F063", "F064", "F066", "F068", "F070", "F072", "F073", "F074", "F075", "F076",
-    "F077", "F078", "F079", "F080", "F081", "F082", "F083", "F085", "F086", "F087", "F088", "F089",
-    "F090", "F091", "F092", "F093", "F094", "F095", "F096", "F097", "F099", "F100", "F101", "F102",
-    "F103", "F104", "F105", "F106", "F107", "F110", "F112", "F114", "F115", "F116", "F118", "F119",
-    "Z001", "Z002", "Z003", "Z004", "Z005", "Z006", "Z007", "Z008", "Z009", "Z010", "Z011", "Z012",
-    "Z013", "Z014", "Z015", "Z016", "Z017", "Z018", "Z019",
+    "F014", "F015", "F016", "F017", "F018", "F019", "F020", "F021", "F022", "F023", "F024", "F025",
+    "F026", "F027", "F028", "F029", "F030", "F031", "F032", "F033", "F034", "F035", "F036", "F038",
+    "F039", "F041", "F042", "F043", "F044", "F045", "F046", "F048", "F049", "F050", "F051", "F052",
+    "F053", "F055", "F056", "F057", "F058", "F060", "F061", "F062", "F063", "F064", "F066", "F068",
+    "F070", "F072", "F073", "F074", "F075", "F076", "F077", "F078", "F079", "F080", "F081", "F082",
+    "F083", "F085", "F086", "F087", "F088", "F089", "F090", "F091", "F092", "F093", "F094", "F095",
+    "F096", "F097", "F098", "F099", "F100", "F101", "F102", "F103", "F104", "F105", "F106", "F107",
+    "F108", "F110", "F112", "F114", "F115", "F116", "F117", "F118", "F119", "F121", "F122", "F123",
+    "F124", "F126", "F127", "F128", "Z001", "Z002", "Z003", "Z004", "Z005", "Z006", "Z007", "Z008",
+    "Z009", "Z010", "Z011", "Z012", "Z013", "Z014", "Z015", "Z016", "Z017", "Z018", "Z019",
 ];
 
 /// Known TradingView divergences `(id, class)` — engine items for their crates (R-P1), never
@@ -221,24 +222,17 @@ const TV_PASS: &[&str] = &[
 const TV_GAPS: &[(&str, &str)] = &[
     ("E106", "differ"),
     ("F011", "differ"),
-    ("F019", "differ"),
-    ("F020", "differ"),
-    ("F024", "differ"),
-    ("F025", "differ"),
     ("F037", "differ"),
     ("F040", "differ"),
     ("F047", "differ"),
-    ("F061", "differ"),
-    ("F062", "differ"),
-    ("F098", "differ"),
-    ("F117", "differ"),
+    ("F120", "differ"),
 ];
 
 /// Chart / SynSig fixtures of the run: all `harness-gap · NoBarsRoot` without a bars root (the
 /// Mac runs them with `pine-conf report --tv --bars DIR`).
-const TV_NO_BARS: usize = 194;
-/// The captured TradingView fixtures the ratchet runs (r31 capture session 07).
-const TV_CAPTURED: usize = 550;
+const TV_NO_BARS: usize = 204;
+/// The captured TradingView fixtures the ratchet runs (r39 capture session 08).
+const TV_CAPTURED: usize = 569;
 
 fn tv_options() -> RunnerOptions {
     let mut o = RunnerOptions::new(root());
@@ -265,7 +259,7 @@ fn tv_fixtures_hold_the_known_pass_set() {
     assert_eq!(
         tv.len(),
         TV_CAPTURED,
-        "captured fixtures run (r31: 550 — F108 escalated, uncapturable)"
+        "captured fixtures run (r39: 569 — capture 08 added the r34 probes and F108)"
     );
     let (mut pass, mut gaps) = (Vec::new(), Vec::new());
     let mut no_bars = 0usize;

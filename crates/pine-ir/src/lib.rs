@@ -90,7 +90,7 @@ pub use ids::{Dialect, FileId, NodeId, OverloadId, SiteId, Span, StrKey, Sym};
 pub use intent::{
     intent_flag, trade_flag, BrokerView, IntentKind, IntentSide, OcaType, OrderIntent, TradeRec,
 };
-pub use isa::{abi, argwin, flg, op, Insn};
+pub use isa::{abi, argwin, flg, op, Insn, CMP_TOL};
 pub use journal::JrnlHdr;
 pub use layout::{
     ring_flag, state_flag, FrameLayout, Lane, PlotDesc, PlotKind, RingDesc, StateDesc, StateKind,

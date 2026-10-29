@@ -182,8 +182,10 @@ fn levels(k: Kind, p: Period, open: f64) -> [f64; LEVELS] {
                 s3,
                 r4,
                 s4,
-                r4 + 1.168 * (r4 - r3),
-                s4 - 1.168 * (s3 - s4),
+                // r39 (TradingView B126, 256 / 256 rows): R5 = H / L · C, S5 = C − (R5 − C) — not
+                // the provisional `R4 + 1.168 (R4 − R3)` of the Help Center's other Camarilla table.
+                h / l * c,
+                c - (h / l * c - c),
             ]
         }
     }
@@ -317,5 +319,23 @@ mod tests {
         assert_eq!(nas(Kind::Camarilla), 0);
         assert_eq!(kind_of(b"DM"), Some(Kind::Dm));
         assert_eq!(kind_of(b"dm"), None);
+    }
+
+    /// r39 (TradingView B126): Camarilla R5 = H / L · C and S5 = C − (R5 − C), the previous
+    /// day 2026-10-28 (H 84180, L 82751.1, C 83723) giving TradingView's 85168.68222899755 /
+    /// 82277.31777100245 bit for bit.
+    #[test]
+    fn camarilla_r5_s5_are_h_over_l_times_c() {
+        let p = Period {
+            o: 82941.0,
+            h: 84180.0,
+            l: 82751.1,
+            c: 83723.0,
+        };
+        let k = levels(Kind::Camarilla, p, 83723.0);
+        assert_eq!(k[9], 85168.68222899755);
+        assert_eq!(k[10], 82277.31777100245);
+        assert_eq!(k[7], 84508.895);
+        assert_eq!(k[8], 82937.105);
     }
 }

@@ -587,6 +587,7 @@ fn dispatch(ir: &mut Ir, h: VSlot, f: u16, v: VSlot, cands: &[(u32, VSlot)]) -> 
                         dst: e,
                         a: u,
                         b: c,
+                        tol: false,
                     }),
                     Stmt::If {
                         cond: e,

@@ -5,7 +5,9 @@
 //! bar path and contains no journal instruction. No closures, no iterators,
 //! no `?`, no allocation; every unchecked access names its verifier rule.
 
-use pine_ir::{flg, op, ring_flag, state_flag, FaultKind, Insn, RingDesc, SiteId, StateDesc, NA_I64};
+use pine_ir::{
+    flg, op, ring_flag, state_flag, FaultKind, Insn, RingDesc, SiteId, StateDesc, CMP_TOL, NA_I64,
+};
 
 use crate::builtin::{bf, BuiltinEntry};
 use crate::frame::{Core, Frame};
@@ -240,13 +242,28 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                 // ---- family 2: compare ---------------------------------------------------
                 op::F_LT | op::F_LE | op::F_GT | op::F_GE | op::F_EQ | op::F_NE => {
                     let (a, b) = (c.rf(ins.a), c.rf(ins.b));
-                    let v = match ins.op {
-                        op::F_LT => a < b,
-                        op::F_LE => a <= b,
-                        op::F_GT => a > b,
-                        op::F_GE => a >= b,
-                        op::F_EQ => a == b,
-                        _ => !a.is_nan() & !b.is_nan() & (a != b), // Pine: false when either is na
+                    let v = if ins.flags & flg::TOL == 0 {
+                        match ins.op {
+                            op::F_LT => a < b,
+                            op::F_LE => a <= b,
+                            op::F_GT => a > b,
+                            op::F_GE => a >= b,
+                            op::F_EQ => a == b,
+                            // Pine: false when either is na.
+                            _ => !a.is_nan() & !b.is_nan() & (a != b),
+                        }
+                    } else {
+                        // CAR-R33-7: equal within `CMP_TOL` (`a == b` keeps ±inf equal to itself);
+                        // na makes `eq`, `a < b` and `a > b` all false.
+                        let eq = (a == b) | ((a - b).abs() <= CMP_TOL);
+                        match ins.op {
+                            op::F_LT => !eq & (a < b),
+                            op::F_LE => eq | (a < b),
+                            op::F_GT => !eq & (a > b),
+                            op::F_GE => eq | (a > b),
+                            op::F_EQ => eq,
+                            _ => !a.is_nan() & !b.is_nan() & !eq,
+                        }
                     };
                     c.wiv::<J>(ins.dst, v as i64, true);
                 }
@@ -266,7 +283,8 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
 
                 // ---- family 3: na ---------------------------------------------------------
                 op::NA_CHECK => {
-                    let v = if ins.flags & flg::LANE_I != 0 { !c.ivalid(ins.a) } else { c.rf(ins.a).is_nan() };
+                    // R-na (CAR-R33-6): an f64 is `na` when it is not finite.
+                    let v = if ins.flags & flg::LANE_I != 0 { !c.ivalid(ins.a) } else { !c.rf(ins.a).is_finite() };
                     c.wiv::<J>(ins.dst, v as i64, true);
                 }
                 op::NA_SET => {
@@ -279,7 +297,7 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                 op::NA_CLEAR => c.vput::<J>(c.vbit(ins.a), true),
                 op::NZ_F => {
                     let a = c.rf(ins.a);
-                    let v = if a.is_nan() { c.rf(ins.b) } else { a };
+                    let v = if a.is_finite() { a } else { c.rf(ins.b) };
                     c.wf::<J>(ins.dst, v)
                 }
                 op::NZ_I => {
@@ -295,7 +313,7 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                     c.vput::<J>(ins.dst as u32, ok)
                 }
                 op::VLD_FROM_F => {
-                    let ok = !c.rf(ins.a).is_nan();
+                    let ok = c.rf(ins.a).is_finite();
                     c.vput::<J>(ins.dst as u32, ok)
                 }
 
@@ -343,7 +361,7 @@ pub(crate) fn run<const J: bool>(fr: &mut Frame<'_>, x: &Exec) -> Result<u32, (F
                     }
                 }
                 op::JNA_F => {
-                    if c.rf(ins.b).is_nan() {
+                    if !c.rf(ins.b).is_finite() {
                         jump!(here, ins.target())
                     }
                 }

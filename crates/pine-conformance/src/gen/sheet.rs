@@ -50,6 +50,11 @@ pub const NEVER_PACKED: [&str; 14] = [
     "F096", "F097",
 ];
 
+/// Re-driven after their capture (r39): a fixture made chart-driven once its sheet was pasted keeps
+/// packing as `Syn` — the sheet it was captured on is a record and never re-packs. F125 (CI-022's
+/// P6, captured on sheet-F-15): its `close` column needs TradingView's own close.
+pub const PACKED_AS_SYN: [&str; 1] = ["F125"];
+
 /// The last id of each fixed group block captured before r29 (A, C, D, E, F, Z); B's data-derived
 /// tail is regenerated with `pine-spec` and is never split (`pin:06-sheet-round`).
 pub const R28_LAST: [(Group, u16); 6] = [
@@ -208,8 +213,13 @@ pub fn sheets(d: Dialect) -> Vec<Sheet> {
             continue;
         }
         let shared = c.script.dialects == Dialects::BOTH;
+        let driver = if PACKED_AS_SYN.contains(&c.script.id.as_str()) {
+            Driver::Syn
+        } else {
+            c.run.driver
+        };
         let key = (
-            c.run.driver as u8,
+            driver as u8,
             c.run.align as u8,
             u8::from(c.script.prelude == Prelude::Syn1),
             round(c.script.id),

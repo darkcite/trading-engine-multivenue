@@ -6,7 +6,7 @@
 
 use crate::args::{out1, set_num_out};
 use crate::naf::{fmax, fmin};
-use crate::state::{win_push, win_repoint, Prev, Rng64, WinHdr};
+use crate::state::{win_fresh_sum, win_push, win_repoint, Prev, Rng64, WinHdr};
 use crate::sw;
 use pine_ir::{argwin, color, scale, FaultKind, SiteId};
 use pine_spec::{swr, Sw};
@@ -261,8 +261,10 @@ pub fn bi_round_prec(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), F
     Ok(())
 }
 
-/// `math.round_to_mintick(x)`: `to_1e6(x)` rounded to a multiple of the chart's `mintick_1e6`
-/// in integer arithmetic (ties per `Sw::RoundTies`), back through `from_1e6`.
+/// `math.round_to_mintick(x)`: `x` rounded to a multiple of the chart's `mintick_1e6` by
+/// **R-band** on the exact binary value (`scale::to_tick_band_1e6`; r39, TradingView F123 — an
+/// exact tie, or a value within `1e-10` ticks below it, goes away from zero), back through
+/// `from_1e6`. `na` for na, ±inf and a value outside `to_1e6`'s domain.
 pub fn bi_round_to_mintick(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 2 {
         return Err(FaultKind::Internal);
@@ -273,24 +275,15 @@ pub fn bi_round_to_mintick(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result
         return Err(FaultKind::Internal);
     }
     let half_up = sw::pick(TIES, f.dialect()) == swr::ROUND_TIES_HALF_UP;
-    let r = match scale::to_1e6(x) {
-        Some(v) if x.is_finite() => {
-            let (q, rem) = (v.div_euclid(m), v.rem_euclid(m));
-            let up =
-                2 * rem as i128 > m as i128 || (2 * rem as i128 == m as i128 && (half_up || v > 0));
-            let q = if up { q + 1 } else { q };
-            match q.checked_mul(m) {
-                Some(t) => scale::from_1e6(t),
-                None => f64::NAN,
-            }
-        }
-        _ => f64::NAN,
-    };
+    let r = scale::to_tick_band_1e6(x, m, half_up).map_or(f64::NAN, scale::from_1e6);
     f.set_f64_arg(args[1], r);
     Ok(())
 }
 
-/// `math.sum(source, length)`: the rolling sum over the site's window (`W(len)`, `skip` na).
+/// `math.sum(source, length)`: the sum over the site's window (`W(len)`, `skip` na), a **fresh pass
+/// each bar, oldest first, Neumaier-compensated** — r39 (TradingView F127, capture 08: rows 15 / 16 /
+/// 18 = 19686.16 / 20008.7 / 20588.510000000002, the rolling sum's 19686.159999999996 refuted), the
+/// law `ta.sma` / `ta.cmo` / `ta.cog` already follow (`pin:04-sma-fresh-sum`, `pin:04-cog-tv-order`).
 pub fn bi_sum(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 3 {
         return Err(FaultKind::Internal);
@@ -315,7 +308,7 @@ pub fn bi_sum(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fault
         if h.n < len {
             f64::NAN
         } else {
-            h.sum
+            win_fresh_sum(h, ring, len)
         }
     };
     f.set_f64_arg(args[2], out);
@@ -350,8 +343,8 @@ pub fn bi_random(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
     Ok(())
 }
 
-/// `fixnan(x)` for every lane: the last non-na value, na before any (`Prev`; an i64 value is
-/// kept as its bits).
+/// `fixnan(x)` for every lane: the last non-na value (a float: finite, R-na), na before any
+/// (`Prev`; an i64 value is kept as its bits).
 pub fn bi_fixnan(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     if args.len() != 2 {
         return Err(FaultKind::Internal);
@@ -376,7 +369,8 @@ pub fn bi_fixnan(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), Fa
         let x = f.f64_arg(a);
         let r = {
             let p = f.state::<Prev>(site);
-            if !x.is_nan() {
+            // R-na (CAR-R33-6, r39): ±inf is `na` to `fixnan`.
+            if x.is_finite() {
                 p.v = x;
                 p.primed = 1;
             }

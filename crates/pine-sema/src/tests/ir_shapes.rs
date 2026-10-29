@@ -1091,16 +1091,21 @@ plot(y)
     .is_empty());
 }
 
-/// CAR-R33-4: a folded float `%` is rounded to 15 significant digits (TradingView F098).
+/// CAR-R33-4 (r39): a folded float result is rounded to 16 decimal places (TradingView F098, F124).
 #[test]
-fn ir_shapes_folded_float_mod_is_15_digits() {
+fn ir_shapes_folded_float_is_16_decimals() {
     let r = ir(
         "plot(1.0 % 0.1)
 plot(10.0 % 0.1)
+plot(0.1 + 0.2)
 ",
         Dialect::V6,
     );
-    for want in [0.1f64, 0.0999999999999995] {
+    assert!(!r
+        .const_list
+        .iter()
+        .any(|c| c.1 == (0.1f64 + 0.2).to_bits()));
+    for want in [0.1f64, 0.0999999999999995, 0.3] {
         assert!(
             r.const_list.iter().any(|c| c.1 == want.to_bits()),
             "{want} {:?}",

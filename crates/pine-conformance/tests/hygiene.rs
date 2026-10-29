@@ -278,6 +278,17 @@ fn chart_sha_and_capture_stamp_in_every_fixture() {
     }
 }
 
+/// `pin:06-distil-no-empty-selection` (r39, B127): a captured series fixture carries at least one
+/// row — an empty `series` block passes every run vacuously.
+#[test]
+fn no_captured_series_is_empty() {
+    for (_, f) in disk_fixtures() {
+        if let Expect::Series(rows) = &f.expect {
+            assert!(!rows.is_empty(), "{}: empty captured series", f.id.as_str());
+        }
+    }
+}
+
 /// I2 and I8 over every `.fix` on disk.
 #[test]
 fn script_sha256_matches_disk() {
@@ -1092,8 +1103,9 @@ fn manifest_is_frozen() {
     // r29 (2026-10-17): E122–E132 and F099–F119 appended for the next capture session (pending;
     // F109 / F111 / F113 authored `refuse 3005`); no existing row changed. Re-frozen r37
     // (2026-10-18, R-P26): the probe sheet r34's B125–B127, E133–E138 and F120–F128 appended
-    // (pending); no existing row changed.
-    const FROZEN_SHA256: &str = "152758a4b3336f1a9bcc28d111efabcb0555b12afdab85cb4a1150b7c02f175c";
+    // (pending); no existing row changed. Re-frozen r39 (2026-10-29, capture 08): F125 is
+    // chart-driven (`driver chart`, `align step` — P6 judged on TradingView's own close).
+    const FROZEN_SHA256: &str = "e1d68c82b90e1e59dfcfe681a1084f0004c4917de62ee10af8fa297542485381";
     let text =
         std::fs::read_to_string(workspace_root().join(pine_conformance::manifest::MANIFEST_TSV))
             .unwrap();

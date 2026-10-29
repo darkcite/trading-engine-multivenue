@@ -4,9 +4,9 @@
 //! The script-visible f64 the book keeps beside its integers (CAR-R33-1, r33h).
 //!
 //! D18 keeps every broker law in integers; this module is the one exception, and it decides
-//! nothing: it forms `strategy.netprofit` the way TradingView does — a running f64 sum — so the
-//! view can lend it to `pine-std` (`BrokerView::netprofit_f64_bits`). No fill, sizing or risk
-//! rule reads it.
+//! nothing: it forms `strategy.netprofit` the way TradingView does — f64 running gross profit
+//! less gross loss (r39; a single running sum before) — so the view can lend it to `pine-std`
+//! (`BrokerView::netprofit_f64_bits`). No fill, sizing or risk rule reads it.
 //!
 //! CAR-R33K-1 (r33m): `strategy.max_drawdown_percent` likewise — a running maximum of an f64 ratio
 //! over the closed-equity peak, folded at every marked path point ([`raise_peak`],
@@ -45,14 +45,13 @@ pub(crate) fn qty_f64(q_1e6: i64) -> f64 {
 
 /// One closed slice's script-visible profit (`pin:04-trade-profit-f64`, r33f):
 /// `(px(exit) − px(entry)) · qty(q) · pointvalue` over the formed prices and the signed slice
-/// quantity, less `fee(entry share) + fee(exit share)`, each share `fee_1e12 / 1e12`.
+/// quantity, less `fee(entry share)`, less `fee(exit share)`, each share `fee_1e12 / 1e12`.
 ///
-/// `pin:05-net-f64-fees-provisional` (r33h) — E114 (0.1 % commission, one slice per trade) fits
-/// `gross − (entry_fee + exit_fee)` on 4320/4320 `strategy.equity` rows; the slice's integer fee
-/// converted once (`gross − (entry + exit)_1e12 / 1e12`) fits 4196, and `gross − entry − exit`
-/// 4196. Whether TradingView's fee is `fee_1e12 / 1e12` or `px · qty · rate` in f64 is not decided
-/// (both fit E114); a pro-rata share of a partly closed trade's entry fee is uncaptured. With no
-/// fee the subtraction is `− 0.0`, exact: the commission-free law is r33f's, unchanged.
+/// `pin:05-net-f64-fees-provisional` (r39, R-P29) — E133 (0.1 % commission on a slipped fill, 45
+/// trades) fits `gross − entry − exit` (left to right) on 4320/4320 `strategy.netprofit` rows
+/// under the [`view_bits`] law; `gross − (entry + exit)`, r33h's reading, misses 706. E114 (one
+/// slice per trade) fits both. A pro-rata share of a partly closed trade's entry fee is
+/// uncaptured. With no fee each subtraction is `− 0.0`, exact: the commission-free law is r33f's.
 #[inline(always)]
 fn slice_profit_f64(
     entry_px_1e6: i64,
@@ -66,16 +65,18 @@ fn slice_profit_f64(
     let gross = (px_f64(exit_px_1e6, mt_1e6) - px_f64(entry_px_1e6, mt_1e6))
         * qty_f64(qty_1e6)
         * scale::from_1e6(pv_1e6);
-    gross - (scale::from_1e12(entry_fee_1e12) + scale::from_1e12(exit_fee_1e12))
+    gross - scale::from_1e12(entry_fee_1e12) - scale::from_1e12(exit_fee_1e12)
 }
 
-/// The running sum after one more closed slice, `net + slice_profit_f64(…)`, in close order (E086
-/// 4320/4320 rows; the integer sum fits 72). The sum travels as `f64::to_bits` so the book itself
-/// holds no float (D18's grep gate covers every file but this one).
+/// The two running sums after one more closed slice (r39, E133): a profit `p > 0` joins the
+/// gross profit `gp + p`, any other the gross loss `gl + (−p)`, in close order. The sums travel
+/// as `f64::to_bits` so the book itself holds no float (D18's grep gate covers every file but
+/// this one). Returns `(gp_bits, gl_bits)`.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn add_slice(
-    net_bits: u64,
+    gp_bits: u64,
+    gl_bits: u64,
     entry_px_1e6: i64,
     exit_px_1e6: i64,
     qty_1e6: i64,
@@ -83,7 +84,7 @@ pub(crate) fn add_slice(
     exit_fee_1e12: i128,
     mt_1e6: i64,
     pv_1e6: i64,
-) -> u64 {
+) -> (u64, u64) {
     let p = slice_profit_f64(
         entry_px_1e6,
         exit_px_1e6,
@@ -93,15 +94,22 @@ pub(crate) fn add_slice(
         mt_1e6,
         pv_1e6,
     );
-    (f64::from_bits(net_bits) + p).to_bits()
+    if p > 0.0 {
+        ((f64::from_bits(gp_bits) + p).to_bits(), gl_bits)
+    } else {
+        (gp_bits, (f64::from_bits(gl_bits) + (-p)).to_bits())
+    }
 }
 
-/// The view's `netprofit_f64_bits`: the running sum less the open trades' paid entry fees, the
-/// integer Σ converted once — the integer view's `pin:05-openprofit-fees` rule (E114: one open
-/// trade per row, 4320/4320 equity rows).
+/// The view's `netprofit_f64_bits` (`pin:05-net-f64-fees-provisional`, r39 — TradingView forms
+/// `strategy.netprofit` as gross profit less gross loss): `gp − (gl + open)`, `open` the open
+/// trades' paid entry fees, the integer Σ converted once (`pin:05-openprofit-fees`). E133
+/// 4320/4320 rows (45 closes, 45 open entries); E086 E114 E118 4320/4320 each. The running sum
+/// of r33h (`net + p`, close order) misses 2431 E133 rows; `(gp − gl) − open` misses 1362.
 #[inline(always)]
-pub(crate) fn view_bits(net_bits: u64, open_fees_1e12: i128) -> u64 {
-    (f64::from_bits(net_bits) - scale::from_1e12(open_fees_1e12)).to_bits()
+pub(crate) fn view_bits(gp_bits: u64, gl_bits: u64, open_fees_1e12: i128) -> u64 {
+    (f64::from_bits(gp_bits) - (f64::from_bits(gl_bits) + scale::from_1e12(open_fees_1e12)))
+        .to_bits()
 }
 
 /// `initial_capital` as the script reads it, `ic_1e12 / 1e12` (`pine-std`'s
@@ -125,9 +133,12 @@ pub(crate) fn add_open(
     mt_1e6: i64,
     pv_1e6: i64,
 ) -> u64 {
-    let t = (px_f64(px_1e6, mt_1e6) - px_f64(entry_px_1e6, mt_1e6))
-        * qty_f64(qty_1e6)
-        * scale::from_1e6(pv_1e6);
+    // r39 (E133): the entry as the position average, `(entry · size) / size` (pine-std's
+    // `avg_entry_f64`, twin).
+    let q = qty_f64(qty_1e6);
+    let e = px_f64(entry_px_1e6, mt_1e6);
+    let avg = if q == 0.0 { e } else { (e * q) / q };
+    let t = (px_f64(px_1e6, mt_1e6) - avg) * q * scale::from_1e6(pv_1e6);
     (f64::from_bits(op_bits) + t).to_bits()
 }
 
@@ -216,20 +227,43 @@ mod tests {
         // A fee-free slice is the gross exactly (`− 0.0`), a short's sign included.
         let s = slice_profit_f64(e, x, -1_000_000, 0, 0, MT, PV);
         assert_eq!(s.to_bits(), 1595.800000000003f64.to_bits());
-        // E114 trade 1 (0.1 %): the two fees converted, summed, then subtracted.
+        // E114 trade 1 (0.1 %): the two fees converted, then subtracted one by one (r39).
         let (fe, fx) = (77_249_600_000_000, 75_653_800_000_000);
         let f = slice_profit_f64(e, x, 1_000_000, fe, fx, MT, PV);
         assert_eq!(
             f.to_bits(),
-            (-1595.800000000003f64 - (77.2496 + 75.6538)).to_bits()
+            (-1595.800000000003f64 - 77.2496 - 75.6538).to_bits()
         );
-        // The running sum and the view, through the bits.
-        let n = add_slice(0, e, x, 1_000_000, 0, 0, MT, PV);
-        assert_eq!(n, p.to_bits());
-        assert_eq!(add_slice(n, e, x, -1_000_000, 0, 0, MT, PV), 0f64.to_bits());
-        assert_eq!(view_bits(n, 0), p.to_bits());
-        assert_eq!(view_bits(0, 0), 0f64.to_bits());
-        assert_eq!(view_bits(0, fe), (-77.2496f64).to_bits());
+        // The two sums and the view, through the bits: a loss joins `gl`, a win `gp`.
+        let (gp, gl) = add_slice(0, 0, e, x, 1_000_000, 0, 0, MT, PV);
+        assert_eq!((gp, gl), (0, (-p).to_bits()));
+        let (gp2, gl2) = add_slice(gp, gl, e, x, -1_000_000, 0, 0, MT, PV);
+        assert_eq!((gp2, gl2), (s.to_bits(), gl));
+        assert_eq!(view_bits(gp2, gl2, 0), 0f64.to_bits());
+        assert_eq!(view_bits(gp, gl, 0), p.to_bits());
+        assert_eq!(view_bits(0, 0, 0), 0f64.to_bits());
+        assert_eq!(view_bits(0, 0, fe), (-77.2496f64).to_bits());
+    }
+
+    /// r39 (E133, `pin:05-net-f64-fees-provisional`): trades 1–2 closed, trade 3 open — TradingView
+    /// 4091.349999999915, the r33h running sum 4091.349999999914.
+    #[test]
+    fn netprofit_is_gross_profit_less_gross_loss_and_open_fees() {
+        const Q: i64 = 10_000_000;
+        // 0.1 % of px · 10: px_1e6 · 1e7 / 1000 (×1e12).
+        let fee = |px: i64| i128::from(px) * i128::from(Q) / 1000;
+        let t = [
+            (77_254_600_000, 75_648_800_000),
+            (75_582_400_000, 77_981_300_000),
+        ];
+        let (mut gp, mut gl) = (0, 0);
+        for (e, x) in t {
+            (gp, gl) = add_slice(gp, gl, e, x, Q, fee(e), fee(x), MT, PV);
+        }
+        assert_eq!(view_bits(gp, gl, 0), 4866.328999999914f64.to_bits());
+        let np = view_bits(gp, gl, fee(77_497_900_000));
+        assert_eq!(np, 4091.349999999915f64.to_bits());
+        assert_ne!((4866.328999999914f64 - 774.979).to_bits(), np);
     }
 
     /// CAR-R33K-1's worked rows (TV E118, `pin:04-max-dd-pct-equity-f64`), one fold each.
@@ -248,7 +282,18 @@ mod tests {
         assert_eq!(fold_dd_pct(m1, peak0, ic, 0, up), m1);
         // Trade 2 after trade 1's −1595.800000000003: the peak stays 1e6 (1859.2 below the
         // initial capital at its low 75314.0, entry 75577.4).
-        let np = add_slice(0, 77_249_600_000, 75_653_800_000, 1_000_000, 0, 0, MT, PV);
+        let (gp, gl) = add_slice(
+            0,
+            0,
+            77_249_600_000,
+            75_653_800_000,
+            1_000_000,
+            0,
+            0,
+            MT,
+            PV,
+        );
+        let np = view_bits(gp, gl, 0);
         assert_eq!(
             raise_peak(peak0, ic, np),
             peak0,

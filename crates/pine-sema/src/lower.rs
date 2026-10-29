@@ -711,9 +711,47 @@ impl Lower<'_> {
         if matches!(op, BinOp::And | BinOp::Or) {
             return self.and_or(n, op, lhs, rhs, ty);
         }
+        if op == BinOp::Add {
+            if let Some(c) = crate::reassoc::chain(self.ast, n) {
+                return self.chain(&c, ty);
+            }
+        }
         let (lt, rt) = (self.ty(lhs), self.ty(rhs));
         let (a, b) = (self.expr(lhs)?, self.expr(rhs)?);
         self.apply(op, a, b, lt, rt, ty, self.ast.span(n))
+    }
+
+    /// CI-022 (`crate::reassoc`): a flattened additive chain, left to right, each step typed (and,
+    /// where its prefix folded, valued) by infer on its host node; the last step is the root's
+    /// `ty`.
+    fn chain(&mut self, c: &crate::reassoc::Chain, ty: TypeQ) -> Result<VSlot, Diag> {
+        let t0 = c.terms[0].1;
+        let mut acc = self.expr(t0)?;
+        let mut at = self.ty(t0);
+        let last = c.terms.len() - 1;
+        for i in 1..c.terms.len() {
+            let (op, t) = c.terms[i];
+            let host = c.hosts[i - 1];
+            let hty = if i == last {
+                ty
+            } else {
+                self.ty(host)
+                    .ok_or_else(|| self.todo(host, "an untyped additive chain step"))?
+            };
+            if i < last {
+                if let Some(k) = self.cur().k.get(host.0 as usize).copied().flatten() {
+                    // The prefix through term `i` folded (its terms are constants): its value
+                    // replaces the steps so far.
+                    acc = self.konst(k, hty, self.ast.span(host));
+                    at = Some(hty);
+                    continue;
+                }
+            }
+            let b = self.expr(t)?;
+            acc = self.apply(op, acc, b, at, self.ty(t), hty, self.ast.span(host))?;
+            at = Some(hty);
+        }
+        Ok(acc)
     }
 
     /// A binary operator over two evaluated operands (§4.14.2).
@@ -785,6 +823,9 @@ impl Lower<'_> {
                 };
                 return Ok(self.call_op(f, &[a, b], ty, at));
             }
+            // U06 `abs_1e10` (CAR-R33-7, R-P28): a float comparison — any of the six, either
+            // dialect — carries `flg::TOL`.
+            let tol = numeric && float && self.rd.float_eq_v6 == swr::FLOAT_EQ_V6_ABS_1E10;
             if c == CmpK::Ne && self.rd.pins.na_compare == NaCompare::NeTrue {
                 // pin:06-na-compare `NeTrue`: `B_NOT` of the `==` result.
                 let eq = self.temp(ty, at);
@@ -793,6 +834,7 @@ impl Lower<'_> {
                     dst: eq,
                     a,
                     b,
+                    tol,
                 });
                 let dst = self.temp(ty, at);
                 self.op(Op::Un {
@@ -803,7 +845,13 @@ impl Lower<'_> {
                 return Ok(dst);
             }
             let dst = self.temp(ty, at);
-            self.op(Op::Cmp { op: c, dst, a, b });
+            self.op(Op::Cmp {
+                op: c,
+                dst,
+                a,
+                b,
+                tol,
+            });
             return Ok(dst);
         }
         let k = match op {
@@ -1271,6 +1319,7 @@ impl Lower<'_> {
                     dst,
                     a,
                     b: z,
+                    tol: false,
                 });
                 // pin:02-v5-num-to-bool `Na` (F082: TradingView's v5 `bool(na)` is `na`): an `na`
                 // operand replaces the comparison's `false` with an `na` bool. v6 keeps `false`.
@@ -1774,6 +1823,7 @@ impl Lower<'_> {
             dst,
             a: v,
             b: z,
+            tol: false,
         });
         Ok(dst)
     }
@@ -2265,6 +2315,7 @@ impl Lower<'_> {
                     dst: u,
                     a: i,
                     b: b0,
+                    tol: false,
                 });
                 let neg = self.temp(series, at);
                 self.op(Op::Un {
@@ -2294,6 +2345,7 @@ impl Lower<'_> {
                         dst: c,
                         a: i,
                         b,
+                        tol: false,
                     });
                 }
                 (None, Some(u)) => {
@@ -2317,6 +2369,7 @@ impl Lower<'_> {
                         dst: c,
                         a: lo,
                         b: hi,
+                        tol: false,
                     });
                 }
                 (None, None) => return Err(x.todo(n, "a `for` without a direction")),
@@ -2336,6 +2389,7 @@ impl Lower<'_> {
                 dst: nz,
                 a: s,
                 b: z,
+                tol: false,
             });
             let both = x.temp(bool_t, at);
             x.op(Op::Bin {
@@ -2404,6 +2458,7 @@ impl Lower<'_> {
             dst: bad,
             a: s,
             b: z,
+            tol: false,
         });
         let ov = self.helper("runtime.error", at)?;
         let ((), fault, _) = self.region(|x| {
@@ -2517,6 +2572,7 @@ impl Lower<'_> {
                 dst: c,
                 a: idx,
                 b: size,
+                tol: false,
             });
             Ok(c)
         })?;
@@ -2860,12 +2916,14 @@ impl Lower<'_> {
             dst: neg,
             a: k,
             b: z,
+            tol: false,
         });
         self.op(Op::Cmp {
             op: CmpK::Gt,
             dst: big,
             a: k,
             b: lim,
+            tol: false,
         });
         self.op(Op::Bin {
             op: BinOpK::Or,

@@ -36,14 +36,24 @@ fn series_value(f: &Frame<'_>, e: u16) -> f64 {
             None => f64::NAN,
         }
     } else {
-        f.f64_arg(e)
+        plotted(f.f64_arg(e))
+    }
+}
+
+/// A plotted float: ±inf plots as `na` (CAR-R33-6 R-na, r39 — TradingView F020 F024 F025 F121).
+#[inline(always)]
+fn plotted(v: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        f64::NAN
     }
 }
 
 /// `plot(series, …)` → `plot_set(__plot, series)`; the handle output is the ordinal.
 pub fn bi_plot(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     let p = plot_index(f, args, 3)?;
-    let v = f.f64_arg(args[1]);
+    let v = plotted(f.f64_arg(args[1]));
     f.plot_set(p, v);
     f.set_i64_arg(args[args.len() - 1], Some(p as i64));
     Ok(())
@@ -57,7 +67,7 @@ pub fn bi_hline(f: &mut Frame<'_>, s: SiteId, args: &[u16]) -> Result<(), FaultK
 /// `plotarrow(series, …)`: `plot_set(__plot, series)`; no output.
 pub fn bi_plot_series(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
     let p = plot_index(f, args, 2)?;
-    let v = f.f64_arg(args[1]);
+    let v = plotted(f.f64_arg(args[1]));
     f.plot_set(p, v);
     Ok(())
 }
@@ -75,7 +85,7 @@ pub fn bi_plot_ohlc(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), Fa
     let p = plot_index(f, args, 5)?;
     let mut k = 0u32;
     while k < 4 {
-        let v = f.f64_arg(args[1 + k as usize]);
+        let v = plotted(f.f64_arg(args[1 + k as usize]));
         f.plot_set(p + k, v);
         k += 1;
     }

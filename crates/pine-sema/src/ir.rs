@@ -220,6 +220,9 @@ pub(crate) enum Op {
         a: VSlot,
         /// Right.
         b: VSlot,
+        /// A script's float comparison under U06 `abs_1e10` (CAR-R33-7): `flg::TOL` on the
+        /// `F_*` opcode. Sema's own comparisons (loop bounds, `bool(x)`, `switch`) keep IEEE.
+        tol: bool,
     },
     /// `dst ← a`.
     Mov {

@@ -30,17 +30,21 @@ pub(crate) fn f_mod(a: f64, b: f64, rd: &Readings) -> f64 {
     non_finite(a % b, rd)
 }
 
-/// `pin:03-float-mod` (CAR-R33-4, TradingView F098): a folded float `%` is the VM's `F_MOD`
-/// rounded to 15 significant decimal digits — `1.0 % 0.1` is `0.1`, `10.0 % 0.1` is
-/// `0.0999999999999995`, `-0.3 % 0.1` is `-0.1` (3 of 3 folded columns), while the same `%` on a
-/// series is the exact remainder (F098's series columns). Non-finite values pass through.
-/// `pin:02-fold-sig15-ties`: an exact decimal tie at the 16th digit takes Rust's correctly
-/// rounded `{:.14e}` (the capture is silent on ties).
-pub(crate) fn sig15(x: f64) -> f64 {
-    if !x.is_finite() {
+/// `pin:03-float-mod` / `pin:02-fold-sig15-ties` (CAR-R33-4 as amended by r39, TradingView F098
+/// and F124): every constant-folded float `+ − * / %` is the VM's result rounded to **16 decimal
+/// places** — `0.1 + 0.2` is `0.3`, `0.3 − 0.1` is `0.2`, `1.0 % 0.1` is `0.1`, `10.0 % 0.1` is
+/// `0.0999999999999995`, while `1.0 / 3.0` stays `0.3333333333333333` and
+/// `1234567890123.125 % 1e15` stays `1234567890123.125` (16 significant digits: r33's
+/// "15 significant digits" fits F098 only because at 0.1 the two rules coincide). The same
+/// operations on series keep the exact IEEE result (F098's series columns, F125). For `|x| ≥ 1` the
+/// 1e-16 grid is finer than half an ulp, so the rounding returns `x` itself and is skipped.
+/// Non-finite values pass through. A tie at the 17th decimal takes Rust's correctly rounded
+/// `{:.16}` (half to even; the captures hold no such tie).
+pub(crate) fn dec16(x: f64) -> f64 {
+    if !x.is_finite() || x.abs() >= 1.0 {
         return x;
     }
-    format!("{x:.14e}").parse::<f64>().unwrap_or(x)
+    format!("{x:.16}").parse::<f64>().unwrap_or(x)
 }
 
 /// U15's rule on a float result.

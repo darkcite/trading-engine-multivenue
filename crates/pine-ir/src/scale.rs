@@ -15,7 +15,8 @@
 //! | Pine-visible time | `i64` | UTC ms | — (engine events are ns) |
 //!
 //! The VM computes in `f64` internally; every f64 ↔ fixed crossing goes
-//! through [`to_1e6`] / [`from_1e6`] / [`from_1e12`], and nowhere else.
+//! through [`to_1e6`] / [`from_1e6`] / [`from_1e12`] / [`to_tick_band_1e6`],
+//! and nowhere else.
 //!
 //! The directional ×1e12 → ×1e6 renderings reproduce
 //! `cli::backtest::fill::usd_1e12_to_1e6_floor` / `_ceil` exactly (a
@@ -124,4 +125,64 @@ pub const fn ms_from_ns(ns: i64) -> i64 {
 #[must_use]
 pub const fn ns_from_ms(ms: i64) -> i64 {
     ms.saturating_mul(NS_PER_MS)
+}
+
+/// R-band's edge, as a denominator: a value within `1 / BAND_DEN` of a tick below the half-tick
+/// tie rounds as the tie (`1e-10` ticks, CAR-R33-7's constant).
+pub const BAND_DEN: u128 = 10_000_000_000;
+
+/// f64 → the nearest multiple of `tick_1e6`, ×1e6, by **R-band** (TradingView F123, capture 08,
+/// r39): computed on the **exact** binary value of `|x|` — no f64 step — `|x|` rounds away from
+/// zero iff it is at or above the half-tick tie, or below it by at most `1e-10` ticks
+/// ([`BAND_DEN`]); otherwise it rounds toward zero. `neg_tie_toward_zero` is U04's `half_up`
+/// reading for a negative `x` — ties toward +inf, so the band mirrors: away from zero iff above
+/// the tie by more than `1e-10` ticks; U04's decided `half_away` passes `false`.
+/// `None` for NaN, ±inf, `tick_1e6 < 1`, and any `x` whose ×1e6 leaves `i64` (the domain of
+/// [`to_1e6`]).
+///
+/// No f64 formula fits F123's fourteen readings (`round(x / mintick) · mintick`, `to_1e6` then
+/// an integer tie and a 1e-10 additive nudge each miss at least one); this exact rational one
+/// fits all of them (`pin:06-r34-band-formation`).
+#[must_use]
+pub fn to_tick_band_1e6(x: f64, tick_1e6: i64, neg_tie_toward_zero: bool) -> Option<i64> {
+    if !x.is_finite() || tick_1e6 < 1 || x.abs() * 1e6 >= 9.223_372_036_854_775e18 {
+        return None;
+    }
+    if x == 0.0 {
+        return Some(0);
+    }
+    // |x| = m · 2^-s exactly; in the domain above s ≥ 9 always (|x| < 2^44, m ≥ 2^52 or
+    // subnormal).
+    let bits = x.abs().to_bits();
+    let (exp, frac) = ((bits >> 52) & 0x7ff, bits & ((1u64 << 52) - 1));
+    let (m, e) = if exp == 0 {
+        (u128::from(frac), -1074i64)
+    } else {
+        (u128::from(frac | (1u64 << 52)), exp as i64 - 1075)
+    };
+    debug_assert!(e < 0, "to_tick_band_1e6: |x| in the domain is below 2^44");
+    let s = (-e) as u32;
+    // ticks = |x| · 1e6 / tick = a / d, a = m · 1e6 < 2^73, d = tick · 2^s.
+    let tick = tick_1e6 as u128;
+    let tick_bits = 128 - tick.leading_zeros();
+    if tick_bits + s > 100 {
+        // d ≥ 2^100 > 2^27 · a: |x| is below 2^-27 ticks, half a tick from any tie.
+        return Some(0);
+    }
+    let (a, d) = (m * 1_000_000, tick << s);
+    let (q, r) = (a / d, a % d);
+    // The fraction f = r / d of a tick; the tie is f = 1/2, a gap of |2r − d| / 2d ticks.
+    let within = |gap: u128| gap.checked_mul(BAND_DEN).is_some_and(|g| g <= 2 * d);
+    let up = if r == 0 {
+        false
+    } else if neg_tie_toward_zero && x < 0.0 {
+        // The mirror (ties toward +inf): away from zero iff f > 1/2 + 1e-10.
+        2 * r > d && !within(2 * r - d)
+    } else {
+        // Away from zero iff f ≥ 1/2 − 1e-10.
+        2 * r >= d || within(d - 2 * r)
+    };
+    let q = if up { q + 1 } else { q };
+    let v = i64::try_from(q).ok()?.checked_mul(tick_1e6)?;
+    Some(if x < 0.0 { -v } else { v })
 }

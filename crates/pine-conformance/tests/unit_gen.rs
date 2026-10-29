@@ -830,7 +830,9 @@ fn group_f_r34_block_is_laid_out() {
             (Oracle::Tv, &Expect::Pending),
             "F{n}"
         );
-        assert_eq!(c.run.driver, Driver::Syn, "F{n}");
+        // r39: F125 is chart-driven (its `close` column), still packed on sheet-F-15.
+        let driver = if n == 125 { Driver::Chart } else { Driver::Syn };
+        assert_eq!(c.run.driver, driver, "F{n}");
         assert_eq!(c.script.prelude, Prelude::Syn1, "F{n}");
         assert_eq!(c.window, window, "F{n}");
         assert_eq!(c.tier, tier, "F{n}");

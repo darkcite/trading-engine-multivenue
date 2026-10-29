@@ -251,7 +251,8 @@ fn rt_col(f: &Fixture, cols: &[usize], suffix: &str) -> Result<usize, String> {
 ///   remaining row count; `head n` keeps rows `0..n`, `tail n` rows `bars−n..bars`, the key the row
 ///   index (bar 0 = TradingView's first loaded bar).
 /// - `align time`: only rows whose bar open lies in `[FROM_MS, TO_MS)` (`pine_spec::chart`) are
-///   eligible; `head n` / `tail n` select among them, a `time` window intersects with that range;
+///   eligible; `head n` / `tail n` select among them; an explicit `time` window keeps its own start and
+///   is capped at `TO_MS` (`pin:06-distil-time-window-explicit`);
 ///   the key is the bar open ms.
 /// - `driver rt` (§4.7.8): only the rows where the fixture's `f_<ID>_rt` and `f_<ID>_done` plots are
 ///   both 1 are eligible (the open realtime bar has `done = 0` and drops out with them); `tail n`
@@ -370,10 +371,14 @@ fn select(
                 bars = Some(n as u32);
             }
             Align::Time => {
+                // pin:06-distil-time-window-explicit (r39, B127) — an explicit `time` window keeps
+                // its own start: a chart-driven run replays from the bar root's first row
+                // (`pin:06-replay-from-file-start`), so a window before `FROM_MS` (B127's 2024-10-28
+                // hours) is compared like any other; its end is still capped at `TO_MS`, where the
+                // run stops. Clipping the start to `FROM_MS` selected 0 rows and B127 passed
+                // vacuously.
                 let (from, to) = match f.window {
-                    Window::Time { from_ms, to_ms } => {
-                        (from_ms.max(spec::FROM_MS), to_ms.min(spec::TO_MS))
-                    }
+                    Window::Time { from_ms, to_ms } => (from_ms, to_ms.min(spec::TO_MS)),
                     _ => (spec::FROM_MS, spec::TO_MS),
                 };
                 let elig: Vec<usize> = (0..rows.len())
@@ -386,6 +391,14 @@ fn select(
                 bars = None;
             }
         }
+    }
+    // pin:06-distil-no-empty-selection (r39) — a distil that selects no row would write a fixture
+    // with an empty series, which every run passes; refuse it instead.
+    if picked.is_empty() {
+        return Err(format!(
+            "{}: the export has no row in the fixture's window (pin:06-distil-no-empty-selection)",
+            id.as_str()
+        ));
     }
     let out = picked
         .iter()

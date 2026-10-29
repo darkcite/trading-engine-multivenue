@@ -22,7 +22,8 @@ use crate::money::{floor_step, mul_div, sat_i64};
 use crate::orders::{otype, pflag, state, CommitCtx, OrderTable};
 use crate::risk::Risk;
 use crate::size::{
-    declared_qty, n_rule_entry, n_rule_scale, open_entry_trades, size_entry, unit_qty,
+    declared_qty, declared_qty_tv, n_rule_entry, n_rule_scale, open_entry_trades, size_entry,
+    unit_qty,
 };
 use crate::switch::{
     CloseImmediately, CofCloseTick, CofNextTick, ForcedFillSlippage, HistoryTick, PctEquityAt,
@@ -1497,7 +1498,13 @@ impl TvBroker {
                 if explicit {
                     o.qty_1e6
                 } else {
-                    declared_qty(&self.decl, ref_px, pv, eq)
+                    // R-P29 (r39): at the side's margin 0, `percent_of_equity` caps at 100 %.
+                    let m = if o.side == 0 {
+                        self.decl.margin_long_pct_1e6
+                    } else {
+                        self.decl.margin_short_pct_1e6
+                    };
+                    declared_qty_tv(&self.decl, ref_px, pv, eq, m)
                 }
             }
             SizingMode::FixedNotional { notional_1e6 } => {

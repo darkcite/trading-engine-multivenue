@@ -8,8 +8,8 @@
 //! [`Book::new`] (whose `ClosedRing` is the crate's one allocation); index loops.
 //!
 //! CAR-R33-1 (r33h): beside `netprofit_1e12` the book keeps `strategy.netprofit` as TradingView
-//! forms it, an f64 running sum ([`crate::visible`]); it is lent to the script through
-//! `BrokerView::netprofit_f64_bits` and read by no broker law. CAR-R33K-1 (r33m): likewise
+//! forms it — since r39 the f64 running gross profit less the gross loss ([`crate::visible`]);
+//! it is lent to the script through `BrokerView::netprofit_f64_bits` and read by no broker law. CAR-R33K-1 (r33m): likewise
 //! `strategy.max_drawdown_percent` — the closed-equity peak and the running f64 maximum folded at
 //! every mark ([`visible::raise_peak`], [`visible::fold_dd_pct`]), lent through
 //! `BrokerView::max_drawdown_pct_f64_bits`; the risk rules keep their integer source.
@@ -126,9 +126,12 @@ pub(crate) struct Book {
     mark_1e6: i64,
     initial_1e12: i128,
     netprofit_1e12: i128,
-    /// CAR-R33-1: the f64 running sum of the closed slices' script-visible profits, in close
-    /// order ([`visible::add_slice`]), held as `f64::to_bits` (D18: the book names no float).
-    net_f64_bits: u64,
+    /// CAR-R33-1 (r39 form): the f64 running gross profit and gross loss of the closed slices'
+    /// script-visible profits, in close order ([`visible::add_slice`]); `strategy.netprofit` is
+    /// their difference ([`visible::view_bits`]). Held as `f64::to_bits` (D18: the book names no
+    /// float).
+    gp_f64_bits: u64,
+    gl_f64_bits: u64,
     /// CAR-R33K-1 (`pin:04-max-dd-pct-equity-f64`): the closed-equity peak `ic + NP` in f64
     /// ([`visible::raise_peak`]), starting at `ic`, as `f64::to_bits`.
     dd_peak_bits: u64,
@@ -184,7 +187,8 @@ impl Book {
             mark_1e6: 0,
             initial_1e12: 0,
             netprofit_1e12: 0,
-            net_f64_bits: 0,
+            gp_f64_bits: 0,
+            gl_f64_bits: 0,
             dd_peak_bits: 0,
             dd_pct_bits: 0,
             grossprofit_1e12: 0,
@@ -238,7 +242,8 @@ impl Book {
         self.mark_1e6 = 0;
         self.initial_1e12 = initial;
         self.netprofit_1e12 = 0;
-        self.net_f64_bits = 0;
+        self.gp_f64_bits = 0;
+        self.gl_f64_bits = 0;
         self.dd_peak_bits = visible::initial_bits(initial);
         self.dd_pct_bits = 0;
         self.grossprofit_1e12 = 0;
@@ -504,9 +509,10 @@ impl Book {
             let c_fee = entry_share.saturating_add(exit_share);
             let c_pnl = gross_1e12(sign, px_1e6, l_entry, n, self.pv_1e6).saturating_sub(c_fee);
             // CAR-R33-1 (`pin:04-trade-profit-f64`, `pin:05-net-f64-fees-provisional`): the
-            // slice's script-visible profit joins the f64 running sum in close order.
-            self.net_f64_bits = visible::add_slice(
-                self.net_f64_bits,
+            // slice's script-visible profit joins the f64 gross profit or gross loss (r39).
+            (self.gp_f64_bits, self.gl_f64_bits) = visible::add_slice(
+                self.gp_f64_bits,
+                self.gl_f64_bits,
                 l_entry,
                 px_1e6,
                 c_qty,
@@ -570,7 +576,7 @@ impl Book {
             // `pin:04-max-dd-pct-uncaptured-provisional`: once per closing fill, before a
             // reversal's opening part, `NP` net of the still-open trades' paid entry fees
             // (`open_fees`, kept current slice by slice above).
-            let np = visible::view_bits(self.net_f64_bits, open_fees);
+            let np = visible::view_bits(self.gp_f64_bits, self.gl_f64_bits, open_fees);
             self.dd_peak_bits = visible::raise_peak(self.dd_peak_bits, self.initial_1e12, np);
         }
         if open > 0 {
@@ -688,7 +694,7 @@ impl Book {
         // CAR-R33K-1 (`pin:04-max-dd-pct-equity-f64`, shared with native): every marked path point
         // — a fill's included, the trade it just opened included — folds
         // `(peak − eq) / peak * 100`, `eq = (ic + NP) + op` with `NP` the view's f64 net profit.
-        let np = visible::view_bits(self.net_f64_bits, open_fees);
+        let np = visible::view_bits(self.gp_f64_bits, self.gl_f64_bits, open_fees);
         self.dd_pct_bits = visible::fold_dd_pct(
             self.dd_pct_bits,
             self.dd_peak_bits,
@@ -774,7 +780,7 @@ impl Book {
         v.sum_loss_pct_1e6 = self.sum_loss_pct_1e6;
         // CAR-R33-1: the f64 net profit, less the open trades' paid entry fees as the integer
         // `netprofit_1e12` above (`pin:05-openprofit-fees`).
-        v.netprofit_f64_bits = visible::view_bits(self.net_f64_bits, open_fees);
+        v.netprofit_f64_bits = visible::view_bits(self.gp_f64_bits, self.gl_f64_bits, open_fees);
     }
 }
 

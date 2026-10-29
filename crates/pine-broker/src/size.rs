@@ -26,6 +26,34 @@ pub(crate) fn declared_qty(d: &StrategyDecl, px_1e6: i64, pv_1e6: i64, equity_1e
     }
 }
 
+/// `percent_of_equity` at most 100 %, ×1e6 (R-P29, r39).
+pub(crate) const PCT_EQUITY_CAP_1E6: i64 = 100 * 1_000_000;
+
+/// The TV broker's declared default quantity (R-P29, r39; `pin:W18-margin-default`): as
+/// [`declared_qty`], except that `percent_of_equity` is capped at 100 % of equity when the
+/// side's margin is 0 — TradingView E134 (v5, no margin arguments: W18's default 0), E135 (v5
+/// `margin_long = 0`) and E137 (v6 `margin_long = 0`) each hold 12.945067 BTC for a 250 % order
+/// sized at 77249.5 on 1 000 000 (100 %, floored to the step), and E069 the same; at margin 100
+/// (E136) the 250 % order is refused by the funds check (`pin:05-margin-funds-check`, unchanged).
+/// A margin between 0 and 100 is uncaptured: no cap (the funds check bounds it). TV-only: the
+/// native broker's sizing is unchanged (its venue gate and the engine's risk caps bound it).
+pub(crate) fn declared_qty_tv(
+    d: &StrategyDecl,
+    px_1e6: i64,
+    pv_1e6: i64,
+    equity_1e12: i128,
+    margin_pct_1e6: i64,
+) -> i64 {
+    match d.default_qty_type {
+        QtyType::PercentOfEquity if margin_pct_1e6 == 0 => qty_for_value(
+            pct_1e12(equity_1e12, d.default_qty_value_1e6.min(PCT_EQUITY_CAP_1E6)),
+            px_1e6,
+            pv_1e6,
+        ),
+        _ => declared_qty(d, px_1e6, pv_1e6, equity_1e12),
+    }
+}
+
 /// The unit order `u` ×1e6: what `N` USD ×1e6 buys at `px` with `pv` (§4.7.2).
 pub(crate) fn unit_qty(n_1e6: i64, px_1e6: i64, pv_1e6: i64) -> i64 {
     qty_for_value(usd_1e6_to_1e12(n_1e6), px_1e6, pv_1e6)
@@ -173,7 +201,10 @@ pub(crate) fn size_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::{declared_qty, n_rule_entry, n_rule_scale, size_entry_fill, unit_qty, EntrySize};
+    use super::{
+        declared_qty, declared_qty_tv, n_rule_entry, n_rule_scale, size_entry_fill, unit_qty,
+        EntrySize,
+    };
     use crate::book::{lot_flag, Book, FillSrc};
     use crate::fault::{BrokerFault, ScriptRefusal};
     use crate::money::floor_step;
@@ -225,6 +256,42 @@ mod tests {
             floor_step(declared_qty(&cash, 40_000 * 1_000_000, PV, 0), 1_000_000),
             0
         );
+    }
+
+    /// R-P29 (r39): TradingView E134 / E135 / E137 — 250 % of 1 000 000 holds 12.945067 (100 %,
+    /// sized at the order bar's close 77249.5) at margin 0; any other margin keeps the percent.
+    #[test]
+    fn tv_percent_of_equity_caps_at_100_at_margin_0() {
+        let d = StrategyDecl {
+            default_qty_type: QtyType::PercentOfEquity,
+            default_qty_value_1e6: 250 * 1_000_000,
+            ..StrategyDecl::default()
+        };
+        let (px, eq) = (77_249_500_000, 1_000_000 * 1_000_000_000_000_i128);
+        assert_eq!(
+            floor_step(declared_qty_tv(&d, px, PV, eq, 0), 1),
+            12_945_067
+        );
+        assert_eq!(
+            declared_qty_tv(&d, px, PV, eq, 100 * 1_000_000),
+            declared_qty(&d, px, PV, eq)
+        );
+        assert_eq!(floor_step(declared_qty(&d, px, PV, eq), 1), 32_362_669);
+        // Below the cap, and the other types, unchanged at margin 0.
+        let ten = StrategyDecl {
+            default_qty_value_1e6: 10 * 1_000_000,
+            ..d
+        };
+        assert_eq!(
+            declared_qty_tv(&ten, px, PV, eq, 0),
+            declared_qty(&ten, px, PV, eq)
+        );
+        let fixed = StrategyDecl {
+            default_qty_type: QtyType::FixedContracts,
+            default_qty_value_1e6: 3_000_000,
+            ..d
+        };
+        assert_eq!(declared_qty_tv(&fixed, px, PV, eq, 0), 3_000_000);
     }
 
     fn fill(b: &mut Book, q: i64, eval: u32, flags: u8) {

@@ -679,6 +679,17 @@ fn profit_f64(t: &TradeRec, x: Fmt) -> f64 {
         * scale::from_1e6(x.pv_1e6)
 }
 
+/// The entry price as TradingView's open profit reads it (r39, E133): the position average of
+/// one trade, `(entry · size) / size` in f64; `entry` at size 0.
+#[inline(always)]
+fn avg_entry_f64(entry: f64, size: f64) -> f64 {
+    if size == 0.0 {
+        entry
+    } else {
+        (entry * size) / size
+    }
+}
+
 /// `pin:04-openprofit-f64` (r33f) — `strategy.openprofit` is TradingView's f64 sum over the open
 /// trades, oldest first, of `(close − entry_price) · size · pointvalue`, gross of the entry fee,
 /// prices and sizes as the script reads them, the close formed as ticks × mintick too (E114
@@ -689,6 +700,11 @@ fn profit_f64(t: &TradeRec, x: Fmt) -> f64 {
 /// equals `BrokerView::openprofit_1e12`; any other mark (a `calc_on_order_fills` execution at a
 /// fill price) or an overflow keeps `openprofit_1e12 / 1e12` (`None`). Summation order for
 /// several open trades is unmeasured (one open trade per captured row).
+///
+/// r39 (R-P29, TradingView E133: 10 contracts at a 50-tick slippage): the entry price enters as
+/// the position's average, `(entry · size) / size` in f64 ([`avg_entry_f64`]) — 2393/2393 open
+/// rows, 45/45 trades; `entry` itself fits 1717 (the ten trades below 65536 whose `ticks · 0.1`
+/// is one ulp above the decimal miss). At size 1 (E114) the two coincide.
 fn open_profit_f64(ctx: &dyn BarCtx, b: &BrokerView, close_1e6: i64, x: Fmt) -> Option<f64> {
     let close = px_f64(close_1e6, x.mt_1e6);
     let pv = scale::from_1e6(x.pv_1e6);
@@ -702,7 +718,8 @@ fn open_profit_f64(ctx: &dyn BarCtx, b: &BrokerView, close_1e6: i64, x: Fmt) -> 
             .checked_mul(x.pv_1e6 as i128)?
             / 1_000_000;
         chk = chk.checked_add(if t.qty_1e6 < 0 { -d } else { d })?;
-        sum += (close - px_f64(t.entry_px_1e6, x.mt_1e6)) * qty_f64(t.qty_1e6) * pv;
+        let q = qty_f64(t.qty_1e6);
+        sum += (close - avg_entry_f64(px_f64(t.entry_px_1e6, x.mt_1e6), q)) * q * pv;
         i += 1;
     }
     if chk == b.openprofit_1e12 {

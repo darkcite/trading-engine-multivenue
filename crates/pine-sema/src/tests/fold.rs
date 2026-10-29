@@ -36,18 +36,32 @@ fn fold_truncated_mod_has_the_dividends_sign() {
 }
 
 #[test]
-fn fold_float_mod_rounds_to_15_significant_digits() {
-    // CAR-R33-4 (TradingView F098, folded columns): the folded `%` is the VM's `F_MOD` rounded
-    // to 15 significant digits; the series columns keep the exact remainder (`f_mod` itself).
+fn fold_float_rounds_to_16_decimal_places() {
+    // CAR-R33-4 as amended by r39 (TradingView F098 folded columns, F124): a folded float result is
+    // the VM's result rounded to 16 decimal places; the series columns keep the exact remainder
+    // (`f_mod` itself).
     let rd = v5();
     assert_eq!(fold::f_mod(1.0, 0.1, &rd), 0.09999999999999995);
-    assert_eq!(fold::sig15(fold::f_mod(1.0, 0.1, &rd)), 0.1);
-    assert_eq!(fold::sig15(fold::f_mod(10.0, 0.1, &rd)), 0.0999999999999995);
-    assert_eq!(fold::sig15(fold::f_mod(-0.3, 0.1, &rd)), -0.1);
-    assert_eq!(fold::sig15(fold::f_mod(807.25, -2.5, &rd)), 2.25);
-    assert!(fold::sig15(fold::f_mod(1.0, 0.0, &rd)).is_nan());
-    assert_eq!(fold::sig15(f64::INFINITY), f64::INFINITY);
-    assert_eq!(fold::sig15(-0.0).to_bits(), (-0.0f64).to_bits());
+    assert_eq!(fold::dec16(fold::f_mod(1.0, 0.1, &rd)), 0.1);
+    assert_eq!(fold::dec16(fold::f_mod(10.0, 0.1, &rd)), 0.0999999999999995);
+    assert_eq!(fold::dec16(fold::f_mod(-0.3, 0.1, &rd)), -0.1);
+    assert_eq!(fold::dec16(fold::f_mod(807.25, -2.5, &rd)), 2.25);
+    // F124: `+ − *` fold to the 16-decimal grid; `/` already lies on it; 16 significant digits
+    // above 1 are kept (the r33 15-digit rule would give 1234567890123.12).
+    assert_eq!(fold::dec16(0.1 + 0.2), 0.3);
+    assert_eq!(fold::dec16(0.3 - 0.1), 0.2);
+    assert_eq!(fold::dec16(0.1 * 3.0), 0.3);
+    assert_eq!(fold::dec16(1.0 / 3.0), 0.3333333333333333);
+    assert_eq!(fold::dec16(2.0 / 3.0), 0.6666666666666666);
+    assert_eq!(fold::dec16(1.0 + f64::EPSILON), 1.0 + f64::EPSILON);
+    assert_eq!(
+        fold::dec16(fold::f_mod(1_234_567_890_123.125, 1e15, &rd)),
+        1_234_567_890_123.125
+    );
+    assert!(fold::dec16(fold::f_mod(1.0, 0.0, &rd)).is_nan());
+    assert_eq!(fold::dec16(f64::INFINITY), f64::INFINITY);
+    assert_eq!(fold::dec16(-0.0).to_bits(), (-0.0f64).to_bits());
+    assert_eq!(fold::dec16(1e-17), 0.0);
 }
 
 #[test]

@@ -579,7 +579,13 @@ impl Em<'_, '_> {
                 };
                 self.ins(o, fl, d, x, y);
             }
-            Op::Cmp { op: c, dst, a, b } => {
+            Op::Cmp {
+                op: c,
+                dst,
+                a,
+                b,
+                tol,
+            } => {
                 let (d, x, y) = (self.w(*dst)?, self.p(*a)?, self.p(*b)?);
                 let n = match c {
                     CmpK::Lt => 0,
@@ -597,7 +603,8 @@ impl Em<'_, '_> {
                     };
                     self.ins(op::I_LT + n, f, d, x, y);
                 } else {
-                    self.ins(op::F_LT + n, 0, d, x, y);
+                    let f = if *tol { flg::TOL } else { 0 };
+                    self.ins(op::F_LT + n, f, d, x, y);
                 }
             }
             Op::Mov { dst, a } => self.mov(*dst, *a)?,

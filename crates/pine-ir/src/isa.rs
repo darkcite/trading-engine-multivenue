@@ -167,13 +167,15 @@ pub mod op {
     // 0x3C, 0x3D retired (v3 S_EQ/S_NE → string builtins).
 
     // ---- family 3: na -------------------------------------------------------
-    /// `i[dst] = na(x)`; [`super::flg::LANE_I`] selects the operand lane.
+    /// `i[dst] = na(x)`; [`super::flg::LANE_I`] selects the operand lane. An f64 operand is `na`
+    /// when it is not finite — NaN or ±inf (CAR-R33-6 R-na, r39: ±inf survives arithmetic and
+    /// comparisons; `na()`, `nz()`, `fixnan` and plots read it as `na`).
     pub const NA_CHECK: u8 = 0x40;
     /// Make slot `a` `na`.
     pub const NA_SET: u8 = 0x41;
     /// Mark i64 slot `a` valid (after a store sema proved non-`na`).
     pub const NA_CLEAR: u8 = 0x42;
-    /// `f[dst] = if f[a] is NaN { f[b] } else { f[a] }`.
+    /// `f[dst] = if f[a] is not finite { f[b] } else { f[a] }` (R-na: NaN or ±inf).
     pub const NZ_F: u8 = 0x43;
     /// `i[dst] = if valid(a) { i[a] } else { i[b] }`, valid.
     pub const NZ_I: u8 = 0x44;
@@ -181,7 +183,7 @@ pub mod op {
     pub const VLD_AND: u8 = 0x45;
     /// `valid[dst] = valid[a]` (validity indices, i64 range only).
     pub const VLD_MOV: u8 = 0x46;
-    /// `valid[dst] = !f[a].is_nan()` (dst a validity index in the i64 range).
+    /// `valid[dst] = f[a].is_finite()` (dst a validity index in the i64 range; R-na).
     pub const VLD_FROM_F: u8 = 0x47;
 
     // ---- family 4: history ---------------------------------------------------
@@ -199,7 +201,7 @@ pub mod op {
     pub const JZ: u8 = 0x61;
     /// Jump when `i[b] != 0`.
     pub const JNZ: u8 = 0x62;
-    /// Jump when `f[b]` is NaN.
+    /// Jump when `f[b]` is `na`: not finite (R-na).
     pub const JNA_F: u8 = 0x63;
     /// Jump when validity index `b` is clear.
     pub const JNA_I: u8 = 0x64;
@@ -263,6 +265,10 @@ pub mod op {
     }
 }
 
+/// The absolute comparison tolerance of [`flg::TOL`] (CAR-R33-7: TradingView F061 F062 F122 —
+/// inclusive; `1.0000000001 == 1.0` is false at `1.0000000827e-10`).
+pub const CMP_TOL: f64 = 1e-10;
+
 /// Per-opcode flag bits. Several constants share a bit value because they
 /// belong to disjoint opcode families; the §3.6 table says which applies.
 pub mod flg {
@@ -274,6 +280,10 @@ pub mod flg {
     pub const ROUND: u8 = 1 << 0;
     /// `I_LT..I_NE`: false when either operand is `na`.
     pub const NA_AWARE: u8 = 1 << 0;
+    /// `F_LT..F_NE`: TradingView's comparison tolerance (CAR-R33-7, r39): `a` and `b` are equal
+    /// when `a == b` or `|a − b| ≤` [`super::CMP_TOL`], and ordered only beyond it — `<` is
+    /// `!eq && a < b`, `<=` is `eq || a < b` (mirrored for `>` `>=`); `na` compares false.
+    pub const TOL: u8 = 1 << 0;
     /// `HIST_*`: `b` is a constant-pool index holding `k`.
     pub const K_CONST: u8 = 1 << 0;
     /// `HIST_*`: `b` is an i64 slot holding a dynamic `k` (bounds-checked:

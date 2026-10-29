@@ -470,3 +470,59 @@ fn state_flag_restart_block_layout_is_frozen() {
         b += 8;
     }
 }
+
+#[test]
+fn tick_band_reproduces_tradingview_f123() {
+    // Capture 08 (r39), mintick 0.1: the script forms each input in binary64 (`k(a) * b`).
+    let cases: [(f64, i64); 14] = [
+        (76050.0 * 1.005, 76_430_200_000),
+        (77110.0 * 0.995, 76_724_500_000),
+        (77410.0 * 1.005, 77_797_000_000),
+        (63490.0 * 1.005, 63_807_400_000),
+        (63750.0 * 1.005, 64_068_800_000),
+        (77670.0 * 1.005, 78_058_400_000),
+        (76065.0 * 1.01, 76_825_700_000),
+        (76430.25, 76_430_300_000),
+        (-76430.25, -76_430_300_000),
+        (1000.05, 1_000_100_000),
+        (1000.049999999995, 1_000_100_000),
+        (1000.049999999991, 1_000_100_000),
+        (1000.049999999989, 1_000_000_000),
+        (1000.04999999998, 1_000_000_000),
+    ];
+    for (x, want) in cases {
+        assert_eq!(
+            scale::to_tick_band_1e6(x, 100_000, false),
+            Some(want),
+            "{x:?}"
+        );
+    }
+}
+
+#[test]
+fn tick_band_edges() {
+    let b = |x: f64, t: i64| scale::to_tick_band_1e6(x, t, false);
+    for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e13, -1e13] {
+        assert_eq!(b(x, 100_000), None, "{x:?}");
+    }
+    assert_eq!(b(1.0, 0), None);
+    assert_eq!(b(0.0, 10_000), Some(0));
+    assert_eq!(b(-0.0, 10_000), Some(0));
+    assert_eq!(b(f64::MIN_POSITIVE, 10_000), Some(0));
+    assert_eq!(b(5e-324, 1), Some(0));
+    assert_eq!(b(1.234, 10_000), Some(1_230_000));
+    assert_eq!(b(1.236, 10_000), Some(1_240_000));
+    assert_eq!(b(100.005, 10_000), Some(100_010_000));
+    assert_eq!(b(-0.004, 10_000), Some(0));
+    // A tick that does not divide 1e6 (mintick 5): 12.5 is an exact tie, away from zero.
+    assert_eq!(b(12.5, 5_000_000), Some(15_000_000));
+    assert_eq!(b(-12.5, 5_000_000), Some(-15_000_000));
+    assert_eq!(b(12.49, 5_000_000), Some(10_000_000));
+    // U04's half_up reading: an exact negative tie goes toward +inf; the band mirrors.
+    let h = |x: f64| scale::to_tick_band_1e6(x, 100_000, true);
+    assert_eq!(h(-76430.25), Some(-76_430_200_000));
+    assert_eq!(h(76430.25), Some(76_430_300_000));
+    assert_eq!(h(-1000.049999999995), Some(-1_000_000_000));
+    // The largest in-domain value.
+    assert!(b(9.2e12, 1).is_some());
+}

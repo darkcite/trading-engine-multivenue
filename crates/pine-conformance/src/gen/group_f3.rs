@@ -633,7 +633,18 @@ fn cell_of(r: P) -> Cell {
         tols,
         expect: Expect::Pending,
         readings: r.readings,
-        run: Run::default(),
+        // r39 (capture 08): F125's `close` column reads the chart's close — TradingView ran every
+        // sheet on the BTC chart from its first bar — so F125 is driven by the chart, aligned by
+        // step like the rest of its sheet (bar 0 = the bar root's first row, as SYN-1's own rows);
+        // a synthetic bar's close is not TradingView's (the r39 run's one F125 difference).
+        run: if r.n == 125 {
+            Run {
+                driver: crate::fixture::Driver::Chart,
+                ..Run::default()
+            }
+        } else {
+            Run::default()
+        },
     }
 }
 
