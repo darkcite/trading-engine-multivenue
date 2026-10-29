@@ -21,9 +21,13 @@
 //! the engine's boot — takes no other slot down.
 //!
 //! **The boot**, each step a refusal that aborts it. First, with no
-//! network, no secret and no environment read ([`pmj_preboot`]): slot 11
-//! armed; `exec.HALT` not naming it ("exec.HALT names slot 11 — flip to
-//! paper first"); its section; the member; `live_assets` naming a family
+//! network, no secret and no environment read ([`pmj_preboot`];
+//! [`boot_pmj_arm`] reads `HOME` once, for `~/multivenue`):
+//! slot 11 armed; `exec.HALT` not naming it ("exec.HALT names slot 11 —
+//! flip to paper first"); no dust battery beside it (PMJ J17: no
+//! `pmj-dust.HALT`, no held `pmj-dust.lock`, beside the exec artifact or in
+//! `~/multivenue` — the engine and a battery would trade one wallet); its
+//! section; the member; `live_assets` naming a family
 //! it carries; `pmj.toml`'s per-order and per-market caps inside the
 //! slot's clamps; the frame (again, with `pmj.toml`'s `live_assets`); the
 //! self-test (`pmj_exec::self_test`: RFC 8032, the guard's known answers on
@@ -676,7 +680,7 @@ pub fn read_balances<C: JupClient>(
 ///
 /// # Errors
 /// An unreadable file, another wallet's, or one that does not parse.
-fn read_held(path: &Path, owner_b58: &str) -> Result<Vec<HeldLeg>, String> {
+pub(crate) fn read_held(path: &Path, owner_b58: &str) -> Result<Vec<HeldLeg>, String> {
     // COPY: boot, once — the held file's bytes (≤ HELD_FILE_MAX).
     let text = match std::fs::read(path) {
         Ok(t) => t,
@@ -888,9 +892,12 @@ fn check_member_caps(member: &PmjBoot, s: &core_config::exec::ExecSlot) -> Resul
 /// is not shown absent, and slot 11 runs alone (`exec_boot`), so this
 /// takes no other slot down.
 ///
+/// PMJ J17: the dust battery (`pmj_dust`) reads it the same way, beside
+/// every exec artifact it watches.
+///
 /// # Errors
 /// The halt, or the unreadable file.
-fn check_halt_file(exec_toml: &Path) -> Result<(), String> {
+pub(crate) fn check_halt_file(exec_toml: &Path) -> Result<(), String> {
     let path = crate::exec_boot::halt_file_path(exec_toml);
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
@@ -925,7 +932,12 @@ struct Preboot<'a> {
 
 /// **The boot's first half: no network, no secret, no environment.** In
 /// order: slot 11 armed (a paper slot 11 builds nothing and reads
-/// nothing); `exec.HALT` does not name it ([`check_halt_file`]); its
+/// nothing); `exec.HALT` does not name it ([`check_halt_file`]); no dust
+/// battery beside it (PMJ J17: no `pmj-dust.HALT` and no held
+/// `pmj-dust.lock` beside the exec artifact or in `mv` — `~/multivenue`,
+/// which [`boot_pmj_arm`] reads from `HOME` once and the tests give a
+/// scratch directory; `None` (HOME unset or empty) refuses, the battery's
+/// lock and ledger living only there — `pmj_dust::dust_blocks_arming`); its
 /// section present; the member in `--strategy`; `live_assets` naming a
 /// family it carries; the member's caps inside the slot's clamps; the
 /// frame (`gates`: the binary's [`PMJ_GATES_BUILT`], tests inject theirs);
@@ -935,13 +947,29 @@ struct Preboot<'a> {
 ///
 /// # Errors
 /// The first that fails.
-fn pmj_preboot<'a>(eb: &'a ExecBoot, member: Option<&'a PmjBoot>, gates: PmjGates) -> Result<Preboot<'a>, String> {
+fn pmj_preboot<'a>(
+    eb: &'a ExecBoot,
+    member: Option<&'a PmjBoot>,
+    gates: PmjGates,
+    mv: Option<&Path>,
+) -> Result<Preboot<'a>, String> {
     if !eb.pmj_live() {
         return Err(String::from(
             "slot 11 is not armed live — no arm is built and no secret is read",
         ));
     }
     check_halt_file(&eb.path)?;
+    // PMJ J17 (risk review round 2, M3): never beside a dust battery — the
+    // engine and the battery would trade one wallet. The battery's lock and
+    // ledger live only in ~/multivenue: without it (HOME unset or empty)
+    // the check would be blind there, so the live boot refuses.
+    let Some(mv) = mv else {
+        return Err(String::from(
+            "slot 11 is live, but HOME is unset or empty — ~/multivenue (a dust battery's lock, ledger \
+             and sticky halt) cannot be checked; refusing rather than arming beside a battery it cannot see",
+        ));
+    };
+    crate::pmj_dust::dust_blocks_arming(&eb.path, Some(mv))?;
     let s = eb
         .slots
         .iter()
@@ -995,7 +1023,10 @@ pub fn boot_pmj_arm(
     specs: Consumer<PmWindowSpec, PM15_SPEC_RING>,
     stats: Arc<JupExecStats>,
 ) -> Result<PmjLive, String> {
-    boot_pmj_arm_gated(eb, member, tls, specs, stats, PMJ_GATES_BUILT)
+    // `~/multivenue`, read once (PMJ J17: a dust battery's halt and lock);
+    // an empty HOME is no HOME — `pmj_preboot` refuses a live slot 11 then.
+    let mv = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join("multivenue"));
+    boot_pmj_arm_gated(eb, member, tls, specs, stats, PMJ_GATES_BUILT, mv.as_deref())
 }
 
 /// [`boot_pmj_arm`] with the gates given (the binary's; tests inject
@@ -1012,8 +1043,9 @@ pub(crate) fn boot_pmj_arm_gated(
     specs: Consumer<PmWindowSpec, PM15_SPEC_RING>,
     stats: Arc<JupExecStats>,
     gates: PmjGates,
+    mv: Option<&Path>,
 ) -> Result<PmjLive, String> {
-    let pre = pmj_preboot(eb, member, gates)?;
+    let pre = pmj_preboot(eb, member, gates, mv)?;
     // The public key (not secret): the guard is built for it before the
     // keypair file is opened.
     let pubkey = key58(&env(ENV_PUBKEY)?)
@@ -1534,6 +1566,12 @@ mod tests {
         crate::exec_boot::resolve_gated(Some(&p), Some("11"), DUST).unwrap().unwrap()
     }
 
+    /// The tests' `~/multivenue`: a scratch directory beside the exec
+    /// artifact (never the real one).
+    fn scratch_mv(eb: &ExecBoot) -> PathBuf {
+        eb.path.with_file_name("multivenue")
+    }
+
     fn member(keys: PmjLiveKeys) -> PmjBoot {
         PmjBoot {
             params: strategy_pmj::PmjParams::default(),
@@ -1565,6 +1603,7 @@ mod tests {
             rx,
             Arc::new(JupExecStats::new()),
             gates,
+            Some(&scratch_mv(eb)),
         ) {
             Ok(_) => panic!("the boot passed"),
             Err(e) => e,
@@ -1575,30 +1614,30 @@ mod tests {
     fn the_secret_free_half_refuses_in_order() {
         let d = dir();
         let eb = live_eb(&d);
-        assert!(refusal(pmj_preboot(&eb, None, DUST)).contains("pmj member is not in --strategy"));
+        assert!(refusal(pmj_preboot(&eb, None, DUST, Some(&scratch_mv(&eb)))).contains("pmj member is not in --strategy"));
         let mut m = member(reviewed());
         m.families = vec![String::from("eth")];
-        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST)).contains("names no family it carries"));
+        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST, Some(&scratch_mv(&eb)))).contains("names no family it carries"));
         let mut m = member(reviewed());
         m.max_order_usd_1e6 = 5_020_000;
-        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST)).contains("`max_order_usd_1e6` = 5020000"));
+        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST, Some(&scratch_mv(&eb)))).contains("`max_order_usd_1e6` = 5020000"));
         let mut k = reviewed();
         k.usd_market_1e6 = 6_000_000;
         let m = member(k);
-        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST)).contains("`usd_market_1e6` = 6000000"));
+        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST, Some(&scratch_mv(&eb)))).contains("`usd_market_1e6` = 6000000"));
         let m = member(reviewed());
         let none = PmjGates { dust: false, pilot: false };
-        assert!(refusal(pmj_preboot(&eb, Some(&m), none)).contains("PMJ-DUST-GATE"));
+        assert!(refusal(pmj_preboot(&eb, Some(&m), none, Some(&scratch_mv(&eb)))).contains("PMJ-DUST-GATE"));
         let mut eth = member(reviewed());
         eth.live_assets = vec![String::from("btc"), String::from("eth")];
         eth.families = vec![String::from("btc"), String::from("eth")];
-        assert!(refusal(pmj_preboot(&eb, Some(&eth), DUST)).contains("live_assets"));
+        assert!(refusal(pmj_preboot(&eb, Some(&eth), DUST, Some(&scratch_mv(&eb)))).contains("live_assets"));
         let mut k = reviewed();
         k.min_sol_lamports = 0;
         let m = member(k);
-        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST)).contains("min_sol_lamports"));
+        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST, Some(&scratch_mv(&eb)))).contains("min_sol_lamports"));
         let m = member(reviewed());
-        let pre = pmj_preboot(&eb, Some(&m), DUST).unwrap_or_else(|e| panic!("{e}"));
+        let pre = pmj_preboot(&eb, Some(&m), DUST, Some(&scratch_mv(&eb))).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((pre.frame, pre.live_families), (PmjFrame::Dust, 1));
         std::fs::remove_dir_all(&d).ok();
     }
@@ -1623,6 +1662,44 @@ mod tests {
         k.build_extra.clear();
         let e = boot_refusal(&eb, Some(&member(k)), DUST);
         assert!(e.contains("build_extra") && !e.contains(ENV_KEYFILE), "{e}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// PMJ J17 (risk review round 2, M3): slot 11 does not arm beside a
+    /// dust battery — its standing `pmj-dust.HALT` (fail closed) or its
+    /// held `pmj-dust.lock` beside the exec artifact.
+    #[test]
+    fn a_dust_battery_beside_the_artifact_refuses_the_preboot() {
+        let d = dir();
+        let eb = live_eb(&d);
+        let m = member(reviewed());
+        let halt = d.join(crate::pmj_dust::HALT_FILE);
+        std::fs::write(&halt, "pmj-dust HALT\nreason: test\n").unwrap();
+        let e = refusal(pmj_preboot(&eb, Some(&m), DUST, Some(&scratch_mv(&eb))));
+        assert!(e.contains("pmj-dust.HALT stands") && e.contains("reason: test"), "{e}");
+        std::fs::remove_file(&halt).unwrap();
+        std::fs::create_dir(&halt).unwrap();
+        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST, Some(&scratch_mv(&eb)))).contains("unreadable"), "fail closed");
+        std::fs::remove_dir(&halt).unwrap();
+        let lock = crate::pmj_dust::take_lock(&d.join(crate::pmj_dust::LOCK_FILE)).unwrap();
+        let e = refusal(pmj_preboot(&eb, Some(&m), DUST, Some(&scratch_mv(&eb))));
+        assert!(e.contains("is held") && e.contains("slot 11 does not arm"), "{e}");
+        drop(lock);
+        // ~/multivenue (the boot's `mv`, here a scratch directory) too.
+        let mv = scratch_mv(&eb);
+        std::fs::create_dir_all(&mv).unwrap();
+        std::fs::write(mv.join(crate::pmj_dust::HALT_FILE), "pmj-dust HALT\nreason: mv\n").unwrap();
+        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST, Some(&mv))).contains("reason: mv"));
+        // No HOME (or an empty one): ~/multivenue unknown — refused, never
+        // "beside the artifact only" (the lock and the ledger live there).
+        let e = refusal(pmj_preboot(&eb, Some(&m), DUST, None));
+        assert!(e.contains("HOME is unset or empty") && e.contains("cannot be checked"), "{e}");
+        std::fs::remove_file(mv.join(crate::pmj_dust::HALT_FILE)).unwrap();
+        let lock = crate::pmj_dust::take_lock(&mv.join(crate::pmj_dust::LOCK_FILE)).unwrap();
+        assert!(refusal(pmj_preboot(&eb, Some(&m), DUST, Some(&mv))).contains("is held"));
+        drop(lock);
+        let pre = pmj_preboot(&eb, Some(&m), DUST, Some(&scratch_mv(&eb))).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(pre.frame, PmjFrame::Dust);
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -1668,7 +1745,7 @@ mod tests {
     }
 
     fn boot_on(eb: &ExecBoot, m: &PmjBoot, d: &Path, client: Fake) -> Result<PmjLive, String> {
-        let pre = pmj_preboot(eb, Some(m), DUST)?;
+        let pre = pmj_preboot(eb, Some(m), DUST, Some(&scratch_mv(eb)))?;
         let w = test_wallet(d);
         let pg = guard_from_keys(&m.live_keys, w.key)?;
         let (_tx, rx) = spec_tee();

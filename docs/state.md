@@ -418,6 +418,16 @@ affected paragraph at each lane close; the superseded text goes to
   binary can arm slot 11. `scripts/daily-restart.sh` (the pmj gate) has run
   from the working tree on main's launchd since ~14:46Z and does nothing
   while slot 11 is not armed. Provisional rulings R-PMJ-S76..S78 await Anton.
+- **2026-10-29 16:05Z: the scheduled restart booted `df543c33` (J16), PAPER** —
+  run `run-1793289981578309000` (16:06:57Z), masks 2815, nothing halted, `exec`
+  configured 0, `vm` 2; the CLOB law tallies 0; no `engine_pmj_arm_*` /
+  `engine_pmj_gw_*` metric (paper).
+- **PMJ J17 (the dust battery tool, plan-J5) is committed** (risk-policy
+  `### J17`): `multivenue-engine pmj-dust` / `scripts/pmj-dust.sh`, refused
+  without the dust gate line. `scripts/pmj-exec.sh` and `pmj-dust.sh` now refuse
+  an env file (`MULTIVENUE_ENV_FILE`, else the repo's `.env`) that is not a
+  0600 regular file owned by the user, or that sets a strategy switch — the
+  repo's `.env` must be 0600 before slot 11 can arm. Provisional R-PMJ-S79, S80.
 
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 

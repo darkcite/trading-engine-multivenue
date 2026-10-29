@@ -29,8 +29,25 @@
 //!   against `min_sol_lamports` and — when the flip or daily-restart passes
 //!   it — the day cap; one authenticated read that proves `JUP_API_KEY`
 //!   (`GET /prediction/v1/orders?ownerPubkey=…&start=0&end=1`) and the
-//!   region (an `unsupported_region` answer refuses). A review failure in
-//!   the chain section ends the check at once: 77 wins over any 78.
+//!   region (an `unsupported_region` answer refuses); and (PMJ J17, risk
+//!   review round 2, M3) the wallet's positions (`GET /positions`, first
+//!   page): any position with contracts, not claimed, that no leg of
+//!   `pmj-held.state` (beside the exec artifact the next boot reads:
+//!   `--exec`, else `strategy.conf`'s `EXEC_TOML`, else
+//!   `~/multivenue/exec.toml`) carries is read again [`UNHELD_REREAD_NS`]
+//!   (10 s) later against `pmj-held.state` read again — an order in flight
+//!   gets its leg written in between — and one unheld in both reads refuses
+//!   78 ("UNHELD POSITIONS — …"); one seen only in the second read passes
+//!   (it appeared between the reads: the engine's own order in flight, not
+//!   a battery's leftover; the next key check reads it again): a dust
+//!   battery's legs must be claimed or
+//!   settled (or a fresh wallet used) before slot 11 arms. A review failure
+//!   in the chain section ends the check at once: 77 wins over any 78.
+//!   `HOME` is the binary's, read once and passed in.
+//! * **`--dust-probe [--exec PATH]`** (offline; PMJ J17): refuses while a
+//!   dust battery's `pmj-dust.HALT` stands, or its `pmj-dust.lock` is held,
+//!   beside that exec artifact or in `~/multivenue` ([`dust_probe`]); the
+//!   flip runs it first.
 //!
 //! **Exit codes** (the binary's): 0 PASS; **77 a REVIEW TRIGGER** — the
 //! chain is not what was reviewed: the Predict program's deploy slot is not
@@ -133,6 +150,8 @@ pub const ALT_PROGRAM: [u8; KEY_LEN] = [
 const ALT_META: usize = 56;
 /// The authenticated read's target (one record, read-only).
 const P_ORDERS_ONE: &str = "/prediction/v1/orders?ownerPubkey=";
+/// The positions' target (first page, read-only; PMJ J17, M3).
+const P_POSITIONS_Q: &str = "/prediction/v1/positions?ownerPubkey=";
 
 /// **`multivenue-engine pmj-exec --self-test`** (offline; module docs).
 ///
@@ -416,7 +435,7 @@ pub fn review_mint(owner: &[u8; KEY_LEN], data: &[u8]) -> Result<u8, KeyCheckFai
 /// One `getAccountInfo` of `key` (bytes `offset..offset + len` of its
 /// data) on `rpc`: its owner and data.
 fn get_account(
-    rpc: &mut HttpsReq,
+    rpc: &mut dyn JupClient,
     key: &[u8; KEY_LEN],
     offset: usize,
     len: usize,
@@ -467,21 +486,30 @@ fn chain_review(
     let host = rpc_host(std::env::var(ENV_SOLANA_RPC).ok().as_deref())?;
     let mut rpc = HttpsReq::new(&host, 443, tls, 512, 1_024, 64 * 1024)
         .map_err(|e| format!("the Solana RPC client ({host}): {e:?}"))?;
+    chain_review_on(&mut rpc, keys, reviewed)
+}
+
+/// [`chain_review`] on any client (the tests' scripted RPC).
+fn chain_review_on(
+    rpc: &mut dyn JupClient,
+    keys: &PmjLiveKeys,
+    reviewed: &PmjGuard,
+) -> Result<ChainFacts, KeyCheckFail> {
     let mut data = [0u8; 8_448];
-    let (owner, n) = get_account(&mut rpc, &PREDICT_PROGRAM, 0, 36, &mut data)?;
+    let (owner, n) = get_account(rpc, &PREDICT_PROGRAM, 0, 36, &mut data)?;
     let programdata = review_program(&owner, &data[..n])?;
-    let (_, n) = get_account(&mut rpc, &programdata, 0, 45, &mut data)?;
+    let (_, n) = get_account(rpc, &programdata, 0, 45, &mut data)?;
     let (slot, authority, deploy) = review_deploy(&data[..n], keys.guard_program_slot)?;
     let vault_line = if let Some((table, entry)) = keys.guard_vault_alt.split_once(':') {
         let t = key58(table).ok_or_else(|| String::from("pmj.toml `guard_vault_alt`'s table does not decode"))?;
         let e: u8 = entry.parse().map_err(|_| String::from("pmj.toml `guard_vault_alt`'s entry is not 0..=255"))?;
-        let (owner, n) = get_account(&mut rpc, &t, 0, ALT_META + KEY_LEN * (usize::from(e) + 1), &mut data)?;
+        let (owner, n) = get_account(rpc, &t, 0, ALT_META + KEY_LEN * (usize::from(e) + 1), &mut data)?;
         let k = review_vault(&owner, &data[..n], e, &reviewed.guard.vault)?;
         format!("vault {} = {table}:{e} on chain (the table active)", b58(&k))
     } else {
         format!("vault {} (a static key)", b58(&reviewed.guard.vault))
     };
-    let (owner, n) = get_account(&mut rpc, &reviewed.mint, 0, 82, &mut data)?;
+    let (owner, n) = get_account(rpc, &reviewed.mint, 0, 82, &mut data)?;
     let decimals = review_mint(&owner, &data[..n])?;
     Ok(ChainFacts {
         slot,
@@ -490,6 +518,119 @@ fn chain_review(
         vault_line,
         decimals,
     })
+}
+
+/// The chain section's PASS words.
+fn chain_words(c: &ChainFacts) -> String {
+    format!(
+        "Predict program deploy slot {} ({}), upgrade authority {}; {}; deposit mint decimals {}",
+        c.slot,
+        c.deploy,
+        c.authority.map_or(String::from("none (frozen)"), |a| b58(&a)),
+        c.vault_line,
+        c.decimals
+    )
+}
+
+/// **PMJ J17 — the chain half alone** (the dust battery's preflight, once
+/// a run): the pinned accounts against `pmj.toml` on public Solana RPC
+/// ([`ENV_SOLANA_RPC`] or the default host) — no secret, no Jupiter.
+///
+/// # Errors
+/// [`KeyCheckFail::Review`] (77) when the chain is not what was reviewed,
+/// else [`KeyCheckFail::Refused`] (78).
+pub(crate) fn chain_check(tls: Arc<ClientConfig>, keys: &PmjLiveKeys, reviewed: &PmjGuard) -> Result<String, KeyCheckFail> {
+    chain_review(tls, keys, reviewed).map(|c| chain_words(&c))
+}
+
+/// [`chain_check`] on any client (the tests' scripted RPC).
+///
+/// # Errors
+/// As [`chain_check`].
+#[cfg(test)]
+pub(crate) fn chain_check_on(rpc: &mut dyn JupClient, keys: &PmjLiveKeys, reviewed: &PmjGuard) -> Result<String, KeyCheckFail> {
+    chain_review_on(rpc, keys, reviewed).map(|c| chain_words(&c))
+}
+
+/// **PMJ J17 (risk review round 2, M3) — the positions the engine does not
+/// hold.** In a `GET /positions` answer (J15's scanner, first page), every
+/// position with contracts, not claimed, whose key no held leg
+/// (`pmj-held.state`) carries: the wallet holds what the engine would not
+/// account for — a dust battery's legs, say.
+///
+/// # Errors
+/// The answer does not read.
+pub(crate) fn unheld_positions(body: &[u8], held: &[exec_jupiter::held::HeldLeg]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    exec_jupiter::json::scan_positions(body, &mut |p| {
+        if p.claimed || p.contracts_micro == 0 {
+            return;
+        }
+        let text = p.pubkey.of(body);
+        let mut k = [0u8; KEY_LEN];
+        let ours = matches!(core_crypto::base58_decode(text, &mut k), Ok(KEY_LEN))
+            && held.iter().any(|l| l.state != 0 && l.position == k);
+        if !ours {
+            out.push(String::from_utf8_lossy(text).into_owned());
+        }
+    })
+    .map_err(|e| format!("the positions answer did not read ({e:?})"))?;
+    Ok(out)
+}
+
+/// The refusal [`unheld_positions`] makes before arming (risk review
+/// round 2, M3).
+pub(crate) const UNHELD_REFUSAL: &str = "the wallet holds positions the engine does not hold (a dust \
+     battery's?) — claim or settle them, or use a fresh wallet, before arming slot 11";
+
+/// The second `GET /positions` read, this long after a first that found a
+/// position the engine does not hold (risk review round 3, MINOR 6: an
+/// order in flight whose leg `pmj-held.state` has not yet written), ns.
+pub const UNHELD_REREAD_NS: u64 = 10_000_000_000;
+
+/// `~/multivenue` of `home` (an empty `HOME` is no `HOME`).
+fn mv_of(home: Option<&Path>) -> Result<std::path::PathBuf, String> {
+    home.filter(|h| !h.as_os_str().is_empty())
+        .map(|h| h.join("multivenue"))
+        .ok_or_else(|| String::from("HOME is not set"))
+}
+
+/// The exec artifact the next boot reads: `--exec`, else `strategy.conf`'s
+/// `EXEC_TOML` (sourced as the wrapper sources it), else
+/// `~/multivenue/exec.toml`. `home` is the caller's `HOME` (the binary
+/// reads it once; the tests give a scratch directory).
+///
+/// # Errors
+/// `home` absent, or `strategy.conf` that cannot be sourced.
+fn exec_in_force(exec: Option<&Path>, home: Option<&Path>) -> Result<std::path::PathBuf, String> {
+    if let Some(p) = exec {
+        return Ok(p.to_path_buf());
+    }
+    let mv = mv_of(home)?;
+    let home = mv.parent().unwrap_or(mv.as_path());
+    let (_, in_force) = crate::pmj_dust::conf_sourced(&mv.join("strategy.conf"), Path::new("/bin/zsh"), home)?;
+    Ok(if in_force.is_empty() { mv.join("exec.toml") } else { std::path::PathBuf::from(in_force) })
+}
+
+/// **`multivenue-engine pmj-exec --dust-probe [--exec PATH]`** (PMJ J17,
+/// risk review round 2, M3; offline): slot 11 does not arm beside a dust
+/// battery — refused while `pmj-dust.HALT` stands beside the exec artifact
+/// the next boot reads or in `~/multivenue`, or while a battery holds
+/// `pmj-dust.lock` there (a non-blocking `flock` probe, the battery's own
+/// lock). `scripts/pmj-flip.sh live` runs it before anything else it reads.
+/// `home` is the caller's `HOME` (the binary reads it once).
+///
+/// # Errors
+/// The battery's trace, `HOME` unset, or a file that cannot be read (fail
+/// closed).
+pub fn dust_probe(exec: Option<&Path>, home: Option<&Path>) -> Result<String, String> {
+    let exec = exec_in_force(exec, home)?;
+    let mv = mv_of(home)?;
+    crate::pmj_dust::dust_blocks_arming(&exec, Some(&mv))?;
+    Ok(format!(
+        "pmj-exec dust-probe: PASS — no pmj-dust.HALT and no battery holding pmj-dust.lock beside {} or in ~/multivenue",
+        exec.display()
+    ))
 }
 
 /// What the wallet section read.
@@ -509,13 +650,20 @@ fn wallet_review(
     tls: Arc<ClientConfig>,
     keys: &PmjLiveKeys,
     cap_day_usd_1e6: Option<i64>,
+    exec: Option<&Path>,
+    home: Option<&Path>,
 ) -> Result<WalletFacts, KeyCheckFail> {
     let (_signer, wallet, keyfile) = wallet_from_env()?;
     let pg = guard_from_keys(keys, wallet)?;
     let wallet_b58 = b58(&wallet);
     let mint_b58 = b58(&pg.mint);
+    // PMJ J17 (M3): the legs the engine holds, beside the exec artifact
+    // the next boot reads — re-read before the second positions read.
+    let held_file = crate::pmj_live::held_path(&exec_in_force(exec, home)?);
+    let mut held = || crate::pmj_live::read_held(&held_file, &wallet_b58);
+    let mut pause = || std::thread::sleep(std::time::Duration::from_nanos(UNHELD_REREAD_NS));
     let mut api_key = api_key_from_env()?;
-    let r = jupiter_reads(tls, api_key.as_bytes(), &wallet_b58, &mint_b58);
+    let r = jupiter_reads(tls, api_key.as_bytes(), &wallet_b58, &mint_b58, &mut held, &mut pause);
     api_key.zeroize();
     let (deposit, sol) = r?;
     if keys.min_sol_lamports == 0 {
@@ -570,6 +718,8 @@ pub fn key_check(
     tls: Arc<ClientConfig>,
     pmj: Option<&Path>,
     cap_day_usd_1e6: Option<i64>,
+    exec: Option<&Path>,
+    home: Option<&Path>,
 ) -> Result<String, KeyCheckFail> {
     self_test()?;
     let path = match pmj {
@@ -583,7 +733,7 @@ pub fn key_check(
     let reviewed = guard_from_keys(&keys, [1; KEY_LEN])?;
     let (c, w) = review_first(
         || chain_review(Arc::clone(&tls), &keys, &reviewed),
-        || wallet_review(Arc::clone(&tls), &keys, cap_day_usd_1e6),
+        || wallet_review(Arc::clone(&tls), &keys, cap_day_usd_1e6, exec, home),
     )?;
     let ChainFacts {
         slot,
@@ -620,18 +770,83 @@ pub fn key_check(
     ))
 }
 
-/// The balances and the authenticated read on one connection to Jupiter.
-fn jupiter_reads(tls: Arc<ClientConfig>, api_key: &[u8], wallet_b58: &str, mint_b58: &str) -> Result<(u64, u64), String> {
+/// The legs the engine holds (`pmj-held.state`, read afresh each call).
+type HeldRead<'a> = &'a mut dyn FnMut() -> Result<Vec<exec_jupiter::held::HeldLeg>, String>;
+
+/// The balances, the authenticated read and the positions on one
+/// connection to Jupiter.
+fn jupiter_reads(
+    tls: Arc<ClientConfig>,
+    api_key: &[u8],
+    wallet_b58: &str,
+    mint_b58: &str,
+    held: HeldRead<'_>,
+    pause: &mut dyn FnMut(),
+) -> Result<(u64, u64), String> {
     let mut c = HttpsReq::new(JUP_HOST, 443, tls, HEAD_CAP, BODY_MIN, RESP_CAP)
         .map_err(|e| format!("the Jupiter client: {e:?}"))?;
-    let (deposit, sol) = read_balances(&mut c, api_key, wallet_b58, mint_b58)?;
+    jupiter_reads_on(&mut c, api_key, wallet_b58, mint_b58, held, pause)
+}
+
+/// One `GET /positions` of the wallet: the keys the engine does not hold.
+fn unheld_read<C: JupClient>(
+    c: &mut C,
+    api_key: &[u8],
+    wallet_b58: &str,
+    held: &[exec_jupiter::held::HeldLeg],
+) -> Result<Vec<String>, String> {
+    let target = format!("{P_POSITIONS_Q}{wallet_b58}");
+    let key: Header<'_> = (b"x-api-key", api_key);
+    let (http, range) = c
+        .request(Method::Get, target.as_bytes(), &[key], 0)
+        .map_err(|e| format!("GET /prediction/v1/positions: {e:?}"))?;
+    let body = c.resp().get(range).unwrap_or(&[]);
+    if http != 200 {
+        return Err(jup_refusal("GET /prediction/v1/positions", http, body));
+    }
+    unheld_positions(body, held)
+}
+
+/// [`jupiter_reads`] on any client (the tests' scripted one): the
+/// balances; one authenticated read (the key, the region); and (PMJ J17,
+/// M3) the wallet's positions — a position the engine does not hold is
+/// read again [`UNHELD_REREAD_NS`] later (`pause`), against
+/// `pmj-held.state` read again (`held`), and refuses
+/// ([`UNHELD_REFUSAL`]) only when unheld in both reads (risk review round
+/// 3, MINOR 6: a leg in flight is written in between). A position seen
+/// only in the second read passes: it appeared between the reads (the
+/// engine's own order), so it is no battery's leftover.
+fn jupiter_reads_on<C: JupClient>(
+    c: &mut C,
+    api_key: &[u8],
+    wallet_b58: &str,
+    mint_b58: &str,
+    held: HeldRead<'_>,
+    pause: &mut dyn FnMut(),
+) -> Result<(u64, u64), String> {
+    let (deposit, sol) = read_balances(c, api_key, wallet_b58, mint_b58)?;
     let target = format!("{P_ORDERS_ONE}{wallet_b58}&start=0&end=1");
     let key: Header<'_> = (b"x-api-key", api_key);
-    let (http, range) = JupClient::request(&mut c, Method::Get, target.as_bytes(), &[key], 0)
+    let (http, range) = c
+        .request(Method::Get, target.as_bytes(), &[key], 0)
         .map_err(|e| format!("GET /prediction/v1/orders: {e:?}"))?;
     if http != 200 {
-        let body = JupClient::resp(&c).get(range).unwrap_or(&[]);
+        let body = c.resp().get(range).unwrap_or(&[]);
         return Err(jup_refusal("GET /prediction/v1/orders (the key and the region)", http, body));
+    }
+    let first = unheld_read(c, api_key, wallet_b58, &held()?)?;
+    if first.is_empty() {
+        return Ok((deposit, sol));
+    }
+    pause();
+    let second = unheld_read(c, api_key, wallet_b58, &held()?)?;
+    let both: Vec<&String> = first.iter().filter(|k| second.contains(k)).collect();
+    if !both.is_empty() {
+        return Err(format!(
+            "UNHELD POSITIONS — {UNHELD_REFUSAL}: {both:?} (unheld in two GET /prediction/v1/positions \
+             reads {} s apart, against pmj-held.state read before each)",
+            UNHELD_REREAD_NS / 1_000_000_000
+        ));
     }
     Ok((deposit, sol))
 }
@@ -808,5 +1023,179 @@ mod tests {
     fn the_embedded_loader_and_table_programs_are_their_base58_names() {
         assert_eq!(key58("BPFLoaderUpgradeab1e11111111111111111111111"), Some(BPF_UPGRADEABLE_LOADER));
         assert_eq!(key58("AddressLookupTab1e1111111111111111111111111"), Some(ALT_PROGRAM));
+    }
+
+    // --- PMJ J17 (risk review round 2, M3): the positions the engine
+    // does not hold ---------------------------------------------------------
+
+    fn position(k: &[u8; KEY_LEN], contracts: u64, claimed: bool) -> String {
+        format!(
+            r#"{{"pubkey":"{}","contractsMicro":"{contracts}","claimable":false,"claimed":{claimed}}}"#,
+            b58(k)
+        )
+    }
+
+    fn open_leg(k: [u8; KEY_LEN]) -> exec_jupiter::held::HeldLeg {
+        exec_jupiter::held::HeldLeg {
+            position: k,
+            contracts_micro: 5_000_000,
+            state: exec_jupiter::held::HELD_OPEN,
+            ..exec_jupiter::held::HeldLeg::EMPTY
+        }
+    }
+
+    #[test]
+    fn a_position_no_held_leg_carries_is_unheld() {
+        let ours = [0x0B; KEY_LEN];
+        let foreign = [0xEE; KEY_LEN];
+        let body = format!(
+            r#"{{"data":[{},{},{},{}]}}"#,
+            position(&ours, 5_000_000, false),
+            position(&foreign, 1_000_000, false),
+            position(&[0xEF; KEY_LEN], 0, false),
+            position(&[0xF0; KEY_LEN], 7, true)
+        );
+        assert_eq!(unheld_positions(body.as_bytes(), &[open_leg(ours)]), Ok(vec![b58(&foreign)]), "empty and claimed ones skipped");
+        let free = exec_jupiter::held::HeldLeg { state: 0, ..open_leg(ours) };
+        assert_eq!(unheld_positions(body.as_bytes(), &[free]).unwrap().len(), 2, "a free leg holds nothing");
+        assert_eq!(unheld_positions(br#"{"data":[]}"#, &[]), Ok(Vec::new()));
+        assert!(unheld_positions(b"<html>", &[]).unwrap_err().contains("did not read"));
+    }
+
+    /// Jupiter scripted: the balances, the authenticated read, the
+    /// positions.
+    struct Script {
+        body: Vec<u8>,
+        resp: Vec<u8>,
+        /// The positions answers in turn (the last one repeats).
+        positions: Vec<(u16, String)>,
+        asked: Vec<String>,
+    }
+
+    impl JupClient for Script {
+        fn body_mut(&mut self) -> &mut [u8] {
+            &mut self.body
+        }
+
+        fn request(
+            &mut self,
+            _method: Method,
+            target: &[u8],
+            extra: &[Header<'_>],
+            _body_len: usize,
+        ) -> Result<(u16, core::ops::Range<usize>), core_net::PostErr> {
+            assert!(extra.iter().any(|h| h.0 == b"x-api-key" && h.1 == b"k3y"), "every read carries the key");
+            let t = String::from_utf8(target.to_vec()).unwrap();
+            let (http, a) = if t.starts_with("/ultra/v1/balances/") {
+                let mint = core_config::pmj::PMJ_DEPOSIT_MINTS[0].1;
+                (200, format!(r#"{{"SOL":{{"amount":"60000000"}},"{mint}":{{"amount":"45000000"}}}}"#))
+            } else if t.starts_with(P_ORDERS_ONE) {
+                (200, String::from(r#"{"data":[],"pagination":{"start":0,"end":0,"total":0,"hasNext":false}}"#))
+            } else if t.starts_with(P_POSITIONS_Q) {
+                if self.positions.len() > 1 {
+                    self.positions.remove(0)
+                } else {
+                    self.positions[0].clone()
+                }
+            } else {
+                panic!("no answer for {t}")
+            };
+            self.asked.push(t);
+            self.resp = a.into_bytes();
+            Ok((http, 0..self.resp.len()))
+        }
+
+        fn resp(&self) -> &[u8] {
+            &self.resp
+        }
+    }
+
+    fn script(answers: &[(u16, &str)]) -> Script {
+        Script {
+            body: vec![0; 4_096],
+            resp: Vec::new(),
+            positions: answers.iter().map(|(h, b)| (*h, String::from(*b))).collect(),
+            asked: Vec::new(),
+        }
+    }
+
+    /// The key check's reads on a scripted Jupiter: `held` answers the
+    /// legs, one list per read of `pmj-held.state`; the pauses are counted.
+    fn reads(
+        s: &mut Script,
+        held: &[Vec<exec_jupiter::held::HeldLeg>],
+        pauses: &mut u32,
+    ) -> Result<(u64, u64), String> {
+        let w = "FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z";
+        let mint = core_config::pmj::PMJ_DEPOSIT_MINTS[0].1;
+        let mut k = 0usize;
+        let mut h = || {
+            let v = held[k.min(held.len() - 1)].clone();
+            k += 1;
+            Ok::<_, String>(v)
+        };
+        let mut p = || *pauses += 1;
+        jupiter_reads_on(s, b"k3y", w, mint, &mut h, &mut p)
+    }
+
+    #[test]
+    fn the_key_check_refuses_positions_the_engine_does_not_hold_in_two_reads() {
+        let w = "FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z";
+        let mut pauses = 0u32;
+        let mut s = script(&[(200, r#"{"data":[]}"#)]);
+        assert_eq!(reads(&mut s, &[Vec::new()], &mut pauses), Ok((45_000_000, 60_000_000)));
+        assert!(s.asked.last().unwrap().starts_with(&format!("{P_POSITIONS_Q}{w}")), "{:?}", s.asked);
+        assert_eq!(pauses, 0, "nothing unheld: one read, no pause");
+        let foreign = [0xEE; KEY_LEN];
+        let body = format!(r#"{{"data":[{}]}}"#, position(&foreign, 1_000_000, false));
+        // Unheld in both reads: refused, the cause named.
+        let mut s = script(&[(200, &body)]);
+        let e = reads(&mut s, &[Vec::new()], &mut pauses).unwrap_err();
+        assert!(e.starts_with("UNHELD POSITIONS — ") && e.contains(UNHELD_REFUSAL) && e.contains(&b58(&foreign)), "{e}");
+        assert!(e.contains("a dust battery's?") && e.contains("before arming slot 11") && e.contains("10 s apart"), "{e}");
+        assert_eq!(pauses, 1);
+        assert_eq!(s.asked.iter().filter(|a| a.starts_with(P_POSITIONS_Q)).count(), 2, "read twice");
+        assert_eq!(KeyCheckFail::from(e).exit_code(), EXIT_REFUSED, "78 at the binary");
+        // A leg the engine writes between the reads (an order in flight): passes.
+        let mut s = script(&[(200, &body)]);
+        assert_eq!(reads(&mut s, &[Vec::new(), vec![open_leg(foreign)]], &mut pauses), Ok((45_000_000, 60_000_000)));
+        // Gone from the second read (claimed, settled): passes.
+        let mut s = script(&[(200, &body), (200, r#"{"data":[]}"#)]);
+        assert_eq!(reads(&mut s, &[Vec::new()], &mut pauses), Ok((45_000_000, 60_000_000)));
+        // Held from the start: one read, no pause.
+        let before = pauses;
+        assert_eq!(reads(&mut script(&[(200, &body)]), &[vec![open_leg(foreign)]], &mut pauses), Ok((45_000_000, 60_000_000)));
+        assert_eq!(pauses, before);
+        let e = reads(&mut script(&[(503, "{}")]), &[Vec::new()], &mut pauses).unwrap_err();
+        assert!(e.contains("positions") && e.contains("503"), "{e}");
+    }
+
+    /// The dust probe reads beside the `--exec` it is given (and
+    /// `~/multivenue`): a battery's halt or lock there refuses.
+    #[test]
+    fn the_dust_probe_refuses_beside_a_dust_battery() {
+        let d = std::env::temp_dir().join(format!("pmj-exec-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let home = d.join("home");
+        let mv = home.join("multivenue");
+        std::fs::create_dir_all(&mv).unwrap();
+        let exec = d.join("exec.toml");
+        assert_eq!(exec_in_force(Some(&exec), Some(&home)), Ok(exec.clone()), "--exec wins");
+        assert_eq!(exec_in_force(None, Some(&home)), Ok(mv.join("exec.toml")), "no strategy.conf: ~/multivenue/exec.toml");
+        assert!(exec_in_force(None, None).unwrap_err().contains("HOME is not set"));
+        assert!(exec_in_force(None, Some(Path::new(""))).unwrap_err().contains("HOME is not set"), "empty is unset");
+        assert!(dust_probe(Some(&exec), Some(Path::new(""))).unwrap_err().contains("HOME is not set"));
+        assert!(dust_probe(Some(&exec), Some(&home)).unwrap().contains("PASS"));
+        assert!(dust_probe(Some(&exec), None).unwrap_err().contains("HOME is not set"), "fail closed");
+        for place in [&d, &mv] {
+            std::fs::write(place.join(crate::pmj_dust::HALT_FILE), "pmj-dust HALT\nreason: test\n").unwrap();
+            let e = dust_probe(Some(&exec), Some(&home)).unwrap_err();
+            assert!(e.contains("pmj-dust.HALT stands") && e.contains("reason: test"), "{e}");
+            std::fs::remove_file(place.join(crate::pmj_dust::HALT_FILE)).unwrap();
+            let lock = crate::pmj_dust::take_lock(&place.join(crate::pmj_dust::LOCK_FILE)).unwrap();
+            assert!(dust_probe(Some(&exec), Some(&home)).unwrap_err().contains("is held"));
+            drop(lock);
+        }
+        std::fs::remove_dir_all(&d).ok();
     }
 }

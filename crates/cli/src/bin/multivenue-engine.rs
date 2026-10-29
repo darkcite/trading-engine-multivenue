@@ -263,11 +263,28 @@ enum Cmd {
     /// only), one authenticated read (the API key, the region) and, from
     /// public Solana RPC, the Predict program's deploy slot, the vault's
     /// lookup-table entry and the deposit mint's decimals against their
-    /// pins. No order, no transaction. Exit 0; 77 a REVIEW TRIGGER (the
-    /// deploy, the vault entry or the mint is not what was reviewed —
-    /// `daily-restart.sh` halts a running slot 11 on it); 78 any other
-    /// refusal. The refusal on stderr; never prints a secret.
+    /// pins; and (PMJ J17) the wallet's positions against the legs
+    /// `pmj-held.state` holds — any other refuses. `--dust-probe`
+    /// (offline, PMJ J17) refuses while a dust battery's `pmj-dust.HALT`
+    /// stands or its `pmj-dust.lock` is held. No order, no transaction.
+    /// Exit 0; 77 a REVIEW TRIGGER (the deploy, the vault entry or the mint
+    /// is not what was reviewed — `daily-restart.sh` halts a running slot
+    /// 11 on it); 78 any other refusal. The refusal on stderr; never
+    /// prints a secret.
     PmjExec(PmjExecArgs),
+    /// PMJ J17: the dust battery (plan-J5) — small real $5 Limit BUYs on
+    /// Jupiter Predict from slot 11's own wallet (the wrapper sources it),
+    /// BTC 5-minute only, each recorded in full under
+    /// ~/multivenue/research/pmj/dust/<battery>.jsonl. Refused unless this
+    /// binary was built with the `PMJ-DUST-GATE` line, slot 11 is live
+    /// nowhere on the host, no `exec.HALT` names 11 and no
+    /// `pmj-dust.HALT` stands. Its own interlock: $5 an order, $50 of
+    /// deposits a UTC day (the ledger beside exec.toml, reserved before
+    /// each signature), 40 orders a battery, 2 h a run. `--dry-run`
+    /// builds, guards and records, never signs or lands. Claims are never
+    /// sent. Exit 0; 75 stopped; 77 a sticky stop (`pmj-dust.HALT`
+    /// written); 78 refused. Never prints a secret.
+    PmjDust(PmjDustArgs),
     /// PM15-7: PolyBolt's `price.crypto` and `price.crypto.twap` for the
     /// assets, on the account's CLOB API credentials (the wrapper sources
     /// them; never printed), for `--seconds`: the first frames raw, a JSON
@@ -298,7 +315,7 @@ struct PmExecArgs {
 #[command(group(
     clap::ArgGroup::new("check")
         .required(true)
-        .args(["self_test", "key_check"])
+        .args(["self_test", "key_check", "dust_probe"])
 ))]
 struct PmjExecArgs {
     /// Offline: the self-test's vectors.
@@ -307,6 +324,16 @@ struct PmjExecArgs {
     /// Online, read-only: the self-test, the wallet, the reads.
     #[arg(long)]
     key_check: bool,
+    /// Offline (PMJ J17): refuse while a dust battery's pmj-dust.HALT
+    /// stands or its pmj-dust.lock is held beside the exec artifact or in
+    /// ~/multivenue (the flip runs it first).
+    #[arg(long)]
+    dust_probe: bool,
+    /// The exec artifact the next boot reads (default: strategy.conf's
+    /// EXEC_TOML, else ~/multivenue/exec.toml): pmj-held.state beside it
+    /// for --key-check, the dust traces beside it for --dust-probe.
+    #[arg(long)]
+    exec: Option<PathBuf>,
     /// slot 11's artifact (default ~/multivenue/pmj.toml).
     #[arg(long)]
     pmj: Option<PathBuf>,
@@ -314,6 +341,30 @@ struct PmjExecArgs {
     /// ×1e6 USD (the flip passes the dust frame's).
     #[arg(long)]
     cap_day_usd_1e6: Option<i64>,
+}
+
+#[derive(Debug, Parser)]
+struct PmjDustArgs {
+    /// The battery id, [A-Za-z0-9][A-Za-z0-9_.-]{0,63}: its record is
+    /// ~/multivenue/research/pmj/dust/<battery>.jsonl.
+    #[arg(long)]
+    battery: String,
+    /// Orders this run, 1 ..= 40 (with the battery's earlier ones, at most 40).
+    #[arg(long)]
+    orders: u32,
+    /// The landing path: `execute` (POST /execute); `rpc` refuses (R-PMJ-S79).
+    #[arg(long)]
+    path: String,
+    /// Build, guard and record only: never sign, never land (still
+    /// networked: run it from an allowed region).
+    #[arg(long)]
+    dry_run: bool,
+    /// The τ jitter's seed (default: from the clock); recorded.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// slot 11's artifact (default ~/multivenue/pmj.toml).
+    #[arg(long)]
+    pmj: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -1903,13 +1954,20 @@ fn main() -> ExitCode {
             }
         }
         Cmd::PmjExec(args) => {
+            // `HOME`, read once (PMJ J17: `~/multivenue`; empty is unset).
+            let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
             let r = if args.key_check {
                 cli::pmj_exec::key_check(
                     TlsTransport::default_client_config(),
                     args.pmj.as_deref(),
                     args.cap_day_usd_1e6,
+                    args.exec.as_deref(),
+                    home.as_deref(),
                 )
                 .map_err(|e| (e.exit_code(), e.to_string()))
+            } else if args.dust_probe {
+                cli::pmj_exec::dust_probe(args.exec.as_deref(), home.as_deref())
+                    .map_err(|e| (cli::pmj_exec::EXIT_REFUSED, e))
             } else {
                 cli::pmj_exec::self_test().map_err(|e| (cli::pmj_exec::EXIT_REFUSED, e))
             };
@@ -1921,6 +1979,26 @@ fn main() -> ExitCode {
                 Err((code, reason)) => {
                     eprintln!("pmj-exec: {reason}");
                     ExitCode::from(code)
+                }
+            }
+        }
+        Cmd::PmjDust(args) => {
+            let a = cli::pmj_dust::DustArgs {
+                battery: args.battery.clone(),
+                orders: args.orders,
+                path: args.path.clone(),
+                dry_run: args.dry_run,
+                seed: args.seed,
+                pmj: args.pmj.clone(),
+            };
+            match cli::pmj_dust::run(&a, TlsTransport::default_client_config()) {
+                Ok(tell) => {
+                    println!("{tell}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("pmj-dust: {e}");
+                    ExitCode::from(e.exit_code())
                 }
             }
         }

@@ -28,6 +28,14 @@
 #     compared as a number), names no slot but 11, and the exec.toml the
 #     boot reads marks no other [exec.slot.N] live. These two are checked
 #     first, before anything else is read;
+#   - no dust battery holds the wallet (PMJ J17, risk review round 2 M3):
+#     `multivenue-engine pmj-exec --dust-probe --exec <the exec.toml the
+#     boot reads>` passes — no pmj-dust.HALT standing and no pmj-dust.lock
+#     held (a non-blocking flock probe; macOS has no flock(1), so the
+#     binary probes) beside that exec.toml or in $HOME/multivenue. A binary
+#     that predates the probe refuses too (fail closed). The probe is per
+#     $HOME and per host: another user's or another host's battery on the
+#     same wallet is not seen;
 #   - the COMMITTED docs/risk-policy.md has a line that BEGINS with
 #     `PMJ-DUST-GATE: ruled YYYY-MM-DD` outside fenced code blocks (the
 #     operator's ruling; a section quoting it opens nothing — the engine's
@@ -37,7 +45,14 @@
 #   - pmj.toml pins `guard_program_slot` (the reviewed Predict deploy);
 #   - `multivenue-engine pmj-check` passes on the dust-frame pmj.toml;
 #   - scripts/pmj-exec.sh key-check passes on it, with the wallet's deposit
-#     balance at most the $50 day cap (risk-policy J3 requirement (a)).
+#     balance at most the $50 day cap (risk-policy J3 requirement (a)) and
+#     (PMJ J17) no position on the wallet that pmj-held.state beside the
+#     exec.toml does not hold, in two reads 10 s apart (one seen only in
+#     the second read passes) — a dust battery's legs are claimed or
+#     settled first, or slot 11 arms on a fresh wallet. The key check
+#     sources the wallet's env file itself: MULTIVENUE_ENV_FILE (absolute)
+#     when set in this script's environment, else the repo .env (PMJ J17);
+#     this script reads neither.
 # Only then does it write, each file after a stamped .bak:
 # ~/multivenue/strategy.conf (ARM_LIVE=11 — slot 11 alone — and EXEC_TOML), the
 # [exec.slot.11] section of the exec.toml the boot reads (EXEC_TOML, else
@@ -275,6 +290,10 @@ case "${1:-}" in
     others="$(exec_live_others)"
     [ -z "$others" ] \
       || die "$EXEC marks slot(s) $others live — slot 11 arms only alone in its engine (risk-policy J16, R-PMJ-S77); run it on its own engine (the standalone)"
+    # PMJ J17: never beside a dust battery (its sticky halt or its lock).
+    [ -x "$BIN" ] || die "$BIN is missing — cargo build --release -p cli"
+    "$BIN" pmj-exec --dust-probe --exec "$EXEC" >/dev/null \
+      || die "a dust battery holds this wallet (pmj-dust.HALT standing or pmj-dust.lock held beside $EXEC or in $HOME/multivenue), or $BIN predates PMJ J17's --dust-probe — slot 11 does not arm beside it (risk-policy J17)"
     git -C "$REPO_DIR" show HEAD:docs/risk-policy.md 2>/dev/null \
       | awk '{ t = $0; sub(/^[ \t]*/, "", t); c = substr(t, 1, 3) } c == "```" || c == "~~~" { if (f == "") f = c; else if (f == c) f = ""; next } f == "" && /^PMJ-DUST-GATE: ruled [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ { found = 1 } END { exit !found }' \
       || die "the committed docs/risk-policy.md has no line beginning \`PMJ-DUST-GATE: ruled YYYY-MM-DD\` outside a code block — the dust gate is the operator's ruling (PMJ J16)"
@@ -296,7 +315,7 @@ case "${1:-}" in
     echo "pmj-flip: pmj-check on the dust frame's pmj.toml …" >&2
     "$BIN" pmj-check --pmj "$work_pmj" >/dev/null || die "pmj-check refused the dust frame's pmj.toml — nothing was changed"
     echo "pmj-flip: the key check (the wallet, the reads, the pins; at most the \$50 day cap) …" >&2
-    "$REPO_DIR/scripts/pmj-exec.sh" key-check --pmj "$work_pmj" --cap-day-usd-1e6 50000000 \
+    "$REPO_DIR/scripts/pmj-exec.sh" key-check --pmj "$work_pmj" --cap-day-usd-1e6 50000000 --exec "$EXEC" \
       || die "the key check FAILED — nothing was changed"
     cp -p "$CONF" "$CONF.bak-$TS-pmjflip" && cp -p "$EXEC" "$EXEC.bak-$TS-pmjflip" && cp -p "$PMJ" "$PMJ.bak-$TS-pmjflip" \
       || die "backup failed"

@@ -17606,6 +17606,8 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S76 | **PROVISIONAL — Anton to confirm** (the session's choice, J16): the **pilot** frame's day cap is **$1 000** and its open-order bound **4** (`exec_boot` `PMJ_PILOT_CAP_DAY_USD_1E6`, `PMJ_PILOT_MAX_OPEN_ORDERS`); its order, instance and session bounds ($250.01 / $250.01 / −$500) follow slot 9's R-PM-8. Ruled before any `PMJ-LIVE-GATE` line. |
 | R-PMJ-S77 | **PROVISIONAL — Anton to confirm** (the session's choice, J16, risk review M1): **slot 11 arms only alone in its engine** — the engine and the flip refuse a live slot 11 beside any other live slot, because a slot-11 boot refusal aborts the whole engine (the standalone, R-PM-23). |
 | R-PMJ-S78 | **PROVISIONAL — Anton to confirm** (the session's choice, J16, risk review round 2): a **review trigger** found by the daily restart's key check (`pmj-exec` exit 77: the Predict deploy off its pin, the vault table entry or the mint changed, a pinned account closed) **halts the running slot 11** (`slot=11 reason=operator` appended to `exec.HALT`) and pages (`notify-send.sh -l`); every other key-check failure only defers the restart. |
+| R-PMJ-S79 | **PROVISIONAL — Anton to confirm** (the session's choice, J17): the dust battery lands through Jupiter's `POST /execute` only. The second landing path (our own RPC `sendTransaction`) is built only after J0 shows a build arrives already co-signed; if Jupiter co-signs only at `/execute`, it cannot exist. `--path rpc` refuses. |
+| R-PMJ-S80 | **PROVISIONAL — Anton to confirm** (the session's choice, J17, from J0's public tape 2026-10-19): the dust battery's SOL limits — `DUST_SOL_FALL_MAX_LAMPORTS` 6 619 500 a sent order; `guard_max_sol_lamports` ≤ 6 000 000 (a ceiling only; J0 proposes 0); `guard_max_cu_price` ≤ 100 000 µlamports/CU; ≤ 0.15 SOL at a run's start; SOL ≥ `min_sol_lamports` + 6 619 500 before each order. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -18904,6 +18906,174 @@ warnings · `make license-check` OK (802 files, the five new ones staged) ·
 the restart-gate harness 51 / 51 and `zsh -n` on `daily-restart.sh`,
 `pmj-flip.sh`, `pmj-exec.sh`. `make bench-check` not run (`hot_path` links
 no crate J16 changes; under background QoS it is no reading — J14).
+
+### J17 — the dust battery tool (plan-J5): its own interlock, the coexistence checks, the stops, the report (2026-10-29)
+
+**Why.** plan-J5 (R-PMJ-5) measures the keeper delay D and the fill share
+with 40 × $5 live orders on BTC 5 m at τ spread over [3, 30) s, under an
+interlock of its own; W6's re-score (`TJ(D)`) takes D from it. J17 builds
+the tool. **It refuses today:** no `PMJ-DUST-GATE` line exists. It is a
+cold operator verb (`//! COPY-DOCTRINE:`), reachable only from the
+binary's `pmj-dust` arm, never from the engine loop.
+
+- **The verb.** `multivenue-engine pmj-dust --battery <id> --orders N
+  [--dry-run] [--path execute|rpc]`, through `scripts/pmj-dust.sh`. Exit 0;
+  75 stopped; 77 sticky stop; 78 refused. The wrapper refuses a
+  `MULTIVENUE_DIR` other than `$HOME/multivenue`; checks the env file
+  (`MULTIVENUE_ENV_FILE`, absolute, else the repo's `.env`) — not a
+  symlink, a regular file, mode 0600, owned by the user, setting none of
+  `STRATEGY` / `ARM_LIVE` / `EXEC_TOML` / `PMJ_TOML`; and hands the binary
+  only `HOME`, `PATH`, `PMJ_WALLET_KEYFILE`, `PMJ_WALLET_PUBKEY`,
+  `JUP_API_KEY` and `PMJ_SOLANA_RPC`. `pmj-exec.sh` gained the same env-file
+  checks.
+- **Refusals before any secret or socket**, in order: the arguments (battery
+  id grammar, `--orders` 1..=40, `--path rpc`); the build-time dust gate
+  (J16's grammar, tree AND `HEAD`); `MULTIVENUE_DIR`; `strategy.conf`
+  sourced in `zsh -f` with an absolute `EXEC_TOML`; the lock
+  (`~/multivenue/pmj-dust.lock`, never waiting); `pmj-dust.HALT` beside the
+  exec artifact or in `~/multivenue` (an unreadable one stands);
+  `exec.HALT` naming 11 or unreadable, in either place; slot 11 live on the
+  host (`ARM_LIVE`, any `exec*.toml` — literal strings and spaced headers
+  included —, `/state` + `/metrics` on 127.0.0.1:9191); the guard keys
+  reviewed and `guard_program_slot` pinned; the R-PMJ-S80 ceilings; the
+  offline self-test; the ledger (the battery's 40, today's $50); **the
+  chain half of `pmj-exec --key-check` once a run** (a review trigger writes
+  the halt in both places and exits 77; anything else 78). Then the
+  secrets, J16's way. Requirement (a) at $50 and the SOL limits below; an
+  orphan reconcile; a positions read (an unknown position stops sticky).
+- **The interlock — constants no configuration widens:** $5 a deposit; $50
+  of reservations a UTC day (`DUST_DAY_CAP_MICRO`, const-asserted equal to
+  `PMJ_DUST_CAP_DAY_USD_1E6`; `UNSENT`, `IN_DOUBT` and `ORPHAN` rows count);
+  40 per battery id (ids are free, so the day cap binds the total); BTC
+  5 m only (the request and the answer's `marketId`; the signed bytes bind
+  only the server's `marketIdHash` until requirement (d)); one order a
+  window; τ in nine 3 s cells over [3, 30) s, cycled on reservations, with
+  seeded jitter; the favourite's ask in [0.85, 0.98], limit min(ask + 0.02,
+  0.99); **jup-gw's LATE rule** — an order is dropped unsigned when its send
+  would come within 1 s of the close or more than 15 s after the scheduled
+  decision, checked before the reservation and again after its fsyncs, just
+  before signing; a run ≤ 2 h, no order starting whose deadline plus the
+  41 s worst-case tail would pass it.
+- **The ledger** (`~/multivenue/pmj-dust-ledger.tsv`, whatever `EXEC_TOML`
+  says): each `RESERVED` row is written and fsynced before the signature (a
+  test holds the signer to it); `DONE` / `UNSENT` / `IN_DOUBT` / `ORPHAN`
+  close it; a ledger that does not parse refuses the run; deleting it
+  resets the day cap — the operator's act. Per host, not per wallet.
+- **LAW PMJ-G.** The build passes `check_build` — jup-gw's private
+  `prepare`, its answer checks line for line and in order — then
+  `guard_order` with jup-gw's `OrderAsk` (the constant deposit, the limit,
+  the answer's order, position and market keys, `contractsMicro`) and the
+  reviewed `pmj.toml` keys; the bytes guarded are the bytes signed. Three
+  differences, all at least as strict: a non-200 is an ordinary failure
+  (jup-gw halts on region and auth); a hostile answer is a sticky stop (a
+  plain refusal in jup-gw); jup-gw's pre-build checks are replaced by the
+  dust constants and the dust's own debit check. The co-signer is honoured
+  only when pinned (R-PMJ-S44). J15's residuals stand (CPI trust,
+  requirement (d), the first positions page, positions by key).
+- **Path B (our own RPC `sendTransaction`) is refused** (R-PMJ-S79,
+  PROVISIONAL): J0 has not shown whether Jupiter's build arrives co-signed;
+  if it co-signs only at `/execute`, path B cannot exist.
+- **Stops.** **Sticky (77; `pmj-dust.HALT` written in both places; nothing
+  signs while it stands — the engine's pre-boot and `pmj-flip.sh live`
+  refuse too):** a hostile build or guard refusal (unsigned); an order not
+  terminal by close + 30 s (`IN_DOUBT`: it may still land until 300 s after
+  its execute); an implausible fill (more contracts than signed, an average
+  ≤ 0 or ≥ 1, or above the limit — the arm's `over_limit` law); the debit
+  check (the deposit mint falling more than the deposit + 1 % across an
+  order, or 1 % with none in flight, or no after-read in 3 tries); the SOL
+  check (a fall above `DUST_SOL_FALL_MAX_LAMPORTS` on a sent order, any fall
+  with none sent); an unknown position; `exec.HALT` naming 11 or a dust
+  halt appearing mid-run; slot 11 live on the host; an unreconcilable
+  orphan; a review trigger. **Not sticky (75):** 3 failures in a row (a
+  build, a discovery fetch, a balance read before the decision, an
+  unreadable `/state`, a late send, an execute that never left); the day
+  cap; the 40; the 2 h bound; SOL under one order's allowance; a failed
+  positions read after an order. **Clearing a sticky stop:** check the
+  wallet's orders, positions and balances against the record, wait 300 s
+  past an in-doubt execute, then remove the file.
+- **The SOL limits (R-PMJ-S80, PROVISIONAL, from J0's public tape
+  2026-10-19: a create-order took 5 869 500 lamports, 27 500 fees and the
+  rest rent by CPI; 4 155 440 came back at close):**
+  `DUST_SOL_FALL_MAX_LAMPORTS` 6 619 500 (5 869 500 + 600 000 margin, under
+  the smallest extra account's 890 880 + 2 signatures × 5 000 + 100 000 ×
+  1.4 M / 1e6); `guard_max_sol_lamports` a ceiling only (0..=6 000 000; J0
+  proposes 0 — the guard admits no top-level System instruction in an
+  order); `guard_max_cu_price` ≤ 100 000 µlamports/CU (J0: 50 000 on every
+  create-order); SOL at a run's start ≤ 0.15 SOL; before each order SOL ≥
+  `min_sol_lamports` + 6 619 500, else stop 75. Fund `min_sol_lamports` + n
+  × 6 619 500 for n orders, at most 0.15 SOL.
+- **Coexistence with the engine (one trader per wallet).** The battery
+  refuses while slot 11 is live on the host; the engine's pre-boot and the
+  flip refuse while `pmj-dust.HALT` stands or the lock is held; the engine
+  refuses a live slot 11 with `HOME` unset or empty. **Arming after a
+  battery:** let every order end and claim or let settle every position —
+  `pmj-exec --key-check` (the flip and the daily gate run it) now refuses 78
+  on any wallet position `pmj-held.state` does not hold, read twice 10 s
+  apart (only a position unheld in both reads refuses; one seen only in the
+  second read passes as the engine's own order in flight) — or use a fresh
+  wallet. Persistent 78s: a full held table (32 legs), positions past the
+  first page. Not seen: other `$HOME`s, other hosts, other ports. The dust
+  day cap and slot 11's exec day cap are separate ledgers.
+- **Records** (`~/multivenue/research/pmj/dust/<battery>.jsonl`, directory
+  0700, files 0600, fsynced per line, outside git): per order the τ cell,
+  `t_decision`, the build, guard-done, sign, send and execute-answer times,
+  the tool's overhead (flagged above 2 s), every status poll's raw answer
+  (bounded), the terminal numbers and raw fee fields, the keys, the book
+  series (250 ms, decision − 1 s to + 10 s), the balances. No secret, no
+  signed transaction (only our signature). **Claims are never sent;** the
+  end lists claimable positions, read-only.
+- **The report** (vault, `docs/research/pmj/dust/dust_report.py`, never
+  git): matches each fill to the keeper's print on Polymarket's public
+  data-api tape by J0's Q7 rules (the keeper wallet J0 matched 13 of 13 to;
+  price = `avgFillPriceUsd` within 0.0005; the earliest print in [execute −
+  3 s, fill event + 3 s]); D = print second + 0.5 − decision (W6's
+  convention); three D files — raw, net and **`d_measured_eng` (raw minus
+  the tool's own work between the guard and the send), which feeds W6**,
+  raw as the conservative check; overhead-flagged orders left out; the fill
+  share over orders sent and terminal; X from the fill event's fee first;
+  a loud warning above 50 % unprinted (the J0 facts it assumes may be
+  wrong). D includes the host's clock offset: NTP-synced hosts only.
+- **Open before the dust line:** J16's list; R-PMJ-S79 and S80; the J0
+  facts the report assumes (the keeper wallet, print price = fill price, the
+  fee field); `daily-restart.sh`'s arming parser is narrower than the
+  battery's (`'live'` literal strings, spaced headers) — open; the real
+  `.env` must be 0600 and set no strategy switch, or `pmj-exec.sh` refuses.
+- **Risk review** (an Opus subagent at xhigh, read-only): round 1
+  **BLOCK** — M1 the environment could move the ledger, the sticky halt and
+  the halt watch; M2 the review triggers not re-read before signing; M3 the
+  engine and the flip ignored the dust's halt and lock, and its positions
+  would halt the engine; M4 no stop on an over-limit fill; minors (a
+  fail-open halt read, the 2 h tail, SOL unchecked, the tool's overhead in
+  D, the report's match window) → fixed; round 2 **NEEDS-DOCS** (late sends
+  after the close; the SOL bound tied to the guard key; SOL run-out; the
+  ledger following `EXEC_TOML`; tests reading the real `~/multivenue`;
+  unheld-position re-read) → fixed; round 3 **NEEDS-DOCS** (code approved;
+  NITs: `HOME` unset in the engine, the env-file path instead of the EC2
+  kit's hard link) → fixed; this section.
+
+J17-GATES (2026-10-29, on the Mac, detached, every cargo under `taskpolicy
+-b` unless noted; the release binary untouched). The battery, 19:56–20:03Z,
+at the round-3 tree: `make lint` rc 0, 0 warnings · `cargo nextest run
+--workspace` 5 271 passed, 3 failed, 10 skipped — the reds
+(`exec-hyperliquid` `shutdown_sweeps_then_clears_the_switch`,
+`exec-binance::bn_equity_e2e` `the_cut_past_the_sixth_decimal_is_never_drift`,
+gate 103) are wall-clock tests in crates J17 does not touch, on the
+background-QoS E-cores; all three pass at normal QoS (20:24Z, 3 / 3) ·
+`make alloc-assert` 139 passed at 0 B (no fresh `Compiling bench`: `bench`
+depends on no crate J17 changes — `cli` is not among them — and its last
+fresh build was J16's) · `make copy-audit` new 0. After round 4 (the
+env-file path, the `HOME` refusal): `cargo clippy -p cli --all-targets` rc
+0 · `cargo test -p cli --lib -- pmj` 89 passed · `--bin multivenue-engine`
+7 passed · `cargo nextest run -p cli -p exec-jupiter` 862 passed, 6
+skipped · `make copy-audit` new 0 · `zsh -n` on `pmj-dust.sh`,
+`pmj-exec.sh`, `pmj-flip.sh` · `make license-check` OK (805 files, J17's
+three new ones staged) · the report's self-test PASS (48 checks, offline).
+Linux x86_64 (the cloud container, Intel Xeon, `-C target-cpu=native`,
+the round-2 tree): `cargo build --release -p cli` OK; `cargo test` on
+`cli`, `exec-jupiter`, `signer-ed25519`, `core-config`, `core-net`,
+`exec-router` 1 579 passed; the alloc gates 139 at 0 B; `pmj-exec
+--self-test` PASS. No fuzz target touched; `make bench-check` not run
+(`hot_path` links no crate J17 changes).
 
 ## NOTIFY — N-DOCTRINE: the one-way Telegram notifier (2026-10-24)
 
