@@ -891,6 +891,7 @@ dependencies = [
  "core-types",
  "exec-gateway",
  "ingress-polymarket",
+ "proptest",
  "signer-ed25519",
  "zeroize",
 ]

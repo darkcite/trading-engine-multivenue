@@ -21300,16 +21300,116 @@ fn pm5_ingress_driver_is_zero_alloc() {
     assert_eq!(allocs, 0, "gate 133: the 5 m ingress driver allocated {allocs} times ({bytes} B)");
 }
 
+/// The PMJ W5 gate fixture: a v0 `create_order2` Limit buy of $5 at
+/// 0.95 by `wallet`, its vault loaded through table `[0x88; 32]`'s entry 1
+/// — unsigned, or with `cosigner` as the read-only second signer, its slot
+/// signed over the message. Boot-time (allocates).
+fn pmj_create_order2_tx(wallet: [u8; 32], cosigner: Option<&signer_ed25519::Ed25519Signer>) -> Vec<u8> {
+    use exec_jupiter::tx::{ATA_PROGRAM, DISC_CREATE_ORDER2, SYSTEM_PROGRAM, TOKEN_PROGRAM};
+    let jup = [0x66u8; 32];
+    let mut keys: Vec<[u8; 32]> = vec![wallet];
+    if let Some(c) = cosigner {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(c.public_key());
+        keys.push(k);
+    }
+    let n_sig = keys.len();
+    // The deposit account, the position (the answer's `[0x0B; 32]`), the
+    // order (the answer's `[0x0A; 32]`), the escrow.
+    keys.extend_from_slice(&[[0x33; 32], [0x0B; 32], [0x0A; 32], [0x73; 32]]);
+    let ro: Vec<[u8; 32]> = if cosigner.is_some() {
+        vec![[0x55; 32], [0x74; 32], jup, TOKEN_PROGRAM, ATA_PROGRAM, SYSTEM_PROGRAM]
+    } else {
+        vec![[0x55; 32], [0x74; 32], [0x75; 32], jup, TOKEN_PROGRAM, ATA_PROGRAM, SYSTEM_PROGRAM]
+    };
+    let n_ro = ro.len();
+    keys.extend_from_slice(&ro);
+    let at = |k: [u8; 32]| keys.iter().position(|x| *x == k).expect("named") as u8;
+    let authority = if cosigner.is_some() { 1 } else { at([0x75; 32]) };
+    // The vault: the first address the table loads (index n_keys).
+    let vault = keys.len() as u8;
+    let accounts = [
+        0,
+        0,
+        authority,
+        vault,
+        at([0x0B; 32]),
+        at([0x0A; 32]),
+        at([0x74; 32]),
+        at([0x33; 32]),
+        at([0x55; 32]),
+        at([0x73; 32]),
+        at(TOKEN_PROGRAM),
+        at(ATA_PROGRAM),
+        at(SYSTEM_PROGRAM),
+    ];
+    let mut data = DISC_CREATE_ORDER2.to_vec();
+    for _ in 0..2 {
+        data.extend_from_slice(&32u32.to_le_bytes());
+        data.extend_from_slice(b"ad44626a542bdd650466f1c527f02905");
+    }
+    data.extend_from_slice(&[1, 1]);
+    data.extend_from_slice(&5_263_157u64.to_le_bytes());
+    data.extend_from_slice(&950_000u64.to_le_bytes());
+    data.extend_from_slice(&5_000_000u64.to_le_bytes());
+    data.extend_from_slice(&[1, 0, 0]);
+    let mut msg = vec![0x80u8, n_sig as u8, (n_sig - 1) as u8, n_ro as u8, keys.len() as u8];
+    for k in &keys {
+        msg.extend_from_slice(k);
+    }
+    msg.extend_from_slice(&[0xBB; 32]);
+    msg.extend_from_slice(&[1, at(jup), accounts.len() as u8]);
+    msg.extend_from_slice(&accounts);
+    msg.push(data.len() as u8);
+    msg.extend_from_slice(&data);
+    msg.push(1);
+    msg.extend_from_slice(&[0x88; 32]);
+    msg.extend_from_slice(&[0, 1, 1]);
+    let mut raw = vec![n_sig as u8];
+    raw.resize(1 + 64 * n_sig, 0);
+    if let Some(c) = cosigner {
+        let mut sig = [0u8; 64];
+        c.sign_raw(&msg, &mut sig);
+        raw[65..129].copy_from_slice(&sig);
+    }
+    raw.extend_from_slice(&msg);
+    raw
+}
+
+/// The PMJ W5 gate guard over [`pmj_create_order2_tx`]: Jupiter `[0x66; 32]`
+/// and Token allowed, the table, the deposit account and mint, the vault
+/// pinned at the table's entry 1.
+fn pmj_w5_guard(wallet: [u8; 32]) -> exec_jupiter::tx::TxGuard {
+    use exec_jupiter::tx::{TxGuard, TOKEN_PROGRAM};
+    let mut g = TxGuard::refuse_all(wallet);
+    assert!(g.allow_program([0x66; 32]) && g.allow_program(TOKEN_PROGRAM));
+    assert!(g.allow_alt([0x88; 32]));
+    g.deposit_account = [0x33; 32];
+    g.deposit_mint = [0x55; 32];
+    g.predict_program = [0x66; 32];
+    g.vault = [0x77; 32];
+    g.vault_alt = [0x88; 32];
+    g.vault_alt_entry = 1;
+    g
+}
+
 /// PMJ J3 gate 134: the slot-11 arm's per-order work that is not I/O, at
 /// 0 B — the build answer scanned in place, the transaction base64-decoded
 /// into its fixed buffer, parsed, GUARDED, signed into its own slot, the
 /// execute body rendered (the signed transaction encoded straight into it,
 /// the context carried back), and the status and execute answers scanned.
+/// PMJ W5: the ORDER guard over a v0 `create_order2` (the create-order read
+/// in place, its roles, the vault resolved through its table entry), the
+/// same with a pinned co-signer whose signature is VERIFIED, the build body
+/// with its `build_extra` members, and the status answer's fill numbers.
 #[test]
 fn jupiter_guard_sign_and_scanners_are_zero_alloc() {
     use exec_jupiter::json::{scan_build, scan_execute, scan_status, BuildAnswer, ExecuteAnswer, StatusAnswer};
-    use exec_jupiter::render::{execute_body, order_body, status_path, Outcome, EXECUTE_BODY_MAX, ORDER_BODY_MAX, PATH_MAX};
-    use exec_jupiter::tx::{guard, SolTx, TxGuard, TOKEN_PROGRAM, TX_MAX};
+    use exec_jupiter::render::{execute_body, order_body, status_path, BuildExtra, Outcome, EXECUTE_BODY_MAX, ORDER_BODY_MAX, PATH_MAX};
+    use exec_jupiter::tx::{
+        guard, guard_claim, guard_order, OrderAsk, SolTx, TxGuard, ATA_PROGRAM, COMPUTE_BUDGET_PROGRAM,
+        PREDICT_PROGRAM, TOKEN_PROGRAM, TX_MAX,
+    };
 
     // Boot: the wallet (RFC 8032 TEST 1), a v0 order transaction it pays
     // for with one TransferChecked of the deposit, its build answer.
@@ -21341,12 +21441,52 @@ fn jupiter_guard_sign_and_scanners_are_zero_alloc() {
         r#"{{"transaction":"{}","txMeta":{{"blockhash":"x","lastValidBlockHeight":9}},"externalOrderId":null,"requiredSigners":["FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z"],"execution":{{"endpoint":"/execute","context":{{"type":"create_order","orderPubkey":"Ord1111"}}}},"order":{{"orderPubkey":"Ord1111","positionPubkey":"Pos2222","maxBuyPriceUsd":"960000","estimatedTotalFeeUsd":"35000","orderCostUsd":"5000000","contractsMicro":"5263157"}}}}"#,
         std::str::from_utf8(&b64[..n]).unwrap()
     );
-    let status = br#"{"orderPubkey":"Ord1111","status":"filled","latestEventType":"filled","latestSignature":"s","externalOrderId":"","orderId":"o","history":[]}"#;
+    let status = br#"{"orderPubkey":"Ord1111","status":"closed","latestEventType":"order_closed","latestSignature":"s","externalOrderId":"","orderId":"o","history":[{"eventType":"order_created","status":"pending","timestamp":1},{"eventType":"order_filled","status":"filled","filledContractsMicro":"5263157","avgFillPriceUsd":"950000","timestamp":2}]}"#;
     let exec = br#"{"status":"Success","signature":"5h6xBEauJ3PK6SWCZ1PGjBvj8vDdWG3KpwATGy1ARAXFSDwt8GFXM7W5Ncn16wmqokgpiKRLuS83KUxyZyv2sUYv","error":null}"#;
     let mut g = TxGuard::refuse_all(v.public);
     assert!(g.allow_program(jup) && g.allow_program(TOKEN_PROGRAM));
     g.deposit_account = [0x33; 32];
     g.deposit_mint = [0x55; 32];
+    // PMJ W5: the create-order transactions, the order guards, the extras.
+    let cos = signer_ed25519::Ed25519Signer::from_seed(&signer_ed25519::RFC8032[1].seed).expect("gate 134 co-signer");
+    let create = pmj_create_order2_tx(v.public, None);
+    let cosigned = pmj_create_order2_tx(v.public, Some(&cos));
+    let gw5 = pmj_w5_guard(v.public);
+    let mut gp = gw5;
+    gp.cosigner = signer_ed25519::RFC8032[1].public;
+    gp.has_cosigner = true;
+    let ask = OrderAsk {
+        deposit: 5_000_000,
+        limit_micro: 960_000,
+        order: [0x0A; 32],
+        position: [0x0B; 32],
+        market_hash: b"ad44626a542bdd650466f1c527f02905",
+        contracts: 5_263_157,
+    };
+    // The public claim_payout2 (exec-jupiter's fixture) under its owner's
+    // guard: the claim guard, its ATA instruction admitted.
+    let key = |s: &str| {
+        let mut k = [0u8; 32];
+        assert!(matches!(core_crypto::base58_decode(s.as_bytes(), &mut k), Ok(32)), "{s}");
+        k
+    };
+    let mut claim = vec![0u8; TX_MAX];
+    let cn = core_crypto::base64_decode(
+        include_str!("../../exec-jupiter/tests/fixtures/claim-payout2.b64").trim().as_bytes(),
+        &mut claim,
+    )
+    .expect("gate 134: the claim fixture");
+    claim.truncate(cn);
+    let mut gc = TxGuard::refuse_all(key("5wzHj5BRhsViwc79VUtPv1DpAbafkFnYLc81hK2AT2be"));
+    assert!(gc.allow_program(COMPUTE_BUDGET_PROGRAM) && gc.allow_program(ATA_PROGRAM) && gc.allow_program(PREDICT_PROGRAM));
+    gc.max_cu_price = 400_000;
+    gc.deposit_account = key("911cuEbXmZxEhb2aCVNmukJiiKAftyn8MaYcickGZy5y");
+    gc.deposit_mint = key("JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD");
+    gc.vault = key("2y9Ad2GD7gwiMkkMu4bBK5216Pv9YJsBkSHAGwN3rBuJ");
+    let mut extra = BuildExtra::NONE;
+    extra.push(b"orderType:limit").expect("extra");
+    extra.push(b"limitPriceUsd:{limit_usd}").expect("extra");
+    extra.push(b"limitPriceMicro:{limit_micro}").expect("extra");
     let mut txbuf = [0u8; TX_MAX];
     let mut body = vec![0u8; EXECUTE_BODY_MAX];
     let mut obody = [0u8; ORDER_BODY_MAX];
@@ -21356,7 +21496,15 @@ fn jupiter_guard_sign_and_scanners_are_zero_alloc() {
     let guard_ = AllocGuard::new();
     let mut i = 0u64;
     while i < 2_000 {
-        let on = order_body(&mut obody, b"FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z", 5_798_888 + i, Outcome::Up, 5_000_000, b"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").expect("order body");
+        let on = order_body(&mut obody, b"FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z", 5_798_888 + i, Outcome::Up, 5_000_000, b"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", &extra, 950_000 + i).expect("order body");
+        let t5 = SolTx::parse(&create).expect("gate 134: the create-order parses");
+        let (p5, v5) = guard_order(&create, &t5, &gw5, &ask).expect("gate 134: the order guard passes");
+        let t6 = SolTx::parse(&cosigned).expect("gate 134: the co-signed create-order parses");
+        let (p6, _) = guard_order(&cosigned, &t6, &gp, &ask).expect("gate 134: the co-signature verifies");
+        let tc = SolTx::parse(&claim).expect("gate 134: the public claim parses");
+        let pc = guard_claim(&claim, &tc, &gc).expect("gate 134: the claim guard passes");
+        acc = acc.wrapping_add(u64::from(pc.signer_idx) + 1);
+        acc = acc.wrapping_add(v5.contracts + u64::from(p5.signer_idx) + u64::from(p6.signer_idx));
         let mut a = BuildAnswer::default();
         scan_build(answer.as_bytes(), &mut a).expect("build answer");
         let tn = core_crypto::base64_decode(a.transaction.of(answer.as_bytes()), &mut txbuf).expect("b64");
@@ -21369,7 +21517,8 @@ fn jupiter_guard_sign_and_scanners_are_zero_alloc() {
         scan_execute(exec, &mut e).expect("execute answer");
         let mut s = StatusAnswer::default();
         scan_status(status, &mut s).expect("status answer");
-        acc = acc.wrapping_add((on + en + pn) as u64 + p.token_debit + u64::from(txbuf[1]));
+        let filled = s.record().expect("gate 134: the status answer's fill numbers").filled_micro;
+        acc = acc.wrapping_add((on + en + pn) as u64 + p.token_debit + u64::from(txbuf[1]) + filled);
         i += 1;
     }
     std::hint::black_box(acc);
@@ -21385,6 +21534,10 @@ fn jupiter_guard_sign_and_scanners_are_zero_alloc() {
 /// reconciled by jup-gw against a scripted Jupiter answering from fixed
 /// buffers, its fill and its retirement back on the engine thread. The
 /// arm keeps a done row 120 s, so the run is 3 warm orders and 12 measured.
+/// PMJ W5: the build body with a `build_extra` member, the ORDER guard over
+/// a v0 `create_order2`, recon by the order's pubkey (the status answer,
+/// then the open-order page), and the debit halt — a balance read with the
+/// order in flight (the check) and one once quiet (the re-anchor).
 #[test]
 fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
     use clob_dispatcher::OrderDispatch;
@@ -21394,8 +21547,8 @@ fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
     use exec_jupiter::arm::{JupArm, JupArmCfg};
     use exec_jupiter::client::JupClient;
     use exec_jupiter::cmd::{JupEvent, JupIntent, JUP_CMD_RING, JUP_EVT_RING};
-    use exec_jupiter::gw::{JupGateway, JupGwCfg, BODY_MIN, MIN_LEAD_NS_DEFAULT, POLL_EVERY_NS};
-    use exec_jupiter::tx::{TxGuard, TOKEN_PROGRAM};
+    use exec_jupiter::gw::{JupGateway, JupGwCfg, BODY_MIN, DEBIT_SETTLE_NS, MIN_LEAD_NS_DEFAULT, POLL_EVERY_NS};
+    use exec_jupiter::render::BuildExtra;
     use ingress_polymarket::gamma15::PmWindowSpec;
     use ingress_polymarket::pm15_loop::PM15_SPEC_RING;
 
@@ -21406,6 +21559,7 @@ fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
         exec: Vec<u8>,
         status: Vec<u8>,
         page: Vec<u8>,
+        balances: Vec<u8>,
     }
     impl JupClient for FixedJup {
         fn body_mut(&mut self) -> &mut [u8] {
@@ -21424,6 +21578,8 @@ fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
                 &self.exec
             } else if target.starts_with(b"/prediction/v1/orders/status/") {
                 &self.status
+            } else if target.starts_with(b"/ultra/v1/balances/") {
+                &self.balances
             } else {
                 &self.page
             };
@@ -21435,30 +21591,12 @@ fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
         }
     }
 
-    // Boot: the wallet (RFC 8032 TEST 1), gate 134's v0 order transaction,
-    // its build answer, the execute / status / recon answers.
+    // Boot: the wallet (RFC 8032 TEST 1), the W5 v0 create_order2 (a
+    // Limit buy of $5 at 0.95, the vault loaded through its table), its
+    // build answer, the execute / status / recon / balances answers.
     let v = &signer_ed25519::RFC8032[0];
     let signer = signer_ed25519::Ed25519Signer::from_seed(&v.seed).expect("gate 135 key");
-    let jup = [0x66u8; 32];
-    let mut msg = vec![0x80u8, 1, 0, 3, 6];
-    msg.extend_from_slice(&v.public);
-    msg.extend_from_slice(&[0x33; 32]);
-    msg.extend_from_slice(&[0x44; 32]);
-    msg.extend_from_slice(&[0x55; 32]);
-    msg.extend_from_slice(&jup);
-    msg.extend_from_slice(&TOKEN_PROGRAM);
-    msg.extend_from_slice(&[0xBB; 32]);
-    msg.push(2);
-    msg.extend_from_slice(&[4, 4, 0, 1, 2, 3, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
-    let mut data = vec![12u8];
-    data.extend_from_slice(&5_000_000u64.to_le_bytes());
-    data.push(6);
-    msg.extend_from_slice(&[5, 4, 1, 3, 2, 0, data.len() as u8]);
-    msg.extend_from_slice(&data);
-    msg.push(0);
-    let mut unsigned = vec![1u8];
-    unsigned.extend_from_slice(&[0u8; 64]);
-    unsigned.extend_from_slice(&msg);
+    let unsigned = pmj_create_order2_tx(v.public, None);
     let b58 = |k: &[u8; 32]| {
         let mut o = [0u8; 44];
         let n = core_crypto::base58_encode(k, &mut o).unwrap();
@@ -21468,13 +21606,14 @@ fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
     let n = core_crypto::base64_encode(&unsigned, &mut b64);
     let (wallet, order, position) = (b58(&v.public), b58(&[0x0A; 32]), b58(&[0x0B; 32]));
     let build = format!(
-        r#"{{"transaction":"{}","txMeta":{{"blockhash":"x","lastValidBlockHeight":9}},"requiredSigners":["{wallet}"],"execution":{{"endpoint":"/execute","context":{{"type":"create_order","orderPubkey":"{order}"}}}},"order":{{"orderPubkey":"{order}","positionPubkey":"{position}","marketId":"POLY-5798888-1","isYes":true,"isBuy":true,"userPubkey":"{wallet}","maxBuyPriceUsd":"950000","estimatedTotalFeeUsd":"35000","orderCostUsd":"5000000","contractsMicro":"5263158"}}}}"#,
+        r#"{{"transaction":"{}","txMeta":{{"blockhash":"x","lastValidBlockHeight":9}},"requiredSigners":["{wallet}"],"execution":{{"endpoint":"/execute","context":{{"type":"create_order","orderPubkey":"{order}"}}}},"order":{{"orderPubkey":"{order}","positionPubkey":"{position}","marketId":"POLY-5798888-1","marketIdHash":"ad44626a542bdd650466f1c527f02905","isYes":true,"isBuy":true,"userPubkey":"{wallet}","maxBuyPriceUsd":"950000","estimatedTotalFeeUsd":"35000","orderCostUsd":"5000000","contractsMicro":"5263157"}}}}"#,
         std::str::from_utf8(&b64[..n]).unwrap()
     );
     let status = format!(r#"{{"orderPubkey":"{order}","status":"filled","latestEventType":"filled","history":[]}}"#);
     let page = format!(
         r#"{{"data":[{{"pubkey":"{order}","status":"filled","filledContracts":"5.263158","avgFillPriceUsd":"950000","settled":false}}],"pagination":{{"hasNext":false}}}}"#
     );
+    let balances = format!(r#"{{"SOL":{{"amount":"50000000"}},"{}":{{"amount":"1000000000"}}}}"#, b58(&[0x55; 32]));
     let client = FixedJup {
         body: vec![0u8; BODY_MIN],
         resp: vec![0u8; 8_192],
@@ -21482,22 +21621,26 @@ fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
         exec: br#"{"status":"Success","signature":"5h6x","error":null}"#.to_vec(),
         status: status.into_bytes(),
         page: page.into_bytes(),
+        balances: balances.into_bytes(),
     };
-    let mut g = TxGuard::refuse_all(v.public);
-    assert!(g.allow_program(jup) && g.allow_program(TOKEN_PROGRAM));
-    g.deposit_account = [0x33; 32];
-    g.deposit_mint = [0x55; 32];
+    let mut extra = BuildExtra::NONE;
+    extra.push(b"limitPriceUsd:{limit_usd}").expect("extra");
     let (eng, gwe) = exec_gateway::duplex::<JupIntent, JupEvent, JUP_CMD_RING, JUP_EVT_RING>();
     let (mut specs, specs_rx) = Ring::<PmWindowSpec, PM15_SPEC_RING>::new().split();
     let cfg = JupGwCfg {
         wallet: v.public,
         usdc_mint: [0x55; 32],
-        guard: g,
+        guard: pmj_w5_guard(v.public),
         max_order_micro: 50_000_000,
         min_lead_ns: MIN_LEAD_NS_DEFAULT,
+        build_extra: extra,
     };
     let mut gw = JupGateway::new(cfg, client, gwe, specs_rx, signer, b"gate-135-key").expect("jup-gw");
+    // The debit halt's reference: one quiet balance read before any order.
+    gw.set_idle_schedule(0, u64::MAX);
+    assert!(gw.step(0, 0));
     gw.set_idle_schedule(u64::MAX, u64::MAX);
+    assert_eq!(gw.debit_state(), (1_000_000_000, 0), "gate 135: the reference");
     let window = 5_974_360u32;
     let inst = pm5_instance_id(window, 0).unwrap();
     let mut spec = PmWindowSpec::EMPTY;
@@ -21532,10 +21675,20 @@ fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
         );
         o.strategy_id = 11;
         arm.submit(&o).expect("admitted");
+        // Built, guarded, signed, executed: landed.
         gw.step(*now, wall);
+        // The debit check, the order in flight.
+        gw.set_idle_schedule(*now + 1, u64::MAX);
+        gw.step(*now + 1, wall);
+        // The poll: filled, its numbers not in the answer → recon.
         gw.step(*now + POLL_EVERY_NS, wall);
+        // Recon: the status first, then the open-order page → FILL, DONE.
         gw.step(*now + POLL_EVERY_NS + 1, wall);
-        *now += 2 * POLL_EVERY_NS;
+        // Quiet: the reference re-anchors.
+        gw.set_idle_schedule(*now + DEBIT_SETTLE_NS + 2, u64::MAX);
+        gw.step(*now + DEBIT_SETTLE_NS + 2, wall);
+        gw.set_idle_schedule(u64::MAX, u64::MAX);
+        *now += DEBIT_SETTLE_NS + 4;
         while let Some(f) = arm.try_next_fill() {
             *fills += f.qty.raw() as u64;
         }
@@ -21560,6 +21713,8 @@ fn jupiter_gateway_and_arm_steady_state_is_zero_alloc() {
     let (allocs, bytes, _) = guard_.delta();
     let c = gw.counters();
     assert_eq!((c.landed, c.fills, c.done, c.refused), (15, 15, 15, 0), "gate 135: every order landed, filled, done");
+    assert_eq!((c.balance_reads, c.debit_halts, c.recon_misses), (1 + 2 * 15, 0, 0), "gate 135: checked and re-anchored, no halt");
+    assert_eq!(gw.debit_state(), (1_000_000_000, 0), "gate 135: re-anchored once quiet");
     assert_eq!(fills, 15 * 5_263_158, "gate 135: every fill booked");
     assert_eq!(retired, 15, "gate 135: every order retired");
     assert_eq!(allocs, 0, "gate 135: jup-gw and the arm allocated {allocs} times ({bytes} B)");

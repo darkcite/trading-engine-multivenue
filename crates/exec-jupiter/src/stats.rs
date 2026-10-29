@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicI64, Ordering};
 pub const PUBLISH_EVERY_NS: u64 = 1_000_000_000;
 
 /// The arm's words.
-pub const ARM_WORDS: usize = 20;
+pub const ARM_WORDS: usize = 21;
 /// The arm's names, in word order (the last five are levels).
 pub const ARM_NAMES: [&str; ARM_WORDS] = [
     "submitted",
@@ -46,6 +46,7 @@ pub const ARM_NAMES: [&str; ARM_WORDS] = [
     "legs_lost",
     "claims_ready",
     "out_full",
+    "over_limit",
     "halted",
     "reconciled",
     "worth_usd_1e6",
@@ -54,9 +55,10 @@ pub const ARM_NAMES: [&str; ARM_WORDS] = [
 ];
 
 /// jup-gw's words.
-pub const GW_WORDS: usize = 31;
-/// jup-gw's names, in word order (the last three are levels: the halt
-/// reason, the USDC and SOL gauges; -1 = not read).
+pub const GW_WORDS: usize = 36;
+/// jup-gw's names, in word order (the last five are levels: the halt
+/// reason, the USDC and SOL gauges, -1 = not read; the debit halt's
+/// reference, -1 = none yet, and the deposits sent since it).
 pub const GW_NAMES: [&str; GW_WORDS] = [
     "specs",
     "specs_refused",
@@ -86,9 +88,14 @@ pub const GW_NAMES: [&str; GW_WORDS] = [
     "claims_refused",
     "held_writes",
     "held_full",
+    "debit_halts",
+    "released",
+    "unknown_positions",
     "halt_reason",
     "usdc_micro",
     "sol_lamports",
+    "debit_ref_micro",
+    "debit_allow_micro",
 ];
 
 #[repr(C, align(64))]

@@ -21,7 +21,23 @@
 //!   `guard_max_sol_lamports`, `guard_max_cu_price`: base58 keys kept as
 //!   text here (checked for the alphabet and length) and decoded by the
 //!   live arm's boot (J5). **Empty lists refuse every transaction** — the
-//!   default until J0's decoded programs and tables are reviewed in.
+//!   default until J0's decoded programs and tables are reviewed in;
+//! - **the create-order guard's pins** (PMJ W5, `exec_jupiter::tx::guard_order`)
+//!   — `guard_vault`, the vault every order and claim must name (absent =
+//!   none: every one refused), and `guard_vault_alt` = `"<table>:<entry>"`,
+//!   the lookup-table entry that loads it (absent = the vault must be a
+//!   static key; the table must be one of `guard_alts`);
+//! - **`guard_cosigners`** — the DRAFT co-signer amendment (R-PMJ-S44,
+//!   vault `pmj-g-amendment-draft.md`): at most one pinned read-only
+//!   co-signer. **Absent or empty = LAW PMJ-G as written (exactly one
+//!   signature, ours)**, and it stays empty in every committed config: the
+//!   amendment becomes law only after Anton's own J0 build confirms the
+//!   co-signer and he rules;
+//! - **`build_extra`** (PMJ W5) — at most four `"name:value"` members the
+//!   order build's body carries (J0's limit-order request field), the
+//!   value a literal `[A-Za-z0-9_.]{1,32}` or exactly `{limit_micro}` /
+//!   `{limit_usd}` (the member's limit). Absent = today's body; the guard
+//!   is the law whatever the request says.
 
 use crate::bin15::{int, opt_int, pos_u64, strs, table};
 use crate::icdp::{parse_single_section, Value};
@@ -58,6 +74,24 @@ pub const PMJ_SIZING_SLACK_1E6: i64 = 10_000;
 pub const PMJ_GUARD_PROGRAMS_MAX: usize = 16;
 /// See [`PMJ_GUARD_PROGRAMS_MAX`].
 pub const PMJ_GUARD_ALTS_MAX: usize = 8;
+/// Co-signers the dormant amendment may pin (R-PMJ-S44): one.
+pub const PMJ_GUARD_COSIGNERS_MAX: usize = 1;
+/// `build_extra` members (`exec_jupiter::render::BUILD_EXTRA_MAX`).
+pub const PMJ_BUILD_EXTRA_MAX: usize = 4;
+
+/// Program ids a co-signer may never be: a co-signer is a signing key, not
+/// a program or an account the guard reasons about.
+const NOT_A_COSIGNER: [&str; 5] = [
+    "11111111111111111111111111111111",
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "ComputeBudget111111111111111111111111111111",
+];
+
+/// The members the build body renders itself: a `build_extra` may not
+/// name one (`exec_jupiter::render::BODY_MEMBERS`).
+const BODY_MEMBERS: [&str; 6] = ["ownerPubkey", "marketId", "isYes", "isBuy", "depositAmount", "depositMint"];
 
 /// A `pmj.toml` that could not be read or did not hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +110,7 @@ fn err(msg: impl Into<String>) -> PmjError {
 }
 
 /// Every key the grammar accepts; an unknown key is a refusal.
-const PMJ_KEYS: [&str; 29] = [
+const PMJ_KEYS: [&str; 33] = [
     "families",
     "perp",
     "tau_min_ns",
@@ -108,6 +142,12 @@ const PMJ_KEYS: [&str; 29] = [
     "sigma_res_min_ppm",
     // PMJ J13: the same-side family cap per window.
     "max_side_families",
+    // PMJ W5: the create-order guard's pins, the dormant co-signer, the
+    // limit-order request.
+    "guard_vault",
+    "guard_vault_alt",
+    "guard_cosigners",
+    "build_extra",
 ];
 
 /// `pmj.toml` as parsed. Descriptors and keys stay strings: `pmj_boot`
@@ -169,6 +209,18 @@ pub struct PmjFile {
     pub guard_max_sol_lamports: u64,
     /// The highest compute unit price, micro-lamports (absent = 0).
     pub guard_max_cu_price: u64,
+    /// PMJ W5: the vault every order and claim names, base58 (absent =
+    /// none: every one refused).
+    pub guard_vault: String,
+    /// PMJ W5: `"<table base58>:<entry>"`, the lookup-table entry that
+    /// loads the vault (absent = the vault must be a static key).
+    pub guard_vault_alt: String,
+    /// The pinned co-signer, base58 (absent = none: exactly one signature,
+    /// LAW PMJ-G as before; at most one, R-PMJ-S44 — dormant).
+    pub guard_cosigners: Vec<String>,
+    /// PMJ W5: the build body's extra `"name:value"` members (absent =
+    /// none: today's body).
+    pub build_extra: Vec<String>,
     /// PMJ J12: the strike law and law (iii)'s residual
     /// ([`crate::strike_law`]; absent = the first law).
     pub strike_law: crate::strike_law::StrikeLaw,
@@ -230,6 +282,33 @@ fn b58_key(key: &str, i: usize, v: &str) -> Result<(), PmjError> {
         return Err(err(format!("`{key}`[{i}] = `{v}` is not a base58 key")));
     }
     Ok(())
+}
+
+/// One `build_extra` member: `name:value` (the grammar in the module docs).
+fn build_extra_item(i: usize, spec: &str) -> Result<&str, PmjError> {
+    let Some((name, value)) = spec.split_once(':') else {
+        return Err(err(format!("`build_extra`[{i}] = `{spec}` is not `name:value`")));
+    };
+    let mut nb = name.bytes();
+    let name_ok = name.len() <= 32
+        && nb.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && nb.all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !name_ok {
+        return Err(err(format!("`build_extra`[{i}]: the name `{name}` is not [A-Za-z][A-Za-z0-9_]{{0,31}}")));
+    }
+    if BODY_MEMBERS.iter().any(|m| m.eq_ignore_ascii_case(name)) {
+        return Err(err(format!("`build_extra`[{i}]: `{name}` is a member the body renders itself")));
+    }
+    let value_ok = value == "{limit_micro}"
+        || value == "{limit_usd}"
+        || ((1..=32).contains(&value.len())
+            && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.'));
+    if !value_ok {
+        return Err(err(format!(
+            "`build_extra`[{i}]: the value `{value}` is neither [A-Za-z0-9_.]{{1,32}} nor `{{limit_micro}}` / `{{limit_usd}}`"
+        )));
+    }
+    Ok(name)
 }
 
 /// Parse the artifact.
@@ -375,6 +454,65 @@ pub fn parse(src: &str) -> Result<PmjFile, PmjError> {
     if !guard_deposit_account.is_empty() {
         b58_key("guard_deposit_account", 0, &guard_deposit_account)?;
     }
+    let guard_vault = opt_str(&kv, "guard_vault")?;
+    if !guard_vault.is_empty() {
+        b58_key("guard_vault", 0, &guard_vault)?;
+    }
+    let guard_vault_alt = opt_str(&kv, "guard_vault_alt")?;
+    if !guard_vault_alt.is_empty() {
+        let Some((table, entry)) = guard_vault_alt.split_once(':') else {
+            return Err(err(format!("`guard_vault_alt` = `{guard_vault_alt}` is not `<table>:<entry>`")));
+        };
+        b58_key("guard_vault_alt", 0, table)?;
+        if entry.is_empty() || !entry.bytes().all(|b| b.is_ascii_digit()) || entry.parse::<u8>().is_err() {
+            return Err(err(format!("`guard_vault_alt`: the entry `{entry}` is not 0..=255")));
+        }
+        if guard_vault.is_empty() {
+            return Err(err("`guard_vault_alt` names where the vault loads from: `guard_vault` must name the vault"));
+        }
+        if !guard_alts.iter().any(|a| a == table) {
+            return Err(err(format!("`guard_vault_alt`'s table `{table}` is not one of `guard_alts`")));
+        }
+    }
+    let guard_cosigners = opt_strs(&kv, "guard_cosigners")?;
+    if guard_cosigners.len() > PMJ_GUARD_COSIGNERS_MAX {
+        return Err(err(format!(
+            "`guard_cosigners` pins at most {PMJ_GUARD_COSIGNERS_MAX} co-signer (R-PMJ-S44)"
+        )));
+    }
+    let mut i = 0usize;
+    while i < guard_cosigners.len() {
+        let c = &guard_cosigners[i];
+        b58_key("guard_cosigners", i, c)?;
+        if guard_programs.contains(c)
+            || guard_alts.contains(c)
+            || *c == guard_deposit_account
+            || *c == guard_vault
+            || NOT_A_COSIGNER.contains(&c.as_str())
+        {
+            return Err(err(format!(
+                "`guard_cosigners`[{i}] = `{c}` is a program, a lookup table, the deposit account or the vault — \
+                 a co-signer is a signing key, not an account the guard reasons about"
+            )));
+        }
+        i += 1;
+    }
+    let build_extra = opt_strs(&kv, "build_extra")?;
+    if build_extra.len() > PMJ_BUILD_EXTRA_MAX {
+        return Err(err(format!("`build_extra` carries at most {PMJ_BUILD_EXTRA_MAX} members")));
+    }
+    let mut i = 0usize;
+    while i < build_extra.len() {
+        let name = build_extra_item(i, &build_extra[i])?;
+        let mut j = 0usize;
+        while j < i {
+            if build_extra[j].split_once(':').map(|(n, _)| n) == Some(name) {
+                return Err(err(format!("`build_extra`[{i}]: `{name}` repeats")));
+            }
+            j += 1;
+        }
+        i += 1;
+    }
     let strike_law = crate::strike_law::parse(&kv, families.len()).map_err(err)?;
     let max_side_families = in_range(
         "max_side_families",
@@ -420,6 +558,10 @@ pub fn parse(src: &str) -> Result<PmjFile, PmjError> {
         guard_deposit_account,
         guard_max_sol_lamports,
         guard_max_cu_price,
+        guard_vault,
+        guard_vault_alt,
+        guard_cosigners,
+        build_extra,
         strike_law,
         max_side_families,
     })
@@ -559,6 +701,105 @@ mod tests {
             ("strike_law = \"mean60\"\nsigma_res_min_ppm = [3, 5]\n", "law (iii)'s key under the first law"),
         ] {
             assert!(parse(&src(bad)).is_err(), "{why}: {bad}");
+        }
+    }
+
+    // --- PMJ W5: the co-signer (dormant), the vault pins, the build extras
+
+    const COSIGNER: &str = "AJooF3xRkSx1PUC5Y9dNZHy9LMHcx5xKhPxj4iW4jepf";
+    const VAULT: &str = "2y9Ad2GD7gwiMkkMu4bBK5216Pv9YJsBkSHAGwN3rBuJ";
+    const ALT: &str = "6awx2Pq4uxeHsBcmutEqErz79C4TUg4EQEiBX5T5BVfX";
+
+    #[test]
+    fn guard_cosigners_absent_means_none() {
+        let f = parse(&src("")).expect("valid");
+        assert!(f.guard_cosigners.is_empty(), "LAW PMJ-G: one signature");
+        let f = parse(&src("guard_cosigners = []\n")).expect("valid");
+        assert!(f.guard_cosigners.is_empty());
+    }
+
+    #[test]
+    fn one_cosigner_parses() {
+        let f = parse(&src(&format!("guard_cosigners = [\"{COSIGNER}\"]\n"))).expect("valid");
+        assert_eq!(f.guard_cosigners, vec![COSIGNER.to_string()]);
+    }
+
+    #[test]
+    fn two_cosigners_are_refused() {
+        let two = format!("guard_cosigners = [\"{COSIGNER}\", \"{VAULT}\"]\n");
+        assert!(parse(&src(&two)).is_err());
+    }
+
+    #[test]
+    fn a_malformed_cosigner_is_refused() {
+        for bad in ["guard_cosigners = [\"0OIl\"]\n", "guard_cosigners = \"AJooF3xRkSx1PUC5Y9dNZHy9LMHcx5xKhPxj4iW4jepf\"\n", "guard_cosigners = [1]\n"] {
+            assert!(parse(&src(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_cosigner_equal_to_a_program_table_or_the_deposit_account_is_refused() {
+        for extra in [
+            format!("guard_programs = [\"{COSIGNER}\"]\nguard_cosigners = [\"{COSIGNER}\"]\n"),
+            format!("guard_alts = [\"{COSIGNER}\"]\nguard_cosigners = [\"{COSIGNER}\"]\n"),
+            format!("guard_deposit_account = \"{COSIGNER}\"\nguard_cosigners = [\"{COSIGNER}\"]\n"),
+            format!("guard_vault = \"{COSIGNER}\"\nguard_cosigners = [\"{COSIGNER}\"]\n"),
+            "guard_cosigners = [\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\"]\n".to_string(),
+            "guard_cosigners = [\"ComputeBudget111111111111111111111111111111\"]\n".to_string(),
+            "guard_cosigners = [\"ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL\"]\n".to_string(),
+        ] {
+            assert!(parse(&src(&extra)).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn the_vault_and_its_table_entry_parse_and_bind_each_other() {
+        let f = parse(&src("")).expect("valid");
+        assert_eq!((f.guard_vault.as_str(), f.guard_vault_alt.as_str()), ("", ""), "absent: no vault, every order refused");
+        let f = parse(&src(&format!("guard_vault = \"{VAULT}\"\n"))).expect("a static vault");
+        assert_eq!(f.guard_vault, VAULT);
+        let ok = format!("guard_alts = [\"{ALT}\"]\nguard_vault = \"{VAULT}\"\nguard_vault_alt = \"{ALT}:1\"\n");
+        let f = parse(&src(&ok)).expect("the table entry");
+        assert_eq!(f.guard_vault_alt, format!("{ALT}:1"));
+        for bad in [
+            "guard_vault = \"0OIl\"\n".to_string(),
+            format!("guard_alts = [\"{ALT}\"]\nguard_vault_alt = \"{ALT}:1\"\n"),
+            format!("guard_vault = \"{VAULT}\"\nguard_vault_alt = \"{ALT}:1\"\n"),
+            format!("guard_alts = [\"{ALT}\"]\nguard_vault = \"{VAULT}\"\nguard_vault_alt = \"{ALT}\"\n"),
+            format!("guard_alts = [\"{ALT}\"]\nguard_vault = \"{VAULT}\"\nguard_vault_alt = \"{ALT}:256\"\n"),
+            format!("guard_alts = [\"{ALT}\"]\nguard_vault = \"{VAULT}\"\nguard_vault_alt = \"{ALT}:+1\"\n"),
+            format!("guard_alts = [\"{ALT}\"]\nguard_vault = \"{VAULT}\"\nguard_vault_alt = \"{ALT}:\"\n"),
+            format!("guard_alts = [\"{ALT}\"]\nguard_vault = \"{VAULT}\"\nguard_vault_alt = \"0OIl:1\"\n"),
+        ] {
+            assert!(parse(&src(&bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn build_extras_parse_within_their_grammar() {
+        let f = parse(&src("")).expect("valid");
+        assert!(f.build_extra.is_empty(), "absent: today's body");
+        let f = parse(&src(
+            "build_extra = [\"orderType:limit\", \"limitPriceUsd:{limit_micro}\", \"limitPrice:{limit_usd}\", \"slip_bps:0.5\"]\n",
+        ))
+        .expect("valid");
+        assert_eq!(f.build_extra.len(), 4);
+        for bad in [
+            "build_extra = [\"a:1\", \"b:1\", \"c:1\", \"d:1\", \"e:1\"]\n",
+            "build_extra = [\"noColon\"]\n",
+            "build_extra = [\"1a:x\"]\n",
+            "build_extra = [\"a-b:x\"]\n",
+            "build_extra = [\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:x\"]\n",
+            "build_extra = [\"a:\"]\n",
+            "build_extra = [\"a:x y\"]\n",
+            "build_extra = [\"a:{limit}\"]\n",
+            "build_extra = [\"a:vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv\"]\n",
+            "build_extra = [\"depositAmount:1\"]\n",
+            "build_extra = [\"ISBUY:false\"]\n",
+            "build_extra = [\"a:1\", \"a:2\"]\n",
+            "build_extra = \"a:1\"\n",
+        ] {
+            assert!(parse(&src(bad)).is_err(), "{bad}");
         }
     }
 }

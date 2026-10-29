@@ -10,26 +10,69 @@
 //!
 //! **An order** ([`INTENT_BUY`]): its window's Gamma market id from the
 //! table the 5 m discovery tees in → `POST /orders` (the body rendered in
-//! the client's window) → the answer scanned in place
-//! ([`crate::json::scan_build`]): a keeper order, `requiredSigners`
-//! exactly our wallet, the server's `maxBuyPriceUsd` ≤ the member's limit
-//! → the base64 transaction decoded into the fixed 1 232 B buffer → the
-//! **guard** ([`crate::tx::guard`], mandatory: an empty allowlist refuses
-//! everything) → our signature written into its slot →
+//! the client's window, plus `pmj.toml`'s `build_extra` members — J0's
+//! limit-order request field, [`crate::render::BuildExtra`]) → the answer
+//! scanned in place ([`crate::json::scan_build`]): a keeper order,
+//! `requiredSigners` exactly our wallet (or, with the dormant co-signer
+//! amendment pinned, our wallet and that key), the server's
+//! `maxBuyPriceUsd` ≤ the member's limit → the base64 transaction decoded
+//! into the fixed 1 232 B buffer → the **order guard**
+//! ([`crate::tx::guard_order`], mandatory: an empty allowlist refuses
+//! everything; the signed create-order must be a Limit buy at or under the
+//! member's limit, depositing exactly what we asked, from our deposit
+//! account, into the pinned vault) → our signature written into its slot →
 //! `POST /execute` with the build's `context` → LANDED / REFUSED /
 //! IN_DOUBT. A build creates nothing on chain, so every failure before the
 //! execute is a refusal; an execute that may have left the host and did
 //! not answer readably is IN_DOUBT (its blockhash still lets it land).
 //!
 //! **After the land**: `GET /orders/status/{orderPubkey}` every
-//! [`POLL_EVERY_NS`] until it is terminal or the deadline (the window's
-//! close + [`DEADLINE_AFTER_CLOSE_NS`]) passes, then **recon**: the
-//! account's `GET /orders` pages, the order's `filledContracts` and
-//! `avgFillPriceUsd` → FILL (cumulative) and DONE. An in-doubt order is
-//! polled the same way: a status answer means it landed; recon not
-//! finding it after the deadline means it never did (DONE, `aux` 1). A
-//! landed order recon cannot read for [`RECON_TRIES_MAX`] tries is LOST
-//! and the gateway halts (the operator reconciles).
+//! [`POLL_EVERY_NS`] until it is terminal — its fill numbers in the answer
+//! book it at once — or the deadline (the window's close +
+//! [`DEADLINE_AFTER_CLOSE_NS`]) passes, then **recon by the order's
+//! pubkey** (the build answer's `order.orderPubkey`): the PRIMARY read is
+//! the same status answer, which answers after the close (J0's public
+//! evidence: `GET /orders` lists OPEN orders only); the SECONDARY read is
+//! the account's `GET /orders` pages (an order still open). A terminal
+//! record with its numbers → FILL (cumulative) and DONE; without them it is
+//! not read (never booked unfilled); fill numbers whose sources disagree
+//! are not read either. The signed create-order's order and position
+//! accounts are the answer's own keys (the order guard), so recon reads the
+//! order that was signed. **An in-doubt order is released** (DONE, `aux` 1:
+//! it never landed) only when (i) its status answers the API's OWN JSON 404
+//! of kind `invalid_request_error` (any other kind — `api_error`, a rate
+//! limit, an auth or region refusal — and a CDN's or proxy's 404 are no
+//! evidence), (ii) twice, at least
+//! [`RELEASE_GAP_NS`] apart, both at or after its blockhash's life
+//! ([`BLOCKHASH_LIFE_NS`] after the execute), and (iii) no 200 of any kind
+//! was ever read for it — pages of open orders are no evidence. Whether
+//! Jupiter's 404 for an unknown order is its error object is a J0 fact: if
+//! it is not, nothing releases and the order goes LOST (a halt, never a
+//! guess). An order recon can read nothing about for [`RECON_TRIES_MAX`]
+//! tries — landed, or in doubt with its status unread — is LOST and the
+//! gateway halts (the operator reconciles).
+//!
+//! **The debit halt** (risk-policy J3 pre-dust (c)): the deposit moves by
+//! Jupiter's CPI, so after an order lands the wallet's deposit-mint balance
+//! is checked at every balance read: it must be at least the REFERENCE
+//! minus the deposits of every order whose signed transaction may have
+//! left the host since (landed or in doubt). The reference is the last
+//! balance read taken with no order in flight — no row open and no execute
+//! sent in the last [`DEBIT_SETTLE_NS`] — re-anchored at each such read
+//! (after its own check). A refund or a claim payout only raises the
+//! balance, so it never halts; a lower read halts the gateway and the arm
+//! ([`HALT_DEBIT`], counted). No build is made before the first reference
+//! (`reason::NO_REFERENCE`), when the last read is older than
+//! [`REFERENCE_MAX_AGE_NS`] (`reason::STALE_REFERENCE`: failed reads would
+//! blind the halt), or when the deposits allowed since the reference would
+//! pass [`DEBIT_ALLOW_ORDERS`] per-order maxima (`reason::ALLOWANCE`: the
+//! floor must not sink toward zero). These three are local refusals that
+//! count toward the arm's reject-streak halt BY DESIGN (fail-closed: a
+//! debit halt that cannot judge stops the slot rather than trading blind).
+//! Its limits: a payout landing with a drain can
+//! mask it by up to the payout; a balance answer staler than
+//! [`DEBIT_SETTLE_NS`] at a re-anchor could halt a sound wallet (a halt,
+//! never a loss); the read cadence is [`BALANCE_EVERY_NS`].
 //!
 //! **E-5 for this venue**: the execute's `Success` is the ACK (LANDED);
 //! the order record's fill numbers are the FILL. The venue reports no fee
@@ -37,17 +80,22 @@
 //! `feesPaidUsd` is J5's measure.
 //!
 //! **Idle work** (no order building, no row due): the wallet's balances
-//! every [`BALANCE_EVERY_NS`] (the USDC and SOL gauges, the arm's worth);
-//! the positions every [`POSITIONS_EVERY_NS`] (or at the arm's
-//! [`INTENT_CLAIM`]), and each claimable one's claim — built, guarded
-//! (no token may leave our account) and signed, then held: **the claim's
-//! submission route is unverified until J0 records one** (`claims_held`).
+//! every [`BALANCE_EVERY_NS`] (the USDC and SOL gauges, the arm's worth,
+//! the debit halt); the positions every [`POSITIONS_EVERY_NS`] (or at the
+//! arm's [`INTENT_CLAIM`]), and each claimable one's claim — built, guarded
+//! ([`crate::tx::guard_claim`]: one `claim_payout` / `claim_payout2`, no
+//! token may leave our account, the payout lands in our deposit account)
+//! and signed, then held: **the claim's submission route is unverified
+//! until J0 records one** (`claims_held`).
 //!
 //! **Halts** (the kit's halt word, the first reason wins): a region
 //! refusal, an authentication refusal, an order recon lost, a lost event,
-//! and the operator's (`exec.HALT` on slot 11 reaches the arm's
-//! `cancel_slot`). A halted gateway refuses every build before the wire —
-//! a landed order is still polled and reconciled: it cannot be pulled.
+//! a debit beyond the deposits ([`HALT_DEBIT`]), a position no held leg
+//! and no order in flight accounts for ([`HALT_UNKNOWN_POSITION`]; never
+//! claimed), and the operator's
+//! (`exec.HALT` on slot 11 reaches the arm's `cancel_slot`). A halted
+//! gateway refuses every build before the wire — a landed order is still
+//! polled and reconciled: it cannot be pulled.
 //!
 //! Zero allocation after [`JupGateway::new`]: every body is rendered in
 //! the client's window, the transaction and the context live in fixed
@@ -76,11 +124,11 @@ use crate::json::{
     ExecuteAnswer, OrderRecord, OrderState, StatusAnswer,
 };
 use crate::render::{
-    claim_body, claim_path, execute_body, order_body, status_path, Outcome, B58_KEY_MAX,
-    CONTEXT_MAX, EXECUTE_BODY_MAX, PATH_MAX,
+    claim_body, claim_path, execute_body, order_body, status_path, BuildExtra, Outcome,
+    B58_KEY_MAX, CONTEXT_MAX, EXECUTE_BODY_MAX, ORDER_BODY_MAX, PATH_MAX,
 };
 use crate::stats::{word, JupExecStats, GW_WORDS, PUBLISH_EVERY_NS};
-use crate::tx::{guard, SolTx, TxErr, TxGuard, KEY_LEN, TX_MAX};
+use crate::tx::{guard_claim, guard_order, OrderAsk, SolTx, TxErr, TxGuard, KEY_LEN, TX_MAX};
 
 /// The gateway's end of the engine duplex.
 pub type JupGwEnd = GatewayEnd<JupIntent, JupEvent, JUP_CMD_RING, JUP_EVT_RING>;
@@ -132,6 +180,39 @@ pub const HALT_OPERATOR: u64 = HALT_VENUE_BASE + 5;
 /// Halt: the arm's own (an event of no order, a full queue or ledger, a
 /// fill price off the binary law).
 pub const HALT_ARM: u64 = HALT_VENUE_BASE + 6;
+/// Halt: the wallet's deposit-mint balance fell below the reference minus
+/// the deposits of the orders sent since (module docs, "The debit halt").
+pub const HALT_DEBIT: u64 = HALT_VENUE_BASE + 7;
+/// Halt: the venue lists a position with contracts that no held leg and no
+/// order in flight accounts for (the venue analogue of kill-switch trigger
+/// 3: a position we did not open, or one an order we released as never
+/// landed did open).
+pub const HALT_UNKNOWN_POSITION: u64 = HALT_VENUE_BASE + 8;
+
+/// A balance read counts as "no order in flight" (a debit reference) only
+/// this long after the last execute, ns — room for the balance answer to
+/// show the last deposit's debit.
+pub const DEBIT_SETTLE_NS: u64 = 30_000_000_000;
+
+/// The deposits outstanding since the debit reference may reach this many
+/// per-order maxima, no more (risk review W5-1, MINOR 2): without it, orders
+/// that never leave a quiet balance read would sink the debit floor toward
+/// zero (`saturating_sub`) and blind the halt. Four is the member's own
+/// per-market order cap (`pmj.toml` `max_orders_market`, default 4); a
+/// quiet read (no row open, [`DEBIT_SETTLE_NS`] after the last execute)
+/// re-anchors and frees it. **Sized for the BTC-only dust / pilot frames
+/// (one family live):** before more than one family arms live it must be
+/// re-sized to families × the per-market cap, or the later families' orders
+/// in a window are refused (`reason::ALLOWANCE`).
+pub const DEBIT_ALLOW_ORDERS: u64 = 4;
+
+/// The debit reference is stale — no build — when the last balance read
+/// that read is older than this, ns (two missed reads: MINOR 3).
+pub const REFERENCE_MAX_AGE_NS: u64 = 2 * BALANCE_EVERY_NS;
+
+/// An in-doubt order is released only on two of Jupiter's own 404s at
+/// least this far apart, both at or after its blockhash's life, ns.
+pub const RELEASE_GAP_NS: u64 = 30_000_000_000;
 
 const P_ORDERS: &[u8] = b"/prediction/v1/orders";
 const P_EXECUTE: &[u8] = b"/prediction/v1/execute";
@@ -162,6 +243,9 @@ pub struct JupGwCfg {
     pub max_order_micro: u64,
     /// The lead a build needs before its window's end, ns.
     pub min_lead_ns: u64,
+    /// The build body's extra members (`pmj.toml` `build_extra`; none:
+    /// today's body).
+    pub build_extra: BuildExtra,
 }
 
 /// One market window jup-gw can build for.
@@ -188,6 +272,12 @@ struct Row {
     state: u8,
     tries: u8,
     landed: bool,
+    /// Any 200 for this order was read (it then is never released as
+    /// never-landed).
+    seen_200: bool,
+    /// The first of Jupiter's own 404s at or after the blockhash's life
+    /// (0: none yet).
+    first_404_ns: u64,
 }
 
 const FREE_ROW: Row = Row {
@@ -205,6 +295,8 @@ const FREE_ROW: Row = Row {
     state: R_FREE,
     tries: 0,
     landed: false,
+    seen_200: false,
+    first_404_ns: 0,
 };
 
 /// A claimable position.
@@ -275,6 +367,13 @@ pub struct GwCounters {
     pub held_writes: u64,
     /// Legs the held table could not hold.
     pub held_full: u64,
+    /// Balance reads below the debit floor (each one; the first halts).
+    pub debit_halts: u64,
+    /// In-doubt orders released as never landed (a 404 past the blockhash).
+    pub released: u64,
+    /// Positions read with contracts that no held leg and no order in
+    /// flight accounts for (each; the first halts).
+    pub unknown_positions: u64,
 }
 
 /// Why a prepared build was refused.
@@ -338,13 +437,23 @@ const fn tx_aux(e: TxErr) -> u64 {
     e as u64 + 1
 }
 
+/// What a signed build is for: the guard it must pass.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Want<'a> {
+    /// An order: [`guard_order`] against the request and the answer.
+    Order(OrderAsk<'a>),
+    /// A claim: [`guard_claim`].
+    Claim,
+}
+
 /// Decode, parse, guard and sign the base64 transaction `b64` into `tx`;
-/// its length. `deposit` bounds the token debit (0 for a claim).
+/// its length. An order is signed only through [`guard_order`], a claim
+/// only through [`guard_claim`].
 fn guard_and_sign(
     b64: &[u8],
     tx: &mut [u8; TX_MAX],
     g: &TxGuard,
-    deposit: u64,
+    want: &Want<'_>,
     signer: &Ed25519Signer,
 ) -> Result<usize, TxErr> {
     // COPY: the server's base64 transaction decoded into the fixed
@@ -353,12 +462,31 @@ fn guard_and_sign(
     // none (the plan's own "decode into a fixed buffer").
     let n = base64_decode(b64, &mut tx[..]).map_err(|_| TxErr::Length)?;
     let parsed = SolTx::parse(&tx[..n])?;
-    let passed = guard(&tx[..n], &parsed, g, deposit)?;
+    let passed = match want {
+        Want::Order(ask) => guard_order(&tx[..n], &parsed, g, ask)?.0,
+        Want::Claim => guard_claim(&tx[..n], &parsed, g)?,
+    };
     parsed.sign_into(&mut tx[..n], passed.signer_idx, signer)?;
     Ok(n)
 }
 
-/// The build's answer → a signed transaction and its context, or why not.
+/// `requiredSigners` names our wallet alone — or, with the dormant
+/// co-signer amendment pinned (G-A1), our wallet and the pinned key in
+/// either order, no other key and no duplicate.
+fn signers_ok(a: &BuildAnswer, body: &[u8], wallet_b58: &[u8], cosigner_b58: &[u8]) -> bool {
+    let r0 = a.required[0].of(body);
+    match a.n_required {
+        1 => r0 == wallet_b58,
+        2 if !cosigner_b58.is_empty() => {
+            let r1 = a.required[1].of(body);
+            (r0 == wallet_b58 && r1 == cosigner_b58) || (r0 == cosigner_b58 && r1 == wallet_b58)
+        }
+        _ => false,
+    }
+}
+
+/// The build's answer → a signed transaction and its context, or why not
+/// (`cosigner_b58` empty: no co-signer pinned).
 #[allow(clippy::too_many_arguments)]
 fn prepare(
     http: u16,
@@ -367,6 +495,7 @@ fn prepare(
     market_id: u64,
     cfg: &JupGwCfg,
     wallet_b58: &[u8],
+    cosigner_b58: &[u8],
     signer: &Ed25519Signer,
     tx: &mut [u8; TX_MAX],
     ctx: &mut [u8; CONTEXT_MAX],
@@ -384,7 +513,7 @@ fn prepare(
     if a.max_buy_price_micro > it.limit_px_1e6.max(0) as u64 {
         return Err(refusal(reason::PRICE_CAP, a.max_buy_price_micro));
     }
-    if a.n_required != 1 || a.required[0].of(body) != wallet_b58 {
+    if !signers_ok(&a, body, wallet_b58, cosigner_b58) {
         return Err(refusal(reason::SIGNERS, u64::from(a.n_required)));
     }
     // The answer is the order we asked for: its market and outcome, a
@@ -404,15 +533,33 @@ fn prepare(
     {
         return Err(refusal(reason::MISMATCH, 0));
     }
+    // The order and position keys are what the gateway polls, reconciles
+    // and releases by: both must read, and the guard holds the signed
+    // create-order to them (risk review W5-1, MAJOR 1).
     let Some(order_key) = key_of(a.order_pubkey.of(body)) else {
         return Err(refusal(reason::BUILD_UNREADABLE, 1));
     };
-    let position_key = key_of(a.position_pubkey.of(body)).unwrap_or([0; KEY_LEN]);
+    let Some(position_key) = key_of(a.position_pubkey.of(body)) else {
+        return Err(refusal(reason::BUILD_UNREADABLE, 3));
+    };
     let c = a.context.of(body);
     if c.len() > CONTEXT_MAX {
         return Err(refusal(reason::BUILD_UNREADABLE, 2));
     }
-    let tx_len = match guard_and_sign(a.transaction.of(body), tx, &cfg.guard, it.deposit_micro, signer) {
+    // The signed bytes must be the order we asked: a Limit buy at or under
+    // the member's limit, depositing exactly `deposit_micro` (whatever the
+    // answer's words and the request's `build_extra` said), on the answer's
+    // own order and position accounts, market hash and contracts.
+    let ask = OrderAsk {
+        deposit: it.deposit_micro,
+        limit_micro: it.limit_px_1e6.max(0) as u64,
+        order: order_key,
+        position: position_key,
+        market_hash: a.market_id_hash.of(body),
+        contracts: a.contracts_micro,
+    };
+    let want = Want::Order(ask);
+    let tx_len = match guard_and_sign(a.transaction.of(body), tx, &cfg.guard, &want, signer) {
         Ok(n) => n,
         Err(e) => return Err(refusal(reason::GUARD, tx_aux(e))),
     };
@@ -459,8 +606,20 @@ fn landing(http: u16, body: &[u8]) -> (Landing, u64) {
     (Landing::Doubt(f.why), f.halt)
 }
 
-/// An in-doubt order still not found this long after its execute never
-/// landed, ns: its blockhash lives ~150 blocks (≈ 60–90 s); 300 s bounds a
+/// One status read of an order ([`JupGateway`]'s recon by pubkey).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum StatusRead {
+    /// A 200 that reads.
+    Read(StatusAnswer),
+    /// A 404: the venue does not know the order.
+    NotFound,
+    /// Nothing that reads: a failed request, another status, an unreadable
+    /// body.
+    Unread,
+}
+
+/// An in-doubt order whose status still answers 404 this long after its
+/// execute never landed, ns: its blockhash lives ~150 blocks (≈ 60–90 s); 300 s bounds a
 /// slow cluster with room (the guard refuses a durable nonce, which would
 /// never expire).
 pub const BLOCKHASH_LIFE_NS: u64 = 300_000_000_000;
@@ -478,6 +637,9 @@ pub struct JupGateway<C: JupClient> {
     wallet_len: usize,
     mint_b58: [u8; B58_KEY_MAX],
     mint_len: usize,
+    /// The pinned co-signer, base58 (`cosigner_len` 0: none, LAW PMJ-G).
+    cosigner_b58: [u8; B58_KEY_MAX],
+    cosigner_len: usize,
     markets: [Market; MARKETS_MAX],
     market_next: usize,
     rows: [Row; GW_ROWS],
@@ -492,6 +654,14 @@ pub struct JupGateway<C: JupClient> {
     publish_ns: u64,
     usdc_micro: i64,
     sol_lamports: i64,
+    /// The debit halt's reference balance (-1: none yet — no build).
+    debit_ref_micro: i64,
+    /// The deposits sent since the reference (landed or in doubt).
+    debit_allow_micro: u64,
+    /// No balance read before this counts as "no order in flight".
+    quiet_after_ns: u64,
+    /// When the last balance read that read the deposit mint was taken.
+    debit_read_ns: u64,
     counters: GwCounters,
     stats: Option<std::sync::Arc<JupExecStats>>,
 }
@@ -520,6 +690,11 @@ pub enum GwBootErr {
     /// The guard's deposit mint is not the configured USDC mint, or no
     /// deposit account is configured.
     Deposit,
+    /// (The dormant amendment) the pinned co-signer is the wallet itself,
+    /// or the zero key.
+    Cosigner,
+    /// No vault is pinned (`guard_vault`): every order would be refused.
+    Vault,
 }
 
 impl<C: JupClient> JupGateway<C> {
@@ -556,6 +731,13 @@ impl<C: JupClient> JupGateway<C> {
         if cfg.guard.deposit_mint != cfg.usdc_mint || cfg.guard.deposit_account == [0; KEY_LEN] {
             return Err(GwBootErr::Deposit);
         }
+        let cosigner = cfg.guard.cosigner;
+        if cfg.guard.has_cosigner && (cosigner == cfg.wallet || cosigner == [0; KEY_LEN]) {
+            return Err(GwBootErr::Cosigner);
+        }
+        if cfg.guard.vault == [0; KEY_LEN] {
+            return Err(GwBootErr::Vault);
+        }
         let mut key = [0u8; API_KEY_MAX];
         // COPY: the API key into the gateway's header buffer (boot, once,
         // ≤ 128 B) — rejected: none, the header must outlive the caller's
@@ -565,6 +747,12 @@ impl<C: JupClient> JupGateway<C> {
         let wallet_len = base58_encode(&cfg.wallet, &mut wallet_b58).map_err(|_| GwBootErr::Signer)?;
         let mut mint_b58 = [0u8; B58_KEY_MAX];
         let mint_len = base58_encode(&cfg.usdc_mint, &mut mint_b58).map_err(|_| GwBootErr::Signer)?;
+        let mut cosigner_b58 = [0u8; B58_KEY_MAX];
+        let cosigner_len = if cfg.guard.has_cosigner {
+            base58_encode(&cfg.guard.cosigner, &mut cosigner_b58).map_err(|_| GwBootErr::Cosigner)?
+        } else {
+            0
+        };
         Ok(Self {
             cfg,
             client,
@@ -577,6 +765,8 @@ impl<C: JupClient> JupGateway<C> {
             wallet_len,
             mint_b58,
             mint_len,
+            cosigner_b58,
+            cosigner_len,
             markets: [Market::default(); MARKETS_MAX],
             market_next: 0,
             rows: [FREE_ROW; GW_ROWS],
@@ -591,6 +781,10 @@ impl<C: JupClient> JupGateway<C> {
             publish_ns: 0,
             usdc_micro: -1,
             sol_lamports: -1,
+            debit_ref_micro: -1,
+            debit_allow_micro: 0,
+            quiet_after_ns: 0,
+            debit_read_ns: 0,
             counters: GwCounters::default(),
             stats: None,
         })
@@ -629,6 +823,13 @@ impl<C: JupClient> JupGateway<C> {
             i += 1;
         }
         n
+    }
+
+    /// The debit halt's state: the reference balance (-1: none yet) and
+    /// the deposits sent since it.
+    #[must_use]
+    pub const fn debit_state(&self) -> (i64, u64) {
+        (self.debit_ref_micro, self.debit_allow_micro)
     }
 
     /// The held legs the boot restored (`pmj-held.state`).
@@ -779,6 +980,19 @@ impl<C: JupClient> JupGateway<C> {
         let Some(r) = self.free_row() else {
             return self.refuse(oid, reason::FULL, 0, now);
         };
+        // The debit halt needs its reference before any deposit can leave,
+        // a fresh one (failed reads would blind it), and room under the
+        // deposits it allows before a quiet read re-anchors it.
+        if self.debit_ref_micro < 0 {
+            return self.refuse(oid, reason::NO_REFERENCE, 0, now);
+        }
+        if now > self.debit_read_ns.saturating_add(REFERENCE_MAX_AGE_NS) {
+            return self.refuse(oid, reason::STALE_REFERENCE, now - self.debit_read_ns, now);
+        }
+        let allow_max = self.cfg.max_order_micro.saturating_mul(DEBIT_ALLOW_ORDERS);
+        if self.debit_allow_micro.saturating_add(it.deposit_micro) > allow_max {
+            return self.refuse(oid, reason::ALLOWANCE, self.debit_allow_micro, now);
+        }
         let outcome = if it.outcome == 0 { Outcome::Up } else { Outcome::Down };
 
         // The build.
@@ -789,6 +1003,8 @@ impl<C: JupClient> JupGateway<C> {
             outcome,
             it.deposit_micro,
             &self.mint_b58[..self.mint_len],
+            &self.cfg.build_extra,
+            it.limit_px_1e6.max(0) as u64,
         ) else {
             return self.refuse(oid, reason::LOCAL, 2, now);
         };
@@ -811,6 +1027,7 @@ impl<C: JupClient> JupGateway<C> {
                 market_id,
                 &self.cfg,
                 &self.wallet_b58[..self.wallet_len],
+                &self.cosigner_b58[..self.cosigner_len],
                 &self.signer,
                 &mut self.tx,
                 &mut self.ctx,
@@ -864,6 +1081,8 @@ impl<C: JupClient> JupGateway<C> {
             state: R_DOUBT,
             tries: 0,
             landed: false,
+            seen_200: false,
+            first_404_ns: 0,
         };
         let (verdict, halt) = match res {
             Err(PostErr { left_host: false, .. }) => {
@@ -878,6 +1097,13 @@ impl<C: JupClient> JupGateway<C> {
         };
         if halt != HALT_NONE {
             self.end.stats.halt(halt);
+        }
+        if !matches!(verdict, Landing::Refused(_)) {
+            // The signed transaction may have left the host: its deposit may
+            // leave the wallet (the debit halt's allowance), and no balance
+            // read counts as quiet until it has settled.
+            self.debit_allow_micro = self.debit_allow_micro.saturating_add(it.deposit_micro);
+            self.quiet_after_ns = now.saturating_add(DEBIT_SETTLE_NS);
         }
         match verdict {
             Landing::Landed => {
@@ -948,42 +1174,75 @@ impl<C: JupClient> JupGateway<C> {
         self.emit(&ev);
     }
 
-    fn status(&mut self, i: usize, now: u64) {
+    /// One `GET /orders/status/{pk}` read of row `i`'s order (the build
+    /// answer's `order.orderPubkey`).
+    fn read_status(&mut self, i: usize) -> StatusRead {
         let r = self.rows[i];
         let mut k = [0u8; B58_KEY_MAX];
         let Ok(kl) = base58_encode(&r.order_key, &mut k) else {
-            self.rows[i].state = R_RECON;
-            return;
+            return StatusRead::Unread;
         };
         let Some(pn) = status_path(&mut self.path[..PATH_MAX], &k[..kl]) else {
-            self.rows[i].state = R_RECON;
-            return;
+            return StatusRead::Unread;
         };
-        self.counters.polls += 1;
         let t0 = core_time::now_ns();
         let key: Header<'_> = (b"x-api-key", &self.key[..self.key_len]);
         let res = self.client.request(Method::Get, &self.path[..pn], &[key], 0);
-        self.rows[i].next_ns = now.saturating_add(POLL_EVERY_NS);
-        let state = match res {
+        match res {
             Ok((200, range)) => {
+                // Any 200 for the order — readable or not — is the venue
+                // answering about it: never again "never created".
+                self.rows[i].seen_200 = true;
                 self.end.stats.cancel_rtt.record(core_time::now_ns().saturating_sub(t0));
                 let body = self.client.resp().get(range).unwrap_or(&[]);
                 let mut a = StatusAnswer::default();
                 match scan_status(body, &mut a) {
-                    Ok(()) => Some(a.state),
-                    Err(_) => None,
+                    Ok(()) => StatusRead::Read(a),
+                    Err(_) => StatusRead::Unread,
                 }
             }
-            Ok((404, _)) => return,
-            _ => None,
+            Ok((404, range)) => {
+                // Only the API's own `invalid_request_error` says "not
+                // found". Every other kind (`api_error`, `rate_limit_error`,
+                // `authentication_error`, `permission_error`,
+                // `idempotency_error`, a region refusal) and a CDN's or
+                // proxy's 404 (HTML, another shape) say nothing about the
+                // order: in doubt still. The spec gives the error object no
+                // fixed message, so the kind alone decides (a J0 fact to
+                // tighten: the message Jupiter answers for an unknown order).
+                let body = self.client.resp().get(range).unwrap_or(&[]);
+                let mut e = ErrorAnswer::default();
+                if scan_error(body, &mut e).is_ok() && e.kind == ErrKind::InvalidRequest {
+                    StatusRead::NotFound
+                } else {
+                    StatusRead::Unread
+                }
+            }
+            _ => StatusRead::Unread,
+        }
+    }
+
+    /// The poll: a terminal status with its numbers books the order at
+    /// once; a terminal one without them goes to recon.
+    fn status(&mut self, i: usize, now: u64) {
+        self.counters.polls += 1;
+        let read = self.read_status(i);
+        self.rows[i].next_ns = now.saturating_add(POLL_EVERY_NS);
+        let a = match read {
+            StatusRead::Read(a) => a,
+            // Unknown to the venue (yet): polled again.
+            StatusRead::NotFound => return,
+            StatusRead::Unread => {
+                self.counters.poll_failures += 1;
+                return;
+            }
         };
-        let Some(state) = state else {
-            self.counters.poll_failures += 1;
-            return;
-        };
-        match state {
-            OrderState::Filled | OrderState::Failed => {
+        match a.state {
+            s if s.terminal() => {
                 self.landed_late(i, now);
+                if let Some(rec) = a.record() {
+                    return self.finish(i, &rec, now);
+                }
                 self.rows[i].state = R_RECON;
                 self.rows[i].next_ns = now;
             }
@@ -991,7 +1250,7 @@ impl<C: JupClient> JupGateway<C> {
                 self.landed_late(i, now);
                 self.rows[i].state = R_POLL;
             }
-            OrderState::Unknown => {}
+            _ => {}
         }
     }
 
@@ -1007,13 +1266,14 @@ impl<C: JupClient> JupGateway<C> {
         w.n
     }
 
-    fn recon(&mut self, i: usize, now: u64) {
+    /// The SECONDARY read: the account's open-order pages
+    /// ([`RECON_PAGES_MAX`] at most) for row `i`'s order — `None` when no
+    /// page read it (pages left unread, or a page that failed, are no
+    /// evidence of anything).
+    fn recon_pages(&mut self, i: usize) -> Option<OrderRecord> {
         let r = self.rows[i];
         let mut k = [0u8; B58_KEY_MAX];
         let kl = base58_encode(&r.order_key, &mut k).unwrap_or(0);
-        let mut found: Option<OrderRecord> = None;
-        let mut read_ok = true;
-        let mut ran_out = false;
         let mut page = 0u32;
         while page < RECON_PAGES_MAX {
             let pn = self.recon_target(page);
@@ -1021,63 +1281,86 @@ impl<C: JupClient> JupGateway<C> {
             let key: Header<'_> = (b"x-api-key", &self.key[..self.key_len]);
             let res = self.client.request(Method::Get, &self.path[..pn], &[key], 0);
             let Ok((200, range)) = res else {
-                read_ok = false;
-                break;
+                return None;
             };
             let body = self.client.resp().get(range).unwrap_or(&[]);
             let mut rec = OrderRecord::default();
             match scan_orders(body, &k[..kl], &mut rec) {
-                Ok((true, _)) => {
-                    found = Some(rec);
-                    break;
-                }
-                Ok((false, true)) => {
-                    page += 1;
-                    ran_out = page == RECON_PAGES_MAX;
-                }
-                Ok((false, false)) => break,
-                Err(_) => {
-                    read_ok = false;
-                    break;
-                }
+                Ok((true, _)) => return Some(rec),
+                Ok((false, true)) => page += 1,
+                _ => return None,
             }
         }
-        // Pages left unread are no evidence the order is absent.
-        if found.is_none() && ran_out {
-            read_ok = false;
-        }
-        let terminal = |r: &OrderRecord| r.state == OrderState::Filled || r.state == OrderState::Failed;
-        match found {
-            Some(rec) if terminal(&rec) && rec.has_fill && (rec.filled_micro == 0 || rec.has_avg) => {
-                self.landed_late(i, now);
-                self.finish(i, &rec, now);
+        None
+    }
+
+    /// Recon by the order's pubkey (module docs): the status answer first,
+    /// the open-order pages second; an in-doubt order is released only on
+    /// a 404 past its blockhash's life.
+    fn recon(&mut self, i: usize, now: u64) {
+        let r = self.rows[i];
+        self.counters.recons += 1;
+        let read = self.read_status(i);
+        match read {
+            StatusRead::Read(a) => {
+                if let Some(rec) = a.record() {
+                    self.landed_late(i, now);
+                    return self.finish(i, &rec, now);
+                }
+                match a.state {
+                    // Known and still open past its deadline: read again
+                    // later (a try spent; the pages add nothing).
+                    OrderState::Pending | OrderState::Partial => {
+                        self.landed_late(i, now);
+                        return self.retry_recon(i, now, false);
+                    }
+                    // Terminal without its numbers: the venue knows it.
+                    s if s.terminal() => self.landed_late(i, now),
+                    // A word this reader does not know: no evidence.
+                    _ => {}
+                }
             }
-            Some(rec) if terminal(&rec) => {
-                // Terminal without its numbers: not read (retried, then
-                // LOST) — never booked as unfilled.
-                self.landed_late(i, now);
-                self.counters.recon_misses += 1;
-                self.retry_recon(i, now, false);
-            }
-            Some(_) => {
-                // Still pending past its deadline: read again later.
-                self.landed_late(i, now);
-                self.retry_recon(i, now, false);
-            }
-            None if read_ok && !r.landed && now >= r.sent_ns.saturating_add(BLOCKHASH_LIFE_NS) => {
-                // In doubt, never found, its blockhash long expired: it
-                // never landed.
+            StatusRead::NotFound if !r.landed && !r.seen_200 => {
+                if now < r.sent_ns.saturating_add(BLOCKHASH_LIFE_NS) {
+                    // Its blockhash may still live: wait, spending no tries.
+                    return self.retry_recon(i, now, true);
+                }
+                if r.first_404_ns == 0 {
+                    self.rows[i].first_404_ns = now;
+                    return self.retry_recon(i, now, true);
+                }
+                if now < r.first_404_ns.saturating_add(RELEASE_GAP_NS) {
+                    return self.retry_recon(i, now, true);
+                }
+                // In doubt, never answered with a 200, and the API's own
+                // 404 twice, RELEASE_GAP_NS apart, both past its
+                // blockhash's life: it never landed.
                 self.counters.done += 1;
+                self.counters.released += 1;
                 let mut ev = JupEvent::new(EVT_DONE, r.client_oid, now);
                 ev.aux = 1;
                 self.rows[i] = FREE_ROW;
                 self.emit(&ev);
+                return;
             }
-            None => {
-                self.counters.recon_misses += 1;
-                self.retry_recon(i, now, !r.landed && read_ok);
-            }
+            // A landed (or once answered) order the venue does not know, or
+            // nothing read: the pages may still show it.
+            StatusRead::NotFound | StatusRead::Unread => {}
         }
+        match self.recon_pages(i) {
+            Some(rec)
+                if rec.state.terminal() && rec.has_fill && (rec.filled_micro == 0 || rec.has_avg) =>
+            {
+                self.landed_late(i, now);
+                return self.finish(i, &rec, now);
+            }
+            // Listed, so it landed; terminal without its numbers, or still
+            // open: not read — never booked unfilled.
+            Some(_) => self.landed_late(i, now),
+            None => {}
+        }
+        self.counters.recon_misses += 1;
+        self.retry_recon(i, now, false);
     }
 
     /// Recon again in [`RECON_GAP_NS`]; a landed order that exhausts its
@@ -1207,17 +1490,39 @@ impl<C: JupClient> JupGateway<C> {
         };
         let mut ev = JupEvent::new(EVT_BALANCE, 0, now);
         // No USDC entry is no reading: it must never seed the session
-        // anchor at 0 (that would hide every later loss).
+        // anchor at 0 (that would hide every later loss) — nor the debit
+        // halt's reference.
         if let (true, Some(usdc)) = (ok, b.usdc_micro) {
             self.usdc_micro = word(usdc);
             self.sol_lamports = b.sol_lamports.map_or(-1, word);
             ev.aux = usdc;
             ev.cost_micro = b.sol_lamports.unwrap_or(0);
+            self.debit_check(now, usdc);
         } else {
             self.counters.balance_failures += 1;
             ev.reason = 1;
         }
         self.emit(&ev);
+    }
+
+    /// The debit halt at a balance read of `usdc` (the deposit mint, base
+    /// units; module docs): checked against the reference minus the
+    /// deposits sent since, first; then re-anchored when no order is in
+    /// flight. A breach halts and never re-anchors.
+    fn debit_check(&mut self, now: u64, usdc: u64) {
+        self.debit_read_ns = now;
+        if self.debit_ref_micro >= 0 {
+            let floor = (self.debit_ref_micro as u64).saturating_sub(self.debit_allow_micro);
+            if usdc < floor {
+                self.counters.debit_halts += 1;
+                self.end.stats.halt(HALT_DEBIT);
+                return;
+            }
+        }
+        if self.open_rows() == 0 && now >= self.quiet_after_ns {
+            self.debit_ref_micro = word(usdc);
+            self.debit_allow_micro = 0;
+        }
     }
 
     fn read_positions(&mut self) {
@@ -1235,8 +1540,10 @@ impl<C: JupClient> JupGateway<C> {
         let body = self.client.resp().get(range).unwrap_or(&[]);
         let claims = &mut self.claims;
         let held = &self.held;
+        let rows = &self.rows;
         let mut gone = [0usize; HELD_MAX];
         let mut n_gone = 0usize;
+        let mut unknown = 0u64;
         let read = scan_positions(body, &mut |p| {
             let Some(k) = key_of(p.pubkey.of(body)) else {
                 return;
@@ -1255,7 +1562,31 @@ impl<C: JupClient> JupGateway<C> {
                 }
                 return;
             }
-            if !p.claimable || p.contracts_micro == 0 {
+            if p.contracts_micro == 0 {
+                return;
+            }
+            // Contracts we must account for: a held leg on this position,
+            // or an order in flight (landed, in doubt, in recon) on it. The
+            // fill race cannot trip this: a row exists from before its
+            // execute until the pass that books its fill, which inserts the
+            // held leg before it frees the row. An unknown position is
+            // never claimed.
+            let mut known = false;
+            let mut j = 0usize;
+            while j < HELD_MAX {
+                known |= held[j].state != 0 && held[j].position == k;
+                j += 1;
+            }
+            let mut r = 0usize;
+            while r < GW_ROWS {
+                known |= rows[r].state != R_FREE && rows[r].position_key == k;
+                r += 1;
+            }
+            if !known {
+                unknown += 1;
+                return;
+            }
+            if !p.claimable {
                 return;
             }
             let mut free = CLAIMS_MAX;
@@ -1279,6 +1610,10 @@ impl<C: JupClient> JupGateway<C> {
         });
         if read.is_err() {
             self.counters.position_failures += 1;
+        }
+        if unknown > 0 {
+            self.counters.unknown_positions += unknown;
+            self.end.stats.halt(HALT_UNKNOWN_POSITION);
         }
         // Within the ring's room only: a leg not told this pass stays in
         // the table and the next read tells it.
@@ -1321,7 +1656,8 @@ impl<C: JupClient> JupGateway<C> {
                 let mut a = ClaimAnswer::default();
                 match scan_claim(body, &mut a) {
                     Ok(()) => {
-                        guard_and_sign(a.transaction.of(body), &mut self.tx, &self.cfg.guard, 0, &self.signer)
+                        let b64 = a.transaction.of(body);
+                        guard_and_sign(b64, &mut self.tx, &self.cfg.guard, &Want::Claim, &self.signer)
                             .map(|_| a.payout_micro)
                             .ok()
                     }
@@ -1391,9 +1727,14 @@ impl<C: JupClient> JupGateway<C> {
             word(c.claims_refused),
             word(c.held_writes),
             word(c.held_full),
+            word(c.debit_halts),
+            word(c.released),
+            word(c.unknown_positions),
             word(self.end.stats.halt_reason()),
             self.usdc_micro,
             self.sol_lamports,
+            self.debit_ref_micro,
+            word(self.debit_allow_micro),
         ];
         stats.set_gw(&v);
     }
@@ -1449,6 +1790,7 @@ const _: () = assert!(QUERY_MAX >= P_ORDERS_Q.len() + B58_KEY_MAX + 7 + 10 + 5 +
 const _: () = assert!(QUERY_MAX >= P_POSITIONS_Q.len() + B58_KEY_MAX);
 const _: () = assert!(QUERY_MAX >= P_BALANCES.len() + B58_KEY_MAX);
 const _: () = assert!(PATH_MAX <= QUERY_MAX);
+const _: () = assert!(BODY_MIN >= ORDER_BODY_MAX);
 
 #[cfg(test)]
 mod tests;

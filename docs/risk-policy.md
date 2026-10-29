@@ -18515,6 +18515,182 @@ law included) · `make bench-check` not a valid reading under background QoS
 (every group +50 … +330 %, the clock and ring benches included); `hot_path`
 links no crate J14 changes. No worker change: pytest not run.
 
+### J15 — the pre-dust guard: the signed order bound, the debit halt, recon by order (2026-10-29)
+
+**Why.** `### J3` required, before any `PMJ-DUST-GATE` line, (a) the wallet
+at most the slot's day cap, (b) the guard reading `create_order`'s data and
+checking its amount and price itself, (c) a halt when the wallet's balance
+falls by more than the deposit. The binding pre-check (R-PMJ-S72; project
+`research/pmj/binding-precheck-2026-10-29.md`) found the field that binds
+the price on chain: **`order_type = Limit` with `max_fill_price_usd`** —
+on 1 038 public create-orders, Market fills cleared above their signed cap
+in 210 of 647 cases (up to +197 %), Limit fills in 0 of 58 (IDL error 6053
+`FillPriceExceedsLimit`). This section builds (b), (c), recon by order
+and the co-signer amendment in code; (a) and the live wiring are J16.
+`exec-jupiter` is still linked by `bench` and `fuzz` only; a paper boot
+builds no arm and the engine refuses a live slot 11.
+
+- **LAW PMJ-G for ORDER builds** (replaces J3's "the transfers our wallet
+  authorises … sum to at most the `depositAmount`" line for orders): a
+  build is signed only through `guard_order`, which keeps every J3 line and
+  adds:
+  - **no top-level token debit at all** (the program moves the deposit by
+    CPI; a top-level debit would add to it — a USDC→JupUSD swap build is
+    therefore refused); nothing but Compute Budget instructions and
+    **exactly one** Predict instruction, `create_order` (`8d3625cfedd2fad7`)
+    or `create_order2` (`96ed113d3bc07c34`, deployed, not in the published
+    IDL; same parameter bytes);
+  - `CreateOrderParams` (IDL v0.10.0) read whole: strings ≤ 64 B, Option
+    tags 0 / 1, no trailing byte; `is_buy` and `is_yes`; **order type Limit**
+    (`NotLimit` otherwise); `max_fill_price_usd ≤` the arm's limit `p − e`
+    (`PriceAboveLimit`); `deposit_amount` = the ask (`DepositMismatch`);
+    contracts > 0, = the answer's `contractsMicro`, and contracts × cap ≤
+    deposit × 1e6 (a 6-decimal deposit mint); no integrator, no integrator
+    fee;
+  - by account role (12 accounts for v1, 13 for v2): payer and owner our
+    wallet; the deposit source = `guard_deposit_account` (role 6 / 7); the
+    settlement mint = the deposit mint (7 / 8); the order and position
+    accounts = the answer's `orderPubkey` / `positionPubkey` (roles 5 / 4),
+    static keys; the vault pinned — `guard_vault` (static) or
+    `guard_vault_alt` (`<table>:<entry>`, the table one of `guard_alts`;
+    publicly `2y9Ad2…` at `6awx…:1`; boot refuses with no vault pinned;
+    table `6awx…`'s authority `2SoQ…` is not frozen, its written entries are
+    immutable; J16 re-reads entry 1 before arming);
+  - the signed `market_id` (a 32-hex hash) = the answer's `marketIdHash`
+    (`MarketMismatch`).
+  New `TxErr` codes are appended (existing codes unchanged): 20
+  `CosignerSignature` … 33 `ExtraInstruction`.
+- **Claims** only through `guard_claim`: one `claim_payout`
+  (`7ff0843ee3c69285`) or `claim_payout2` (`8dcd63cb8ee757e2`), no data, 7
+  accounts, the authority our wallet, the payout into our deposit
+  account, the vault pinned; besides it only Compute Budget and at most one
+  ATA `CreateIdempotent` of our own deposit account (payer and owner our
+  wallet). A claim has one signer: LAW PMJ-G holds unchanged there.
+- **The CPI consequence still holds.** The deposit, the price and the order
+  type are bound in the signed bytes; what the CPI moves is still trust in
+  the program, which is upgradeable (authority `5myNNmEm…`): **a new
+  deploy slot is a review trigger** (J16 re-reads it before arming).
+- **Residual — requirement (d), before the dust gate:** the instrument and
+  outcome are bound only to the answer's own `marketIdHash` (the server's
+  word). Its derivation from `POLY-<id>-<o>` is unknown (not md5 / sha of
+  the obvious strings); J0 / J5 must bind the signed hash to the window
+  independently (a derivation, or Jupiter's market record read at
+  discovery). Until then a hostile server could swap the market or the
+  outcome within the deposit and the limit.
+- **The request (`build_extra`, `pmj.toml`).** The documented `POST
+  /orders` has no order-type or limit field; Jupiter's UI places limit buys.
+  `build_extra` adds ≤ 4 `"name":"value"` members to the build body: names
+  `[A-Za-z][A-Za-z0-9_]{0,31}`, never (case-insensitively) one of the body's
+  own members; values `[A-Za-z0-9_.]{1,32}` or exactly `{limit_micro}` /
+  `{limit_usd}` (the member's limit). Rendered in place (zero alloc).
+  **Absent → every build is refused `NotLimit`** (fail-closed). The guard is
+  the law whatever the request said.
+- **The co-signer amendment (R-PMJ-S44) is in code, DORMANT:** G-S1..G-S5
+  and G-A1 exactly as the vault draft (`pmj-g-amendment-draft.md`);
+  `guard_cosigners` (≤ 1; refused if it equals a program, a lookup table,
+  the deposit account, the vault, a system program, the wallet or the zero
+  key). **LAW PMJ-G as written stands** and `guard_cosigners` stays empty in
+  every committed config until Anton's J0 and his S44 ruling.
+- **(c) The debit halt** (jup-gw). Reference: the last balance read with no
+  row open and ≥ 30 s after the last execute; floor: the reference minus
+  the deposits of every execute that may have left the host; checked at
+  every successful read (every 30 s); a breach halts with `HALT_DEBIT`
+  (venue base + 7) on the shared halt word → the arm halted → the router's
+  `GatewayHalt` → `exec.HALT`, sticky; a breaching read never re-anchors.
+  Build refusals, each counting toward the reject streak by design (the
+  slot stops rather than trading without a working check): `NO_REFERENCE`
+  (17, before the first reference), `STALE_REFERENCE` (18, the last good
+  read older than 60 s), `ALLOWANCE` (19, outstanding deposits plus this one
+  over 4 × the per-order maximum — `DEBIT_ALLOW_ORDERS` 4 suits the BTC-only
+  dust and pilot frames and must be re-sized to families × the per-market
+  cap before more than one family arms live). **Limits:** refunds, payouts
+  and unlanded in-doubt deposits can mask a drain within their amount until
+  the next quiet read; a restart re-anchors (a drain while down is unseen);
+  a stale answer can only cause a false halt; the fee is inside the deposit.
+  Requirement (a) bounds all of this and is J16's.
+- **Unknown positions halt** (the venue analogue of kill-switch trigger 3):
+  a `/positions` record with contracts > 0, not claimed, on a position key
+  no held leg or in-flight order carries → `unknown_positions` counted,
+  `HALT_UNKNOWN_POSITION` (base + 8); never claimed. A held-leg file
+  restored with a zero position key fails closed (it halts).
+- **A fill above its own limit halts the arm** (`over_limit`): it falsifies
+  the Limit evidence. The fill is still booked (the contracts are held).
+- **Recon by order** (supersedes J3's "Recon reads 4 pages of 50" text and
+  its pre-arming depth requirement): `GET /orders/status/{orderPubkey}`
+  (the key now tied to the signed account) is primary; `/orders` pages are
+  secondary and never evidence of absence (J0: they list OPEN orders only).
+  A terminal status books at once only with consistent numbers — the top
+  level and every `order_filled` event must agree (a Limit order can fill
+  in increments); missing or conflicting numbers are not read and end LOST
+  (30 tries) → `HALT_RECON`. **Release** (DONE, never landed) only on
+  Jupiter's own `invalid_request_error` 404, twice, ≥ 30 s apart, both ≥
+  300 s after the execute, and only if no 200 of any kind was ever read for
+  that order; any other 404 (a CDN page, another error kind) stays in doubt.
+- **A Limit order rests** (public data: one filled in three increments over
+  11 min; 3 of 12 closed unfilled). The paper IoC does not model a resting
+  order; its lifetime and who cancels it (the IDL has `cancel_order`) are
+  J5 facts — J3's "a landed keeper order cannot be pulled" is to be
+  re-checked there.
+- **Wire facts added to J0 / J5:** the request field for a Limit build;
+  create_order vs create_order2 in our builds; the 404 body for an unknown
+  order; the closed status's fill fields (cumulative or per increment; the
+  event name); `marketIdHash` and `contractsMicro` in our build answer; the
+  `market_id` derivation; the deposit mint's decimals; the co-signer slot.
+- **New `pmj.toml` keys** (all optional): `guard_vault` / `guard_vault_alt`
+  (absent = the boot refuses), `guard_cosigners` (absent = LAW PMJ-G as
+  written), `build_extra` (absent = today's body, so every build is refused
+  `NotLimit`).
+- **Known limits, until J0 / J5 settle them:** (1) **every split fill halts
+  for now** — until J0 settles what an `order_filled` event's quantity means,
+  an order of ours that fills in two or more increments, or still rests ≈ 60 s
+  past its deadline (the window's close + 30 s), ends with `HALT_RECON`; the
+  dust battery expects it; (2) **held-table capacity** — 32 legs; a leg
+  leaves only when `/positions` reads it claimed (lost legs never leave;
+  won legs only when the venue settles them, our claims being built but
+  held), so once full the next booked leg is not held (`held_full`) and the
+  next positions read halts `HALT_UNKNOWN_POSITION` — 40 dust orders can
+  reach it; whether a venue-settled position reads claimed is a J0 / J5
+  fact; (3) the unknown-position check matches **keys, not amounts** (up to
+  4 orders share one position per market) — an amount check at J5 once J0
+  confirms `contractsMicro`'s units; (4) the positions read covers the
+  **first page** only (the envelope's paging is a J0 item).
+- **Proof.** Public mainnet transactions as test vectors
+  (`crates/exec-jupiter/tests/fixtures/`: create_order v1 Market and Limit,
+  create_order2 Market and Limit, claim_payout2; every key pinned); hostile
+  loopback tests refused unsigned (an extra signer, a durable nonce, an
+  unlisted or table-loaded program, a token debit, Market, a cap above the
+  limit, an integrator fee, a deposit or contracts mismatch, a foreign
+  source / order / position / market hash, an unknown Predict instruction,
+  an extra instruction); the debit halt, recon, release and positions
+  cases; alloc gates 134 / 135 over the guard (both versions, the claim,
+  the co-signature verified), the extras, the status numbers, the debit
+  check and re-anchor, recon by status at 0 B; fuzz `jup_wire` extended.
+  proptest as a dev-dependency (already in the workspace; `about.toml`
+  ignores dev-dependencies: no `license-deps`).
+- **Risk review** (an Opus subagent at xhigh, read-only): round 1 **BLOCK**
+  — the answer's order / position keys untied to the signed accounts;
+  conflicting fill numbers could book a filled order unfilled; minors (any
+  404 released; the floor could sink to 0; stale reads blind the halt; a
+  fill above the limit unchecked; other allowlisted instructions in an order
+  build) → fixed with tests; round 2 **NEEDS-DOCS** (code approved; minors:
+  only `invalid_request_error` 404s count; positions vs held legs; the
+  reject-streak note) → fixed; this subsection; round 3 **APPROVE** (the
+  additions on split fills, held-table capacity, key-not-amount positions,
+  the first page and the vault table — folded in above).
+
+J15-GATES (2026-10-29 12:57–13:07Z, on the Mac, detached, every cargo under
+`taskpolicy -b`; the release binary untouched): `make lint` rc 0, 0 warnings
+· `cargo nextest run --workspace` 5 179 passed, 6 failed, 10 skipped — the
+reds are wall-clock and loopback tests in crates J15 does not touch (four
+`exec-binance::bn_equity_e2e`, `core-net` `an_idle_close_is_noticed_and_the_next_request_dials_fresh`,
+gate 103) on the background-QoS E-cores beside another lane's cargo; all six
+pass at normal QoS (30 / 30 of their binaries' tests, 13:0xZ) · `make
+alloc-assert` 139 passed at 0 B (a fresh `Compiling bench`; gates 134 / 135
+over the new paths) · `make copy-audit` new 0 · `make license-check` OK (797
+files) · fuzz `jup_wire` 60 s clean (1.97 M runs). `make bench-check` not run
+(`hot_path` links no crate J15 changes; and under background QoS it is no
+reading — J14).
+
 ## NOTIFY — N-DOCTRINE: the one-way Telegram notifier (2026-10-24)
 
 **Rulings (Anton, 2026-10-24; the plan is the project doc

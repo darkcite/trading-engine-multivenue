@@ -136,3 +136,93 @@ fn error_answers_classify_and_a_region_refusal_is_its_own_kind() {
     assert_eq!(a.kind, ErrKind::Region);
     assert_eq!(scan_error(b"not json", &mut a), Err(JsonErr::Shape));
 }
+
+/// PMJ W5: recon's primary source — the status answer's fill numbers, at
+/// the top level or in the `order_filled` history event.
+#[test]
+fn the_status_answer_carries_the_fill_numbers_from_the_top_or_the_filled_event() {
+    let body = br#"{"orderPubkey":"O","status":"closed","latestEventType":"order_closed","history":[{"eventType":"order_created","status":"pending","timestamp":1},{"eventType":"order_filled","status":"filled","filledContractsMicro":"5263157","avgFillPriceUsd":"950000","timestamp":2},{"eventType":"order_closed","status":"closed","filledContracts":"0","timestamp":3}]}"#;
+    let mut a = StatusAnswer::default();
+    scan_status(body, &mut a).expect("reads");
+    assert_eq!((a.state, a.events), (OrderState::Closed, 3));
+    assert!(a.state.terminal());
+    assert_eq!((a.has_fill, a.filled_micro, a.has_avg, a.avg_px_micro), (true, 5_263_157, true, 950_000));
+    let r = a.record().expect("a terminal record with its numbers");
+    assert_eq!((r.filled_micro, r.avg_px_micro, r.has_fill), (5_263_157, 950_000, true));
+    // The top level's numbers (whole contracts, a dollar price) and a filled
+    // event that agrees.
+    let top = br#"{"status":"filled","filledContracts":"5.5","avgFillPriceUsd":"0.95","history":[{"eventType":"order_filled","filledContractsMicro":"5500000","avgFillPriceUsd":"950000"}]}"#;
+    scan_status(top, &mut a).expect("reads");
+    assert_eq!((a.filled_micro, a.avg_px_micro, a.conflict), (5_500_000, 950_000, false));
+    assert!(a.record().is_some());
+    // Two filled events that agree read as one.
+    let two = br#"{"status":"filled","history":[{"eventType":"order_filled","filledContractsMicro":"7","avgFillPriceUsd":"900000"},{"eventType":"order_filled","filledContractsMicro":"7","avgFillPriceUsd":"900000"}]}"#;
+    scan_status(two, &mut a).expect("reads");
+    assert_eq!((a.filled_micro, a.avg_px_micro, a.conflict), (7, 900_000, false));
+    assert!(a.record().is_some());
+    // A failed order that says it filled nothing reads as 0 filled.
+    let none = br#"{"status":"failed","filledContracts":"0","history":[]}"#;
+    scan_status(none, &mut a).expect("reads");
+    assert_eq!(a.record().map(|r| r.filled_micro), Some(0));
+    // A null history and a non-object event are skipped, not refused.
+    scan_status(br#"{"status":"pending","history":null}"#, &mut a).expect("reads");
+    scan_status(br#"{"status":"pending","history":[1,"x",{"eventType":"order_created"}]}"#, &mut a).expect("reads");
+    assert_eq!(a.events, 1);
+}
+
+/// PMJ W5: without its numbers a terminal status is NOT read (never booked
+/// unfilled); a pending one with numbers is not terminal.
+#[test]
+fn a_status_without_its_numbers_is_no_record() {
+    let mut a = StatusAnswer::default();
+    for (body, why) in [
+        (r#"{"status":"filled","history":[{"eventType":"order_filled","status":"filled"}]}"#, "a filled event without its quantity"),
+        (r#"{"status":"filled","history":[{"eventType":"order_filled","filledContractsMicro":"5"}]}"#, "a quantity without its price"),
+        (r#"{"status":"closed","history":[{"eventType":"order_closed","filledContracts":"5","avgFillPriceUsd":"1"}]}"#, "numbers on another event"),
+        (r#"{"status":"pending","filledContractsMicro":"5","avgFillPriceUsd":"1"}"#, "not terminal"),
+        (r#"{"status":"settled-ish","filledContractsMicro":"5","avgFillPriceUsd":"1"}"#, "an unknown word"),
+    ] {
+        scan_status(body.as_bytes(), &mut a).expect("reads");
+        assert_eq!(a.record(), None, "{why}");
+    }
+    assert_eq!(state_of(b"Closed"), OrderState::Closed);
+    assert!(!OrderState::Pending.terminal() && !OrderState::Unknown.terminal());
+}
+
+/// Risk review W5-1, MAJOR 2: sources of the fill numbers that disagree are
+/// not read — never the max (a Limit order can fill in increments; one
+/// public order filled in three `FillBuyOrder2` transactions), never the top
+/// level over an event.
+#[test]
+fn fill_numbers_that_disagree_are_not_read() {
+    let mut a = StatusAnswer::default();
+    for (body, why) in [
+        (
+            r#"{"status":"filled","filledContractsMicro":"5000000","avgFillPriceUsd":"950000","history":[{"eventType":"order_filled","filledContractsMicro":"1000000","avgFillPriceUsd":"950000"}]}"#,
+            "the top level's quantity and an event's",
+        ),
+        (
+            r#"{"status":"filled","filledContractsMicro":"5000000","avgFillPriceUsd":"950000","history":[{"eventType":"order_filled","filledContractsMicro":"5000000","avgFillPriceUsd":"940000"}]}"#,
+            "the top level's price and an event's",
+        ),
+        (
+            r#"{"status":"closed","history":[{"eventType":"order_filled","filledContractsMicro":"1000000","avgFillPriceUsd":"900000"},{"eventType":"order_filled","filledContractsMicro":"2000000","avgFillPriceUsd":"910000"},{"eventType":"order_filled","filledContractsMicro":"3000000","avgFillPriceUsd":"920000"}]}"#,
+            "three increments",
+        ),
+        (
+            r#"{"status":"closed","history":[{"eventType":"order_filled","filledContractsMicro":"3000000","avgFillPriceUsd":"920000"},{"eventType":"order_filled","filledContractsMicro":"3000000","avgFillPriceUsd":"910000"}]}"#,
+            "one quantity, two prices",
+        ),
+    ] {
+        scan_status(body.as_bytes(), &mut a).expect("reads");
+        assert!(a.conflict, "{why}");
+        assert_eq!(a.record(), None, "{why}: not read, never booked");
+    }
+    // An event without a price beside a priced top level is no conflict:
+    // the top level's numbers are read.
+    let one = br#"{"status":"filled","filledContractsMicro":"5","avgFillPriceUsd":"950000","history":[{"eventType":"order_filled","filledContractsMicro":"5"}]}"#;
+    scan_status(one, &mut a).expect("reads");
+    assert_eq!((a.conflict, a.record().map(|r| r.avg_px_micro)), (false, Some(950_000)));
+    let mut b = StatusAnswer::default();
+    assert_eq!(scan_status(br#"{"status":"filled","filledContracts":"x"}"#, &mut b), Err(JsonErr::Number));
+}

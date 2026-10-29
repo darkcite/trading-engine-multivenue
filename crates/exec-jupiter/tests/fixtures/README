@@ -1,0 +1,24 @@
+SPDX-License-Identifier: Apache-2.0
+Copyright 2026 Anton (darkcite)
+
+exec-jupiter test vectors (PMJ W5, read 2026-10-29): public Solana mainnet
+transactions of Jupiter Predict (program 3ZZuTbwC6aJbvteyVxXUS7gtFYdf7AuXeitx6VyvjvUp),
+each the base64 of the landed wire transaction exactly as
+`getTransaction(sig, {"encoding":"base64","maxSupportedTransactionVersion":0})`
+on api.mainnet-beta.solana.com returned it. Public chain data used as known
+answers for `tx::guard_order` / `tx::guard_claim` (the SDK-vector precedent);
+other people's transactions, never ours, no key of ours in them.
+
+create-order-v1-market.b64  create_order  Market  slot 458816924  4hHfkkafgHv9qJxPdgPLK14vMPrhX8uiFVFnBWiXNMsL5Uq1kMRKc3Ns51troU6R9b7CZ9QZ8SEWmadQ1UvrbcuM
+create-order-v1-limit.b64   create_order  Limit   slot 462839696  49JT5D654ZMBTDF6G1Lb7hrr8yphs3sQVN8RTzGVXRCKkwRFMYLt2XC8H2xM81fAdjJx1fBEfLTJVd6mQ6kHUbdy
+create-order2-market.b64    create_order2 Market  slot 462863510  Z5ftgpU7nvsHKrKLz5FoSbH8ZUewQqpAXFGjoNZ4srYBGApyTwHx22StmSi95tqQntBG1gfLtY6aQ2gNo6x2knP
+create-order2-limit.b64     create_order2 Limit   slot 462844216  3uAXixtzqKBX6XUK7XoaXvhdrsFdyJGQrAg3j56rLDyvun7pb8Be8eahAiaYFNqVUoPZiHvc3jR2yFYjq6npkTwW
+claim-payout2.b64           claim_payout2         slot 462862509  3vydQ3UCDurYFGJUSTvPBhEordvUzcBzcHvM1w2heUzEEmpzVQGb8TqFg7X9FWR5U983ZQZ1efH9ynmDGUHjJseH
+
+Each create-order carries two required signers (the owner; the read-only
+co-signer AJooF3xRkSx1PUC5Y9dNZHy9LMHcx5xKhPxj4iW4jepf), one lookup table
+(6awx2Pq4uxeHsBcmutEqErz79C4TUg4EQEiBX5T5BVfX; its entry 1 is the vault
+2y9Ad2GD7gwiMkkMu4bBK5216Pv9YJsBkSHAGwN3rBuJ, entry 5 the System program) and
+the JupUSD mint JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD. The claim and
+create-order2-market share an owner (5wzHj5BRhsViwc79VUtPv1DpAbafkFnYLc81hK2AT2be)
+and its deposit account (911cuEbXmZxEhb2aCVNmukJiiKAftyn8MaYcickGZy5y).

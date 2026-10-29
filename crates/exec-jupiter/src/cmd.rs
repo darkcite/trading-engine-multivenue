@@ -124,6 +124,20 @@ pub mod reason {
     /// The build answered another order than the one asked (market,
     /// outcome side, buy, owner, or a cost above the deposit).
     pub const MISMATCH: u8 = 16;
+    /// (PMJ W5) No debit-halt reference yet: no deposit-mint balance has
+    /// been read with no order in flight, so a landing could not be checked.
+    /// Like [`STALE_REFERENCE`] and [`ALLOWANCE`], a local refusal that
+    /// counts toward the arm's reject-streak halt by design (fail-closed).
+    pub const NO_REFERENCE: u8 = 17;
+    /// (Risk review W5-1) the debit reference is stale: the last balance
+    /// read that read is older than `gw::REFERENCE_MAX_AGE_NS` (`aux` = its
+    /// age, ns).
+    pub const STALE_REFERENCE: u8 = 18;
+    /// (Risk review W5-1) the deposits sent since the debit reference, plus
+    /// this one, would pass `gw::DEBIT_ALLOW_ORDERS` per-order maxima (`aux`
+    /// = the deposits outstanding, micro). Counts toward the reject streak
+    /// by design; the constant suits one live family (re-size it first).
+    pub const ALLOWANCE: u8 = 19;
 }
 
 /// One gateway event (jup-gw → engine).

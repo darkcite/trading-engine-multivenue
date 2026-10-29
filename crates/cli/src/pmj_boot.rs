@@ -305,6 +305,10 @@ mod tests {
             guard_deposit_account: String::new(),
             guard_max_sol_lamports: 0,
             guard_max_cu_price: 0,
+            guard_vault: String::new(),
+            guard_vault_alt: String::new(),
+            guard_cosigners: Vec::new(),
+            build_extra: Vec::new(),
         }
     }
 

@@ -12,7 +12,10 @@ use std::collections::VecDeque;
 use core_net::{Header, Method, PostErr};
 
 use crate::client::JupClient;
-use crate::tx::{TxGuard, COMPUTE_BUDGET_PROGRAM, SYSTEM_PROGRAM, TOKEN_PROGRAM};
+use crate::tx::{
+    TxGuard, ATA_PROGRAM, COMPUTE_BUDGET_PROGRAM, DISC_CLAIM_PAYOUT2, DISC_CREATE_ORDER,
+    DISC_CREATE_ORDER2, ORDER_TYPE_LIMIT, SYSTEM_PROGRAM, TOKEN_PROGRAM,
+};
 
 /// One request the rig saw.
 #[derive(Debug, Clone)]
@@ -101,6 +104,26 @@ pub(crate) const VAULT_ATA: [u8; 32] = [0x44; 32];
 pub(crate) const MINT: [u8; 32] = [0x55; 32];
 pub(crate) const JUP: [u8; 32] = [0x66; 32];
 pub(crate) const OTHER: [u8; 32] = [0x22; 32];
+/// The pinned vault of every fixture.
+pub(crate) const VAULT: [u8; 32] = [0x77; 32];
+/// The co-signer a pinned-amendment fixture names (read-only, key 1).
+pub(crate) const COSIGNER: [u8; 32] = [0x7A; 32];
+/// The rig's lookup table (a v0 fixture's).
+pub(crate) const TABLE: [u8; 32] = [0x88; 32];
+/// The order account every rig build answers (`orderPubkey`) and signs.
+pub(crate) const ORDER_KEY: [u8; 32] = [0x0A; 32];
+/// The position account every rig build answers and signs.
+pub(crate) const POSITION_KEY: [u8; 32] = [0x0B; 32];
+/// The `market_id` hash every rig create-order signs and answers.
+pub(crate) const MARKET_HASH: &str = "ad44626a542bdd650466f1c527f02905";
+/// The contracts the clean $5 order at [`CAP`] signs and answers.
+pub(crate) const CONTRACTS: u64 = 5_263_157;
+const ESCROW: [u8; 32] = [0x73; 32];
+const MARKET_RESULT: [u8; 32] = [0x74; 32];
+const AUTHORITY: [u8; 32] = [0x75; 32];
+/// The deposit limit the clean order's create-order is signed at (micro
+/// USD): every rig build answers this cap.
+pub(crate) const CAP: u64 = 950_000;
 
 /// The fixture signer.
 pub(crate) fn signer() -> signer_ed25519::Ed25519Signer {
@@ -123,10 +146,18 @@ fn cu16(v: usize, out: &mut Vec<u8>) {
     }
 }
 
-/// A legacy transaction of `keys` (key 0 the fee payer and only signer),
-/// one zero signature, `(program index, accounts, data)` instructions.
-pub(crate) fn legacy(keys: &[[u8; 32]], readonly_unsigned: u8, ixs: &[(u8, Vec<u8>, Vec<u8>)]) -> Vec<u8> {
-    let mut m = vec![1u8, 0, readonly_unsigned];
+/// A lookup table: its key, the writable and the read-only entries loaded.
+pub(crate) type RawAlt = ([u8; 32], Vec<u8>, Vec<u8>);
+
+/// A transaction by raw INDEX: `keys` under `header` (`header[0]` zero
+/// signatures), `(program index, accounts, data)` instructions, and — `Some`
+/// for a v0 message — its lookup tables.
+pub(crate) fn raw_tx(header: [u8; 3], keys: &[[u8; 32]], ixs: &[(u8, Vec<u8>, Vec<u8>)], alts: Option<&[RawAlt]>) -> Vec<u8> {
+    let mut m = Vec::new();
+    if alts.is_some() {
+        m.push(0x80);
+    }
+    m.extend_from_slice(&header);
     cu16(keys.len(), &mut m);
     for k in keys {
         m.extend_from_slice(k);
@@ -140,55 +171,246 @@ pub(crate) fn legacy(keys: &[[u8; 32]], readonly_unsigned: u8, ixs: &[(u8, Vec<u
         cu16(d.len(), &mut m);
         m.extend_from_slice(d);
     }
-    let mut t = vec![1u8];
-    t.resize(65, 0);
+    if let Some(alts) = alts {
+        cu16(alts.len(), &mut m);
+        for (k, w, r) in alts {
+            m.extend_from_slice(k);
+            cu16(w.len(), &mut m);
+            m.extend_from_slice(w);
+            cu16(r.len(), &mut m);
+            m.extend_from_slice(r);
+        }
+    }
+    let mut t = Vec::new();
+    cu16(header[0] as usize, &mut t);
+    t.resize(t.len() + 64 * header[0] as usize, 0);
     t.extend_from_slice(&m);
     t
 }
 
-fn transfer_checked(amount: u64) -> Vec<u8> {
+pub(crate) fn transfer_checked(amount: u64) -> Vec<u8> {
     let mut d = vec![12u8];
     d.extend_from_slice(&amount.to_le_bytes());
     d.push(6);
     d
 }
 
-fn order_keys(payer: [u8; 32]) -> Vec<[u8; 32]> {
-    vec![payer, USER_ATA, VAULT_ATA, MINT, JUP, TOKEN_PROGRAM, COMPUTE_BUDGET_PROGRAM, SYSTEM_PROGRAM]
+/// A create-order's params (Borsh `CreateOrderParams`, IDL v0.10.0): the
+/// fields the guard reads; a hostile test varies one.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Params {
+    pub(crate) disc: [u8; 8],
+    pub(crate) is_yes: u8,
+    pub(crate) is_buy: u8,
+    pub(crate) contracts: u64,
+    pub(crate) cap: u64,
+    pub(crate) deposit: u64,
+    pub(crate) order_type: u8,
+    pub(crate) integrator: Option<[u8; 32]>,
+    pub(crate) fee_bps: Option<u16>,
 }
 
-/// The clean order transaction: compute budget, Jupiter's instruction,
-/// our USDC deposit of `deposit` to the vault.
+impl Params {
+    /// A Limit `create_order2` buy of `deposit` at `cap`, the contracts the
+    /// deposit pays for at the cap.
+    pub(crate) fn limit(deposit: u64, cap: u64) -> Self {
+        Self {
+            disc: DISC_CREATE_ORDER2,
+            is_yes: 1,
+            is_buy: 1,
+            contracts: deposit * 1_000_000 / cap,
+            cap,
+            deposit,
+            order_type: ORDER_TYPE_LIMIT,
+            integrator: None,
+            fee_bps: None,
+        }
+    }
+
+    /// The instruction data: the discriminator, then the params.
+    pub(crate) fn data(&self) -> Vec<u8> {
+        let hash = MARKET_HASH.as_bytes();
+        let mut d = self.disc.to_vec();
+        for s in [hash, hash] {
+            d.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            d.extend_from_slice(s);
+        }
+        d.extend_from_slice(&[self.is_yes, self.is_buy]);
+        d.extend_from_slice(&self.contracts.to_le_bytes());
+        d.extend_from_slice(&self.cap.to_le_bytes());
+        d.extend_from_slice(&self.deposit.to_le_bytes());
+        d.push(self.order_type);
+        match self.integrator {
+            Some(k) => {
+                d.push(1);
+                d.extend_from_slice(&k);
+            }
+            None => d.push(0),
+        }
+        match self.fee_bps {
+            Some(b) => {
+                d.push(1);
+                d.extend_from_slice(&b.to_le_bytes());
+            }
+            None => d.push(0),
+        }
+        d
+    }
+}
+
+/// One instruction by KEY: the program, the accounts, the data.
+pub(crate) type KIx = ([u8; 32], Vec<[u8; 32]>, Vec<u8>);
+
+/// What an order transaction carries (a hostile test changes one field).
+#[derive(Clone, Debug)]
+pub(crate) struct OrderTx {
+    pub(crate) params: Params,
+    /// The co-signer as the second required signer (read-only), its slot
+    /// empty.
+    pub(crate) cosigner: bool,
+    /// The account the create-order names as the deposit's source.
+    pub(crate) source: [u8; 32],
+    /// The order account (role 5).
+    pub(crate) order: [u8; 32],
+    /// The position account (role 4).
+    pub(crate) position: [u8; 32],
+    /// Instructions after the create-order.
+    pub(crate) extra: Vec<KIx>,
+    /// Instructions before it.
+    pub(crate) before: Vec<KIx>,
+}
+
+impl OrderTx {
+    /// The clean order: a Limit `create_order2` of `deposit` at [`CAP`].
+    pub(crate) fn clean(deposit: u64) -> Self {
+        Self {
+            params: Params::limit(deposit, CAP),
+            cosigner: false,
+            source: USER_ATA,
+            order: ORDER_KEY,
+            position: POSITION_KEY,
+            extra: Vec::new(),
+            before: Vec::new(),
+        }
+    }
+
+    /// The create-order's accounts by role (tx module docs' table).
+    pub(crate) fn accounts(&self) -> Vec<[u8; 32]> {
+        let auth = if self.cosigner { COSIGNER } else { AUTHORITY };
+        let mut a = vec![WALLET, WALLET, auth, VAULT, self.position, self.order];
+        if self.params.disc != DISC_CREATE_ORDER {
+            a.push(MARKET_RESULT);
+        }
+        a.extend_from_slice(&[self.source, MINT, ESCROW, TOKEN_PROGRAM, ATA_PROGRAM, SYSTEM_PROGRAM]);
+        a
+    }
+
+    /// The legacy transaction: compute budget, `before`, the create-order,
+    /// `extra` — every key static, the signatures zero.
+    pub(crate) fn build(&self) -> Vec<u8> {
+        let mut limit = vec![2u8];
+        limit.extend_from_slice(&200_000u32.to_le_bytes());
+        let mut ixs: Vec<KIx> = vec![(COMPUTE_BUDGET_PROGRAM, Vec::new(), limit)];
+        ixs.extend(self.before.iter().cloned());
+        ixs.push((JUP, self.accounts(), self.params.data()));
+        ixs.extend(self.extra.iter().cloned());
+        let signers: &[[u8; 32]] = if self.cosigner { &[WALLET, COSIGNER] } else { &[WALLET] };
+        by_key(signers, u8::from(self.cosigner), &ixs)
+    }
+}
+
+/// A legacy transaction of `ixs` named by key: `signers` first (key 0 the
+/// fee payer; the last `ro_signed` of them read-only), then the writable
+/// accounts, then the read-only ones (every program, and `MINT`, `VAULT`,
+/// `MARKET_RESULT`, `AUTHORITY`, `COSIGNER` when not a signer), each once
+/// in first-use order; zero signatures.
+pub(crate) fn by_key(signers: &[[u8; 32]], ro_signed: u8, ixs: &[KIx]) -> Vec<u8> {
+    let readonly = |k: &[u8; 32]| {
+        *k == MINT || *k == VAULT || *k == MARKET_RESULT || *k == AUTHORITY || *k == COSIGNER || *k == ATA_PROGRAM
+    };
+    let mut keys: Vec<[u8; 32]> = signers.to_vec();
+    let mut ro: Vec<[u8; 32]> = Vec::new();
+    for (p, accs, _) in ixs {
+        for k in accs.iter() {
+            if keys.contains(k) || ro.contains(k) {
+                continue;
+            }
+            if readonly(k) || *k == TOKEN_PROGRAM || *k == SYSTEM_PROGRAM {
+                ro.push(*k);
+            } else {
+                keys.push(*k);
+            }
+        }
+        if !keys.contains(p) && !ro.contains(p) {
+            ro.push(*p);
+        }
+    }
+    let n_ro = ro.len() as u8;
+    keys.extend(ro);
+    let at = |k: &[u8; 32]| keys.iter().position(|x| x == k).expect("named") as u8;
+    let mut m = vec![signers.len() as u8, ro_signed, n_ro];
+    cu16(keys.len(), &mut m);
+    for k in &keys {
+        m.extend_from_slice(k);
+    }
+    m.extend_from_slice(&[0xBB; 32]);
+    cu16(ixs.len(), &mut m);
+    for (p, accs, d) in ixs {
+        m.push(at(p));
+        cu16(accs.len(), &mut m);
+        for k in accs.iter() {
+            m.push(at(k));
+        }
+        cu16(d.len(), &mut m);
+        m.extend_from_slice(d);
+    }
+    let mut t = Vec::new();
+    cu16(signers.len(), &mut t);
+    t.resize(t.len() + 64 * signers.len(), 0);
+    t.extend_from_slice(&m);
+    t
+}
+
+/// The clean order transaction: compute budget, then a Limit
+/// `create_order2` buy depositing `deposit` from our deposit account at
+/// [`CAP`] (the deposit moves by Jupiter's CPI, as on chain), on
+/// [`ORDER_KEY`] and [`POSITION_KEY`].
 pub(crate) fn order_tx(deposit: u64) -> Vec<u8> {
-    let mut limit = vec![2u8];
-    limit.extend_from_slice(&200_000u32.to_le_bytes());
-    legacy(
-        &order_keys(WALLET),
-        5,
-        &[
-            (6, vec![], limit),
-            (4, vec![0, 1, 2, 3], vec![0xAA; 24]),
-            (5, vec![1, 3, 2, 0], transfer_checked(deposit)),
-        ],
-    )
+    OrderTx::clean(deposit).build()
 }
 
-/// The order transaction plus a second transfer out of our account.
+/// [`order_tx`] on the order account `order`.
+pub(crate) fn order_tx_for(deposit: u64, order: [u8; 32]) -> Vec<u8> {
+    OrderTx {
+        order,
+        ..OrderTx::clean(deposit)
+    }
+    .build()
+}
+
+/// The order transaction plus a top-level transfer out of our account
+/// (any one adds to the CPI deposit).
 pub(crate) fn hostile_extra_transfer(deposit: u64) -> Vec<u8> {
-    legacy(
-        &order_keys(WALLET),
-        5,
-        &[
-            (4, vec![0, 1, 2, 3], vec![0xAA; 24]),
-            (5, vec![1, 3, 2, 0], transfer_checked(deposit)),
-            (5, vec![1, 3, 2, 0], transfer_checked(1)),
-        ],
-    )
+    let mut o = OrderTx::clean(deposit);
+    o.extra.push((TOKEN_PROGRAM, vec![USER_ATA, MINT, VAULT_ATA, WALLET], transfer_checked(1)));
+    o.build()
 }
 
-/// A claim transaction: Jupiter's instruction alone (the payout comes IN).
+/// A claim transaction: one `claim_payout2` (the payout comes IN to our
+/// deposit account).
 pub(crate) fn claim_tx() -> Vec<u8> {
-    legacy(&order_keys(WALLET), 5, &[(4, vec![0, 1, 2, 3], vec![0xCC; 16])])
+    claim_tx_with(Vec::new())
+}
+
+/// A claim transaction with `before` ahead of its `claim_payout2`.
+pub(crate) fn claim_tx_with(before: Vec<KIx>) -> Vec<u8> {
+    let mut ixs = before;
+    ixs.push((
+        JUP,
+        vec![WALLET, VAULT, POSITION_KEY, MARKET_RESULT, USER_ATA, VAULT_ATA, TOKEN_PROGRAM],
+        DISC_CLAIM_PAYOUT2.to_vec(),
+    ));
+    by_key(&[WALLET], 0, &ixs)
 }
 
 /// The guard that passes the fixtures.
@@ -198,10 +420,21 @@ pub(crate) fn guard_ok() -> TxGuard {
     assert!(g.allow_program(TOKEN_PROGRAM));
     assert!(g.allow_program(COMPUTE_BUDGET_PROGRAM));
     assert!(g.allow_program(SYSTEM_PROGRAM));
+    assert!(g.allow_alt(TABLE));
     g.max_sol_lamports = 3_000_000;
     g.max_cu_price = 50_000;
     g.deposit_account = USER_ATA;
     g.deposit_mint = MINT;
+    g.predict_program = JUP;
+    g.vault = VAULT;
+    g
+}
+
+/// [`guard_ok`] with the co-signer pinned (the dormant amendment).
+pub(crate) fn guard_pinned() -> TxGuard {
+    let mut g = guard_ok();
+    g.cosigner = COSIGNER;
+    g.has_cosigner = true;
     g
 }
 
@@ -222,14 +455,38 @@ pub(crate) fn b58(k: &[u8; 32]) -> String {
 /// A build answer for `tx`, priced at `cap` micro USD, for the Down
 /// outcome of market 5 798 888 (every rig order's).
 pub(crate) fn build_answer(tx: &[u8], cap: u64, order: &[u8; 32], position: &[u8; 32]) -> String {
+    build_answer_signed(tx, cap, order, position, &[WALLET])
+}
+
+/// [`build_answer`] naming `signers` as `requiredSigners`.
+pub(crate) fn build_answer_signed(tx: &[u8], cap: u64, order: &[u8; 32], position: &[u8; 32], signers: &[[u8; 32]]) -> String {
+    answer_full(tx, cap, order, position, signers, CONTRACTS, MARKET_HASH)
+}
+
+/// A build answer with every word the guard holds the signed bytes to.
+pub(crate) fn answer_full(
+    tx: &[u8],
+    cap: u64,
+    order: &[u8; 32],
+    position: &[u8; 32],
+    signers: &[[u8; 32]],
+    contracts: u64,
+    market_hash: &str,
+) -> String {
+    let req: Vec<String> = signers.iter().map(|k| format!("\"{}\"", b58(k))).collect();
     format!(
-        r#"{{"transaction":"{}","txMeta":{{"blockhash":"x","lastValidBlockHeight":7}},"requiredSigners":["{}"],"execution":{{"endpoint":"/execute","context":{{"type":"create_order","orderPubkey":"{}"}}}},"order":{{"orderPubkey":"{}","positionPubkey":"{}","marketId":"POLY-5798888-1","isYes":true,"isBuy":true,"userPubkey":"{}","maxBuyPriceUsd":"{}","orderCostUsd":"5000000","contracts":"5","contractsMicro":"5263157","estimatedTotalFeeUsd":"35000","estimatedVenueFeeUsd":"17500","estimatedProtocolFeeUsd":"17500"}}}}"#,
+        r#"{{"transaction":"{}","txMeta":{{"blockhash":"x","lastValidBlockHeight":7}},"requiredSigners":[{}],"execution":{{"endpoint":"/execute","context":{{"type":"create_order","orderPubkey":"{}"}}}},"order":{{"orderPubkey":"{}","positionPubkey":"{}","marketId":"POLY-5798888-1","marketIdHash":"{market_hash}","isYes":true,"isBuy":true,"userPubkey":"{}","maxBuyPriceUsd":"{}","orderCostUsd":"5000000","contracts":"5","contractsMicro":"{contracts}","estimatedTotalFeeUsd":"35000","estimatedVenueFeeUsd":"17500","estimatedProtocolFeeUsd":"17500"}}}}"#,
         b64(tx),
-        b58(&WALLET),
+        req.join(","),
         b58(order),
         b58(order),
         b58(position),
         b58(&WALLET),
         cap
     )
+}
+
+/// A balances answer: `usdc` micro of the rig's mint and 2.5 mSOL.
+pub(crate) fn balances(usdc: u64) -> String {
+    format!(r#"{{"SOL":{{"amount":"2500000"}},"{}":{{"amount":"{usdc}"}}}}"#, b58(&MINT))
 }

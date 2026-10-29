@@ -182,6 +182,10 @@ pub struct BuildAnswer {
     pub last_valid_block_height: u64,
     /// `order.marketId` (`POLY-<id>-<o>`): checked against the request.
     pub market_id: Span,
+    /// `order.marketIdHash`: the signed create-order's `market_id` string
+    /// must be it (`tx::guard_order`; its derivation from the market id is a
+    /// J0 fact).
+    pub market_id_hash: Span,
     /// `order.userPubkey` (base58): checked against our wallet.
     pub user_pubkey: Span,
     /// `order.isYes` (`None`: absent).
@@ -277,6 +281,11 @@ pub fn scan_build(buf: &[u8], out: &mut BuildAnswer) -> Result<(), JsonErr> {
                 b"marketId" => {
                     let (s, e) = string(buf, v2)?;
                     a.market_id = s;
+                    Ok(e)
+                }
+                b"marketIdHash" => {
+                    let (s, e) = string(buf, v2)?;
+                    a.market_id_hash = s;
                     Ok(e)
                 }
                 b"userPubkey" => {
@@ -421,15 +430,121 @@ pub enum OrderState {
     /// `failed` / `cancelled` / `expired`: done, nothing more fills; the
     /// unfilled deposit is refunded by the program.
     Failed,
+    /// `closed` (PMJ W5): the keeper closed the order account — done; its
+    /// fill numbers say what filled (never read as unfilled without them).
+    Closed,
 }
 
-/// The order status answer.
+impl OrderState {
+    /// Nothing more fills: filled, failed or closed.
+    #[inline]
+    #[must_use]
+    pub const fn terminal(self) -> bool {
+        matches!(self, Self::Filled | Self::Failed | Self::Closed)
+    }
+}
+
+/// The order status answer: the state and, when the answer carries them,
+/// the order's fill numbers — recon's PRIMARY source (PMJ W5: `GET /orders`
+/// lists open orders only, the status answers after the close).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatusAnswer {
     /// The top-level `status`.
     pub state: OrderState,
     /// `latestEventType`.
     pub latest_event: Span,
+    /// A fill quantity was read: the top level's `filledContractsMicro` /
+    /// `filledContracts`, else the `order_filled` history events' — and every
+    /// source that names one agrees (`conflict` otherwise).
+    pub has_fill: bool,
+    /// Contracts filled, micro units (cumulative).
+    pub filled_micro: u64,
+    /// The average price read with that quantity.
+    pub has_avg: bool,
+    /// `avgFillPriceUsd`, micro USD (an integer string; a decimal one is
+    /// read as dollars).
+    pub avg_px_micro: u64,
+    /// History events read.
+    pub events: u32,
+    /// Two sources of the fill numbers disagree (the top level and a filled
+    /// event, or two filled events): the answer is NOT read — a Limit order
+    /// can fill in increments, and whether an event's quantity is the
+    /// increment or the total is a J0 fact, so neither is guessed.
+    pub conflict: bool,
+}
+
+impl StatusAnswer {
+    /// The order's terminal record, when the answer carries its numbers: a
+    /// terminal state, a fill quantity, and its price when anything filled.
+    /// `None` is "not read" — never "unfilled".
+    #[must_use]
+    pub const fn record(&self) -> Option<OrderRecord> {
+        if self.conflict
+            || !self.state.terminal()
+            || !self.has_fill
+            || (self.filled_micro > 0 && !self.has_avg)
+        {
+            return None;
+        }
+        Some(OrderRecord {
+            state: self.state,
+            filled_micro: self.filled_micro,
+            avg_px_micro: self.avg_px_micro,
+            settled: false,
+            has_fill: true,
+            has_avg: self.has_avg,
+        })
+    }
+}
+
+/// A fill's numbers as one object carries them (`filledContractsMicro` over
+/// `filledContracts`; `avgFillPriceUsd`).
+#[derive(Copy, Clone, Debug, Default)]
+struct FillNums {
+    micro: Option<u64>,
+    whole: Option<u64>,
+    has_avg: bool,
+    avg: u64,
+}
+
+impl FillNums {
+    /// Read `key`'s value at `v` when it is a fill number: `Some(end)`.
+    fn read(&mut self, buf: &[u8], key: &[u8], v: usize) -> Result<Option<usize>, JsonErr> {
+        match key {
+            b"filledContractsMicro" => {
+                let (n, e) = uint(buf, v)?;
+                self.micro = n;
+                Ok(Some(e))
+            }
+            b"filledContracts" => {
+                let (n, e) = decimal_micro(buf, v)?;
+                self.whole = n;
+                Ok(Some(e))
+            }
+            b"avgFillPriceUsd" => {
+                let (has, px, e) = avg_fill(buf, v)?;
+                self.has_avg = has;
+                self.avg = px;
+                Ok(Some(e))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The quantity, when one was read.
+    const fn filled(&self) -> Option<u64> {
+        match (self.micro, self.whole) {
+            (Some(m), _) => Some(m),
+            (None, Some(w)) => Some(w),
+            (None, None) => None,
+        }
+    }
+
+    /// Whether `other` (with quantity `q`) disagrees with these numbers
+    /// (quantity `mine`): another quantity, or both priced and differently.
+    const fn disagrees(&self, mine: u64, other: &Self, q: u64) -> bool {
+        mine != q || (self.has_avg && other.has_avg && self.avg != other.avg)
+    }
 }
 
 /// Scan a `GET /orders/status/{orderPubkey}` 200 answer.
@@ -439,6 +554,11 @@ pub struct StatusAnswer {
 pub fn scan_status(buf: &[u8], out: &mut StatusAnswer) -> Result<(), JsonErr> {
     let mut a = StatusAnswer::default();
     let mut seen = false;
+    let mut top = FillNums::default();
+    // The first `order_filled` event's numbers; any later one must agree
+    // (never the max: a Limit order can fill in increments).
+    let mut first: Option<(u64, FillNums)> = None;
+    let mut conflict = false;
     members(buf, 0, &mut |key, v| match key {
         b"status" => {
             let (s, e) = string(buf, v)?;
@@ -451,13 +571,80 @@ pub fn scan_status(buf: &[u8], out: &mut StatusAnswer) -> Result<(), JsonErr> {
             a.latest_event = s;
             Ok(e)
         }
-        _ => skip(buf, v),
+        b"history" if buf.get(v) == Some(&b'[') => elements(buf, v, &mut |el| {
+            if buf.get(el) != Some(&b'{') {
+                return skip(buf, el);
+            }
+            a.events = a.events.saturating_add(1);
+            let mut ev = FillNums::default();
+            let mut filled_event = false;
+            let end = members(buf, el, &mut |k2, v2| {
+                if k2 == b"eventType" {
+                    let (s, e2) = string(buf, v2)?;
+                    filled_event = s.of(buf) == b"order_filled";
+                    return Ok(e2);
+                }
+                match ev.read(buf, k2, v2)? {
+                    Some(e2) => Ok(e2),
+                    None => skip(buf, v2),
+                }
+            })?;
+            if let (true, Some(q)) = (filled_event, ev.filled()) {
+                match first {
+                    None => first = Some((q, ev)),
+                    Some((q0, f0)) => conflict |= f0.disagrees(q0, &ev, q),
+                }
+            }
+            Ok(end)
+        }),
+        _ => match top.read(buf, key, v)? {
+            Some(e) => Ok(e),
+            None => skip(buf, v),
+        },
     })?;
     if !seen {
         return Err(JsonErr::Missing);
     }
+    match (top.filled(), first) {
+        (Some(q), ev) => {
+            if let Some((q1, f1)) = ev {
+                conflict |= top.disagrees(q, &f1, q1);
+            }
+            a.has_fill = true;
+            a.filled_micro = q;
+            a.has_avg = top.has_avg;
+            a.avg_px_micro = top.avg;
+        }
+        (None, Some((q, ev))) => {
+            a.has_fill = true;
+            a.filled_micro = q;
+            a.has_avg = ev.has_avg;
+            a.avg_px_micro = ev.avg;
+        }
+        (None, None) => {}
+    }
+    a.conflict = conflict;
     *out = a;
     Ok(())
+}
+
+/// `avgFillPriceUsd` at `v`: `(present and not empty, micro USD, end)` —
+/// an integer string is micro USD, a decimal one dollars; `null` or a
+/// non-string is absent.
+fn avg_fill(buf: &[u8], v: usize) -> Result<(bool, u64, usize), JsonErr> {
+    let (s, e) = match buf.get(v) {
+        Some(b'"') => string(buf, v)?,
+        _ => (Span::default(), skip(buf, v)?),
+    };
+    let t = s.of(buf);
+    let px = if t.contains(&b'.') {
+        micro_of(t).ok_or(JsonErr::Number)?
+    } else if t.is_empty() {
+        0
+    } else {
+        micro_of(t).ok_or(JsonErr::Number)? / 1_000_000
+    };
+    Ok((!t.is_empty(), px, e))
 }
 
 /// A status word, case-insensitively.
@@ -477,6 +664,7 @@ pub fn state_of(w: &[u8]) -> OrderState {
         b"partiallyfilled" | b"partially_filled" | b"partial" => OrderState::Partial,
         b"filled" => OrderState::Filled,
         b"failed" | b"cancelled" | b"canceled" | b"expired" => OrderState::Failed,
+        b"closed" => OrderState::Closed,
         _ => OrderState::Unknown,
     }
 }
@@ -723,19 +911,9 @@ pub fn scan_orders(buf: &[u8], want: &[u8], out: &mut OrderRecord) -> Result<(bo
                         Ok(e2)
                     }
                     b"avgFillPriceUsd" => {
-                        let (s, e2) = match buf.get(v2) {
-                            Some(b'"') => string(buf, v2)?,
-                            _ => (Span::default(), skip(buf, v2)?),
-                        };
-                        let t = s.of(buf);
-                        r.has_avg = !t.is_empty();
-                        r.avg_px_micro = if t.contains(&b'.') {
-                            micro_of(t).ok_or(JsonErr::Number)?
-                        } else if t.is_empty() {
-                            0
-                        } else {
-                            micro_of(t).ok_or(JsonErr::Number)? / 1_000_000
-                        };
+                        let (has, px, e2) = avg_fill(buf, v2)?;
+                        r.has_avg = has;
+                        r.avg_px_micro = px;
                         Ok(e2)
                     }
                     b"settled" => {

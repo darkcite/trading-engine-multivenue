@@ -35,3 +35,8 @@ core-parse     = { workspace = true }
 core-types     = { workspace = true }
 # The wallet's Ed25519 signer (ring, O-BX5) and verification.
 signer-ed25519 = { workspace = true }
+
+[dev-dependencies]
+# PMJ W5: the create-order reader's and the build extras' property tests
+# (already in the workspace graph: no new crate).
+proptest       = { workspace = true }

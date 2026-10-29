@@ -138,6 +138,10 @@ pub struct ArmCounters {
     pub unknown: u64,
     /// Legs the ledger could not hold (the arm halts).
     pub ledger_full: u64,
+    /// (Risk review W5-1) fills whose average price is above the order's
+    /// own limit: the Limit evidence is false — booked (the contracts are
+    /// held), and the arm halts.
+    pub over_limit: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -151,6 +155,8 @@ struct Row {
     instance: u32,
     outcome: u8,
     state: u8,
+    /// The order's own limit, ×1e6 (the intent's `limit_px_1e6`).
+    limit_px: i64,
 }
 
 const EMPTY_ROW: Row = Row {
@@ -159,6 +165,7 @@ const EMPTY_ROW: Row = Row {
     filled_micro: 0,
     cost_micro: 0,
     done_ns: 0,
+    limit_px: 0,
     sym: 0,
     instance: 0,
     outcome: 0,
@@ -504,6 +511,14 @@ impl JupArm {
         }
         self.counters.fills += 1;
         self.ledger_add(r.instance, r.outcome, delta, cost_delta);
+        // Only a Limit order is signed (`tx::guard_order`), and the program
+        // fills a Limit order at or under its cap: a fill whose average is
+        // above the order's own limit falsifies that evidence. The fill is
+        // booked (the contracts are held); the arm halts.
+        if word(ev.avg_px_micro) > r.limit_px {
+            self.counters.over_limit += 1;
+            self.halt();
+        }
     }
 
     fn ledger_add(&mut self, instance: u32, outcome: u8, contracts: i64, cost: i64) {
@@ -649,6 +664,7 @@ impl JupArm {
             word(c.legs_lost),
             word(c.claims_ready),
             word(c.out_full),
+            word(c.over_limit),
             i64::from(self.halted()),
             i64::from(self.reconciled),
             self.worth_micro,
@@ -743,6 +759,7 @@ impl OrderDispatch for JupArm {
             instance,
             outcome: (off % 2) as u8,
             state: R_QUEUED,
+            limit_px: px,
         };
         Ok(())
     }

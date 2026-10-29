@@ -332,3 +332,36 @@ fn execute_stage_refusals_count_toward_the_reject_streak() {
     let _ = b.arm.on_idle();
     assert_eq!(b.arm.halt_signal().reject_streak, 0);
 }
+
+/// Risk review W5-1, MINOR 4: a fill whose average is above the order's
+/// own limit falsifies the Limit evidence — booked (the contracts are
+/// held), counted, and the arm (with jup-gw) halts.
+#[test]
+fn a_fill_above_the_orders_own_limit_is_booked_and_halts_the_arm() {
+    let mut b = bench();
+    let cid = oid(0, 1);
+    b.arm.submit(&order(0, 1, 950_000, QTY, 1)).unwrap();
+    let _ = intents(&mut b);
+    send(&mut b, EVT_LANDED, cid, |_| {});
+    // At the limit: no halt.
+    send(&mut b, EVT_FILL, cid, |e| {
+        e.filled_micro = 1_000_000;
+        e.avg_px_micro = 950_000;
+        e.cost_micro = 950_000;
+    });
+    assert!(b.arm.try_next_fill().is_some());
+    assert!(!b.arm.halted());
+    // One micro-dollar above it, cumulative.
+    send(&mut b, EVT_FILL, cid, |e| {
+        e.filled_micro = 2_000_000;
+        e.avg_px_micro = 950_001;
+        e.cost_micro = 1_900_002;
+    });
+    let f = b.arm.try_next_fill().expect("booked: the contracts are held");
+    assert_eq!(f.qty.raw(), 1_000_000);
+    assert!(b.arm.halted());
+    assert_eq!(b.arm.counters().over_limit, 1);
+    assert_eq!(b.gw.stats.halt_reason(), HALT_ARM, "jup-gw halts too");
+    // Nothing more is admitted.
+    assert_eq!(b.arm.submit(&order(0, 0, 950_000, QTY, 2)), Err(DispatchError::SlotDisabled));
+}
