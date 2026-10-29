@@ -69,6 +69,15 @@ pub mod hl_outcome_probe;
 /// B'4 T27: `exec-smoke --perp-probe` — the Hyperliquid perp limits probe
 /// (TESTNET; writes `hl-perp-limits.tsv`, which the perp boot requires).
 pub mod hl_perp_probe;
+/// PMJ J4: `pmj.toml` → slot 11's member (paper).
+pub mod pmj_boot;
+/// PMJ J16: slot 11's gate-line grammar (`PMJ-DUST-GATE: ruled YYYY-MM-DD`),
+/// shared with `build.rs` through `include!` — one parser, unit-tested here.
+pub mod gate_line;
+/// PMJ J16: slot 11's operator checks (`pmj-exec --self-test | --key-check`).
+pub mod pmj_exec;
+/// PMJ J16: slot 11's live boot — the Jupiter arm, jup-gw, the wallet.
+pub mod pmj_live;
 pub mod pm15_boot;
 pub mod pm15_live;
 pub mod pm15_polybolt;
@@ -134,10 +143,11 @@ pub use paper::{
     engine_loop_rule_tree_full, engine_loop_set_full, extend_deribit_table_with_combos,
     extend_deribit_table_with_options, extend_okx_table_with_options, funding_lane_mask,
     hl_lane_mask, hyperevm_pool_table, join_reverse, log_hl_families, new_capture_run_dir,
-    open_events_capture, open_fills_capture, open_orders_capture, parse_ai_hmac_key,
-    parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai, spawn_binance,
-    spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall, spawn_hyperevm,
-    spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_pm15, spawn_polymarket, spawn_rpc,
+    open_events_capture, open_fills_capture, open_latency_capture, open_orders_capture,
+    parse_ai_hmac_key, parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai,
+    spawn_binance, spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall,
+    spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_pm15, spawn_pm5,
+    spawn_polymarket, spawn_rpc,
     split_host_port, state_writer, AiIngressCounterIds, AiIngressStatus, BinanceConnSpec,
     BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters,
     EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds, HypercallSpec, IngressCounterIds,

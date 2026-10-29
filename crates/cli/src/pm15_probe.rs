@@ -55,8 +55,8 @@ pub fn run(assets: &[String], seconds: u64) -> Result<(), String> {
     }
     let tls = core_net::TlsTransport::default_client_config();
     let refs: Vec<&[u8]> = assets.iter().map(|a| a.as_bytes()).collect();
-    let mut discovery =
-        Pm15Discovery::new(tls.clone(), &refs).map_err(|e| format!("gamma client: {e:?}"))?;
+    let mut discovery = Pm15Discovery::new(tls.clone(), &refs)
+        .map_err(|e| format!("discovery clients (gamma, clob): {e:?}"))?;
     let seed = now_ns();
     let market = core_net::WsConn::new(
         PM15_MARKET_HOST,
@@ -97,7 +97,11 @@ pub fn run(assets: &[String], seconds: u64) -> Result<(), String> {
     let h_ing = thread::Builder::new()
         .name("ingress-pm15".into())
         .spawn(move || {
-            let mut socks = Pm15Sockets { market, rtds };
+            // One market socket: the probe's driver keeps the default (PMJ J7).
+            let mut socks = Pm15Sockets {
+                market: vec![market],
+                rtds,
+            };
             let mut capture = NullCapture;
             let mut out = Pm15Out {
                 tick: &mut tick_tx,
@@ -106,6 +110,7 @@ pub fn run(assets: &[String], seconds: u64) -> Result<(), String> {
                 status: &i_status,
                 counters: &i_counters,
                 capture: &mut capture,
+                depth: None,
             };
             if let Err(e) = run_pm15(
                 &mut driver,

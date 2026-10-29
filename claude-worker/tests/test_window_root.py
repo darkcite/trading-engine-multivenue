@@ -133,6 +133,31 @@ def test_run_span_skips_files_whose_header_never_landed(tmp_path):
         claude_worker.window_root.cut_run(run, tmp_path / "roots", 0.0, 60.0)
 
 
+def test_run_span_ignores_a_file_on_another_clock(tmp_path):
+    """The live HL lane stamps ``engine-fills.pmlr`` with the venue's WALL ns
+    while every capture file is on the host's boot-relative monotonic clock.
+    One live fill made a 10-23 run span 57 years, and the daily accrual cut
+    249 k empty windows (2026-10-24). A file whose first stamp is more than
+    ``CLOCK_DOMAIN_NS`` from the tick files' first ends nothing."""
+    ticks = [76_000 * S, 76_000 * S + 3 * 3600 * S]
+    run = _mk_run(tmp_path, ticks)
+    expected = claude_worker.window_root.run_span(run)
+    wall = 1_792_654_181_777_000_000  # 2026-10-23 live fill, venue wall ns
+    tests.craft.write_fills(
+        run / "engine-fills.pmlr",
+        [(wall, 42, 0, 3, 0, 0, 940_000, 42, 1), (wall + 30 * S, 42, 0, 3, 0, 0, 940_000, 8, 2)],
+        EPOCH,
+    )
+    assert claude_worker.window_root.run_span(run) == expected
+    assert claude_worker.window_root.windows_of(run) == [(0.0, 7200.0), (7200.0, 14400.0)]
+    # A same-clock file that starts later still ends the span.
+    tests.craft.write_ticks(run / "late-events.pmlr", [ticks[1] + 600 * S], EPOCH, sym=5, venue=1)
+    assert claude_worker.window_root.run_span(run) == (expected[0], ticks[1] + 600 * S)
+    # The wall-clock file cuts to header-only: none of its slots is in a window.
+    out = claude_worker.window_root.cut_run(run, tmp_path / "roots", 0.0, 7200.0)
+    assert (out / "engine-fills.pmlr").stat().st_size == claude_worker.window_root.HEADER_SIZE
+
+
 # ---- RG3: ai-cmds.pmlr — cut by ts_ns + the SetRegime carry-over ----
 
 _AI = struct.Struct("<QIIqqQBBBBHH")  # AiCmd head (48 B) — frames.py _HEAD without the len prefix

@@ -78,6 +78,13 @@ pub struct BootUniverse {
     /// PM15: `[polymarket] rolling` family keys (`updown:<asset>:15m`), in
     /// file order. Empty = the pre-PM15 boot: no rolling ingress thread.
     pub pm_rolling: Vec<String>,
+    /// PMJ (R-PMJ-S15): the rolling legs' depth capture policy
+    /// (`[polymarket] rolling_depth*`; the default with no universe file).
+    pub pm_rolling_depth: universe::RollingDepth,
+    /// PMJ J7 (R-PMJ-S17..S19): the market sockets per rolling pipeline
+    /// (`[polymarket] rolling_market_sockets`; the default with no universe
+    /// file — one per family).
+    pub pm_rolling_market_sockets: universe::RollingMarketSockets,
     /// Effective OKX depth-channel toggle (flag OR config).
     pub okx_depth: bool,
     /// M2.2 capped options-chain policy for OKX (config-file only;
@@ -195,6 +202,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 hl_spec: flag_spec(f.hl_coins),
                 hl_rolling: Vec::new(),
                 pm_rolling: Vec::new(),
+                pm_rolling_depth: universe::RollingDepth::default(),
+                pm_rolling_market_sockets: universe::RollingMarketSockets::default(),
                 okx_depth: f.okx_depth,
                 deribit_depth: f.deribit_depth,
                 okx_options: universe::OptionsPolicy::default(),
@@ -286,6 +295,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 hl_spec: flag_spec(f.hl_coins).or_else(|| join_or_none(&u.hl_coins)),
                 hl_rolling: u.hl_rolling.clone(),
                 pm_rolling: u.pm_rolling.clone(),
+                pm_rolling_depth: u.pm_rolling_depth,
+                pm_rolling_market_sockets: u.pm_rolling_market_sockets,
                 okx_depth: f.okx_depth || u.okx_depth,
                 deribit_depth: f.deribit_depth || u.deribit_depth,
                 okx_options,

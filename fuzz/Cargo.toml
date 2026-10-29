@@ -39,6 +39,11 @@ core-types         = { path = "../crates/core-types" }
 # checks against (§4.2 rule 1).
 core-crypto        = { path = "../crates/core-crypto" }
 ingress-polymarket = { path = "../crates/ingress-polymarket" }
+# pm_rolling_frame (PMJ J1b): the rolling driver's rings and status.
+core-ring          = { path = "../crates/core-ring" }
+core-metrics       = { path = "../crates/core-metrics" }
+# jup_wire (PMJ J3): the Solana transaction guard and the Prediction API's answers.
+exec-jupiter       = { path = "../crates/exec-jupiter" }
 ingress-binance    = { path = "../crates/ingress-binance" }
 ingress-bybit      = { path = "../crates/ingress-bybit" }
 ingress-mexc       = { path = "../crates/ingress-mexc" }
@@ -296,6 +301,20 @@ bench  = false
 [[bin]]
 name   = "pm_gamma_markets"
 path   = "fuzz_targets/pm_gamma_markets.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "pm_rolling_frame"
+path   = "fuzz_targets/pm_rolling_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "jup_wire"
+path   = "fuzz_targets/jup_wire.rs"
 test   = false
 doc    = false
 bench  = false

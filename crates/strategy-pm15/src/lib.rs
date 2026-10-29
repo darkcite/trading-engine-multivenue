@@ -23,12 +23,27 @@
 //!    favoured side's belief `p ≥ p_min` on `persist` consecutive report
 //!    seconds, and its ask `≤ p − e` ⇒ one IoC BUY at `p − e` (on the
 //!    leg's tick), sized to the order cap, inside the market cap. One IoC
-//!    in flight per market; re-entry while room and belief remain.
+//!    in flight per market; re-entry while room and belief remain. PMJ J8
+//!    (ruling R-PMJ-S24, a documented deviation from doc 39 §4): the ask
+//!    must also be at least `price_floor` (0.90) — a favourite the book
+//!    prices under it is no H90 entry, the near-tie windows where the
+//!    strike estimate and the venue disagree (slot 11's law, and the month
+//!    research's).
 //! 5. **The book**: positions from fills only; at the settled roll each
 //!    leg pays 1 or 0, minus its cost and the venue's taker fee
 //!    `0.07·p·(1 − p)` per share — the session's realised P&L. Once it is
 //!    at or under `−session_loss`, entries stop (the paper frame equals
 //!    the live one, ruling R-PM-8).
+//!
+//! ## The strike law (PMJ J12, R-PMJ-S61)
+//!
+//! `strike_law` picks one of two laws at boot. [`STRIKE_LAW_MEAN60`] is the
+//! first: the strike is the mean of the reports of `[open − 60, open − 1]`
+//! and the price `report_fair`. [`STRIKE_LAW_TRAP62`] is law (iii), the
+//! venue's measured law: the trapezoid of `[open − 62, open − 2]` (known one
+//! report earlier), priced by `report_fair_trap` with a residual of
+//! `max(res_ratio · σ, res_min_ppm)`. Law (iii) reads the reports ×1e9 (v1)
+//! and the perp's BBO ×1e9, so a market's `strike_1e6` holds ×1e9 under it.
 //!
 //! ## What it does NOT do
 //!
@@ -48,7 +63,10 @@
 use core_fill::ORDER_KIND_IOC;
 use core_time::{NsTs, WallAnchor};
 use core_twaplock::late::{LateHold, LateLut, SEC_NS};
-use core_twaplock::report::{report_fair, ReportGrid};
+use core_twaplock::report::{
+    report_fair, report_fair_trap, ReportGrid, TrapResidual, FINE_PER_1E6, FINE_PER_V1,
+    PM_TRAP_LAST_OFFSET_S, STRIKE_LAW_MEAN60, STRIKE_LAW_TRAP62,
+};
 use core_types::pm_roll::{
     pm_instance_parts, pm_rolling_of, pm_window_open_s, PM_OFF_MARK, PM_PAIRS, PM_ROLLING_MAX,
     PM_SETTLED_DOWN, PM_SETTLED_UP,
@@ -100,8 +118,15 @@ pub struct Pm15Params {
     pub persist: u8,
     /// IoCs at most per market.
     pub max_orders_market: u8,
+    /// The strike law (PMJ J12): [`STRIKE_LAW_MEAN60`], the first, or
+    /// [`STRIKE_LAW_TRAP62`], law (iii) — which reads the reports ×1e9 and
+    /// keeps the market's strike in that scale.
+    pub strike_law: u8,
+    /// The same-side family cap per window (PMJ J13): at most this many
+    /// families hold, or are buying, one side of one window; 0 = off.
+    pub max_side_families: u8,
     /// Explicit padding — always zero.
-    pub _pad: [u8; 6],
+    pub _pad: [u8; 4],
     /// The pricer's σ scale ×1e3.
     pub sigma_k_1e3: i64,
     /// Most one order spends ×1e6 USD.
@@ -113,6 +138,14 @@ pub struct Pm15Params {
     pub session_loss_1e6: i64,
     /// An IoC's time-to-live at the dispatcher, ns.
     pub order_ttl_ns: u64,
+    /// PMJ J8 (R-PMJ-S24): the least ask an entry takes ×1e6 (0.90; 0 = no
+    /// floor, P0's law as frozen).
+    pub price_floor_1e6: i64,
+    /// Law (iii)'s residual: ρ ×1e3 of the raw σ (F4 §11; 0 under the
+    /// first law).
+    pub res_ratio_1e3: i64,
+    /// Law (iii)'s residual floor per family, ppm of the strike.
+    pub res_min_ppm: [i64; PM15_MAX_FAMILIES],
 }
 
 impl Default for Pm15Params {
@@ -127,13 +160,39 @@ impl Default for Pm15Params {
             e_1e6: 20_000,
             persist: 2,
             max_orders_market: 4,
-            _pad: [0; 6],
+            strike_law: STRIKE_LAW_MEAN60,
+            max_side_families: 0,
+            _pad: [0; 4],
             sigma_k_1e3: 1_550,
             usd_order_1e6: 250_000_000,
             usd_market_1e6: 250_000_000,
             session_loss_1e6: 500_000_000,
             order_ttl_ns: 1_000_000_000,
+            price_floor_1e6: 900_000,
+            res_ratio_1e3: 0,
+            res_min_ppm: [0; PM15_MAX_FAMILIES],
         }
+    }
+}
+
+/// Law (iii)'s keys hold (PMJ J12); the first law needs none.
+fn strike_law_ok(p: &Pm15Params) -> bool {
+    match p.strike_law {
+        STRIKE_LAW_MEAN60 => true,
+        STRIKE_LAW_TRAP62 => {
+            if !(1..=1_000).contains(&p.res_ratio_1e3) {
+                return false;
+            }
+            let mut f = 0usize;
+            while f < p.n_families && f < PM15_MAX_FAMILIES {
+                if !(1..=100).contains(&p.res_min_ppm[f]) {
+                    return false;
+                }
+                f += 1;
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -202,7 +261,8 @@ pub struct Market {
     pub open_ns: u64,
     /// The window's end, Unix ns.
     pub end_ns: u64,
-    /// The strike ×1e6 (0 = not known yet).
+    /// The strike in the grid's scale — ×1e6 under the first law, ×1e9
+    /// under law (iii) (PMJ J12) — 0 = not known yet.
     pub strike_1e6: i64,
     /// 0 none, 1 estimated from the reports.
     pub strike_src: u8,
@@ -236,6 +296,14 @@ impl Market {
     #[inline(always)]
     fn is_bound(&self) -> bool {
         self.instance != 0
+    }
+
+    /// PMJ J13: whether this market holds `leg` or has an IoC in flight on
+    /// it — its family counts against the side cap. An IoC that ended
+    /// unfilled (its pending cleared, no shares) frees the family.
+    #[inline(always)]
+    fn on_side(&self, leg: usize) -> bool {
+        self.pos_1e6[leg & 1] > 0 || (self.pending.oid != 0 && usize::from(self.pending.leg) == leg)
     }
 }
 
@@ -334,7 +402,10 @@ impl Pm15Strategy {
             && params.usd_order_1e6 > 0
             && params.usd_market_1e6 >= params.usd_order_1e6
             && params.session_loss_1e6 > 0
-            && params.order_ttl_ns > 0;
+            && params.order_ttl_ns > 0
+            && (params.price_floor_1e6 == 0 || (500_000..ONE_1E6).contains(&params.price_floor_1e6))
+            && strike_law_ok(&params)
+            && usize::from(params.max_side_families) <= params.n_families.min(PM15_MAX_FAMILIES);
         if !ok {
             return Err(Pm15ConfigErr::Bound);
         }
@@ -472,10 +543,19 @@ impl Pm15Strategy {
         }
         let open_s = m.open_ns / SEC_NS;
         let g = &self.grids[f];
-        if g.last_sec() + 1 < open_s {
+        let trap = self.params.strike_law == STRIKE_LAW_TRAP62;
+        // The first law waits for the report of `open − 1`, law (iii) for
+        // `open − 2` (its last label).
+        let lag = if trap { PM_TRAP_LAST_OFFSET_S } else { 1 };
+        if g.last_sec() + lag < open_s {
             return;
         }
-        match g.mean(open_s - 60, open_s - 1) {
+        let k = if trap {
+            g.trap(open_s)
+        } else {
+            g.mean(open_s - 60, open_s - 1)
+        };
+        match k {
             Some(k) if k > 0 => {
                 let m = &mut self.markets[f][pair];
                 m.strike_1e6 = k;
@@ -547,7 +627,17 @@ impl Pm15Strategy {
         if f >= self.params.n_families || off != PM_OFF_MARK || ev.v0 <= 0 {
             return;
         }
-        self.grids[f].on_report(ev.venue_seq, ev.v0);
+        // Law (iii) keeps the report's fine scale (×1e9, from v1's ×1e12 —
+        // DOGE's ×1e6 steps are 12.6 ppm); the first law keeps v0 ×1e6.
+        let px = if self.params.strike_law == STRIKE_LAW_TRAP62 {
+            ev.v1 / FINE_PER_V1
+        } else {
+            ev.v0
+        };
+        if px <= 0 {
+            return;
+        }
+        self.grids[f].on_report(ev.venue_seq, px);
         let now = ctx.now_ns();
         let mut pair = 0usize;
         while pair < PM_PAIRS {
@@ -586,14 +676,31 @@ impl Pm15Strategy {
             self.counters.hold_strike += 1;
             return;
         }
-        let fair = match report_fair(
-            &self.grids[f],
-            &self.lut,
-            m.strike_1e6,
-            m.end_ns,
-            wall,
-            p.sigma_k_1e3,
-        ) {
+        let priced = if p.strike_law == STRIKE_LAW_TRAP62 {
+            report_fair_trap(
+                &self.grids[f],
+                &self.lut,
+                m.strike_1e6,
+                m.end_ns,
+                wall,
+                p.sigma_k_1e3,
+                TrapResidual {
+                    ratio_1e3: p.res_ratio_1e3,
+                    min_ppm: p.res_min_ppm[f],
+                },
+            )
+            .map(|(fair, _)| fair)
+        } else {
+            report_fair(
+                &self.grids[f],
+                &self.lut,
+                m.strike_1e6,
+                m.end_ns,
+                wall,
+                p.sigma_k_1e3,
+            )
+        };
+        let fair = match priced {
             Ok(fair) => fair,
             Err(h) => {
                 match h {
@@ -648,6 +755,34 @@ impl Pm15Strategy {
         self.take(f, pair, if up { 0 } else { 1 }, p_side, now, ctx);
     }
 
+    /// PMJ J13: whether `leg` of the window `markets[f][pair]` rides has room
+    /// under `max_side_families`. Every family of one window rides the same
+    /// pair, so the other families' markets of that pair with the same open
+    /// are the window's. The room is there while the families other than
+    /// `f` on that side are fewer than the cap; a family already on the side
+    /// is never stopped by it (a second IoC of its own adds no family).
+    /// Bounded: at most [`PM15_MAX_FAMILIES`] markets read, no allocation.
+    #[inline]
+    fn side_room(&self, f: usize, pair: usize, leg: usize) -> bool {
+        let own = &self.markets[f][pair];
+        if own.on_side(leg) {
+            return true;
+        }
+        let cap = usize::from(self.params.max_side_families);
+        let mut n = 0usize;
+        let mut g = 0usize;
+        while g < self.params.n_families && g < PM15_MAX_FAMILIES {
+            if g != f {
+                let o = &self.markets[g][pair];
+                if o.is_bound() && o.open_ns == own.open_ns && o.on_side(leg) {
+                    n += 1;
+                }
+            }
+            g += 1;
+        }
+        n < cap
+    }
+
     /// The take: one IoC BUY of `leg` at `p_side − e` on its tick, if the
     /// ask allows and the caps leave room.
     fn take<C: Ctx>(
@@ -670,6 +805,12 @@ impl Pm15Strategy {
             self.counters.skip_book += 1;
             return;
         }
+        // PMJ J8 (R-PMJ-S24): the floor — a favourite the book prices under
+        // it is no H90 entry.
+        if book.ask_1e6 < p.price_floor_1e6 {
+            self.counters.skip_price += 1;
+            return;
+        }
         if now.saturating_sub(book.ts_ns) >= TOUCH_FRESH_NS {
             self.counters.skip_book_old += 1;
             return;
@@ -683,6 +824,11 @@ impl Pm15Strategy {
         }
         if m.pending.oid != 0 || m.orders >= p.max_orders_market {
             self.counters.skip_cap += 1;
+            return;
+        }
+        // PMJ J13: the same-side family cap (off at 0).
+        if p.max_side_families != 0 && !self.side_room(f, pair, leg) {
+            self.counters.skip_side += 1;
             return;
         }
         let room = p.usd_market_1e6 - m.committed_1e6;
@@ -892,7 +1038,13 @@ impl Strategy for Pm15Strategy {
         while let Some(f) = self.family_of_perp(tick.sym, from) {
             let (b, a) = (tick.bid_px.raw(), tick.ask_px.raw());
             if b > 0 && a > 0 && !tick.is_stale() {
-                self.grids[f].on_perp(self.anchor.wall_of(tick.ts_ns), b + a);
+                // The nowcast in the grid's scale (law (iii): ×1e9).
+                let x2 = if self.params.strike_law == STRIKE_LAW_TRAP62 {
+                    (b + a).saturating_mul(FINE_PER_1E6)
+                } else {
+                    b + a
+                };
+                self.grids[f].on_perp(self.anchor.wall_of(tick.ts_ns), x2);
             }
             from = f + 1;
         }
@@ -908,6 +1060,12 @@ impl Strategy for Pm15Strategy {
 
     fn on_venue_event<C: Ctx>(&mut self, event: &ChannelEvent, ctx: &mut C) {
         if !self.configured || event.venue != VenueId::Polymarket as u8 {
+            return;
+        }
+        // PMJ J1b (ruling R-PMJ-3, the family split): a 5-minute family's
+        // records are slot 11's. They are not this member's to refuse, so
+        // nothing of slot 9's — orders, markets, counters — sees them.
+        if core_types::pm_roll::pm5_rolling_of(event.sym).is_some() {
             return;
         }
         match ChannelId::from_u8(event.channel) {

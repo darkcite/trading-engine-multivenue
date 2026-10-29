@@ -185,6 +185,15 @@ fn configure_refuses_every_bad_frame() {
         m.configure(q, lut(), WallAnchor::new(0, 0)),
         Err(Pm15ConfigErr::Bound)
     );
+    // PMJ J8 (R-PMJ-S24): the floor is 0 (none) or in 0.50..1.
+    for bad in [1, 499_999, 1_000_000, -1] {
+        let mut q = p;
+        q.price_floor_1e6 = bad;
+        assert_eq!(m.configure(q, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "{bad}");
+    }
+    let mut q = p;
+    q.price_floor_1e6 = 0;
+    assert!(Pm15Strategy::new().configure(q, lut(), WallAnchor::new(0, 0)).is_ok(), "0 = no floor");
     assert!(!m.is_configured());
     assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Ok(()));
 }
@@ -242,8 +251,15 @@ fn a_decided_window_takes_once_fills_and_settles_into_the_session_pnl() {
     m.on_tick(&touch(w, PM_LEG_UP, c.now, 920_000, 930_000), &mut c);
     assert!(c.orders.is_empty(), "one second of belief is not two");
     assert!(m.counters().skip_persist > 0, "{:?}", m.counters());
-    // The next report second: two in a row — the take.
+    // PMJ J8 (R-PMJ-S24): the book drops under the 0.90 floor before the
+    // next report second — two seconds of belief, and still no take: an
+    // ask under the floor is no H90 entry, however far under the belief.
+    m.on_tick(&touch(w, PM_LEG_UP, c.now, 840_000, 850_000), &mut c);
+    let skip_price = m.counters().skip_price;
     second(&mut m, &mut c, end - 20, BASE + 400_000_000);
+    assert!(c.orders.is_empty(), "an ask under the floor: no take");
+    assert!(m.counters().skip_price > skip_price, "{:?}", m.counters());
+    // The book comes back over the floor: the take.
     m.on_tick(&touch(w, PM_LEG_UP, c.now, 920_000, 930_000), &mut c);
     assert_eq!(c.orders.len(), 1, "{:?}", m.counters());
     let o = c.orders[0];
@@ -450,4 +466,282 @@ fn a_late_fill_books_by_its_client_id() {
         &mut c,
     );
     assert_eq!(m.counters().unknown_fills, 1);
+}
+
+/// PMJ J1b (R-PMJ-3): the 5-minute families are slot 11's. Their rolls,
+/// order laws, marks and touches reach slot 9 on the same lane once the
+/// 5-minute ingress runs; none of them may change an order, a market or a
+/// counter of this member.
+#[test]
+fn five_minute_records_leave_slot_9_untouched() {
+    use core_types::pm_roll::{
+        pm5_instance_id, pm5_mark_sym, pm5_pair_of_window, pm5_roll_family, pm5_rolling_sym,
+        pm5_window_end_ns, pm5_window_of_open,
+    };
+    let w = pm_window_of_open(OPEN).unwrap();
+    let mut m = member();
+    let mut c = TestCtx {
+        now: OPEN * S,
+        orders: Vec::new(),
+    };
+    m.on_venue_event(&roll(w, false, 0), &mut c);
+    let before = m.counters();
+    let w5 = pm5_window_of_open(OPEN).unwrap();
+    let pair = pm5_pair_of_window(w5);
+    let inst = pm5_instance_id(w5, 0).unwrap();
+    let created = ChannelEvent::new(
+        0,
+        VenueId::Polymarket,
+        ChannelId::InstrumentRoll,
+        pm5_rolling_sym(0, pair, PM_LEG_UP),
+        pack_roll_seq(inst, PM_TWAP_S, pm5_roll_family(0, pair), false),
+        0,
+        0,
+        pm5_window_end_ns(w5) as i64,
+    );
+    let settled = ChannelEvent::new(
+        0,
+        VenueId::Polymarket,
+        ChannelId::InstrumentRoll,
+        pm5_rolling_sym(0, pair, PM_LEG_UP),
+        pack_roll_seq(inst, PM_TWAP_S, pm5_roll_family(0, pair), true),
+        0,
+        PM_SETTLED_DOWN,
+        pm5_window_end_ns(w5) as i64,
+    );
+    let law5 = ChannelEvent::new(
+        0,
+        VenueId::Polymarket,
+        ChannelId::OutcomeMeta,
+        pm5_rolling_sym(0, pair, PM_LEG_DOWN),
+        u64::from(inst),
+        0,
+        10_000,
+        5_000_000,
+    );
+    let mark5 = ChannelEvent::new(
+        OPEN * S,
+        VenueId::Polymarket,
+        ChannelId::Mark,
+        pm5_mark_sym(0),
+        OPEN,
+        OPEN * 1_000,
+        BASE,
+        BASE * 1_000_000,
+    );
+    m.on_venue_event(&created, &mut c);
+    m.on_venue_event(&law5, &mut c);
+    m.on_venue_event(&mark5, &mut c);
+    let t5 = Tick::new(
+        OPEN * S,
+        VenueId::Polymarket,
+        pm5_rolling_sym(0, pair, PM_LEG_UP),
+        1,
+        Price::from_raw(950_000),
+        Qty::from_raw(500_000_000),
+        Price::from_raw(960_000),
+        Qty::from_raw(500_000_000),
+    );
+    m.on_tick(&t5, &mut c);
+    m.on_venue_event(&settled, &mut c);
+    assert_eq!(m.counters(), before, "a 5 m record changed slot 9's counters");
+    assert!(c.orders.is_empty(), "a 5 m record made slot 9 order");
+    assert_eq!(m.market(0, pm_pair_of_window(w)).instance, pm_instance_id(w, 0).unwrap());
+}
+
+// ---- PMJ J12: law (iii) ----------------------------------------------------
+
+fn member_trap() -> Pm15Strategy {
+    let mut perp_sym = [SYMBOL_ID_NONE; PM15_MAX_FAMILIES];
+    perp_sym[0] = perp();
+    let mut res_min_ppm = [0; PM15_MAX_FAMILIES];
+    res_min_ppm[0] = 3;
+    let p = Pm15Params {
+        n_families: 1,
+        perp_sym,
+        strike_law: STRIKE_LAW_TRAP62,
+        res_ratio_1e3: 130,
+        res_min_ppm,
+        ..Pm15Params::default()
+    };
+    let mut m = Pm15Strategy::new();
+    m.configure(p, lut(), WallAnchor::new(0, 0)).expect("valid");
+    m
+}
+
+#[test]
+fn law_iii_needs_its_residual_keys() {
+    let mut perp_sym = [SYMBOL_ID_NONE; PM15_MAX_FAMILIES];
+    perp_sym[0] = perp();
+    let mut p = Pm15Params {
+        n_families: 1,
+        perp_sym,
+        strike_law: STRIKE_LAW_TRAP62,
+        ..Pm15Params::default()
+    };
+    let mut m = Pm15Strategy::new();
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "no keys");
+    p.res_ratio_1e3 = 130;
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "no floor");
+    p.res_min_ppm[0] = 101;
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "floor > 100");
+    p.res_min_ppm[0] = 3;
+    let mut q = p;
+    q.strike_law = 2;
+    assert_eq!(m.configure(q, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "law 2");
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Ok(()));
+    assert_eq!(Pm15Params::default().strike_law, STRIKE_LAW_MEAN60, "the first law by default");
+}
+
+#[test]
+fn law_iii_strikes_at_open_minus_two_and_takes_a_decided_window() {
+    let w = pm_window_of_open(OPEN).unwrap();
+    let end = OPEN + 900;
+    let mut m = member_trap();
+    let mut c = TestCtx {
+        now: 0,
+        orders: Vec::new(),
+    };
+    tape(&mut m, &mut c, OPEN - 3, 1_100, BASE, 2_000_000);
+    c.now = OPEN * S;
+    m.on_venue_event(&roll(w, false, 0), &mut c);
+    m.on_venue_event(&law(w, PM_LEG_UP, 10_000), &mut c);
+    m.on_venue_event(&law(w, PM_LEG_DOWN, 10_000), &mut c);
+    assert_eq!(m.market(0, pm_pair_of_window(w)).strike_src, 0, "open − 2 not reported yet");
+    // OPEN − 2 is even: the +step second; the trapezoid is the base, ×1e9.
+    second(&mut m, &mut c, OPEN - 2, BASE + 2_000_000);
+    let mk = *m.market(0, pm_pair_of_window(w));
+    assert_eq!((mk.strike_src, mk.strike_1e6), (1, BASE * 1_000));
+    tape(&mut m, &mut c, end - 22, 900 - 21, BASE + 400_000_000, 2_000_000);
+    let mut s = end - 21;
+    while s <= end - 20 {
+        second(&mut m, &mut c, s, BASE + 400_000_000);
+        m.on_tick(&touch(w, PM_LEG_UP, c.now, 920_000, 930_000), &mut c);
+        m.on_tick(&touch(w, PM_LEG_DOWN, c.now, 70_000, 80_000), &mut c);
+        s += 1;
+    }
+    assert_eq!(c.orders.len(), 1, "{:?}", m.counters());
+    assert_eq!(c.orders[0].sym, pm_rolling_sym(0, pm_pair_of_window(w), PM_LEG_UP));
+}
+
+// ---------------------------------------------------------------------
+// PMJ J13: the same-side family cap per window (`max_side_families`).
+// The markets are crafted in place (four families, one window) and the
+// take is driven directly: the cap is a gate in `take`, after the book
+// and price gates these tests do not exercise.
+// ---------------------------------------------------------------------
+
+fn side_member(cap: u8) -> Pm15Strategy {
+    let mut perp_sym = [SYMBOL_ID_NONE; PM15_MAX_FAMILIES];
+    let mut f = 0usize;
+    while f < 4 {
+        perp_sym[f] = make_symbol_id(VenueId::Hyperliquid, f as u32 + 1);
+        f += 1;
+    }
+    let p = Pm15Params {
+        n_families: 4,
+        perp_sym,
+        max_side_families: cap,
+        ..Pm15Params::default()
+    };
+    let mut m = Pm15Strategy::new();
+    m.configure(p, lut(), WallAnchor::new(0, 0)).expect("valid");
+    m
+}
+
+/// Binds family `f`'s market on `pair` to the window opening at `open`
+/// (seconds), both legs quoted 0.92 / 0.93 on a 0.01 tick at `at`.
+fn side_bind(m: &mut Pm15Strategy, f: usize, pair: usize, open: u64, at: NsTs) {
+    let mk = &mut m.markets[f][pair];
+    mk.instance = 7 + f as u32;
+    mk.open_ns = open * S;
+    mk.end_ns = (open + 900) * S;
+    for book in mk.legs.iter_mut() {
+        book.bid_1e6 = 920_000;
+        book.ask_1e6 = 930_000;
+        book.ask_sz_1e6 = 500_000_000;
+        book.ts_ns = at;
+        book.tick_1e6 = 10_000;
+    }
+}
+
+#[test]
+fn the_side_cap_must_fit_the_families() {
+    let mut m = Pm15Strategy::new();
+    let mut p = Pm15Params { max_side_families: 2, ..Pm15Params::default() };
+    p.n_families = 1;
+    p.perp_sym[0] = perp();
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Err(Pm15ConfigErr::Bound), "2 over 1 family");
+    p.max_side_families = 1;
+    assert_eq!(m.configure(p, lut(), WallAnchor::new(0, 0)), Ok(()));
+}
+
+#[test]
+fn the_side_cap_counts_families_holding_or_buying_one_side_of_one_window() {
+    let at = OPEN * S + 280 * S;
+    let mut c = TestCtx { now: at, orders: Vec::new() };
+    let mut m = side_member(2);
+    let pair = 0usize;
+    for f in 0..4 {
+        side_bind(&mut m, f, pair, OPEN, at);
+    }
+    let (up, down) = (0usize, 1usize);
+    m.take(0, pair, up, 970_000, at, &mut c);
+    m.take(1, pair, up, 970_000, at, &mut c);
+    assert_eq!(c.orders.len(), 2, "two families on Up: under the cap");
+    m.take(2, pair, up, 970_000, at, &mut c);
+    assert_eq!((c.orders.len(), m.counters().skip_side), (2, 1), "the third family on Up is capped");
+    m.take(2, pair, down, 970_000, at, &mut c);
+    assert_eq!(c.orders.len(), 3, "Down is its own side");
+    // Family 0's IoC ends unfilled: no shares, no IoC in flight — it frees its place.
+    m.markets[0][pair].pending = Pending::default();
+    m.take(3, pair, up, 970_000, at, &mut c);
+    assert_eq!(c.orders.len(), 4, "the freed place is taken");
+    // Family 1 filled: its shares keep its place. Family 2's Down IoC ended
+    // unfilled (else its market's own IoC gate would hold it first).
+    m.markets[1][pair].pending = Pending::default();
+    m.markets[2][pair].pending = Pending::default();
+    m.markets[1][pair].pos_1e6[up] = 5_000_000;
+    m.take(2, pair, up, 970_000, at, &mut c);
+    assert_eq!((c.orders.len(), m.counters().skip_side), (4, 2), "families 1 (filled) and 3 (in flight)");
+    // A family already on the side adds no family: the cap never stops it.
+    assert!(m.side_room(1, pair, up));
+    // Another window's market does not count, even on the same pair.
+    m.markets[3][pair].open_ns = (OPEN + 2 * 900) * S; // the pair's next window (PM_PAIRS 2)
+    assert!(m.side_room(2, pair, up), "family 3's market is another window's");
+    assert_eq!(m.counters().skip_cap, 0, "no other gate held");
+}
+
+#[test]
+fn the_side_cap_at_zero_is_off() {
+    let at = OPEN * S + 280 * S;
+    let mut c = TestCtx { now: at, orders: Vec::new() };
+    let mut m = side_member(0);
+    for f in 0..4 {
+        side_bind(&mut m, f, 0, OPEN, at);
+        m.take(f, 0, 0, 970_000, at, &mut c);
+    }
+    assert_eq!((c.orders.len(), m.counters().skip_side), (4, 0), "all four families on Up");
+}
+
+#[test]
+fn the_side_cap_frees_a_place_when_the_timer_writes_an_unfilled_ioc_off() {
+    let at = OPEN * S + 280 * S;
+    let mut c = TestCtx { now: at, orders: Vec::new() };
+    let mut m = side_member(1);
+    side_bind(&mut m, 0, 0, OPEN, at);
+    side_bind(&mut m, 1, 0, OPEN, at);
+    m.take(0, 0, 0, 970_000, at, &mut c);
+    m.take(1, 0, 0, 970_000, at, &mut c);
+    assert_eq!((c.orders.len(), m.counters().skip_side), (1, 1), "family 0's IoC holds the one place");
+    // Before its deadline the place stays held; at it, the sweep writes the
+    // IoC off (unfilled) and the place is free.
+    let deadline = at + 2 * m.params.order_ttl_ns;
+    m.on_timer(deadline - 1, &mut c);
+    assert!(!m.side_room(1, 0, 0));
+    m.on_timer(deadline, &mut c);
+    assert_eq!(m.counters().takes_unfilled, 1);
+    assert!(m.side_room(1, 0, 0));
+    m.take(1, 0, 0, 970_000, at, &mut c);
+    assert_eq!(c.orders.len(), 2);
 }

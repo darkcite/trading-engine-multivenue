@@ -39,11 +39,11 @@ use strategy_pine::WarmSlice;
 use strategy_set::{StrategySet, BIT_PINE};
 
 const _: () = assert!(
-    engine::NUM_TICK_LANES == 9
-        && engine::NUM_EVENT_LANES == 9
+    engine::NUM_TICK_LANES == 10
+        && engine::NUM_EVENT_LANES == 10
         && engine::NUM_OPT_LANES == 4
         && engine::NUM_FILL_LANES == 5
-        && engine::NUM_DEPTH_LANES == 2
+        && engine::NUM_DEPTH_LANES == 4
 );
 
 /// The boot instant, UTC ms (a minute boundary).
@@ -214,6 +214,8 @@ fn rig(tag: &str, scripts: &[ScriptSpec]) -> Rig {
     let (_g, t7) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     // PM15-2/3 (main): engine lane 8 carries the rolling 15m ingress.
     let (_g8, t8) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // PMJ (main, merged r40): lane 9 carries the rolling 5m ingress.
+    let (_g9, t9) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     type Ev = Ring<ChannelEvent, { core_types::EVENT_RING_SIZE }>;
     let (ep, e0) = Ev::new().split();
     let (_h, e1) = Ev::new().split();
@@ -224,9 +226,12 @@ fn rig(tag: &str, scripts: &[ScriptSpec]) -> Rig {
     let (_m, e6) = Ev::new().split();
     let (_n, e7) = Ev::new().split();
     let (_n8, e8) = Ev::new().split();
+    let (_n9, e9) = Ev::new().split();
     type Dp = Ring<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>;
     let (_o, d0) = Dp::new().split();
     let (_p, d1) = Dp::new().split();
+    let (_p2, d2) = Dp::new().split();
+    let (_p3, d3) = Dp::new().split();
     type Op = Ring<core_types::OptSummary, { core_types::OPT_RING_SIZE }>;
     let (_q, o0) = Op::new().split();
     let (_r, o1) = Op::new().split();
@@ -244,9 +249,9 @@ fn rig(tag: &str, scripts: &[ScriptSpec]) -> Rig {
     let mut eng = Engine::new(
         set,
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5, t6, t7, t8],
-        [e0, e1, e2, e3, e4, e5, e6, e7, e8],
-        [d0, d1],
+        [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9],
+        [e0, e1, e2, e3, e4, e5, e6, e7, e8, e9],
+        [d0, d1, d2, d3],
         [o0, o1, o2, o3],
         sc,
         [f0, f1, f2, f3, f4],

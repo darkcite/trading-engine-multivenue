@@ -18,7 +18,7 @@ MacBook Pro M4 on free-tier APIs. Claude (the `claude-worker` process, and
 in-session) is an **offline strategy researcher** — never in the hot path.
 
 Slots (`crates/strategy-set`: one `member_table!` row and one `SlotMask`
-(u16) bit each; `BUILT_MASK` 0x03FF, `ALL_MASK` = `all` 0x00FF; timers per
+(u16) bit each; `BUILT_MASK` 0x0BFF, `ALL_MASK` = `all` 0x00FF; timers per
 slot): 0 hyparb (HyperEVM AMM ↔ HL Core arb; needs `~/multivenue/hyparb.toml`
 + the pool ingress; EVM writes TESTNET only, chain 998) · 1 vrp · 2 xsd ·
 3 bin15 (HIP-4 15-minute binaries, H90 late law only) · 4 ai-exec (AI door
@@ -28,9 +28,11 @@ needs `hcv.toml`; a live slot 7 refuses the boot) · 8 pine (third-party Pine
 scripts, `strategy-pine`, PVM impl-08; PAPER only — boots with `--pine
 <manifest>`; live is refused at parse (`[exec.slot.8]`), by `--arm-live 8`
 and for the AI's enable; not in `all`) · 9 pm15 (H90 on Polymarket
-15-minute up/down; needs `pm15.toml`; not in `all`). Slots 10–15 are
-RESERVED: arming one is refused; a member there needs its own ruling
-(S16-R5). `latency-arb` and `icdp` are unlinked and refuse the boot.
+15-minute up/down; needs `pm15.toml`; not in `all`) · 11 pmj (H90 on
+Polymarket 5-minute up/down through Jupiter Predict; needs `pmj.toml`;
+PAPER only — a live slot 11 refuses the boot; not in `all`). Slots 10 and
+12–15 are RESERVED: arming one is refused; a member there needs its own
+ruling (S16-R5). `latency-arb` and `icdp` are unlinked and refuse the boot.
 Paper/live, caps and boot tells per slot: `/state`, `docs/state.md`, the
 slot's risk-policy section.
 
@@ -118,7 +120,12 @@ refused). A binary rollback rolls the wrapper back too.
   binding): no AI-promoted member goes live before one keyed `serve` cycle
   with auto-promotion and one monitor-triggered rollback are observed live.
   **Waived for BIN15 only** (O-E1, 2026-09-15: hand-coded, no AI promotion
-  path). No `serve`, no Anthropic API calls until the operator opens it.
+  path). No `serve`, no Anthropic API calls from `claude-worker` or anything
+  the engine reaches, until the operator opens it. **Exempt (O-AR0,
+  2026-10-19):** the AIRES research workspace — Claude Managed Agents driven
+  from the Mac by the research controller; its own key `MV_RESEARCH_API_KEY`
+  in `.env` (O-AR9), never the worker's; it never touches 9191, `ai.sock`,
+  exec keys or venue credentials; research only.
 - **Execution laws:** a live slot never falls back to paper (E-1); every live
   submit AND modify passes the risk gate, a cancel is never blocked by a cap;
   the HTTP response is the ACK, the `userFills` stream is the FILL (E-5); a
@@ -137,6 +144,13 @@ refused). A binary rollback rolls the wrapper back too.
 - **Detached runs on the Mac:** `launchctl submit` relaunches on exit until
   `launchctl remove` — a wrapper's LAST line removes its own label; nohup
   children of MCP terminals die with the window.
+- **Pushing a message to the operator (any AI session):**
+  `scripts/notify-send.sh [-l] [-s SOURCE] TEXT` (POSIX sh — a Cowork shell or
+  the Mac; stdin when no TEXT) or `multivenue-notify send` drops a file into
+  an inbox that main's notifier relays to Telegram as `[AI:SOURCE]` (`-l`
+  rings, default silent, ≤ 60 an hour). Use it for a finished long run, a
+  gate verdict or a finding the operator must see — not for routine
+  narration; never a secret or a key in a message.
 - **If context runs short:** write interim state + the exact resume point +
   a relaunch prompt to the lane's vault log, then tell the operator.
 
@@ -269,6 +283,17 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 - **No cloud services on the trading path, no observability stack** — TUI +
   log files + `/metrics` and `/state` on `127.0.0.1:9191`. Phase 7 is a plain
   Linux VM.
+- **N-DOCTRINE (O-NT-A, 2026-10-24) — the one-way Telegram notifier is
+  permitted beside that rule.** `multivenue-notify` (`crates/notify`; launchd
+  `com.multivenue.notify`; `~/multivenue/notify.toml` absent = off) runs out of process,
+  is never linked into or reached by the engine, only READS `/state` (and
+  `/metrics`, for the HL gateway's session anchor and worth) on loopback and
+  the run's `engine-{fills,orders,events}.pmlr`, takes only
+  `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` from `.env` (launched under
+  `env -i`), writes only its own state dir and log, talks only to
+  `api.telegram.org` and never reads Telegram updates. Deploying, reloading
+  or rolling it back restarts no engine. `docs/risk-policy.md` "NOTIFY —
+  N-DOCTRINE".
 - **Signing keys** load into an `mlock`'d page and zeroize on drop.
 
 ## Directory guide (the full map: `docs/repo-map.md`)
@@ -279,7 +304,8 @@ thread per source (`discovery.rs` = boot REST; `ingress-ai` = UDS+HMAC) ·
 `rule-tree`, `icdp` unlinked) · `crates/engine` the loop · `crates/exec-*`,
 `signer-*`, `clob-dispatcher`, `exec-gateway` the order path · `crates/cli`
 `multivenue-engine` (`exec_boot.rs` = the arming interlock) · `crates/bench`
-· `fuzz/` · `claude-worker/` · `scripts/` + `launchd/` · `.claude/`.
+· `crates/notify` `multivenue-notify` (the one-way Telegram notifier,
+N-DOCTRINE) · `fuzz/` · `claude-worker/` · `scripts/` + `launchd/` · `.claude/`.
 
 ## Common pitfalls — if you're about to do one of these, stop
 

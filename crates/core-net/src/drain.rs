@@ -75,6 +75,35 @@ pub const fn poll_timeout(repoll_now: bool) -> Duration {
     }
 }
 
+/// **T2T T1-b — one read into rx, the hot window's fill.** [`fill_rx`]
+/// reads until the transport would block. A thread that never blocks
+/// reaches a burst while it is still arriving (a venue's block of frames
+/// streams in over tens of µs), so that loop would hold every frame of the
+/// burst until its last byte. One read per step parses each wave as it
+/// lands; [`RxFill::Full`] then asks the caller to drive again, as a full
+/// rx does. Seen live on main (10-25 06:59Z, HL, under `fill_rx`): inside
+/// the window the first tick of each read turn was stamped 50–90 µs after
+/// the turn began (outside it, ~1 µs), with the same ticks per turn.
+///
+/// # Errors
+/// Any transport error but `WouldBlock`.
+#[inline]
+pub fn fill_rx_once<T: Transport>(transport: &mut T, rx: &mut IoBuf) -> io::Result<RxFill> {
+    let free = rx.free_mut();
+    if free.is_empty() {
+        return Ok(RxFill::Drained);
+    }
+    match transport.read(free) {
+        Ok(0) => Ok(RxFill::Eof),
+        Ok(n) => {
+            rx.advance(n);
+            Ok(RxFill::Full)
+        }
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(RxFill::Drained),
+        Err(e) => Err(e),
+    }
+}
+
 /// What [`fill_rx`] left behind.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RxFill {
@@ -317,6 +346,30 @@ mod tests {
         t.inject_incoming(&[7u8; 10]);
         assert_eq!(fill_rx(&mut t, &mut rx).unwrap(), RxFill::Drained);
         assert_eq!(t.incoming_len(), 10, "nothing was read");
+    }
+
+    #[test]
+    fn fill_rx_once_takes_one_read_and_asks_to_be_driven_again() {
+        let mut t = TestTransport::with_capacity(256);
+        let mut rx = IoBuf::with_capacity(64);
+        t.inject_incoming(&[7u8; 10]);
+        assert_eq!(fill_rx_once(&mut t, &mut rx).unwrap(), RxFill::Full);
+        assert_eq!(rx.len(), 10);
+        // Nothing more has landed: the next step stops.
+        assert_eq!(fill_rx_once(&mut t, &mut rx).unwrap(), RxFill::Drained);
+        // More lands: one read again, then the close.
+        t.inject_incoming(&[8u8; 5]);
+        assert_eq!(fill_rx_once(&mut t, &mut rx).unwrap(), RxFill::Full);
+        assert_eq!(rx.len(), 15);
+        t.mark_closed();
+        assert_eq!(fill_rx_once(&mut t, &mut rx).unwrap(), RxFill::Eof);
+        // A full rx takes nothing and is not progress, as for `fill_rx`.
+        let mut full = IoBuf::with_capacity(64);
+        full.advance(64);
+        let mut t2 = TestTransport::with_capacity(256);
+        t2.inject_incoming(&[7u8; 10]);
+        assert_eq!(fill_rx_once(&mut t2, &mut full).unwrap(), RxFill::Drained);
+        assert_eq!(t2.incoming_len(), 10, "nothing was read");
     }
 
     #[test]

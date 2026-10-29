@@ -253,6 +253,11 @@ enum Cmd {
     /// exactly as `run` would, then print the boot tell. No socket, no
     /// thread, no `.env`: exit 0, or 78 with the refusal on stderr.
     Pm15Check(Pm15CheckArgs),
+    /// PMJ J4: the deploy's dry check for slot 11 — parse the universe file
+    /// and `pmj.toml` and resolve slot 11's 5-minute families and nowcast
+    /// venues exactly as `run` would, then print the boot tell. No socket,
+    /// no thread, no `.env`: exit 0, or 78 with the refusal on stderr.
+    PmjCheck(PmjCheckArgs),
     /// PM15-6c: slot 9's arm, checked. `--self-test` (offline) runs every
     /// pinned signing vector; `--key-check` (online, read-only; the
     /// wrapper sources slot 9's account) adds CLOB V2, the account open,
@@ -260,6 +265,19 @@ enum Cmd {
     /// `--miss-probe` (PM15-6e, ONE order) sends a $1 FAK priced to miss.
     /// Exit 0, or 78 with the refusal on stderr. Never prints a secret.
     PmExec(PmExecArgs),
+    /// PMJ J16: slot 11's arm, checked. `--self-test` (offline) runs RFC
+    /// 8032, the guard's known answers on the public Jupiter Predict
+    /// fixtures and the keypair parser's vector; `--key-check` (online,
+    /// READ-ONLY; the wrapper sources slot 11's wallet) adds `pmj.toml`'s
+    /// guard keys, the 0600 keypair file, the wallet's balances (amounts
+    /// only), one authenticated read (the API key, the region) and, from
+    /// public Solana RPC, the Predict program's deploy slot, the vault's
+    /// lookup-table entry and the deposit mint's decimals against their
+    /// pins. No order, no transaction. Exit 0; 77 a REVIEW TRIGGER (the
+    /// deploy, the vault entry or the mint is not what was reviewed —
+    /// `daily-restart.sh` halts a running slot 11 on it); 78 any other
+    /// refusal. The refusal on stderr; never prints a secret.
+    PmjExec(PmjExecArgs),
     /// PM15-7: PolyBolt's `price.crypto` and `price.crypto.twap` for the
     /// assets, on the account's CLOB API credentials (the wrapper sources
     /// them; never printed), for `--seconds`: the first frames raw, a JSON
@@ -287,6 +305,28 @@ struct PmExecArgs {
 }
 
 #[derive(Debug, Parser)]
+#[command(group(
+    clap::ArgGroup::new("check")
+        .required(true)
+        .args(["self_test", "key_check"])
+))]
+struct PmjExecArgs {
+    /// Offline: the self-test's vectors.
+    #[arg(long)]
+    self_test: bool,
+    /// Online, read-only: the self-test, the wallet, the reads.
+    #[arg(long)]
+    key_check: bool,
+    /// slot 11's artifact (default ~/multivenue/pmj.toml).
+    #[arg(long)]
+    pmj: Option<PathBuf>,
+    /// Refuse when the wallet's deposit balance is over this day cap,
+    /// ×1e6 USD (the flip passes the dust frame's).
+    #[arg(long)]
+    cap_day_usd_1e6: Option<i64>,
+}
+
+#[derive(Debug, Parser)]
 struct Pm15CheckArgs {
     /// The universe file (default: the boot's own, ~/multivenue/universe.toml).
     #[arg(long)]
@@ -294,6 +334,16 @@ struct Pm15CheckArgs {
     /// slot 9's artifact (default ~/multivenue/pm15.toml).
     #[arg(long)]
     pm15: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct PmjCheckArgs {
+    /// The universe file (default: the boot's own, ~/multivenue/universe.toml).
+    #[arg(long)]
+    universe: Option<PathBuf>,
+    /// slot 11's artifact (default ~/multivenue/pmj.toml).
+    #[arg(long)]
+    pmj: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -1720,6 +1770,13 @@ struct RunArgs {
     /// unresolvable artifact refuses the boot with the bit set.
     #[arg(long)]
     pm15: Option<PathBuf>,
+    /// PMJ J4: the slot-11 parameter artifact (`~/multivenue/pmj.toml` by
+    /// default). Read only when the requested mask carries the pmj bit
+    /// (`--strategy …+pmj`; `all` does not name it); an absent or
+    /// unresolvable artifact refuses the boot with the bit set. Slot 11 is
+    /// PAPER: its `paper_delay_ms` sets the paper law's keeper delay.
+    #[arg(long)]
+    pmj: Option<PathBuf>,
     /// HYPARB H5: the slot-0 parameter artifact
     /// (`~/multivenue/hyparb.toml` by default). Read only when the
     /// requested mask carries slot 0 (`--strategy hyparb` / `ai+hyparb`
@@ -1992,6 +2049,18 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Cmd::PmjCheck(args) => {
+            match cli::pmj_boot::check(args.universe.as_deref(), args.pmj.as_deref()) {
+                Ok(tell) => {
+                    println!("{tell}");
+                    ExitCode::SUCCESS
+                }
+                Err(reason) => {
+                    eprintln!("pmj-check: {reason}");
+                    ExitCode::from(78)
+                }
+            }
+        }
         Cmd::PmExec(args) => {
             let r = if args.key_check {
                 cli::pm15_live::key_check(TlsTransport::default_client_config())
@@ -2008,6 +2077,28 @@ fn main() -> ExitCode {
                 Err(reason) => {
                     eprintln!("pm-exec: {reason}");
                     ExitCode::from(78)
+                }
+            }
+        }
+        Cmd::PmjExec(args) => {
+            let r = if args.key_check {
+                cli::pmj_exec::key_check(
+                    TlsTransport::default_client_config(),
+                    args.pmj.as_deref(),
+                    args.cap_day_usd_1e6,
+                )
+                .map_err(|e| (e.exit_code(), e.to_string()))
+            } else {
+                cli::pmj_exec::self_test().map_err(|e| (cli::pmj_exec::EXIT_REFUSED, e))
+            };
+            match r {
+                Ok(tell) => {
+                    println!("{tell}");
+                    ExitCode::SUCCESS
+                }
+                Err((code, reason)) => {
+                    eprintln!("pmj-exec: {reason}");
+                    ExitCode::from(code)
                 }
             }
         }
@@ -4543,6 +4634,17 @@ fn run(args: RunArgs) -> ExitCode {
     } else {
         (None, None)
     };
+    // PMJ J16: slot 11's jup-gw reads every window the 5-minute discovery
+    // finds — the tee's two ends, when slot 11 is live (none on paper).
+    let (mut pmj_tee_tx, mut pmj_tee_rx) = if exec_boot
+        .as_ref()
+        .is_some_and(cli::exec_boot::ExecBoot::pmj_live)
+    {
+        let (t, r) = cli::pmj_live::spec_tee();
+        (Some(t), Some(r))
+    } else {
+        (None, None)
+    };
     // (BX9: before the discovery too — a live Binance arm's options held
     // outside the chain join it right after the discovery, before any
     // table is built from the chain: the R3 ruling.)
@@ -5020,6 +5122,8 @@ fn run(args: RunArgs) -> ExitCode {
     // PM15: lane 8 = the Polymarket rolling families (engine::PM15_LANE —
     // venue byte Polymarket, wired by index).
     let (pm15_prod, pm15_lane_cons) = rings.tick[engine::PM15_LANE].clone().split();
+    // PMJ J1b: lane 9 = the Polymarket 5-minute families (engine::PM5_LANE).
+    let (pm5_prod, pm5_lane_cons) = rings.tick[engine::PM5_LANE].clone().split();
     // WS10-A: venue-event lanes, tick-lane indexing. Producers ride
     // into the four funding-capable venue spawns; PM (0) and the
     // spare lane 4 producer for HL are dropped — HL carries premium
@@ -5036,6 +5140,8 @@ fn run(args: RunArgs) -> ExitCode {
     let (hl_event_prod, hl_event_cons) = rings.event[4].clone().split();
     // PM15: the rolling families' roll, order law and Chainlink mark.
     let (pm15_event_prod, pm15_event_cons) = rings.event[engine::PM15_LANE].clone().split();
+    // PMJ J1b: the 5-minute families' roll, order law and Chainlink mark.
+    let (pm5_event_prod, pm5_event_cons) = rings.event[engine::PM5_LANE].clone().split();
     let event_lane_cons = [
         pm_event_cons,
         bn_event_cons,
@@ -5046,12 +5152,16 @@ fn run(args: RunArgs) -> ExitCode {
         mexc_event_cons,
         hypercall_event_cons,
         pm15_event_cons,
+        pm5_event_cons,
     ];
     // WS10-B: depth lanes (engine::depth_lane_of order — okx 0,
     // deribit 1). Producers ride into the two depth-capable spawns.
     let (okx_depth_prod, okx_depth_cons) = rings.depth[0].clone().split();
     let (deribit_depth_prod, deribit_depth_cons) = rings.depth[1].clone().split();
-    let depth_lane_cons = [okx_depth_cons, deribit_depth_cons];
+    // PMJ J8: the rolling legs' depth lanes — the paper fill law's levels.
+    let (pm15_depth_prod, pm15_depth_cons) = rings.depth[engine::PM15_DEPTH_LANE].clone().split();
+    let (pm5_depth_prod, pm5_depth_cons) = rings.depth[engine::PM5_DEPTH_LANE].clone().split();
+    let depth_lane_cons = [okx_depth_cons, deribit_depth_cons, pm15_depth_cons, pm5_depth_cons];
     // VM2 V2: options-summary lanes (engine::opt_lane_of order —
     // okx 0, deribit 1, binance 2, hypercall 3 — HC1). Producers ride
     // into the options-capable spawns.
@@ -5576,6 +5686,9 @@ fn run(args: RunArgs) -> ExitCode {
 
     // Hyperliquid rides core 7 per the §9 core map.
     let hl_wall_anchor = core_time::WallAnchor::now();
+    // T2T T1-b: the late law's hot window, published once slot 3's artifact
+    // is read (below); the ingress never blocks inside it.
+    let hl_hot = std::sync::Arc::new(core_time::HotCell::new());
     if let Some((mut hl_coins, mut hl_families, hl_ep, hl_info_ep)) = hl_boot {
         // BIN15 O2: adopt each family's LIVE instance out of the
         // discovery body, so the first `Steady` subscribes it instead
@@ -5630,6 +5743,7 @@ fn run(args: RunArgs) -> ExitCode {
             raw_tap_cfg.hl,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hyperliquid)),
             trade_routes.of(core_types::VenueId::Hyperliquid),
+            std::sync::Arc::clone(&hl_hot),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -5880,15 +5994,18 @@ fn run(args: RunArgs) -> ExitCode {
         drop(hypercall_opt_prod);
     }
 
-    // PM15: the rolling 15-minute families (`[polymarket] rolling`).
-    // Absent = the unspawned shape: lane 8 reads empty, bit for bit the
-    // pre-PM15 boot.
-    if boot.pm_rolling.is_empty() {
+    // PM15: the rolling 15-minute families (`[polymarket] rolling`'s
+    // `:15m` keys; PMJ J1b: a `:5m` key is the 5-minute pipeline's, not
+    // this one's). Absent = the unspawned shape: lane 8 reads empty, bit
+    // for bit the pre-PM15 boot.
+    let pm15_keys = core_config::universe::pm_rolling_15m(&boot.pm_rolling);
+    if pm15_keys.is_empty() {
         drop(pm15_prod);
         drop(pm15_event_prod);
+        drop(pm15_depth_prod);
     } else {
-        let mut assets = Vec::with_capacity(boot.pm_rolling.len());
-        for key in &boot.pm_rolling {
+        let mut assets = Vec::with_capacity(pm15_keys.len());
+        for key in &pm15_keys {
             match core_config::universe::pm_rolling_asset(key) {
                 Some(a) => assets.push(a.to_string()),
                 None => {
@@ -5898,14 +6015,17 @@ fn run(args: RunArgs) -> ExitCode {
                 }
             }
         }
-        info!(families = ?assets, "pm15: starting the rolling discovery + ingress threads");
+        info!(families = ?assets, depth = ?boot.pm_rolling_depth, "pm15: starting the rolling discovery + ingress threads");
         match cli::spawn_pm15(
             assets,
+            boot.pm_rolling_depth,
+            boot.pm_rolling_market_sockets,
             tls_config.clone(),
             core_time::WallAnchor::now(),
             stale_after_ms[core_types::VenueId::Polymarket as usize],
             pm15_prod,
             pm15_event_prod,
+            pm15_depth_prod,
             statuses.pm15.clone(),
             statuses.pm15c.clone(),
             12,
@@ -5918,6 +6038,58 @@ fn run(args: RunArgs) -> ExitCode {
             Ok(hs) => handles.extend(hs),
             Err(e) => {
                 error!(error = ?e, "pm15: boot failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // PMJ J1b: the rolling 5-minute families (`[polymarket] rolling`'s
+    // `:5m` keys) — the same pipeline driven for `PmPeriod::M5`, on lane 9.
+    // Absent = the unspawned shape: lane 9 reads empty.
+    let pm5_keys = core_config::universe::pm_rolling_5m(&boot.pm_rolling);
+    if pm5_keys.is_empty() {
+        drop(pm5_prod);
+        drop(pm5_event_prod);
+        drop(pm5_depth_prod);
+        // PMJ J16: no 5-minute discovery, no windows for jup-gw — a live
+        // slot 11 refuses its boot (fail closed) rather than arm blind.
+        pmj_tee_rx = None;
+    } else {
+        let mut assets = Vec::with_capacity(pm5_keys.len());
+        for key in &pm5_keys {
+            match core_config::universe::pm5_rolling_asset(key) {
+                Some(a) => assets.push(a.to_string()),
+                None => {
+                    error!(key = %key, "pm5: a rolling key the universe let through has no asset");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        info!(families = ?assets, depth = ?boot.pm_rolling_depth, "pm5: starting the 5-minute discovery + ingress threads");
+        match cli::spawn_pm5(
+            assets,
+            boot.pm_rolling_depth,
+            boot.pm_rolling_market_sockets,
+            tls_config.clone(),
+            core_time::WallAnchor::now(),
+            stale_after_ms[core_types::VenueId::Polymarket as usize],
+            pm5_prod,
+            pm5_event_prod,
+            pm5_depth_prod,
+            statuses.pm5.clone(),
+            statuses.pm5c.clone(),
+            13,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.pm5,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_pm5)),
+            pmj_tee_tx.take(),
+        ) {
+            Ok(hs) => handles.extend(hs),
+            Err(e) => {
+                error!(error = ?e, "pm5: boot failed");
                 join_reverse(handles);
                 return ExitCode::from(1);
             }
@@ -6103,6 +6275,17 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // T2T T0: the per-order latency capture beside them — the same stance.
+    let obs = match cli::open_latency_capture(&run_dir, epoch_ns) {
+        Ok(cap) => obs.with_latency_capture(cap),
+        Err(e) => {
+            error!(error = ?e, dir = %run_dir.display(), "latency capture open failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
+    // T2T T1-b: the engine loop reads the same hot window as the ingress.
+    let obs = obs.with_hot_cell(std::sync::Arc::clone(&hl_hot));
 
     // -- Main thread: real engine loop until SIGINT --
     // HK6: the captures are open — the run directory stays from here on.
@@ -6118,6 +6301,7 @@ fn run(args: RunArgs) -> ExitCode {
             mexc_lane_cons,
             hypercall_lane_cons,
             pm15_lane_cons,
+            pm5_lane_cons,
         ],
         event_lanes: event_lane_cons,
         depth_lanes: depth_lane_cons,
@@ -6231,6 +6415,8 @@ fn run(args: RunArgs) -> ExitCode {
     let mut bin15_stop: Option<cli::xmm_live::GatewayStop> = None;
     // PM15-6c: slot 9's two threads' owner, alike.
     let mut pm15_stop: Option<cli::xmm_live::GatewayStop> = None;
+    // PMJ J16: slot 11's jup-gw thread's owner, alike.
+    let mut pmj_stop: Option<cli::xmm_live::GatewayStop> = None;
     let result = match (strategy_choice, args.live, set_mask) {
         // HYPARB H0 (O-H1): `latency-arb` has no arm any more — slot 0
         // is the hyparb set member and the old name falls through to
@@ -6545,6 +6731,19 @@ fn run(args: RunArgs) -> ExitCode {
             } else {
                 None
             };
+            // T2T T1-b: slot 3's late window keeps the HL ingress awake.
+            if let Some((w, open_ms, close_ms)) = bin15_boot
+                .as_ref()
+                .and_then(|b| cli::bin15_boot::late_hot_window(&b.params.late))
+            {
+                hl_hot.set(w);
+                info!(
+                    open_ms,
+                    close_ms,
+                    duty_ppm = w.duty_ppm(),
+                    "T2T T1-b: the Hyperliquid ingress never blocks inside the late window"
+                );
+            }
             // F19 / the icdp law: requested-but-absent REFUSES. Booting
             // `ai+bin15` silently as `ai` is how an operator comes to
             // watch a member that was never there.
@@ -6562,7 +6761,7 @@ fn run(args: RunArgs) -> ExitCode {
                 match cli::pm15_boot::load_pm15_boot(
                     args.pm15.as_deref(),
                     &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
-                    &boot.pm_rolling,
+                    &core_config::universe::pm_rolling_15m(&boot.pm_rolling),
                 ) {
                     Ok(b) => b,
                     Err(reason) => {
@@ -6582,6 +6781,36 @@ fn run(args: RunArgs) -> ExitCode {
                 join_reverse(handles);
                 return ExitCode::from(1);
             }
+            // PMJ J4: slot 11's artifact, against the same descriptor table
+            // and the universe's 5-minute `[polymarket] rolling` order.
+            let pmj_boot = if cli::pmj_boot::pmj_wanted(requested) {
+                match cli::pmj_boot::load_pmj_boot(
+                    args.pmj.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &core_config::universe::pm_rolling_5m(&boot.pm_rolling),
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "pmj: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
+            if cli::pmj_boot::pmj_wanted(requested) && pmj_boot.is_none() {
+                error!(
+                    "pmj: requested by --strategy but the artifact is absent \
+                     (~/multivenue/pmj.toml or --pmj) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+            // The paper law's keeper delay for the 5-minute legs (slot 11's).
+            let pm5_held_delay_ns = pmj_boot
+                .as_ref()
+                .map_or(core_fill::held::PMJ_PAPER_DELAY_NS_DEFAULT, |b| b.paper_delay_ns);
             // HYPARB H5: slot 0's artifact. Coins resolve against the
             // same descriptor table; pools against the universe's
             // `[hyperevm]` list (the universe allocates their symbols).
@@ -6725,7 +6954,8 @@ fn run(args: RunArgs) -> ExitCode {
                     info!("running strategy-set PAPER — no orders will be submitted");
                     engine_loop_set_full(
                         cons,
-                        clob_dispatcher::PaperDispatcher::new(),
+                        clob_dispatcher::PaperDispatcher::new()
+                            .with_pm5_held_delay_ns(pm5_held_delay_ns),
                         obs,
                         requested,
                         vrp_boot.as_ref(),
@@ -6738,6 +6968,7 @@ fn run(args: RunArgs) -> ExitCode {
                         har_boot.as_ref(),
                         pine_boot,
                         pm15_boot.as_ref(),
+                        pmj_boot.as_ref(),
                     )
                 }
                 // WITH `--exec`: the same loop over the compositing
@@ -7082,6 +7313,53 @@ fn run(args: RunArgs) -> ExitCode {
                     } else {
                         exec_router::NO_SLOT
                     };
+                    // PMJ J16: **slot 11 on its own Jupiter arm**, when the
+                    // artifact marks it live (and the binary carries the
+                    // PMJ-DUST-GATE line — `exec_boot` refused it otherwise):
+                    // `SlotSplit(11, …)` just outside slot 9's — none
+                    // (`NO_SLOT`) without. jup-gw is released after the
+                    // loop, as slot 9's threads.
+                    let pmj_arm = if eb.pmj_live() {
+                        let booted = match pmj_tee_rx.take() {
+                            Some(rx) => cli::pmj_live::boot_pmj_arm(
+                                &eb,
+                                pmj_boot.as_ref(),
+                                TlsTransport::default_client_config(),
+                                rx,
+                                statuses.pmjx.clone(),
+                            ),
+                            None => Err(String::from(
+                                "slot 11 is live, but the 5-minute ingress did not start (no \
+                                 `[polymarket] rolling` :5m family): its arm would have no windows",
+                            )),
+                        };
+                        match booted {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                pmj_stop = Some(b.stop);
+                                handles.push(b.handle);
+                                Some(b.arm)
+                            }
+                            Err(reason) => {
+                                error!(%reason, "pmj: slot 11's arm refused — boot aborted");
+                                if let Some(s) = &bin15_stop {
+                                    s.release();
+                                }
+                                if let Some(s) = &pm15_stop {
+                                    s.release();
+                                }
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let pmj_slot = if pmj_arm.is_some() {
+                        cli::exec_boot::PMJ_SLOT as u8
+                    } else {
+                        exec_router::NO_SLOT
+                    };
                     let xmm_arm = if eb.gateway_live().is_some() {
                         let spec = cli::xmm_live::XmmSpec {
                             eb: &eb,
@@ -7105,6 +7383,9 @@ fn run(args: RunArgs) -> ExitCode {
                                     s.release();
                                 }
                                 if let Some(s) = &pm15_stop {
+                                    s.release();
+                                }
+                                if let Some(s) = &pmj_stop {
                                     s.release();
                                 }
                                 join_reverse(handles);
@@ -7159,7 +7440,8 @@ fn run(args: RunArgs) -> ExitCode {
                         }
                     }
                     let anchor = core_time::WallAnchor::now();
-                    let paper = clob_dispatcher::PaperDispatcher::new();
+                    let paper = clob_dispatcher::PaperDispatcher::new()
+                        .with_pm5_held_delay_ns(pm5_held_delay_ns);
                     let live_line = cli::exec_boot::render_slot_mask(eb.live_mask);
                     let bn_venue = core_types::VenueId::Binance as u8;
                     macro_rules! enter_loop {
@@ -7180,6 +7462,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 har_boot.as_ref(),
                                 pine_boot,
                                 pm15_boot.as_ref(),
+                                pmj_boot.as_ref(),
                             )
                         }};
                     }
@@ -7196,6 +7479,9 @@ fn run(args: RunArgs) -> ExitCode {
                                 s.release();
                             }
                             if let Some(s) = &pm15_stop {
+                                s.release();
+                            }
+                            if let Some(s) = &pmj_stop {
                                 s.release();
                             }
                             join_reverse(handles);
@@ -7244,16 +7530,20 @@ fn run(args: RunArgs) -> ExitCode {
                             match xmm_arm {
                                 None => {
                                     let inner = exec_router::SlotSplit::new(
-                                        pm15_slot,
-                                        exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
-                                        pm15_arm,
+                                        pmj_slot,
+                                        exec_router::SlotSplit::new(
+                                            pm15_slot,
+                                            exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
+                                            pm15_arm,
+                                        ),
+                                        pmj_arm,
                                     );
                                     let mut d = exec_router::RoutedDispatcher::new(
                                         eb.route, paper, inner, anchor,
                                     );
                                     wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                                     $(
-                                        let split_aliases = *d.live().a().a()$(.$hop())*.aliases();
+                                        let split_aliases = *d.live().a().a().a()$(.$hop())*.aliases();
                                         finish_bn!(d, split_aliases, $specs);
                                     )?
                                     enter_loop!(d, $what)
@@ -7262,9 +7552,13 @@ fn run(args: RunArgs) -> ExitCode {
                                     let split = exec_router::SlotSplit::new(
                                         cli::exec_boot::XMM_SLOT as u8,
                                         exec_router::SlotSplit::new(
-                                            pm15_slot,
-                                            exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
-                                            pm15_arm,
+                                            pmj_slot,
+                                            exec_router::SlotSplit::new(
+                                                pm15_slot,
+                                                exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
+                                                pm15_arm,
+                                            ),
+                                            pmj_arm,
                                         ),
                                         xmm,
                                     );
@@ -7273,7 +7567,7 @@ fn run(args: RunArgs) -> ExitCode {
                                     );
                                     wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                                     $(
-                                        let split_aliases = *d.live().a().a().a()$(.$hop())*.aliases();
+                                        let split_aliases = *d.live().a().a().a().a()$(.$hop())*.aliases();
                                         finish_bn!(d, split_aliases, $specs);
                                     )?
                                     finish_xmm!(d, xspecs);
@@ -7398,6 +7692,9 @@ fn run(args: RunArgs) -> ExitCode {
         s.release();
     }
     if let Some(s) = &pm15_stop {
+        s.release();
+    }
+    if let Some(s) = &pmj_stop {
         s.release();
     }
     join_reverse(handles);

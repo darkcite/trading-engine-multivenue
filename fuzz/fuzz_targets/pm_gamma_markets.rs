@@ -18,6 +18,16 @@
 //!    half and both halves are ingested sequentially into a fresh
 //!    table, re-checking the same invariant.
 //!
+//! 4. PM15 / PMJ J1b: the rolling window law (`gamma15`) over the same
+//!    bytes, for both periods — `out` is written only on `Ok`, and an
+//!    `Ok` spec names the family and window it was asked for.
+//!
+//! 5. PM15-9b: the CLOB market record (`clob_law::parse_clob_market`) and
+//!    its law (`check_clob_law`) over the same bytes, against a fixed
+//!    condition id and against one cut from the input itself — `out` is
+//!    untouched on `false`, and a passing law binds one of the two ticks
+//!    and a positive minimum size.
+//!
 //! None of this may panic or read out of bounds on any input. (The
 //! module itself allocates by design — it runs at boot only.)
 
@@ -52,5 +62,45 @@ fuzz_target!(|data: &[u8]| {
         let key_len = data.len().min(80);
         let _ = d2.find_by_token(&data[..key_len]);
         let _ = d2.sibling_of(&data[..key_len]);
+    }
+
+    // PM15 / PMJ J1b: the rolling window law, both periods.
+    let periods = [
+        (core_types::pm_roll::PmPeriod::M15, 1_792_216_800u64),
+        (core_types::pm_roll::PmPeriod::M5, 1_792_308_000u64),
+    ];
+    let mut k = 0usize;
+    while k < periods.len() {
+        let (period, open) = periods[k];
+        k += 1;
+        let w = period.window_of_open(open).unwrap_or(0);
+        let mut spec = ingress_polymarket::gamma15::PmWindowSpec::EMPTY;
+        match ingress_polymarket::gamma15::parse_window_spec_for(period, data, 3, b"btc", w, &mut spec) {
+            Ok(()) => assert_eq!((spec.family, spec.window), (3, w)),
+            Err(_) => assert_eq!(spec, ingress_polymarket::gamma15::PmWindowSpec::EMPTY),
+        }
+    }
+
+    // PM15-9b: the CLOB record and its law.
+    let cids: [&[u8]; 2] = [
+        b"0x232a3351a0f7775a834b8c4deb6d9fe09f11b96226937e5268ede62cae817fe6",
+        &data[..data.len().min(66)],
+    ];
+    let mut k = 0usize;
+    while k < cids.len() {
+        let sentinel = ingress_polymarket::clob_law::PmClobLaw {
+            mts_1e9: 7,
+            ..ingress_polymarket::clob_law::PmClobLaw::EMPTY
+        };
+        let mut law = sentinel;
+        if ingress_polymarket::clob_law::parse_clob_market(data, cids[k], &mut law) {
+            if let Ok(tick) = ingress_polymarket::clob_law::check_clob_law(&law) {
+                assert!(tick == 10_000_000 || tick == 1_000_000);
+                assert!(law.mos_1e6 > 0);
+            }
+        } else {
+            assert_eq!(law, sentinel);
+        }
+        k += 1;
     }
 });

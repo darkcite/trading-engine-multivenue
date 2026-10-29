@@ -191,7 +191,8 @@ STRATEGY_RESOLVED="$(./target/release/multivenue-engine strategy-mask "$STRATEGY
   echo "engine-wrapper: refusing STRATEGY=$STRATEGY (an older release binary has no strategy-mask: rebuild it)" >&2
   exit 78
 }
-# The answer's shape, not just its exit code: `<1..255>\t<members>`.
+# The answer's shape, not just its exit code: `<mask>\t<members>` (the mask
+# 1..65535 since S16).
 case "$STRATEGY_RESOLVED" in
   [1-9]*$'\t'?*) ;;
   *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (strategy-mask answered '$STRATEGY_RESOLVED')" >&2; exit 78 ;;
@@ -389,6 +390,23 @@ if [ -n "${HCV_EVENTS:-}" ]; then
   fi
   HCV_ARGS+=(--hcv-events "$HCV_EVENTS")
 fi
+# PMJ J4 (2026-10-18): slot 11's artifact, the XMM_TOML shape.
+# ~/multivenue/pmj.toml is the default whenever STRATEGY carries pmj
+# (absent => the ENGINE refuses the boot); PMJ_TOML=<path> in strategy.conf
+# names another one. It must be a file, and STRATEGY must carry pmj.
+# Paper only: nothing here can arm slot 11 (the engine refuses a live one).
+PMJ_ARGS=()
+if [ -n "${PMJ_TOML:-}" ]; then
+  if [ ! -f "$PMJ_TOML" ]; then
+    echo "engine-wrapper: refusing — PMJ_TOML=$PMJ_TOML is not a file" >&2
+    exit 78
+  fi
+  case "$STRATEGY_MEMBERS" in
+    *+pmj+*) ;;
+    *) echo "engine-wrapper: refusing — PMJ_TOML without pmj in STRATEGY=$STRATEGY" >&2; exit 78 ;;
+  esac
+  PMJ_ARGS=(--pmj "$PMJ_TOML")
+fi
 # HK19 (2026-10-15): the §6.5 raw tap from strategy.conf. RAW_TAP=<labels>
 # (comma-separated, from pm bn okx rpc deribit hl bybit mexc hyperevm
 # hypercall; or `all` alone) writes the payloads those parsers REJECT to
@@ -425,4 +443,4 @@ if [ -n "${RAW_TAP:-}" ]; then
   fi
   echo "engine-wrapper: raw tap ${TAP_ARGS[*]}" >&2
 fi
-exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}" "${XMM_ARGS[@]}" "${HCV_ARGS[@]}" "${TAP_ARGS[@]}"
+exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}" "${XMM_ARGS[@]}" "${HCV_ARGS[@]}" "${PMJ_ARGS[@]}" "${TAP_ARGS[@]}"

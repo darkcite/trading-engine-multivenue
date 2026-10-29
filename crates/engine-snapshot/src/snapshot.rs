@@ -82,8 +82,9 @@ pub const RUN_DIR_MAX: usize = 160;
 /// **Slots 8–15 appeared in schema 3 (S16-5)** as
 /// [`RESERVED_SLOT_NAME`]; a member taking one later is additive in the
 /// same way — **slot 8 is `"pine"` since PVM impl-08 T4** (2026-10-16; the
-/// Pine member, paper only) and **slot 9 is `strategy-pm15` since PM15-5
-/// (2026-10-17)** — both additive (`"reserved"` → a name); 10–15 stay
+/// Pine member, paper only), **slot 9 is `strategy-pm15` since PM15-5
+/// (2026-10-17)** and **slot 11 is `strategy-pmj` since PMJ J4 (2026-10-18)** —
+/// each additive (`"reserved"` → a name); 10 and 12–15 stay
 /// reserved. This is a copy of the `strategy-set` member table's names
 /// (the snapshot crate does not link the members): the cli's
 /// `exec_boot` snapshot-parity test is the guard against drift.
@@ -99,7 +100,7 @@ pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
     "pine",
     "pm15",
     RESERVED_SLOT_NAME,
-    RESERVED_SLOT_NAME,
+    "pmj",
     RESERVED_SLOT_NAME,
     RESERVED_SLOT_NAME,
     RESERVED_SLOT_NAME,
@@ -660,6 +661,17 @@ pub const RETIRED_WHY_WORDS: [&str; 6] = [
 /// (`clob_dispatcher::RETIRED_WHY_UNKNOWN`, pinned in `cli`).
 pub const RETIRED_WHY_UNKNOWN: usize = 7;
 
+/// **O-WSG1 — the hold bits' words**, index = the bits
+/// (`exec_router::halt::hold_word`'s copy; `cli` pins the two together).
+pub const HOLD_WORDS: [&str; 4] = ["none", "ws-gap", "recon-stale", "ws-gap+recon-stale"];
+
+/// The word for a slot's hold bits; bits this binary does not know are
+/// masked off.
+#[must_use]
+pub fn hold_word(v: u8) -> &'static str {
+    HOLD_WORDS[(v & 3) as usize]
+}
+
 /// The word for a `HaltReason` byte, or `"unknown"` for one this
 /// binary does not have. Never a panic and never an empty string: a
 /// reason we cannot name is still a halt.
@@ -775,6 +787,9 @@ pub struct ExecSnapshot {
     pub file_present: u8,
     /// Per-slot `HaltReason as u8`; `0` = running.
     pub halted: [u8; SNAPSHOT_SLOTS],
+    /// **O-WSG1** — per-slot hold bits (`exec_router::halt::HOLD_*`);
+    /// `0` = not held. A hold lifts by itself.
+    pub held: [u8; SNAPSHOT_SLOTS],
     /// Halt edges since boot.
     pub halts: u64,
     /// Requests refused because their slot is halted.
@@ -850,6 +865,10 @@ pub struct ExecSnapshot {
     /// **BX11** — the Binance arm's own words (`exec.arms.binance_gw`;
     /// rendered only when `present`).
     pub arms_binance_gw: BinanceGwSnapshot,
+    /// **O-WSG1** — hold edges since boot.
+    pub holds: u64,
+    /// **O-WSG1** — requests refused because their slot was held.
+    pub refused_held: u64,
 }
 
 /// **BX6 — one venue arm's numbers** in `/state` `exec.arms.<venue>`:
@@ -1276,9 +1295,11 @@ mod tests {
         // (it fit the previous alignment slack): 384 B left. PVM PB2's
         // `off_grid` refusal (+8 B in `BinanceGwSnapshot`, 432 B) crosses a
         // 64 B line: 32,448 B, 320 B left.
+        // Merged with main's O-WSG1 hold (`exec.held` 16 B and two counters) in the r40
+        // merge (2026-10-29): they fit the same 64 B alignment — still 32,448 B, 320 B left.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
-        assert_eq!(n, 32_448, "the PB2 figure: a change states its own");
+        assert_eq!(n, 32_448, "the r40 merge figure (PB2 + O-WSG1): a change states its own");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);
         assert_eq!(core::mem::size_of::<HarSnapshot>(), 2_216);
     }

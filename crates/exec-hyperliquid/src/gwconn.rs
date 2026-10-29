@@ -91,6 +91,9 @@ pub struct GwConn {
     frames: u64,
     posts: u32,
     last_rx_ns: u64,
+    /// When this session's dial started: the client heartbeat's anchor
+    /// until its first ping (`Keepalive::poll_client_heartbeat`).
+    dial_ns: u64,
     keepalive: Keepalive,
     /// HK2: the TLS drive met the peer's close while a readiness event was
     /// pumped. The bytes before the close may still sit decrypted in
@@ -122,6 +125,7 @@ impl GwConn {
             frames: 0,
             posts: 0,
             last_rx_ns: 0,
+            dial_ns: 0,
             keepalive: Keepalive::new(keepalive),
             peer_closed: false,
             #[cfg(feature = "testvenue")]
@@ -206,6 +210,7 @@ impl GwConn {
         self.rx.clear();
         self.posts = 0;
         self.last_rx_ns = now_ns;
+        self.dial_ns = now_ns;
         self.keepalive.reset();
         self.peer_closed = false;
         Ok(())
@@ -419,8 +424,20 @@ impl GwConn {
         Ok(())
     }
 
-    /// The keepalive step for a ready connection: ping when quiet.
-    /// `Ok(true)` = the connection is dead (silent past the idle timeout).
+    /// The keepalive step for a ready connection: a CLIENT heartbeat — a
+    /// ping every `ping_interval_ns` after the last one WE sent (the dial
+    /// before the first), however busy the socket is. `Ok(true)` = the
+    /// connection is dead (no inbound byte past the idle timeout).
+    ///
+    /// **Why not a quiet-time ping (the cut before 2026-10-20).** The venue
+    /// closes a `/ws` socket 60 s after its last client ping or subscribe
+    /// with `Close 1000 "Inactive"`; a post and its answer do not count.
+    /// This socket posts the arm's reads every few seconds, so it was
+    /// never quiet, never pinged, and was cut and redialled every 60 s —
+    /// any post in flight at the cut left in doubt (E-5). Measured live
+    /// 2026-10-20: a probe posting info every 10 s, never pinging, was
+    /// closed `Inactive` at 60.1–60.2 s, twice; the same probe pinging
+    /// every 30 s stayed up.
     ///
     /// # Errors
     /// The ping could not be written.
@@ -428,7 +445,10 @@ impl GwConn {
         if self.phase != Phase::Ready {
             return Ok(false);
         }
-        match self.keepalive.poll(now_ns, self.last_rx_ns) {
+        match self
+            .keepalive
+            .poll_client_heartbeat(now_ns, self.last_rx_ns, self.dial_ns)
+        {
             KeepaliveAction::None => Ok(false),
             KeepaliveAction::Reconnect => Ok(true),
             KeepaliveAction::SendPing => {
@@ -538,6 +558,38 @@ mod tests {
             Ok(false),
             "a down connection is not kept alive"
         );
+    }
+
+    /// **The client heartbeat (2026-10-20).** A ready connection whose
+    /// inbound traffic never stops (post answers every few seconds) is
+    /// still due its ping 30 s after the dial, then 30 s after each ping;
+    /// a quiet-time ping never came due on it and the venue cut the socket
+    /// `Inactive` at 60 s. Without a socket the ping's write reports
+    /// `Closed` — that error IS the ping being attempted.
+    #[test]
+    fn a_busy_connection_still_pings_on_the_client_heartbeat() {
+        const S: u64 = 1_000_000_000;
+        let mut c = GwConn::new(0, KA);
+        c.phase = Phase::Ready;
+        c.dial_ns = 100 * S;
+        // Inbound every second from the dial on: never quiet.
+        c.last_rx_ns = 129 * S;
+        assert_eq!(c.maintain(129 * S), Ok(false), "not due before 30 s");
+        c.last_rx_ns = 130 * S;
+        assert_eq!(
+            c.maintain(130 * S),
+            Err(ConnErr::Closed),
+            "due 30 s after the dial however busy the socket is"
+        );
+        // A ping sent at 130 s: the next is due at 160 s, inbound or not.
+        c.keepalive.mark_ping_sent(130 * S);
+        c.last_rx_ns = 159 * S;
+        assert_eq!(c.maintain(159 * S), Ok(false));
+        c.last_rx_ns = 160 * S;
+        assert_eq!(c.maintain(160 * S), Err(ConnErr::Closed));
+        // No inbound byte for the idle timeout: dead, ping or not.
+        c.keepalive.mark_ping_sent(160 * S);
+        assert_eq!(c.maintain(220 * S), Ok(true));
     }
 
     #[test]

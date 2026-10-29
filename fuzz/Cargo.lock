@@ -195,6 +195,7 @@ dependencies = [
  "core-latency",
  "core-net",
  "core-ring",
+ "core-time",
 ]
 
 [[package]]
@@ -246,6 +247,24 @@ dependencies = [
  "rustls",
  "secp256k1",
  "signer-eip712",
+ "zeroize",
+]
+
+[[package]]
+name = "exec-jupiter"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-crypto",
+ "core-fill",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "exec-gateway",
+ "ingress-polymarket",
+ "signer-ed25519",
  "zeroize",
 ]
 
@@ -424,6 +443,7 @@ dependencies = [
  "core-types",
  "memchr",
  "mio",
+ "rustls",
 ]
 
 [[package]]
@@ -521,13 +541,16 @@ dependencies = [
  "core-config",
  "core-crypto",
  "core-fill",
+ "core-metrics",
  "core-net",
  "core-parse",
+ "core-ring",
  "core-types",
  "exec-binance",
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
+ "exec-jupiter",
  "ingress-ai",
  "ingress-binance",
  "ingress-bybit",
@@ -657,6 +680,8 @@ version = "0.1.0"
 dependencies = [
  "core-time",
  "core-types",
+ "getrandom 0.2.17",
+ "libc",
  "secp256k1",
  "tiny-keccak",
  "zeroize",

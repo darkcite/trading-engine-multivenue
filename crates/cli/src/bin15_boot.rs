@@ -96,6 +96,34 @@ pub struct Bin15Boot {
     pub resolved: usize,
 }
 
+/// The 15 m families' period: the late law's instances expire on the
+/// quarter hours.
+const LATE_PERIOD_MS: u64 = 900_000;
+/// How far the hot window reaches past the law's own τ bounds: it opens
+/// 2 s before `tau_max` and closes 1 s after `tau_min`.
+const LATE_HOT_LEAD_MS: u64 = 2_000;
+/// See [`LATE_HOT_LEAD_MS`].
+const LATE_HOT_TAIL_MS: u64 = 1_000;
+
+/// **T2T T1-a/b** — the late law's hot window, for slot 3's gateway and
+/// the Hyperliquid ingress: from `tau_max + 2 s` to `tau_min − 1 s` before
+/// each quarter hour, with its open and close offsets (ms). `None` when the
+/// law is off, or when its window would open more than ~65 s before the
+/// quarter hour (`HotWindow`'s bound; the ruled τ max is 30 s).
+#[must_use]
+pub fn late_hot_window(
+    late: &strategy_bin15::late::LateParams,
+) -> Option<(core_time::HotWindow, u64, u64)> {
+    if late.enabled == 0 {
+        return None;
+    }
+    let open_ms = (late.tau_max_ns / 1_000_000)
+        .saturating_add(LATE_HOT_LEAD_MS)
+        .min(LATE_PERIOD_MS);
+    let close_ms = (late.tau_min_ns / 1_000_000).saturating_sub(LATE_HOT_TAIL_MS);
+    core_time::HotWindow::new(LATE_PERIOD_MS, open_ms, close_ms).map(|w| (w, open_ms, close_ms))
+}
+
 /// Whether the operator asked for the member.
 #[must_use]
 pub fn bin15_wanted(requested: core_types::SlotMask) -> bool {
@@ -212,6 +240,28 @@ pub fn load_bin15_boot(
         u += 1;
     }
     params.n_underlyings = file.underlying.len();
+    // BIN15 fills B-4: the lead books, resolved like the marks — a lead the
+    // engine does not subscribe to is a refusal, never a silent fallback to
+    // the HL perp.
+    let mut u = 0usize;
+    while u < file.late_lead.len() {
+        let d = &file.late_lead[u];
+        // `"none"`: no lead for this underlying — its lead sym stays
+        // `SYMBOL_ID_NONE` and the HL perp drives it.
+        if d == core_config::bin15::LATE_LEAD_NONE {
+            u += 1;
+            continue;
+        }
+        let Some(sym) = resolve(d) else {
+            return Err(format!(
+                "bin15.toml `late_lead`[{u}] = `{d}` does not resolve against the \
+                 instrument manifest — the lead has to be a book the engine \
+                 actually subscribes to"
+            ));
+        };
+        params.lead_sym[u] = sym;
+        u += 1;
+    }
 
     // The families. The Yes slot comes from the UNIVERSE (the rolling
     // ordinals it allocated), not from a descriptor: a rolling slot's
@@ -275,13 +325,18 @@ pub fn load_bin15_boot(
     params.late = strategy_bin15::late::LateParams {
         enabled: file.late_enabled,
         persist_polls: file.late_persist_polls,
-        _pad: [0; 6],
+        refire_fresh: file.late_refire_fresh,
+        limit_bound: file.late_limit_bound,
+        lead_guard_1e6: file.late_lead_guard_1e6,
         tau_min_ns: file.late_tau_min_ns,
         tau_max_ns: file.late_tau_max_ns,
         p_min_1e6: file.late_p_min_1e6,
         e_1e6: file.late_e_1e6,
         usd_1e6: file.late_usd_1e6,
         sigma_k_1e3: file.late_sigma_k_1e3,
+        // The parser bounds the age at 60 000 ms.
+        max_quote_age_ms: u32::try_from(file.late_max_quote_age_ns / 1_000_000).unwrap_or(u32::MAX),
+        limit_max_1e6: file.late_limit_max_1e6,
     };
     let late_lut = if file.late_phi_lut.len() == core_config::bin15::LATE_PHI_POINTS {
         let mut l = Box::new(strategy_bin15::late::LateLut::flat());
@@ -416,7 +471,10 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
 
 /// BIN15 H90: the LATE law as the boot line spells it — `off`, or the
 /// window, the belief floor, the margin, the persistence, the spend and
-/// the σ scale: `2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`.
+/// the σ scale: `2-30s:p>=0.90:ask<=p-2c:persist2:$100:k1.550`. The
+/// BIN15-fills keys follow only when stated: `:fresh` (B-1), `:age{ms}ms`
+/// (B-2), `:bound` (B-3), `:lead` (B-4, any underlying with a lead book),
+/// `:guard{p}` (G26) and `:cap{px}` (PR-BIN15-P2, three decimals).
 #[must_use]
 pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
     let l = &p.late;
@@ -424,7 +482,7 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
         return String::from("off");
     }
     format!(
-        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}",
+        "{}-{}s:p>={}.{:02}:ask<=p-{}c:persist{}:${}:k{}.{:03}{}{}{}{}{}{}",
         l.tau_min_ns / 1_000_000_000,
         l.tau_max_ns / 1_000_000_000,
         l.p_min_1e6 / 1_000_000,
@@ -433,13 +491,62 @@ pub fn late_law(p: &strategy_bin15::Bin15Params) -> String {
         l.persist_polls,
         l.usd_1e6 / 1_000_000,
         l.sigma_k_1e3 / 1_000,
-        l.sigma_k_1e3 % 1_000
+        l.sigma_k_1e3 % 1_000,
+        if l.refire_fresh == 1 { ":fresh" } else { "" },
+        if l.max_quote_age_ms == 0 {
+            String::new()
+        } else {
+            format!(":age{}ms", l.max_quote_age_ms)
+        },
+        if l.limit_bound == 1 { ":bound" } else { "" },
+        if p.lead_sym[..p.n_underlyings].iter().any(|s| *s != core_types::SYMBOL_ID_NONE) {
+            ":lead"
+        } else {
+            ""
+        },
+        // G26: the lead's guard, two decimals, only when set.
+        if l.lead_guard_1e6 == 0 {
+            String::new()
+        } else {
+            format!(
+                ":guard{}.{:02}",
+                l.lead_guard_1e6 / 1_000_000,
+                (l.lead_guard_1e6 % 1_000_000) / 10_000
+            )
+        },
+        // PR-BIN15-P2: the price cap, three decimals, only when set.
+        if l.limit_max_1e6 == 0 {
+            String::new()
+        } else {
+            format!(
+                ":cap{}.{:03}",
+                l.limit_max_1e6 / 1_000_000,
+                (l.limit_max_1e6 % 1_000_000) / 1_000
+            )
+        },
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T2T T1-a: the late law at its ruled τ ∈ [2, 30) s keeps the gateway
+    /// awake from 32 s to 1 s before each quarter hour; off, never.
+    #[test]
+    fn the_late_law_s_hot_window_brackets_its_tau_bounds() {
+        let mut late = strategy_bin15::late::LateParams::default();
+        assert!(late_hot_window(&late).is_none(), "the law off: no hot window");
+        late.enabled = 1;
+        late.tau_min_ns = 2_000_000_000;
+        late.tau_max_ns = 30_000_000_000;
+        let (w, open_ms, close_ms) = late_hot_window(&late).expect("on: a window");
+        assert_eq!((open_ms, close_ms), (32_000, 1_000));
+        let q = 1_792_900_800_000u64;
+        assert!(w.contains(q - 30_000) && w.contains(q - 2_000));
+        assert!(!w.contains(q - 33_000) && !w.contains(q - 500));
+    }
+
 
     /// XH4i-3a (risk review r1), H90 G2: BIN15's grid test and the gateway
     /// arm's `OutcomeRules::check` agree on EVERY ×1e6 price from below zero
@@ -641,6 +748,26 @@ mod tests {
         p.late.p_min_1e6 = 925_000;
         p.late.e_1e6 = 10_000;
         assert_eq!(late_law(&p), "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550");
+        // BIN15 fills: each stated key is spelled, in a fixed order.
+        p.late.refire_fresh = 1;
+        assert_eq!(late_law(&p), "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550:fresh");
+        p.late.max_quote_age_ms = 1_500;
+        p.late.limit_bound = 1;
+        assert_eq!(
+            late_law(&p),
+            "8-30s:p>=0.92:ask<=p-1c:persist2:$100:k1.550:fresh:age1500ms:bound"
+        );
+        p.n_underlyings = 1;
+        p.lead_sym[0] = 16_777_729;
+        assert!(late_law(&p).ends_with(":bound:lead"), "{}", late_law(&p));
+        // G26: the guard follows the lead, two decimals.
+        p.late.lead_guard_1e6 = 800_000;
+        assert!(late_law(&p).ends_with(":bound:lead:guard0.80"), "{}", late_law(&p));
+        p.late.lead_guard_1e6 = 955_000;
+        assert!(late_law(&p).ends_with(":lead:guard0.95"), "{}", late_law(&p));
+        // PR-BIN15-P2: the cap closes the line, three decimals.
+        p.late.limit_max_1e6 = 985_000;
+        assert!(late_law(&p).ends_with(":guard0.95:cap0.985"), "{}", late_law(&p));
     }
 
     #[test]

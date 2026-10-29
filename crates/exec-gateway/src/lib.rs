@@ -69,7 +69,7 @@ pub mod stats;
 pub mod timer;
 
 pub use duplex::{duplex, CmdRx, CmdTx, EngineEnd, EvtRx, EvtTx, GatewayEnd};
-pub use idle::Idle;
+pub use idle::{HotWindow, Idle};
 pub use mbb::{Mbb, MbbAction, SlotState};
 pub use pending::{Pending, PendingErr};
 pub use rate::{RateWindow, RATE_WINDOW_S};

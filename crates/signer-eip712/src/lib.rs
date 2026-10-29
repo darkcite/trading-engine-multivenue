@@ -60,6 +60,11 @@ pub mod hypercall;
 /// pre-cutover form).
 pub mod pmv2;
 
+/// T2T T1-c: signing from precomputed, guarded ECDSA nonces — the
+/// Hyperliquid gateway's per-order signer. Additive: the RFC 6979 path
+/// below is unchanged and is its fallback.
+pub mod prenonce;
+
 use std::sync::OnceLock;
 
 pub use secp256k1::SecretKey;
@@ -172,12 +177,21 @@ pub fn parse_secret_key(key: &[u8; 32]) -> Result<SecretKey, SignError> {
 pub enum SignError {
     /// Key bytes don't form a valid secp256k1 scalar (zero / ≥ n).
     InvalidKey,
+    /// T2T T1-c: the nonce pool's page could not be `mlock`'d (errno).
+    Mlock(i32),
+    /// T2T T1-c: the OS CSPRNG failed.
+    Entropy,
+    /// T2T T1-c: the boot self-test signature did not recover to the key.
+    SelfTest,
 }
 
 impl ::core::fmt::Display for SignError {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         match self {
             Self::InvalidKey => f.write_str("invalid secp256k1 private key"),
+            Self::Mlock(e) => write!(f, "the nonce pool could not be mlock'd (errno {e})"),
+            Self::Entropy => f.write_str("the OS CSPRNG failed"),
+            Self::SelfTest => f.write_str("the nonce pool's self-test signature did not recover"),
         }
     }
 }

@@ -801,7 +801,7 @@ mod tests {
 /// matcher's counters in `clob_dispatcher::MatcherCounters` field order, read in the 5 s block
 /// through the existing `OrderDispatch::matcher_counters` (the same read `/metrics`'
 /// `mirror_paper_matcher_metrics` makes) — no new surface in a non-pine crate.
-pub const MATCHER_COLS: [&str; 22] = [
+pub const MATCHER_COLS: [&str; 37] = [
     "intake",
     "rejected_open_cap",
     "unroutable",
@@ -824,14 +824,30 @@ pub const MATCHER_COLS: [&str; 22] = [
     "queue_canceled",
     "queue_fills",
     "order_events_overflow",
+    "held_swept_deeper",
+    "held_levels_lagged",
+    "pmj_shadow_refused",
+    "pmj_judged_0",
+    "pmj_judged_1",
+    "pmj_judged_2",
+    "pmj_filled_0",
+    "pmj_filled_1",
+    "pmj_filled_2",
+    "pmj_qty_1e6_0",
+    "pmj_qty_1e6_1",
+    "pmj_qty_1e6_2",
+    "pmj_usd_1e6_0",
+    "pmj_usd_1e6_1",
+    "pmj_usd_1e6_2",
 ];
 
-// Every `MatcherCounters` field is a column (22 × u64); a new field breaks this build.
-const _: () = assert!(core::mem::size_of::<clob_dispatcher::MatcherCounters>() == 8 * 22);
+// Every `MatcherCounters` field is a column, an array field one per element (37 × u64 since the
+// r40 merge brought main's `held_*` and `pmj_*` counters); a new field breaks this build.
+const _: () = assert!(core::mem::size_of::<clob_dispatcher::MatcherCounters>() == 8 * 37);
 
 /// One `set.tsv` matcher row, in [`MATCHER_COLS`] order.
 #[must_use]
-pub fn matcher_row(m: &clob_dispatcher::MatcherCounters) -> [u64; 22] {
+pub fn matcher_row(m: &clob_dispatcher::MatcherCounters) -> [u64; 37] {
     [
         m.intake,
         m.rejected_open_cap,
@@ -855,6 +871,21 @@ pub fn matcher_row(m: &clob_dispatcher::MatcherCounters) -> [u64; 22] {
         m.queue_canceled,
         m.queue_fills,
         m.order_events_overflow,
+        m.held_swept_deeper,
+        m.held_levels_lagged,
+        m.pmj_shadow_refused,
+        m.pmj_judged[0],
+        m.pmj_judged[1],
+        m.pmj_judged[2],
+        m.pmj_filled[0],
+        m.pmj_filled[1],
+        m.pmj_filled[2],
+        m.pmj_qty_1e6[0],
+        m.pmj_qty_1e6[1],
+        m.pmj_qty_1e6[2],
+        m.pmj_usd_1e6[0],
+        m.pmj_usd_1e6[1],
+        m.pmj_usd_1e6[2],
     ]
 }
 

@@ -6,6 +6,292 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-25 — T2T T1: the hot window, the precomputed-nonce signer, smoke phase C
+
+**What changed** (plan `t2t-plan-2026-10-25` T1; risk policy "T2T T1")
+- `exec-smoke`'s JSON gains `pooled_verified` (phase C: a signature from the
+  gateway's precomputed-nonce pool, verified by the venue), and `passed`
+  now needs it. A phase C failure exits 20, as phase A's does.
+- The HL gateway's halt reasons gain `HALT_SIGNER` (`HALT_VENUE_BASE + 1`):
+  a pooled signature failed its after-the-fact check.
+- `HlGateway::new` refuses with `GatewayErr::Signer` when the signer's page
+  cannot be locked, the OS CSPRNG fails or its self-test does not recover.
+- `exec_gateway::Idle` narrows its fields (spin `u16`, park `u32` ns, both
+  clamped) and carries a `HotWindow` (`core_time::HotWindow`, re-exported);
+  `Idle::new` keeps its signature.
+- `cli::paper::spawn_hyperliquid` takes the HL ingress's `HotCell`.
+- `/metrics`, the hlgw family: `engine_exec_hlgw_gateway_signs_pooled_total`
+  and `engine_exec_hlgw_gateway_signs_fallback_total` (actions signed from
+  the pool, and by RFC 6979), and the level `engine_exec_hlgw_signer_pool_ready`
+  (the pool's ready entries). They ride the gateway's published words
+  (`pw::SIGNS_POOLED`, `pw::SIGNS_FALLBACK`, `pw::POOL_READY`; 22 of 32) and
+  `clob_dispatcher::GatewayArmReport` (1 016 → 1 040 B).
+
+**Readers**
+- Anything parsing the smoke's JSON line sees one more key; `/metrics` gains
+  the three hlgw rows above; nothing in a capture or `/state` changes.
+
+## 2026-10-25 — T2T T0: `Tick.rx_lag_ns`, `engine-latency.pmlr` and the stage gauges
+
+**What changed** (plan `t2t-plan-2026-10-25`, T0: measure, no behaviour change)
+- `Tick` bytes 52..56 (explicit zeroed pad until now) carry `rx_lag_ns`: ns
+  from the Hyperliquid ingress read turn that delivered the frame to the
+  tick's `ts_ns` (decrypt, deframe, parse). Every other venue writes 0. The
+  pad shrinks to bytes 50..52. The PMLR header version stays 3: a reader
+  that ignores the field is unaffected, and every older capture reads 0
+  (not measured).
+- A new engine-thread capture `engine-latency.pmlr`, PMLR `slot_kind = 10`
+  (`T2tRecord`, docs/wire-format.md): one record per accepted order, with
+  `submit_ns` at offset 0 like every slot kind, so `window_root` cuts it by
+  time as it does every file.
+- `/metrics`: `engine_latency_<stage>_{p50,p99,p999,max}_ns` for the stages
+  parse, ingest, member, decide, route and ack (24 gauges); the six
+  existing `engine_latency_{ingest,decide,ack}_{p50,p99}_ns` keep their
+  names and meaning. New `engine_latency_capture_{io_errors,records}`.
+  `member` (the engine's pop → `ctx.submit`) is the member alone; `decide`
+  starts at the order's own stamp, which bin15 takes from the tick, so for
+  it `decide` spans the ring as well.
+- `core_metrics::MAX_GAUGES` 640 → 768: the worst-case registry (every
+  slot live, both gateway arms) sat at 638 and the stage family adds 20.
+  The registry grows 16 KiB (196 672 B).
+- The HL gateway's `push_to_write` (`engine_exec_hlgw_push_to_write_p99_ns`)
+  and the origin of its `post_rtt` are now stamped after the socket took the
+  frame. They were stamped before rustls' seal and `write(2)`, which the t2t
+  harness measures at ~15 µs a post on the Mac: a reading taken before this
+  binary is that much low.
+- `/state` is unchanged.
+
+**Readers**
+- `claude_worker.pmlr.Reader` refuses kind 10 (it refuses every kind it
+  has no accessor for); the generic tools (`window_root`, `archive`) read
+  any 64 B kind with its stamp at offset 0 and need no change.
+- The hgrm dump (`write_latency_hgrm`) gains `engine.read_to_tick`,
+  `engine.pop_to_submit` and `engine.submit_to_routed`.
+
+## 2026-10-19 — PMJ J10: `audit-pnl` settles Polymarket's rolling windows and charges their p-dependent fee
+
+**What changed** (ruling R-PMJ-S42; risk-policy "PMJ — slot 11", `### J10`)
+- `multivenue-engine audit-pnl` now reads `pm15-ticks` / `pm5-ticks` for the
+  rolling legs a run placed orders on (inside the run's tick span), and the
+  settled roll rows of `pm15-events` / `pm5-events`: each window on a traded
+  slot settles at the venue's result (a window retired unresolved, or one
+  whose pair was re-created with no result, at 0 on both legs; one a run
+  ended without a result for at a later run's settled row, else at 0 at its
+  run's last instant when a later run follows, else — the root's last run —
+  it marks out).
+- audit-pnl's interner never issues dense id 7 on the Polymarket byte (the
+  legacy anchor's id, judged as Binance): a root with seven or more
+  Polymarket descriptors renumbers from the seventh on, and that leg is now
+  judged on Polymarket's Δ.
+- A rolling leg's taker fill pays `rate · p · (1 − p)` per share (0.07; slot
+  11 at 0.14), its maker fill and its settlement nothing — in place of the
+  flat `pm` bps from `fees.toml`.
+- The paper view settles rolling paper fills on the same schedule.
+- `FillEngine` accepts a Jupiter-routed order on a Polymarket sym (slot 11).
+
+**Readers**
+- Day reports before and after this binary differ for slots 9 / 11 (before:
+  no fills, and every paper fill a total loss at a zero mark).
+- New stderr lines `audit-pnl: run-<e>: pm rolling orders=… ticks=…` and
+  `audit-pnl: pm settlement table: …`, and an additive JSON key
+  `pm_settlement` — all only when a run traded a rolling leg;
+  `audit_pnl_version` stays 2. Roots without a rolling trade (every pre-PM15
+  pool) are byte-identical — except one whose orders hit its seventh
+  Polymarket descriptor, which is now judged on Polymarket's Δ (above).
+- The replay's fill law for these legs is the harness's (IOC at the first
+  fresh touch after Δ_pm, displayed size), not paper's held-book sweep: the
+  J9 ledger (`worker/pm/paper-pnl.json`) stays the paper truth.
+
+**Rollback**
+- The previous binary. Nothing on disk changes format.
+
+## 2026-10-19 — PMJ J8: the rolling legs' paper fill sweeps the depth lane; slot 9's `price_floor_1e6`; slot 11's shadow verdicts
+
+**What changed** (rulings R-PMJ-S21..S26; risk-policy "PMJ — slot 11", `### J8`)
+- Paper fills of a Polymarket rolling leg's IoC (slots 9 and 11) now take the
+  touch AND the levels behind it up to the limit — one fill at the
+  size-weighted price, rounded against the taker. A fill's `px` is no longer
+  always a printed level; its `qty` may exceed the touch's size.
+- `engine::NUM_DEPTH_LANES` 2 → 4 (`PM15_DEPTH_LANE` 2, `PM5_DEPTH_LANE` 3);
+  `OrderDispatch::observe_depth` (default no-op); `ingress_polymarket::
+  pm15_loop::Pm15Out.depth`; `cli::spawn_pm15` / `spawn_pm5` take the depth
+  producer. Members see the same depth as before (OKX, Deribit only).
+- `pm15.toml` gains optional **`price_floor_1e6`** (500000..=999999, or 0 =
+  none; absent = 900000): slot 9 no longer decides entries under 0.90. Its
+  boot tell names it (`…:ask<=p-0.020:floor0.900:…`).
+- `clob_dispatcher::MatcherCounters` grows (176 → 296 B): `held_swept_deeper`,
+  `held_levels_lagged`, `pmj_shadow_refused` and
+  `pmj_{judged,filled,qty_1e6,usd_1e6}[3]`; metrics
+  `engine_paper_matcher_held_{swept_deeper,levels_lagged}_total`,
+  `engine_paper_matcher_pmj_shadow_refused_total` and
+  `engine_paper_matcher_pmj_{shadow350ms,shadow1s,real}_{judged,filled,qty_1e6,usd_1e6}_total`.
+- Config, not code (same day, 07:10Z): `pm15.toml` session loss −$3 500;
+  `pmj.toml` deposit $250 (max $250.01), $250 per market, −$3 500.
+
+**Readers:** slot 9 / 11 paper P&L before and after the J8 boot are different
+laws; `docs/state.md` dates the boot. The capture's records are unchanged in
+format (the depth lane is not captured; `*-depth.pmlr` keeps J6's policy).
+`/state` `counters.depths` (`Engine::depths_dispatched`) now counts the
+rolling legs' depth lanes too — about 2 000 records a second more.
+**Rollback:** the previous binary; with this one, `pm15.toml
+price_floor_1e6 = 0` restores slot 9's frozen law (the sweep has no switch).
+The previous binary refuses `price_floor_1e6` in `pm15.toml` (unknown key) —
+remove it with the binary.
+
+## 2026-10-19 — PMJ J7: `[polymarket] rolling_market_sockets` — the rolling families spread over several market sockets
+
+**What changed** (rulings R-PMJ-S17..S20; risk-policy "PMJ — slot 11", `### J7`)
+- `universe.toml` `[polymarket]` gains **`rolling_market_sockets`** (1..=8,
+  default **8** = one socket per family). Each rolling pipeline (15 m, 5 m)
+  now runs one market socket per shard of its families (family `f` on shard
+  `f mod n`; min(n, families) sockets) — seven per period at today's seven
+  families — instead of one.
+  `1` is one socket per period, the pre-J7 stream bit for bit.
+- New gauge `engine_ingress_pm15_market_sockets_open` /
+  `engine_ingress_pm5_market_sockets_open`. `…_market_reconnects_total` now
+  sums the shards' losses, and a loss withdraws only that shard's families'
+  touches (stale ticks on their legs alone).
+- Library: `ingress_polymarket::pm15_loop` — the rolling driver speaks
+  through the new shard-aware `Pm15Wires` (`is_open(k)`, `queue(k, ..)`;
+  `Pm15Wire`, one socket, stays as slot 9's user socket uses it),
+  `Pm15Sockets.market` is a `Vec<WsConn>`,
+  `Pm15Driver::{on_market_open, on_market_down, on_market_text}` take the
+  shard first, `PM15_RTDS_TOKEN` is `Token(8)`; `rolling::PmAction::Unsubscribe`
+  carries the slot first. `cli::spawn_pm15` / `spawn_pm5` take the
+  `RollingMarketSockets`. The `pm15-probe` keeps one socket.
+
+**Readers:** the capture is unchanged in format; the `pm15` / `pm5` raw
+frames now interleave several sockets' frames (each record still carries
+its own arrival stamp), and nothing in the capture says which socket a
+frame or a `PONG` came on — `PONG`s now arrive n times per 5 s, and one
+shard's loss cannot be rebuilt from the raw frames (no in-repo tool replays
+them through the driver). The boot log lines `pm15: the families ride n
+market socket(s)` / `pm5: …` name the shape; runs captured before the
+deploy (`docs/state.md` dates it) rode one socket per period.
+**Rollback:** `rolling_market_sockets = 1` with this binary. The previous
+binary refuses a universe that names the key (unknown key) — remove it with
+the binary.
+
+## 2026-10-19 — PMJ: `[polymarket] rolling_depth` / `rolling_depth_ms` — the rolling depth capture at most one record per leg per second
+
+**What changed** (ruling R-PMJ-S15; risk-policy "PMJ — slot 11", `### J6`)
+- `universe.toml` `[polymarket]` gains **`rolling_depth`** (bool, default
+  `true`) and **`rolling_depth_ms`** (0..=60000, default **1000**; `0` =
+  every change). The rolling legs' `<label>-depth.pmlr` (`pm15-depth`,
+  `pm5-depth`) now keep at most one record per leg per `rolling_depth_ms`;
+  a change the spacing held is written by the first market `PONG` sweep at
+  least the spacing after the leg's last record (≤ spacing + 5 s). J1b
+  shipped every top-5-per-side change (~1.35 GB/h at 7 + 7 families).
+- Capture only: no lane carries depth, so no member and no `/state` field
+  changes, and no metric is added or renamed (the capture record gauges of
+  pm15 / pm5 fall).
+
+**Readers:** a `*-depth.pmlr` reader sees one leg's records at least
+`rolling_depth_ms` apart (a new window's first book is not held by the
+spacing; two records on one sym across a rebind can be closer). A sweep record
+is stamped with the PONG's arrival, not the frame that made the book, and
+is indistinguishable from a change record (`flags` 0). Nothing in the
+capture marks the policy — the boot log line `pm15: … depth = …` / `pm5: …`
+does; runs captured before the deploy (`docs/state.md` dates it) are
+every-change. `rolling_depth_ms = 0` restores J1b's stream exactly.
+**Rollback:** the previous binary refuses a universe that names either key
+(unknown key) — remove them with it — and goes back to every-change
+capture (~1.35 GB/h).
+
+## 2026-10-18 — PMJ J4: slot 11 `pmj` (`BUILT_MASK` 0x0AFF), `pmj.toml`, the `engine_pmj_*` family, 5-minute held quotes
+
+**What changed** (rulings R-PMJ-1, R-PMJ-3; risk-policy "PMJ — slot 11", `### J4`)
+- `strategy-set`: the member row `pmj` at slot 11; **`BUILT_MASK` 0x02FF →
+  0x0AFF**. `ALL_MASK` (`all`) stays 0x00FF: slot 11 runs only when
+  `--strategy` names `pmj`. `/state`'s slot 11 reads **`pmj`** (it read
+  `reserved`), and so do the dashboard and the exec boot's slot list.
+- New artifact **`~/multivenue/pmj.toml`** (`core_config::pmj`, one `[pmj]`
+  section; `--pmj <path>` overrides the default, and the wrapper passes it
+  from `PMJ_TOML=<path>` in `strategy.conf`). A boot whose `--strategy`
+  names `pmj` without it aborts; `multivenue-engine pmj-check` validates it
+  offline. Its `families` must equal the universe's 5-minute
+  `[polymarket] rolling` list, in order. A `pm15.toml` copied whole refuses.
+- `/metrics`: **`engine_pmj_<tally>_total`** (31 counters, pm15's tally
+  names) and six gauges (`engine_pmj_pnl_usd_1e6`, `_fees_usd_1e6`,
+  `_bought_usd_1e6`, `_open_cost_usd_1e6`, `_markets_live`, `_halted`),
+  registered at every boot (zero while slot 11 idles).
+- Paper fills: the held-quote book (`core_fill::held`) carries the 5-minute
+  legs after the 15-minute ones; a 5-minute IoC is judged at submit +
+  `paper_delay_ms` (2 s default).
+- `scripts/pmj-flip.sh` (`status`, `paper`; `live` refuses); `scripts/engine-wrapper.sh`
+  `PMJ_TOML` (the `XMM_TOML` shape: a file, `STRATEGY` carrying `pmj`, else exit 78).
+
+**Readers:** a `/state` reader that maps slot 11 to `reserved` now sees
+`pmj`; a capture of a boot that names `pmj` carries orders with venue byte
+10 (Jupiter) on the 5-minute Polymarket syms. The schema-1 backtest output is
+unchanged. **Rollback:** the previous binary refuses a `--strategy` naming
+`pmj` (an unknown member) — remove the name with it; `pmj.toml` may stay
+(nothing else reads it).
+
+## 2026-10-18 — PMJ J3: `VenueId::Jupiter` = 10 (`VENUE_COUNT` 11), `exec.toml` venue `jupiter`, the `exec-jupiter` crate
+
+**What changed** (ruling R-PMJ-S2; risk-policy "PMJ — slot 11", `### J3`)
+- `core_types::VenueId` gains **`Jupiter = 10`**; `VENUE_COUNT` 10 → **11**.
+  It is an execution route with no market data: no tick, depth, option or
+  fill lane, staleness 0, paper activation 0, harness latency 0 (dead, like
+  `Ai`), never tradeable in the harness. Every `[_; VENUE_COUNT]` table
+  gained its eleventh column at the end; no existing index moved.
+- `exec.toml`: the venue name **`jupiter`** (byte 10) parses. A live slot
+  naming it refuses the boot (only slot 11 may, and a live slot 11 refuses
+  until a `PMJ-DUST-GATE` line); a paper slot naming it arms nothing.
+- `core_types::STRATEGY_SLOT_PMJ` = 11 (the member arrives with J4).
+- `cli::exec_boot::{LIVE_ARM_VENUES, PNL_JUDGING_VENUES}` gain Jupiter.
+- New crate `crates/exec-jupiter` (the slot-11 arm, built and rig-tested;
+  nothing links it into the engine in this pass). Its state file,
+  `pmj-held.state` (`pmj-held v1 owner=<base58>`, one `leg` line per held
+  position), has no writer until J5.
+
+**Readers:** an offline reader that decodes a venue byte must accept 10
+(`VenueId::from_u8(10)` is now `Some`); no capture written today carries it
+(no member stamps venue 10 before J4, and slot 11 runs paper). The harness's
+model tables index by the venue byte and grew by one; the schema-1 backtest
+output is unchanged. **Rollback:** the previous binary refuses an
+`exec.toml` that names `jupiter` (an unknown venue) — remove the name with
+it.
+
+## 2026-10-18 — PMJ J1b: the 5-minute rolling families (their own sym pool, tick/event lane 9, the `pm5` capture), `LEDGER_ROWS` 64, the rolling depth capture
+
+**What changed** (rulings R-PMJ-3, R-PMJ-S1 and R-PMJ-S2; risk-policy "PMJ — slot 11")
+- `universe.toml` `[polymarket] rolling` accepts `updown:<asset>:5m` beside
+  `updown:<asset>:15m`, at most 8 families per period. **A family's index
+  is its rank among its period's keys**: a `:5m` key anywhere in the list
+  moves no 15-minute family's index, syms or manifest rows (pinned by a
+  test). A 5-minute family allocates SEVEN manifest rows,
+  `polymarket-rolling:updown:<asset>:5m[up0|down0|up1|down1|up2|down2|mark]`.
+- `core_types::pm_roll`: the 5-minute pool — ordinals 4160 + 7·g + offset
+  on venue byte 0 (above the whole 15-minute pool, 4096..4136), three token
+  pairs by window mod 3, roll family bytes **16..40** (`16 + 3·g + pair`;
+  the 15-minute families keep 0..16), instance ids `0x8000_0000 |
+  (window5 · 8 + g)` (bit 31 = 5 m; a 15-minute id never has it), the 300 s
+  grid. `PmPeriod` serves code shared by both pools; every 15-minute
+  answer is the old free function's own.
+- `engine::NUM_TICK_LANES` (= `NUM_EVENT_LANES`) 9 → **10**; `PM5_LANE` = 9
+  carries the 5-minute pipeline's ticks and events (venue byte Polymarket,
+  wired by index). Empty, the unspawned shape, without a `:5m` key.
+- Capture: the 5-minute pipeline writes the `pm5-*.pmlr` files (label
+  `pm5`); `--raw-tap` accepts `pm5`; `/metrics` gains
+  `engine_ingress_pm5_state`, the `pm5` ingress counters and capture
+  gauges, and the `engine_ingress_pm5_*` family (the `pm15` family's
+  shape).
+- **`pm15-depth.pmlr` (and `pm5-depth.pmlr`) now carry data**: a top-5
+  `DepthTopK` per leg, change-gated, whenever the leg's slot ticks. The file
+  existed empty in every run before.
+- `exec_router::LEDGER_ROWS` 32 → **64** (`Ledger` 151 168 → 161 408 B):
+  the 5-minute families' roll family bytes reach 39.
+- `PmWindowSpec` gains `market_id` (the Gamma market id); the rolling
+  `PmFamilies` / driver arrays are sized for three pairs (24 slots, 48 legs).
+
+**Readers:** an offline reader of `InstrumentRoll` events must accept family
+bytes up to 39 and the flagged 5-minute instance ids; nothing in the worker
+reads the rolling families today. **Rollback:** the previous binary reads a
+`:5m` key as a refused universe (`only the 15m period exists`), so roll the
+universe back with it.
+
 ## 2026-10-16 — BIN15 trades the late-window law only: the old arms, their keys, counters and sidecar blocks are removed (BIN15 H90 G3)
 
 **What changed** (ruling O-GL-2; the removed law and its recovery commit,

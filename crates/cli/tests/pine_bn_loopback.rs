@@ -166,6 +166,18 @@ impl Opts {
     }
 }
 
+/// The router (`Ledger` ≈ 158 KiB inline after the r40 merge), the arm and the member are
+/// boot-constructed on the stack and the held tests move the rig out of a helper: each test
+/// runs on a thread with the engine thread's room (as `pine_g5`), never libtest's 2 MiB.
+fn big(f: fn()) {
+    thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("test body");
+}
+
 /// The booted chain: the router (arm inside), lane 4, the member, the gateway thread.
 struct Rig {
     d: Disp,
@@ -651,75 +663,79 @@ fn venue_trade(id: &str, qty: i64) -> Vec<u8> {
 /// carrying the member's u64 oid whole; one fill, booked by the router and the broker alike.
 #[test]
 fn an_ioc_entry_fills_end_to_end() {
-    let venue = Venue::start();
-    let mut r = Rig::boot(&venue, Opts::new(ENTRY));
-    r.until("the entry fills", |r| r.pine_pos() > 0);
-    r.feed_for(50);
-    let pl = places(&venue);
-    assert_eq!(pl.len(), 1, "one entry, then long: {pl:?}");
-    assert_eq!(jfield(&pl[0], "timeInForce"), Some("IOC"));
-    assert_eq!(jfield(&pl[0], "side"), Some("BUY"));
-    assert_eq!(
-        jfield(&pl[0], "price"),
-        Some("65000.2"),
-        "the ask + 2 ticks, on the grid"
-    );
-    let oid = oid_of(&pl[0]);
-    let (script, _) =
-        decode_client_oid(u32::try_from(oid >> 32).expect("epoch"), oid).expect("a member oid");
-    assert_eq!(script, 0);
-    let q = venue.with(|v| v.pos_1e6);
-    assert!(q >= 2_000 && q % 1_000 == 0, "{q}");
-    assert_eq!((r.pine_pos(), r.ledger_pos()), (q, q));
-    let f = r
-        .fills
-        .iter()
-        .find(|f| f.order_id == oid)
-        .expect("the fill");
-    assert_eq!((f.strategy_id, f.sym, f.side), (SLOT8, BTC, Side::Bid));
-    let k = r.k();
-    assert_eq!(
-        (k.submits, k.fills, k.fills_prior_boot, k.fills_foreign),
-        (1, 1, 0, 0)
-    );
-    assert_eq!(r.d.live().counters().refused[Refusal::OffGrid as usize], 0);
-    r.shutdown();
+    big(|| {
+        let venue = Venue::start();
+        let mut r = Rig::boot(&venue, Opts::new(ENTRY));
+        r.until("the entry fills", |r| r.pine_pos() > 0);
+        r.feed_for(50);
+        let pl = places(&venue);
+        assert_eq!(pl.len(), 1, "one entry, then long: {pl:?}");
+        assert_eq!(jfield(&pl[0], "timeInForce"), Some("IOC"));
+        assert_eq!(jfield(&pl[0], "side"), Some("BUY"));
+        assert_eq!(
+            jfield(&pl[0], "price"),
+            Some("65000.2"),
+            "the ask + 2 ticks, on the grid"
+        );
+        let oid = oid_of(&pl[0]);
+        let (script, _) =
+            decode_client_oid(u32::try_from(oid >> 32).expect("epoch"), oid).expect("a member oid");
+        assert_eq!(script, 0);
+        let q = venue.with(|v| v.pos_1e6);
+        assert!(q >= 2_000 && q % 1_000 == 0, "{q}");
+        assert_eq!((r.pine_pos(), r.ledger_pos()), (q, q));
+        let f = r
+            .fills
+            .iter()
+            .find(|f| f.order_id == oid)
+            .expect("the fill");
+        assert_eq!((f.strategy_id, f.sym, f.side), (SLOT8, BTC, Side::Bid));
+        let k = r.k();
+        assert_eq!(
+            (k.submits, k.fills, k.fills_prior_boot, k.fills_foreign),
+            (1, 1, 0, 0)
+        );
+        assert_eq!(r.d.live().counters().refused[Refusal::OffGrid as usize], 0);
+        r.shutdown();
+    });
 }
 
 /// PL1 on the real chain: the venue expires the IoC (no fill); the member reports it only at
 /// the first settle point at or past `E + live_settle_ms`, then re-enters and fills.
 #[test]
 fn an_ioc_miss_settles_after_the_window() {
-    let venue = Venue::start();
-    venue.with(|v| v.ioc_plan.push_back(0));
-    let mut r = Rig::boot(&venue, Opts::new(ENTRY));
-    // The feed whose evaluation dispatched the IoC: its E is E_dispatch.
-    r.until("the first IoC", |r| r.k().submits == 1);
-    let sent = r.fed_ts;
-    r.until("the venue's EXPIRED", |_| {
-        venue.with(|v| v.orders.iter().any(|o| o.status == "EXPIRED"))
+    big(|| {
+        let venue = Venue::start();
+        venue.with(|v| v.ioc_plan.push_back(0));
+        let mut r = Rig::boot(&venue, Opts::new(ENTRY));
+        // The feed whose evaluation dispatched the IoC: its E is E_dispatch.
+        r.until("the first IoC", |r| r.k().submits == 1);
+        let sent = r.fed_ts;
+        r.until("the venue's EXPIRED", |_| {
+            venue.with(|v| v.orders.iter().any(|o| o.status == "EXPIRED"))
+        });
+        // The window's report of THIS IoC: a re-entry the script submits while the IoC is still in
+        // its window may meet a full submit ring (the gateway still holding the first) and is
+        // reported at once (`SubmitErr::RingFull`, §4.5.4) — that is a different oid, so it is not
+        // counted here (a timing seen under a detached launchd run, 2026-10-19).
+        r.until("the window reports it", |r| {
+            let k = r.k();
+            k.cancelled_reported == 1 + k.submit_errors
+        });
+        // The window is in E (the engine's `CLOCK_MONOTONIC_RAW`), so it is measured in E: the
+        // feed that reported the miss sits at or past `E_dispatch + live_settle_ms`.
+        assert!(
+            r.fed_ts - sent >= u64::from(SETTLE_MS) * 1_000_000,
+            "reported inside the window: {} ns after the dispatch feed (window {} ms)",
+            r.fed_ts - sent,
+            SETTLE_MS
+        );
+        assert_eq!(r.pine_pos(), 0);
+        r.until("the re-entry fills", |r| r.pine_pos() > 0);
+        assert_eq!(places(&venue).len(), 2);
+        assert_eq!(r.pine_pos(), r.ledger_pos());
+        r.shutdown();
     });
-    // The window's report of THIS IoC: a re-entry the script submits while the IoC is still in
-    // its window may meet a full submit ring (the gateway still holding the first) and is
-    // reported at once (`SubmitErr::RingFull`, §4.5.4) — that is a different oid, so it is not
-    // counted here (a timing seen under a detached launchd run, 2026-10-19).
-    r.until("the window reports it", |r| {
-        let k = r.k();
-        k.cancelled_reported == 1 + k.submit_errors
-    });
-    // The window is in E (the engine's `CLOCK_MONOTONIC_RAW`), so it is measured in E: the
-    // feed that reported the miss sits at or past `E_dispatch + live_settle_ms`.
-    assert!(
-        r.fed_ts - sent >= u64::from(SETTLE_MS) * 1_000_000,
-        "reported inside the window: {} ns after the dispatch feed (window {} ms)",
-        r.fed_ts - sent,
-        SETTLE_MS
-    );
-    assert_eq!(r.pine_pos(), 0);
-    r.until("the re-entry fills", |r| r.pine_pos() > 0);
-    assert_eq!(places(&venue).len(), 2);
-    assert_eq!(r.pine_pos(), r.ledger_pos());
-    r.shutdown();
 }
 
 /// A maker rests (`GTX`), the close moves and the requote is ONE `order.modify` that keeps the
@@ -727,91 +743,95 @@ fn an_ioc_miss_settles_after_the_window() {
 /// `current_oid`).
 #[test]
 fn a_maker_rests_is_modified_and_fills_under_the_new_oid() {
-    let venue = Venue::start();
-    let mut r = Rig::boot(
-        &venue,
-        Opts {
-            maker: true,
-            ..Opts::new(MAKER)
-        },
-    );
-    r.until("the maker rests", |_| {
-        // Ours: this epoch, slot 8 (the venue also rests a COIN-M orphan the USDⓈ-M lane never sees).
-        venue.with(|v| {
-            v.orders
+    big(|| {
+        let venue = Venue::start();
+        let mut r = Rig::boot(
+            &venue,
+            Opts {
+                maker: true,
+                ..Opts::new(MAKER)
+            },
+        );
+        r.until("the maker rests", |_| {
+            // Ours: this epoch, slot 8 (the venue also rests a COIN-M orphan the USDⓈ-M lane never sees).
+            venue.with(|v| {
+                v.orders
+                    .iter()
+                    .any(|o| o.tif == "GTX" && o.open() && o.cid.starts_with(&cid8(0)[..11]))
+            })
+        });
+        let first = places(&venue)[0].clone();
+        assert_eq!(jfield(&first, "timeInForce"), Some("GTX"));
+        assert_eq!(jfield(&first, "price"), Some("64950.0"));
+        let first_oid = oid_of(&first);
+        r.close_px = ASK + 10_000_000;
+        r.until("the requote", |_| venue.with(|v| v.modifies.len()) == 1);
+        r.feed_for(100);
+        let m = venue.with(|v| v.modifies[0].clone());
+        assert_eq!(
+            jfield(&m, "origClientOrderId"),
+            Some(cid8(first_oid).as_str())
+        );
+        assert_eq!(jfield(&m, "price"), Some("64960.0"));
+        assert_eq!(
+            places(&venue).len(),
+            1,
+            "a requote is a modify, never a new place"
+        );
+        assert_eq!(r.k().modifies, 1);
+        let qty = venue.with(|v| {
+            let o = v
+                .orders
                 .iter()
-                .any(|o| o.tif == "GTX" && o.open() && o.cid.starts_with(&cid8(0)[..11]))
-        })
-    });
-    let first = places(&venue)[0].clone();
-    assert_eq!(jfield(&first, "timeInForce"), Some("GTX"));
-    assert_eq!(jfield(&first, "price"), Some("64950.0"));
-    let first_oid = oid_of(&first);
-    r.close_px = ASK + 10_000_000;
-    r.until("the requote", |_| venue.with(|v| v.modifies.len()) == 1);
-    r.feed_for(100);
-    let m = venue.with(|v| v.modifies[0].clone());
-    assert_eq!(
-        jfield(&m, "origClientOrderId"),
-        Some(cid8(first_oid).as_str())
-    );
-    assert_eq!(jfield(&m, "price"), Some("64960.0"));
-    assert_eq!(
-        places(&venue).len(),
-        1,
-        "a requote is a modify, never a new place"
-    );
-    assert_eq!(r.k().modifies, 1);
-    let qty = venue.with(|v| {
-        let o = v
-            .orders
+                .find(|o| o.cid == cid8(first_oid))
+                .expect("rests");
+            o.qty
+        });
+        assert_eq!(r.k().cancels, 0, "the requoted maker still rests");
+        venue.with(|v| v.fill_open(&cid8(first_oid), qty));
+        r.until("the broker books the fill", |r| r.pine_pos() == qty);
+        let f = r
+            .fills
             .iter()
-            .find(|o| o.cid == cid8(first_oid))
-            .expect("rests");
-        o.qty
+            .find(|f| f.qty.raw() == qty && f.order_id != 0)
+            .expect("fill");
+        assert_ne!(f.order_id, first_oid, "booked under the replacement's oid");
+        assert_eq!((f.order_id >> 32, f.strategy_id), (first_oid >> 32, SLOT8));
+        let k = r.k();
+        assert_eq!(
+            (k.fills, k.late_fills_after_cancel, k.fills_prior_boot),
+            (1, 0, 0)
+        );
+        assert_eq!(r.ledger_pos(), qty);
+        r.shutdown();
     });
-    assert_eq!(r.k().cancels, 0, "the requoted maker still rests");
-    venue.with(|v| v.fill_open(&cid8(first_oid), qty));
-    r.until("the broker books the fill", |r| r.pine_pos() == qty);
-    let f = r
-        .fills
-        .iter()
-        .find(|f| f.qty.raw() == qty && f.order_id != 0)
-        .expect("fill");
-    assert_ne!(f.order_id, first_oid, "booked under the replacement's oid");
-    assert_eq!((f.order_id >> 32, f.strategy_id), (first_oid >> 32, SLOT8));
-    let k = r.k();
-    assert_eq!(
-        (k.fills, k.late_fills_after_cancel, k.fills_prior_boot),
-        (1, 0, 0)
-    );
-    assert_eq!(r.ledger_pos(), qty);
-    r.shutdown();
 }
 
 /// `strategy.close` leaves as a `reduceOnly=true` SELL IoC; venue, ledger and broker end flat.
 #[test]
 fn a_reduce_only_exit_closes_the_position() {
-    let venue = Venue::start();
-    let mut r = Rig::boot(&venue, Opts::new(CLOSE));
-    r.until("the entry fills", |r| r.pine_pos() > 0);
-    r.until("the exit fills", |r| r.pine_pos() == 0);
-    let pl = places(&venue);
-    assert_eq!(jfield(&pl[0], "side"), Some("BUY"));
-    assert_eq!(
-        jfield(&pl[0], "reduceOnly"),
-        None,
-        "an entry carries no reduce-only"
-    );
-    assert_eq!(jfield(&pl[1], "side"), Some("SELL"));
-    assert_eq!(jfield(&pl[1], "reduceOnly"), Some("true"));
-    assert_eq!(
-        jfield(&pl[1], "price"),
-        Some("64999.7"),
-        "the bid − 2 ticks, on the grid"
-    );
-    assert_eq!(r.ledger_pos(), r.pine_pos());
-    r.shutdown();
+    big(|| {
+        let venue = Venue::start();
+        let mut r = Rig::boot(&venue, Opts::new(CLOSE));
+        r.until("the entry fills", |r| r.pine_pos() > 0);
+        r.until("the exit fills", |r| r.pine_pos() == 0);
+        let pl = places(&venue);
+        assert_eq!(jfield(&pl[0], "side"), Some("BUY"));
+        assert_eq!(
+            jfield(&pl[0], "reduceOnly"),
+            None,
+            "an entry carries no reduce-only"
+        );
+        assert_eq!(jfield(&pl[1], "side"), Some("SELL"));
+        assert_eq!(jfield(&pl[1], "reduceOnly"), Some("true"));
+        assert_eq!(
+            jfield(&pl[1], "price"),
+            Some("64999.7"),
+            "the bid − 2 ticks, on the grid"
+        );
+        assert_eq!(r.ledger_pos(), r.pine_pos());
+        r.shutdown();
+    });
 }
 
 /// D19 + Q1 `protective` on the real chain: the venue's held long is the broker's at boot (the
@@ -848,174 +868,186 @@ fn held_position_closes(held: i64) -> (Venue, Rig) {
 
 #[test]
 fn a_held_position_is_adopted_under_protective_and_closed() {
-    let (_venue, r) = held_position_closes(2_000);
-    r.shutdown();
+    big(|| {
+        let (_venue, r) = held_position_closes(2_000);
+        r.shutdown();
+    });
 }
 
 /// PB3 (I-PB3): a held 0.001 (65 USDT, under BTCUSDT's 100 USDT minimum) closes reduce-only;
 /// the arm never counts `MinNotional`.
 #[test]
 fn a_dust_exit_is_closed_reduce_only_below_the_minimum() {
-    let (_venue, r) = held_position_closes(1_000);
-    assert_eq!(
-        r.d.live().counters().refused[Refusal::MinNotional as usize],
-        0
-    );
-    r.shutdown();
+    big(|| {
+        let (_venue, r) = held_position_closes(1_000);
+        assert_eq!(
+            r.d.live().counters().refused[Refusal::MinNotional as usize],
+            0
+        );
+        r.shutdown();
+    });
 }
 
 /// OD-8 / PB6: a liquidation (`autoclose-`) fill reaches slot 8 with oid 0 — the router books
 /// it, the broker does not; the script is disabled WITHOUT a flatten and sends nothing more.
 #[test]
 fn a_liquidation_fill_disables_the_script_without_a_flatten() {
-    let venue = Venue::start();
-    let mut r = Rig::boot(&venue, Opts::new(CLOSE));
-    // Hold the close back: entries only until the liquidation.
-    venue.with(|v| v.ioc_plan.push_back(2_000));
-    r.until("the entry fills", |r| r.pine_pos() > 0);
-    let held = r.pine_pos();
-    let n = places(&venue).len();
-    venue.with(|v| {
-        v.pos_1e6 -= 1_000;
-        v.user_q
-            .push_back(venue_trade("autoclose-1790000000123", 1_000));
+    big(|| {
+        let venue = Venue::start();
+        let mut r = Rig::boot(&venue, Opts::new(CLOSE));
+        // Hold the close back: entries only until the liquidation.
+        venue.with(|v| v.ioc_plan.push_back(2_000));
+        r.until("the entry fills", |r| r.pine_pos() > 0);
+        let held = r.pine_pos();
+        let n = places(&venue).len();
+        venue.with(|v| {
+            v.pos_1e6 -= 1_000;
+            v.user_q
+                .push_back(venue_trade("autoclose-1790000000123", 1_000));
+        });
+        r.until("the liquidation reaches the member", |r| {
+            r.k().fills_venue_originated == 1
+        });
+        let k = r.k();
+        assert_eq!((k.scripts_faulted, k.flattens_started), (1, 0));
+        assert_eq!(r.pine_pos(), held, "the broker never books a venue fill");
+        assert_eq!(r.ledger_pos(), held - 1_000, "the router does");
+        let liq = r
+            .fills
+            .iter()
+            .find(|f| f.order_id == 0)
+            .expect("the venue's fill");
+        assert_eq!((liq.strategy_id, liq.side), (SLOT8, Side::Ask));
+        r.feed_for(200);
+        assert!(
+            places(&venue).len() <= n + 1,
+            "a disabled script sends no new order (at most the close in flight before it)"
+        );
+        r.shutdown();
     });
-    r.until("the liquidation reaches the member", |r| {
-        r.k().fills_venue_originated == 1
-    });
-    let k = r.k();
-    assert_eq!((k.scripts_faulted, k.flattens_started), (1, 0));
-    assert_eq!(r.pine_pos(), held, "the broker never books a venue fill");
-    assert_eq!(r.ledger_pos(), held - 1_000, "the router does");
-    let liq = r
-        .fills
-        .iter()
-        .find(|f| f.order_id == 0)
-        .expect("the venue's fill");
-    assert_eq!((liq.strategy_id, liq.side), (SLOT8, Side::Ask));
-    r.feed_for(200);
-    assert!(
-        places(&venue).len() <= n + 1,
-        "a disabled script sends no new order (at most the close in flight before it)"
-    );
-    r.shutdown();
 }
 
 /// OD-13: a venue reject (`-2019`) is invisible to the member — the arm retires it REJECTED;
 /// the member settles it by the window and re-enters.
 #[test]
 fn a_venue_reject_is_settled_by_the_window() {
-    let venue = Venue::start();
-    venue.with(|v| v.refuse_place = Some(-2019));
-    let mut r = Rig::boot(&venue, Opts::new(ENTRY));
-    r.until("the arm retires it", |r| {
-        r.d.retired().by_why[RETIRED_REJECTED as usize] == 1
+    big(|| {
+        let venue = Venue::start();
+        venue.with(|v| v.refuse_place = Some(-2019));
+        let mut r = Rig::boot(&venue, Opts::new(ENTRY));
+        r.until("the arm retires it", |r| {
+            r.d.retired().by_why[RETIRED_REJECTED as usize] == 1
+        });
+        assert_eq!(
+            r.k().acks,
+            1,
+            "submit `Ok` is queued: the member saw an ack"
+        );
+        r.until("the window reports it", |r| r.k().cancelled_reported == 1);
+        r.until("the re-entry fills", |r| r.pine_pos() > 0);
+        assert_eq!(places(&venue).len(), 2);
+        assert_eq!(r.pine_pos(), r.ledger_pos());
+        r.shutdown();
     });
-    assert_eq!(
-        r.k().acks,
-        1,
-        "submit `Ok` is queued: the member saw an ack"
-    );
-    r.until("the window reports it", |r| r.k().cancelled_reported == 1);
-    r.until("the re-entry fills", |r| r.pine_pos() > 0);
-    assert_eq!(places(&venue).len(), 2);
-    assert_eq!(r.pine_pos(), r.ledger_pos());
-    r.shutdown();
 }
 
 /// A venue position the book never saw: two drifted cycles halt the slot `ReconDrift`; the
 /// member's IoC is refused by the router and never reaches the venue.
 #[test]
 fn a_drift_halt_refuses_the_members_entries() {
-    let venue = Venue::start();
-    let mut r = Rig::boot(
-        &venue,
-        Opts {
-            halts: HaltLimits::new(0, 1_000_000, 0, 0, 0),
-            ..Opts::new(ENTRY)
-        },
-    );
-    // A user frame that does not scan is unbounded drift (BX-15), the e2e suite's drill.
-    // pin:cli-pb10-drift-by-scan-failure — a venue position moved with no frame did not halt
-    // within 10 s on the loopback (not judged here; reported for the next round).
-    venue.with(|v| {
-        v.user_q.push_back(
-            br#"{"e":"ORDER_TRADE_UPDATE","E":1,"T":1,"o":{"s":"BTCUSDT","x":"TRADE"}}"#.to_vec(),
+    big(|| {
+        let venue = Venue::start();
+        let mut r = Rig::boot(
+            &venue,
+            Opts {
+                halts: HaltLimits::new(0, 1_000_000, 0, 0, 0),
+                ..Opts::new(ENTRY)
+            },
         );
+        // A user frame that does not scan is unbounded drift (BX-15), the e2e suite's drill.
+        // pin:cli-pb10-drift-by-scan-failure — a venue position moved with no frame did not halt
+        // within 10 s on the loopback (not judged here; reported for the next round).
+        venue.with(|v| {
+            v.user_q.push_back(
+                br#"{"e":"ORDER_TRADE_UPDATE","E":1,"T":1,"o":{"s":"BTCUSDT","x":"TRADE"}}"#.to_vec(),
+            );
+        });
+        let t0 = Instant::now();
+        while r.d.halt().reason(SLOT8 as usize) != HaltReason::ReconDrift {
+            r.turn();
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "timed out: the drift halt"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let n = places(&venue).len();
+        r.until("the member's IoC is refused", |r| r.k().submit_errors >= 1);
+        r.feed_for(100);
+        assert_eq!(
+            places(&venue).len(),
+            n,
+            "nothing reaches the venue after the halt"
+        );
+        assert_eq!(r.pine_pos(), 0);
+        r.shutdown();
     });
-    let t0 = Instant::now();
-    while r.d.halt().reason(SLOT8 as usize) != HaltReason::ReconDrift {
-        r.turn();
-        assert!(
-            t0.elapsed() < Duration::from_secs(10),
-            "timed out: the drift halt"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    let n = places(&venue).len();
-    r.until("the member's IoC is refused", |r| r.k().submit_errors >= 1);
-    r.feed_for(100);
-    assert_eq!(
-        places(&venue).len(),
-        n,
-        "nothing reaches the venue after the halt"
-    );
-    assert_eq!(r.pine_pos(), 0);
-    r.shutdown();
 }
 
 /// The operator halt (`exec.HALT`'s latch) sweeps the resting maker off the venue; a member
 /// cancel still passes, a member submit is refused.
 #[test]
 fn exec_halt_sweeps_and_a_cancel_still_passes() {
-    let venue = Venue::start();
-    let mut r = Rig::boot(
-        &venue,
-        Opts {
-            maker: true,
-            ..Opts::new(MAKER)
-        },
-    );
-    r.until("the maker rests", |_| {
-        // Ours: this epoch, slot 8 (the venue also rests a COIN-M orphan the USDⓈ-M lane never sees).
-        venue.with(|v| {
-            v.orders
-                .iter()
-                .any(|o| o.tif == "GTX" && o.open() && o.cid.starts_with(&cid8(0)[..11]))
-        })
+    big(|| {
+        let venue = Venue::start();
+        let mut r = Rig::boot(
+            &venue,
+            Opts {
+                maker: true,
+                ..Opts::new(MAKER)
+            },
+        );
+        r.until("the maker rests", |_| {
+            // Ours: this epoch, slot 8 (the venue also rests a COIN-M orphan the USDⓈ-M lane never sees).
+            venue.with(|v| {
+                v.orders
+                    .iter()
+                    .any(|o| o.tif == "GTX" && o.open() && o.cid.starts_with(&cid8(0)[..11]))
+            })
+        });
+        let oid = oid_of(&places(&venue)[0]);
+        assert!(r.d.halt_slot(SLOT8 as usize, HaltReason::Operator));
+        {
+            let mut ctx = EngCtx { d: &mut r.d };
+            let mut c = StampCtx::new(&mut ctx, SLOT8);
+            let req = CancelReq::new(core_time::now_ns(), VenueId::Binance, BTC, oid);
+            assert_eq!(c.cancel(req), Ok(()), "a cancel is never blocked by a halt");
+            let o = Order::new(
+                core_time::now_ns(),
+                VenueId::Binance,
+                BTC,
+                Side::Bid,
+                core_fill::ORDER_KIND_IOC,
+                Price::from_raw(ASK),
+                Qty::from_raw(2_000),
+                oid + 1,
+            );
+            assert_eq!(
+                c.submit(o),
+                Err(SubmitErr::Refused),
+                "a halted slot refuses entries"
+            );
+        }
+        let t0 = Instant::now();
+        while r.d.halt().cancel_outstanding() {
+            r.turn();
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "timed out: the sweep"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!venue.with(|v| v.orders.iter().any(|o| o.cid == cid8(oid) && o.open())));
+        r.shutdown();
     });
-    let oid = oid_of(&places(&venue)[0]);
-    assert!(r.d.halt_slot(SLOT8 as usize, HaltReason::Operator));
-    {
-        let mut ctx = EngCtx { d: &mut r.d };
-        let mut c = StampCtx::new(&mut ctx, SLOT8);
-        let req = CancelReq::new(core_time::now_ns(), VenueId::Binance, BTC, oid);
-        assert_eq!(c.cancel(req), Ok(()), "a cancel is never blocked by a halt");
-        let o = Order::new(
-            core_time::now_ns(),
-            VenueId::Binance,
-            BTC,
-            Side::Bid,
-            core_fill::ORDER_KIND_IOC,
-            Price::from_raw(ASK),
-            Qty::from_raw(2_000),
-            oid + 1,
-        );
-        assert_eq!(
-            c.submit(o),
-            Err(SubmitErr::Refused),
-            "a halted slot refuses entries"
-        );
-    }
-    let t0 = Instant::now();
-    while r.d.halt().cancel_outstanding() {
-        r.turn();
-        assert!(
-            t0.elapsed() < Duration::from_secs(10),
-            "timed out: the sweep"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(!venue.with(|v| v.orders.iter().any(|o| o.cid == cid8(oid) && o.open())));
-    r.shutdown();
 }

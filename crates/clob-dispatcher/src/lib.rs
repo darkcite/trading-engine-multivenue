@@ -49,7 +49,8 @@ pub use queued::{DispatcherWorker, QueuedDispatcher, ORDER_RING_CAP};
 pub use response::{parse_clob_response, ClobResponse, ResponseScanErr};
 
 use core_types::{
-    CancelReq, Fill, ModifyReq, NsTs, Order, OrderIdentity, Price, Qty, Side, SymbolId, Tick,
+    CancelReq, DepthTopK, Fill, ModifyReq, NsTs, Order, OrderIdentity, Price, Qty, Side, SymbolId,
+    Tick,
 };
 
 /// Dispatcher error modes.
@@ -509,6 +510,15 @@ pub trait OrderDispatch {
     #[inline]
     fn observe_tick(&mut self, _tick: &Tick, _now_ns: NsTs) {}
 
+    /// PMJ J8: show the dispatcher one rolling leg's top five per side (the
+    /// rolling ingress's depth lane), so a PAPER one can match a rolling
+    /// IoC as the venue matches a FAK — across the levels behind the touch
+    /// (`core_fill::held`).
+    ///
+    /// Defaulted to nothing for the reason [`Self::observe_tick`] is.
+    #[inline]
+    fn observe_depth(&mut self, _depth: &DepthTopK, _now_ns: NsTs) {}
+
     /// HYPARB H2: show the dispatcher one pool-event signal (the HyperEVM
     /// ingress's `Signal`: `sym` = the pool or `SYMBOL_ID_NONE`, the
     /// 40-byte `core_amm::payload`), so a PAPER one can keep pool state
@@ -551,7 +561,7 @@ pub trait OrderDispatch {
     /// X1: what the paper matcher has done. All zeros for a dispatcher
     /// that does not model fills, which is how `/metrics` reads for a
     /// live boot.
-    // COPY: `MatcherCounters` (176 B, size-pinned) crosses the trait by
+    // COPY: `MatcherCounters` (296 B, size-pinned) crosses the trait by
     // value on the 5 s metrics cadence only — cold, and a reference
     // would pin the matcher's borrow across the mirror.
     #[inline]
@@ -889,7 +899,7 @@ pub trait OrderDispatch {
     /// everything else (the default; `out` untouched). `now_ns` is the
     /// engine clock (the heartbeat's age, the slot's health). Cold: the 1 s
     /// `/state` publish and the 5 s `/metrics` mirror; an out-param, so the
-    /// 1 016 B report never crosses by value.
+    /// 1 040 B report never crosses by value.
     #[inline]
     fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
         false
@@ -987,6 +997,13 @@ impl<D: OrderDispatch> OrderDispatch for Option<D> {
     fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         if let Some(d) = self {
             d.observe_tick(tick, now_ns);
+        }
+    }
+
+    #[inline]
+    fn observe_depth(&mut self, depth: &DepthTopK, now_ns: NsTs) {
+        if let Some(d) = self {
+            d.observe_depth(depth, now_ns);
         }
     }
 
@@ -1261,7 +1278,9 @@ const _: () = assert!(core::mem::size_of::<LiveArmCounters>() == 272);
 // `live_submits` moves 16 → 24 (+8); the three halt bytes + `halted`
 // grow 11 → 19 B, padded 16 → 24 (+8); the two per-slot `u64` arrays
 // +64 B each. Copied once per 1 Hz mirror, never on the submit path.
-const _: () = assert!(core::mem::size_of::<ExecCounters>() == 1080);
+// O-WSG1 (1 080 → 1 112 B): the hold — `refused_held`, `holds` and the
+// sixteen `held` bytes at the tail.
+const _: () = assert!(core::mem::size_of::<ExecCounters>() == 1112);
 const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 24);
 
 /// **XMM XH4f (D11) — the Hyperliquid gateway arm's numbers** (slot 6's
@@ -1272,7 +1291,7 @@ const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 24);
 /// the ones it publishes at its heartbeat), the budget, the rates and the
 /// latencies, and the router's words for the arm's slot. Counters are
 /// totals since boot; the fields after [`Self::refused_foreign_row`] are
-/// levels. [`ExecCounters`] keeps its pinned size (1 080 B since S16-3).
+/// levels. [`ExecCounters`] keeps its pinned size (1 112 B since O-WSG1).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct GatewayArmReport {
@@ -1432,6 +1451,11 @@ pub struct GatewayArmReport {
     pub gw_ttl_cancels: u64,
     /// Orders whose TTL the full table could not keep.
     pub gw_ttl_full: u64,
+    /// T2T T1-c: actions signed from the precomputed-nonce pool.
+    pub gw_signs_pooled: u64,
+    /// T2T T1-c: actions signed by RFC 6979 (an empty pool, an edge, the
+    /// pool turned off).
+    pub gw_signs_fallback: u64,
     // --- counters: the outcome mode (XMM XH4i-5: slot 3; 0 on a perps arm) ---
     /// Created rolls bound, both legs.
     pub outcome_rolls_bound: u64,
@@ -1566,6 +1590,9 @@ pub struct GatewayArmReport {
     /// The session's top-up spend, USD ×1e6 — added back to its P&L,
     /// bounded by the day's max instead.
     pub topup_cost_usd_1e6: i64,
+    /// T2T T1-c: the signer pool's ready entries (refilled outside the
+    /// late window; 0 means the next action signs by RFC 6979).
+    pub signer_pool_ready: u64,
 }
 
 // XH4f: 94 words — pinned, as the other blocks crossing this boundary are.
@@ -1573,8 +1600,9 @@ pub struct GatewayArmReport {
 // counters and the own account's five levels (102). XMM XH5c-2: + the
 // top-ups' three counters and three levels (108). XMM XH5c-3: + the REST
 // round trips' p99 and maximum (110). XMM XH4i-5: + the outcome mode's
-// seventeen counters (127).
-const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 1_016);
+// seventeen counters (127). T2T T1-c: + the signer's two counters and its
+// pool's level (130).
+const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 1_040);
 
 /// The Binance arm's local refusal reasons ([`BinanceArmReport::refused`]
 /// — `exec_binance::arm::Refusal`, pinned there). PVM PB2: + `off_grid`.
@@ -2098,6 +2126,13 @@ pub struct HaltSignal {
     /// the last reconciliation. Meaningful only while
     /// [`Self::pnl_judged`] is set; `0` otherwise.
     pub pnl_delta_usd_1e6: i64,
+    /// **O-WSG1 (2026-10-20)** `1` from the instant the user-event stream
+    /// came back after a gap until a reconciliation built only from reads
+    /// issued since then has AGREED with the venue. Not a trigger: the
+    /// router releases a slot held on a stream gap or a stale
+    /// reconciliation only once this reads `0` — what happened while the
+    /// arm was blind has been re-read, not assumed.
+    pub resync_pending: u8,
 }
 
 impl HaltSignal {
@@ -2128,6 +2163,7 @@ impl HaltSignal {
             alo_reject_permille: 0,
             recon_age_ns,
             pnl_delta_usd_1e6: 0,
+            resync_pending: 0,
         }
     }
 
@@ -2157,6 +2193,15 @@ impl HaltSignal {
         self
     }
 
+    /// O-WSG1: attach whether the arm still owes a reconciliation since
+    /// its stream last came back.
+    #[inline]
+    #[must_use]
+    pub const fn with_resync_pending(mut self, pending: bool) -> Self {
+        self.resync_pending = pending as u8;
+        self
+    }
+
     /// BX3: attach the venue's verdicts — a restriction it imposed, and
     /// the arm's margin judgement.
     #[inline]
@@ -2170,7 +2215,8 @@ impl HaltSignal {
     /// **BX3 (O-BX17) — one slot's signal from two arms that both
     /// trade it.** The worse of each observation: the MAX of the
     /// streaks, the drift, the stream gap, the reconciliation age and the
-    /// ALO rate; the OR of the flags that trip a halt; the AND of the two
+    /// ALO rate; the OR of the flags that trip a halt and of
+    /// `resync_pending`; the AND of the two
     /// that permit trading (`reconciled`, `pnl_judged`) — a slot is
     /// seeded, and its session bound judged, only when both arms can say
     /// so; the SUM of the session P&L. Symmetric: `a.merged(b) ==
@@ -2221,11 +2267,15 @@ impl HaltSignal {
             alo_reject_permille: max_u16(self.alo_reject_permille, o.alo_reject_permille),
             recon_age_ns: max_u64(self.recon_age_ns, o.recon_age_ns),
             pnl_delta_usd_1e6: self.pnl_delta_usd_1e6.saturating_add(o.pnl_delta_usd_1e6),
+            resync_pending: ((self.resync_pending | o.resync_pending) != 0) as u8,
         }
     }
 }
 
-const _: () = assert!(core::mem::size_of::<HaltSignal>() == 48);
+// O-WSG1: `resync_pending` takes the tail (48 → 56 B; the signal is read
+// by value once a poll per live slot, cold).
+const _: () = assert!(core::mem::size_of::<HaltSignal>() == 56);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, resync_pending) == 48);
 const _: () = assert!(core::mem::offset_of!(HaltSignal, venue_lock) == 27);
 const _: () = assert!(core::mem::offset_of!(HaltSignal, margin_risk) == 28);
 const _: () = assert!(core::mem::offset_of!(HaltSignal, gateway_halted) == 29);
@@ -2354,6 +2404,14 @@ pub struct ExecCounters {
     /// **BX6** — the Binance arm's own numbers (`/state`
     /// `exec.arms.binance`), valid when [`Self::arm_bn_present`].
     pub arm_bn: LiveArmCounters,
+    /// **O-WSG1 (2026-10-20) — refused because the slot is HELD** (its
+    /// user stream is down or its reconciliation stale): the hold, not a
+    /// halt, so it lifts by itself. Distinct from `refused_halted`.
+    pub refused_held: u64,
+    /// Hold edges — slots that went from trading to held.
+    pub holds: u64,
+    /// Per-slot hold bits (`exec_router::halt::HOLD_*`); `0` = not held.
+    pub held: [u8; EXEC_COUNTER_SLOTS],
 }
 
 /// X1 counters — what the matcher did, mirrored to `/metrics` as
@@ -2434,9 +2492,27 @@ pub struct MatcherCounters {
     /// XMM XH2: order events dropped because the event ring was full
     /// between two pumps. Must stay 0: the engine pumps every iteration.
     pub order_events_overflow: u64,
+    /// PMJ J8: rolling IoCs whose fill took a level behind the touch.
+    pub held_swept_deeper: u64,
+    /// PMJ J8: rolling IoCs judged while the levels were older than the
+    /// touch (swept the touch alone).
+    pub held_levels_lagged: u64,
+    /// PMJ J8: slot-11 shadow judgements the table refused (must stay 0
+    /// while `paper_delay_ms` ≥ 1 s).
+    pub pmj_shadow_refused: u64,
+    /// PMJ J8 (R-PMJ-S25): slot 11's IoCs judged — `[0]` in shadow at
+    /// 350 ms, `[1]` in shadow at 1 s (`core_fill::held::PMJ_SHADOW_DELAYS_NS`),
+    /// `[2]` the real verdict at `pmj.toml paper_delay_ms`.
+    pub pmj_judged: [u64; 3],
+    /// PMJ J8: … of which filled (any size), by the same index.
+    pub pmj_filled: [u64; 3],
+    /// PMJ J8: the size those fills took ×1e6, by the same index.
+    pub pmj_qty_1e6: [u64; 3],
+    /// PMJ J8: their cost ×1e6 USD (price × size), by the same index.
+    pub pmj_usd_1e6: [u64; 3],
 }
 
-const _: () = assert!(::core::mem::size_of::<MatcherCounters>() == 176);
+const _: () = assert!(::core::mem::size_of::<MatcherCounters>() == 296);
 
 /// One order the paper matcher is holding.
 #[repr(C)]
@@ -2549,6 +2625,9 @@ pub struct PaperMatcher {
     /// too, at the quote in force after the venue's taker hold. Its own
     /// table: the strict-cross members' 64 slots are not shared with it.
     held: core_fill::held::HeldBook,
+    /// PMJ J4: when a rolling 5-minute leg's IoC is judged after its
+    /// submit, ns — the keeper's delay (`pmj.toml paper_delay_ms`).
+    pm5_held_delay_ns: u64,
     /// XMM XH2: order events waiting for [`Self::try_next_order_event`],
     /// FIFO.
     events: [core_types::OrderEvent; ORDER_EVENT_OUT],
@@ -2606,6 +2685,7 @@ impl PaperMatcher {
             amm: core_fill::AmmBook::new(),
             queue: core_fill::QueueBook::new(),
             held: core_fill::held::HeldBook::new(),
+            pm5_held_delay_ns: core_fill::held::PMJ_PAPER_DELAY_NS_DEFAULT,
             events: [EMPTY_ORDER_EVENT; ORDER_EVENT_OUT],
             ev_head: 0,
             ev_len: 0,
@@ -2632,6 +2712,13 @@ impl PaperMatcher {
                 queue_canceled: 0,
                 queue_fills: 0,
                 order_events_overflow: 0,
+                held_swept_deeper: 0,
+                held_levels_lagged: 0,
+                pmj_shadow_refused: 0,
+                pmj_judged: [0; 3],
+                pmj_filled: [0; 3],
+                pmj_qty_1e6: [0; 3],
+                pmj_usd_1e6: [0; 3],
             },
         }
     }
@@ -2641,6 +2728,20 @@ impl PaperMatcher {
     #[must_use]
     pub const fn open_len(&self) -> usize {
         self.open_len
+    }
+
+    /// PMJ J4: judge a rolling 5-minute leg's IoC `ns` after its submit
+    /// (boot only: `pmj.toml paper_delay_ms`).
+    #[inline]
+    pub fn set_pm5_held_delay_ns(&mut self, ns: u64) {
+        self.pm5_held_delay_ns = ns;
+    }
+
+    /// The delay a rolling 5-minute leg's IoC is judged at, ns.
+    #[inline]
+    #[must_use]
+    pub const fn pm5_held_delay_ns(&self) -> u64 {
+        self.pm5_held_delay_ns
     }
 
     /// Take an order into the open table.
@@ -2672,8 +2773,14 @@ impl PaperMatcher {
             || core_fill::held::held_pm_leg(order.sym)
         {
             if order.kind == core_fill::ORDER_KIND_IOC && px > 0 && qty > 0 {
+                // PMJ J4: a 5-minute leg at the keeper's delay the boot set.
+                let delay = if core_fill::held::held_pm5_leg(order.sym) {
+                    self.pm5_held_delay_ns
+                } else {
+                    core_fill::held::held_delay_ns(order.sym)
+                };
                 let o = core_fill::held::HeldOrder::new(
-                    now_ns.saturating_add(core_fill::held::held_delay_ns(order.sym)),
+                    now_ns.saturating_add(delay),
                     order.sym,
                     order.side,
                     px,
@@ -2684,6 +2791,16 @@ impl PaperMatcher {
                 );
                 if self.held.submit(o) {
                     self.counters.intake = self.counters.intake.wrapping_add(1);
+                    // PMJ J8 (R-PMJ-S25): slot 11's shadow judgements.
+                    if core_fill::held::held_pm5_leg(order.sym) {
+                        let mut c = 0usize;
+                        while c < core_fill::held::PMJ_SHADOW_DELAYS_NS.len() {
+                            let mut sh = o;
+                            sh.due_ns = now_ns.saturating_add(core_fill::held::PMJ_SHADOW_DELAYS_NS[c]);
+                            let _ = self.held.submit_shadow(sh, c as u8);
+                            c += 1;
+                        }
+                    }
                 } else if core_fill::held::quote_index(order.sym).is_none() {
                     self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
                 } else {
@@ -2910,7 +3027,7 @@ impl PaperMatcher {
         // ignores every other symbol). The record's own stamp is the
         // clock, not the drain instant: a quote stamped before the due
         // instant but drained after it is still in force.
-        if self.held.pending_len() > 0 {
+        if self.held.pending_len() > 0 || self.held.shadow_len() > 0 {
             self.judge_held(tick.ts_ns, now_ns);
         }
         self.held.on_quote(tick);
@@ -3118,7 +3235,33 @@ impl PaperMatcher {
         c.queue_rejected_alo = q.rejected_alo;
         c.queue_canceled = q.canceled;
         c.queue_fills = q.fills;
+        c.held_swept_deeper = self.held.swept_deeper();
+        c.held_levels_lagged = self.held.levels_lagged();
+        c.pmj_shadow_refused = self.held.shadow_refused();
         c
+    }
+
+    /// PMJ J8: one slot-11 verdict into its class's tallies.
+    fn count_pmj(&mut self, class: usize, v: core_fill::Verdict) {
+        let c = class % 3;
+        self.counters.pmj_judged[c] = self.counters.pmj_judged[c].wrapping_add(1);
+        if let core_fill::Verdict::Fill { px_1e6, qty_1e6 } = v {
+            self.counters.pmj_filled[c] = self.counters.pmj_filled[c].wrapping_add(1);
+            self.counters.pmj_qty_1e6[c] = self.counters.pmj_qty_1e6[c].wrapping_add(qty_1e6 as u64);
+            let usd = (i128::from(px_1e6) * i128::from(qty_1e6) / 1_000_000) as u64;
+            self.counters.pmj_usd_1e6[c] = self.counters.pmj_usd_1e6[c].wrapping_add(usd);
+        }
+    }
+
+    /// PMJ J8: one rolling leg's top five per side (the depth lane): every
+    /// held IoC and shadow due by its stamp is judged first, against the
+    /// book BEFORE it — as [`Self::observe_tick`] — then the leg's levels
+    /// become the ones in force.
+    pub fn observe_depth(&mut self, d: &DepthTopK, now_ns: NsTs) {
+        if self.held.pending_len() > 0 || self.held.shadow_len() > 0 {
+            self.judge_held(d.ts_ns, now_ns);
+        }
+        self.held.on_depth(d);
     }
 
     /// XMM XH2: take a post-only maker into the queue law. It lands at
@@ -3351,6 +3494,26 @@ impl PaperMatcher {
     /// the member frees the instrument at the verdict instead of on a
     /// timer.
     fn judge_held(&mut self, stamp_ns: NsTs, now_ns: NsTs) {
+        // PMJ J8 (R-PMJ-S25): the shadows first — they read the book and
+        // take nothing, so the order of the two passes cannot change either.
+        if self.held.shadow_len() > 0 {
+            let mut sh = [(0u8, core_fill::Verdict::Cancel); core_fill::held::HELD_SHADOW];
+            let mut m = 0usize;
+            self.held.judge_shadows(stamp_ns, |_, class, v| {
+                if m < sh.len() {
+                    sh[m] = (class, v);
+                    m += 1;
+                }
+            });
+            let mut k = 0usize;
+            while k < m {
+                self.count_pmj(usize::from(sh[k].0), sh[k].1);
+                k += 1;
+            }
+        }
+        if self.held.pending_len() == 0 {
+            return;
+        }
         let mut due = [(0u64, core_types::SYMBOL_ID_NONE, Side::Bid, 0u8, core_fill::Verdict::Cancel);
             core_fill::held::HELD_PENDING];
         let mut n = 0usize;
@@ -3363,6 +3526,9 @@ impl PaperMatcher {
         let mut k = 0usize;
         while k < n {
             let (oid, sym, side, slot, v) = due[k];
+            if core_fill::held::held_pm5_leg(sym) {
+                self.count_pmj(2, v);
+            }
             match v {
                 core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
                     self.push_fill_of(sym, side, oid, slot, px_1e6, qty_1e6, now_ns);
@@ -3411,7 +3577,9 @@ pub struct PaperDispatcher {
     /// itself boot-constructed once by the engine, and its fixed arrays
     /// (≈ 60 KiB since XMM XH2: the strict table, the fill and
     /// order-event rings, the AMM and queue books; ≈ 93 KiB since HC11's
-    /// held-quote book, 1 024 quotes; PM15-5c + 32 rolling legs) are the same memory
+    /// held-quote book, 1 024 quotes; PM15-5c + 32 rolling legs; PMJ J8 +
+    /// ≈ 16 KiB, the 80 rolling legs' levels, stamps and the shadow table)
+    /// are the same memory
     /// either way. It moves by value only at boot — handed on a few times
     /// before the loop starts (the boot's `engine_loop_set_full` →
     /// `run_engine_loop` → `Engine::new`, plus `RoutedDispatcher::new` on
@@ -3439,6 +3607,14 @@ impl PaperDispatcher {
     #[must_use]
     pub const fn open_orders(&self) -> usize {
         self.matcher.open_len() + self.matcher.queue_len() + self.matcher.held_pending()
+    }
+
+    /// PMJ J4: the matcher judges a rolling 5-minute leg's IoC `ns` after
+    /// its submit (`pmj.toml paper_delay_ms`; boot only).
+    #[must_use]
+    pub fn with_pm5_held_delay_ns(mut self, ns: u64) -> Self {
+        self.matcher.set_pm5_held_delay_ns(ns);
+        self
     }
 
     /// Construct empty.
@@ -3533,6 +3709,11 @@ impl OrderDispatch for PaperDispatcher {
     #[inline]
     fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         self.matcher.observe_tick(tick, now_ns);
+    }
+
+    #[inline]
+    fn observe_depth(&mut self, depth: &DepthTopK, now_ns: NsTs) {
+        self.matcher.observe_depth(depth, now_ns);
     }
 
     #[inline]
@@ -3937,6 +4118,167 @@ mod tests {
         legacy.sym = core_types::make_symbol_id(VenueId::Polymarket, 7);
         m.submit(&legacy, 2_000_000_000);
         assert_eq!((m.held_pending(), m.open_len()), (0, 1));
+    }
+
+    /// PMJ J4: a rolling 5-minute leg's IoC (slot 11, addressed to Jupiter)
+    /// is judged by the held-quote law at the keeper's delay the boot set —
+    /// 2 s by default, `with_pm5_held_delay_ns` otherwise — and its fill
+    /// keeps the slot.
+    #[test]
+    fn a_five_minute_leg_ioc_fills_at_the_keepers_delay() {
+        let leg = core_types::pm_roll::pm5_rolling_sym(0, 2, 1);
+        let run = |delay: Option<u64>| {
+            let mut d = PaperDispatcher::new();
+            if let Some(ns) = delay {
+                d = d.with_pm5_held_delay_ns(ns);
+            }
+            let mut m = d.matcher;
+            let book = Tick::new_stamped(
+                500,
+                VenueId::Polymarket,
+                leg,
+                1,
+                Price::from_raw(920_000),
+                Qty::from_raw(9_000_000),
+                Price::from_raw(930_000),
+                Qty::from_raw(300_000_000),
+                0,
+                0,
+            );
+            m.observe_tick(&book, 500);
+            let mut o = Order::new(
+                1_000,
+                VenueId::Jupiter,
+                leg,
+                Side::Bid,
+                core_fill::ORDER_KIND_IOC,
+                Price::from_raw(940_000),
+                Qty::from_raw(5_380_000),
+                77,
+            );
+            o.strategy_id = 11;
+            m.submit(&o, 1_000);
+            assert_eq!((m.held_pending(), m.open_len()), (1, 0));
+            m
+        };
+        let other = |ts: u64| {
+            Tick::new_stamped(
+                ts,
+                VenueId::Binance,
+                core_types::make_symbol_id(VenueId::Binance, 1),
+                1,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                Price::from_raw(2),
+                Qty::from_raw(1),
+                0,
+                0,
+            )
+        };
+        let mut m = run(None);
+        assert_eq!(m.pm5_held_delay_ns(), core_fill::held::PMJ_PAPER_DELAY_NS_DEFAULT);
+        m.observe_tick(&other(2_000_000_999), 2_000_000_999);
+        assert!(m.try_next_fill().is_none(), "inside the keeper's 2 s");
+        m.observe_tick(&other(2_000_001_000), 2_000_001_000);
+        let f = m.try_next_fill().expect("the ask in force at the delay");
+        assert_eq!((f.px.raw(), f.qty.raw(), f.order_id, f.strategy_id), (930_000, 5_380_000, 77, 11));
+        let mut m = run(Some(5_000_000_000));
+        m.observe_tick(&other(2_000_001_000), 2_000_001_000);
+        assert!(m.try_next_fill().is_none(), "the boot's 5 s");
+        m.observe_tick(&other(5_000_001_000), 5_000_001_000);
+        assert!(m.try_next_fill().is_some());
+    }
+
+    /// PMJ J8 (R-PMJ-S23, S25): a rolling leg's IoC sweeps the levels the
+    /// depth lane holds behind the touch — one fill at the size-weighted
+    /// price, rounded against it — and a slot-11 IoC is also judged in
+    /// shadow at 350 ms and 1 s: counted, never booked, taking nothing.
+    #[test]
+    fn a_rolling_ioc_sweeps_the_depth_lane_and_slot_11_counts_its_shadows() {
+        let mut m = PaperMatcher::new();
+        let leg = core_types::pm_roll::pm5_rolling_sym(1, 0, 0);
+        let touch = |ts: u64, ask: i64, aq: i64| {
+            Tick::new_stamped(
+                ts,
+                VenueId::Polymarket,
+                leg,
+                1,
+                Price::from_raw(900_000),
+                Qty::from_raw(50_000_000),
+                Price::from_raw(ask),
+                Qty::from_raw(aq),
+                0,
+                0,
+            )
+        };
+        let lv = |px: i64, q: i64| core_types::DepthLevel { px_1e6: px, qty_1e6: q };
+        let mut asks = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+        asks[0] = lv(940_000, 10_000_000);
+        asks[1] = lv(950_000, 20_000_000);
+        asks[2] = lv(970_000, 500_000_000);
+        let depth = |ts: u64| {
+            core_types::DepthTopK::new(
+                ts,
+                VenueId::Polymarket,
+                leg,
+                0,
+                [core_types::DepthLevel::EMPTY; core_types::DEPTH_K],
+                asks,
+            )
+        };
+        let other = |ts: u64| {
+            Tick::new_stamped(
+                ts,
+                VenueId::Binance,
+                core_types::make_symbol_id(VenueId::Binance, 1),
+                1,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                Price::from_raw(2),
+                Qty::from_raw(1),
+                0,
+                0,
+            )
+        };
+        m.observe_tick(&touch(500, 940_000, 10_000_000), 500);
+        m.observe_depth(&depth(600), 600);
+        let mut o = Order::new(
+            1_000,
+            VenueId::Jupiter,
+            leg,
+            Side::Bid,
+            core_fill::ORDER_KIND_IOC,
+            Price::from_raw(950_000),
+            Qty::from_raw(100_000_000),
+            88,
+        );
+        o.strategy_id = 11;
+        m.submit(&o, 1_000);
+        assert_eq!((m.held_pending(), m.held.shadow_len()), (1, 2));
+        // 350 ms: the shadow sweeps 10 @ 0.94 + 20 @ 0.95 → 0.946667; nothing booked.
+        m.observe_tick(&other(350_001_000), 350_001_000);
+        let c = m.counters_snapshot();
+        assert_eq!((c.pmj_judged, c.pmj_filled), ([1, 0, 0], [1, 0, 0]));
+        assert_eq!((c.pmj_qty_1e6[0], c.pmj_usd_1e6[0]), (30_000_000, 28_400_010));
+        assert!(m.try_next_fill().is_none(), "a shadow books nothing");
+        // 1 s: the same book, the same sweep — the first shadow took nothing.
+        m.observe_tick(&other(1_000_001_000), 1_000_001_000);
+        let c = m.counters_snapshot();
+        assert_eq!((c.pmj_judged, c.pmj_filled), ([1, 1, 0], [1, 1, 0]));
+        assert_eq!(c.pmj_qty_1e6[1], 30_000_000);
+        assert!(m.try_next_fill().is_none());
+        // 2 s, no record of the leg in between: the real sweep, whole — the
+        // shadows took no size.
+        m.observe_tick(&other(2_000_001_000), 2_000_001_000);
+        let f = m.try_next_fill().expect("the real sweep");
+        assert_eq!(
+            (f.px.raw(), f.qty.raw(), f.order_id, f.strategy_id),
+            (946_667, 30_000_000, 88, 11)
+        );
+        let c = m.counters_snapshot();
+        assert_eq!((c.pmj_judged, c.pmj_filled), ([1, 1, 1], [1, 1, 1]));
+        assert_eq!((c.held_swept_deeper, c.held_levels_lagged, c.pmj_shadow_refused), (1, 0, 0));
+        assert_eq!((m.held_pending(), m.held.shadow_len()), (0, 0));
     }
 
     /// HC11: a Hypercall IoC waiting for its held-quote verdict is an open

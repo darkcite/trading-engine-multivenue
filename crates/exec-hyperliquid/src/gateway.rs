@@ -199,10 +199,11 @@ use crate::response::{
     scan, scan_items, HlResponse, ItemStatus, ItemsReply, ITEM_ERROR, ITEM_FILLED, ITEM_RESTING,
     ITEM_SUCCESS,
 };
-use crate::sign::{sign_action, Network, Vault};
+use crate::sign::{dry_sign_action, sign_action_prenonce, Network, Vault};
 use crate::ttl::{TtlTable, TTL_CANCEL_MARK};
 use crate::userws::{scan_user_fills, sum_fill_rows, TidRing, UserFill, SNAPSHOT_RING};
 use crate::wspost::{classify, PostKind, WsIn};
+use signer_eip712::prenonce::PrenonceSigner;
 
 /// Command ring slots (engine → gateway).
 pub const CMD_RING: usize = 1024;
@@ -242,6 +243,9 @@ const TX_CAP: usize = 16 * 1024;
 const _: () = assert!(TX_CAP <= MAX_REQ_BODY);
 const ROOM: usize = WS_CLIENT_HDR_MAX;
 const GROUPING: &[u8] = b"na";
+/// T2T T1-f: the keep-hot dry run's asset (a HIP-4 leg's id shape; never
+/// sent).
+const DRY_ASSET: u32 = crate::asset::ASSET_BASE + 1;
 
 /// An ALO batch's grouping (XMM XH5d): its priority's `{"p": N}`, or
 /// `"na"` when it bids none.
@@ -298,6 +302,13 @@ pub const WS_MSG_SHARE: u32 = 1_000;
 /// session anchor could not be stored ([`crate::anchor::AnchorKeeper`]): the
 /// slot never quotes on an anchor a restart would lose (E7).
 pub const HALT_ANCHOR_UNKEPT: u64 = exec_gateway::stats::HALT_VENUE_BASE;
+/// **T2T T1-c — a pooled signature failed its after-the-fact check**
+/// (`PrenonceSigner::check_one`): the pool is off for the process (every
+/// later signature is RFC 6979) and the gateway halts, so an operator reads
+/// why before anything grows again.
+pub const HALT_SIGNER: u64 = exec_gateway::stats::HALT_VENUE_BASE + 1;
+/// T2T T1-f — the keep-hot dry run's cadence inside the hot window.
+const KEEP_HOT_NS: u64 = 1_000_000;
 /// XH4e — growth is refused unsent at this % of either share.
 const THROTTLE_PCT: u64 = 80;
 /// XH4e — the congestion word reads busy from this % of either share …
@@ -367,8 +378,13 @@ const STREAM_RESERVE: usize = 512;
 /// is counted and the arm halts (XG-2).
 const ROOM_WAIT_NS: u64 = 50_000_000;
 
-/// Ping after 30 s of silence; dead after 60 s (the venue cuts idle
-/// sockets at 60 s).
+/// A client heartbeat: a ping 30 s after the last one we sent (the dial
+/// before the first), however busy the socket is; dead after 60 s with no
+/// inbound byte. The venue closes a socket 60 s after its last client ping
+/// or subscribe (`Close 1000 "Inactive"`) and a post does not count, so
+/// the quiet-time ping this was until 2026-10-20 never came due on a socket
+/// posting reads every few seconds — it was cut every 60 s
+/// (`GwConn::maintain`).
 const KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
     ping_interval_ns: 30_000_000_000,
     idle_timeout_ns: 60_000_000_000,
@@ -466,6 +482,9 @@ pub enum GatewayErr {
     Http,
     /// XH4e: a rate share of 0 — the gateway could grow nothing.
     Rates,
+    /// T2T T1-c: the precomputed-nonce signer did not build (its page
+    /// could not be locked, the CSPRNG failed, or its self-test failed).
+    Signer,
 }
 
 /// Coins the gateway resolves to asset ids for the streams and the sweep
@@ -633,6 +652,8 @@ pub struct GatewayCounters {
     pub ttl_cancels: u64,
     /// Orders whose TTL the full table could not keep (XH4f).
     pub ttl_full: u64,
+    /// T2T T1-f: keep-hot dry runs (the hot window's quiet turns).
+    pub keep_hot: u64,
 }
 
 /// XH4f (D11) — the words this gateway publishes at its heartbeat
@@ -678,10 +699,17 @@ pub mod pw {
     pub const RATE_IP: usize = 17;
     /// The WebSocket-message window's sum (the last minute).
     pub const RATE_WS: usize = 18;
+    /// T2T T1-c: actions signed from the precomputed-nonce pool.
+    pub const SIGNS_POOLED: usize = 19;
+    /// T2T T1-c: actions signed by RFC 6979 (an empty pool, an edge the
+    /// pool cannot sign, or the pool turned off).
+    pub const SIGNS_FALLBACK: usize = 20;
+    /// T2T T1-c: the pool's ready entries (a level).
+    pub const POOL_READY: usize = 21;
     /// Words published.
-    pub const N: usize = 19;
+    pub const N: usize = 22;
     // The last word and the count move together, inside the granule.
-    const _: () = assert!(RATE_WS + 1 == N && N <= exec_gateway::stats::PUBLISHED_WORDS);
+    const _: () = assert!(POOL_READY + 1 == N && N <= exec_gateway::stats::PUBLISHED_WORDS);
 }
 
 /// One resting order of ours a sweep read found: what its cancel takes.
@@ -1782,7 +1810,11 @@ pub struct HlGateway {
     tls: Arc<ClientConfig>,
     master_hex: String,
     slots: SlotMask,
-    sk: secp256k1::SecretKey,
+    /// T2T T1-c: the key and its precomputed-nonce pool, in one `mlock`'d
+    /// page (boxed: the gateway's inline state stays bounded).
+    signer: Box<PrenonceSigner>,
+    /// T2T T1-f: when the keep-hot dry run last ran.
+    hot_ns: u64,
     network: Network,
     nonce: NonceSource,
     batches: Box<Batches>,
@@ -1887,7 +1919,9 @@ impl HlGateway {
             server_name,
             tls: cfg.tls,
             slots: cfg.slots,
-            sk,
+            // T2T T1-c: ~5 ms at boot (the pool filled, the self-test).
+            signer: Box::new(PrenonceSigner::new(&sk).map_err(|_| GatewayErr::Signer)?),
+            hot_ns: 0,
             network: cfg.network,
             nonce: NonceSource::own(),
             // COPY: the ≈ 7.7 KiB batch arrays, built on the stack and
@@ -1933,10 +1967,20 @@ impl HlGateway {
     }
 
     /// One turn — see the module docs.
+    ///
+    /// T2T T1-a: the command ring is drained FIRST, before the poll and the
+    /// reads (it is drained again after them, as before), so a take never
+    /// waits behind a park's tail or behind the decoding of inbound frames;
+    /// and inside the idle policy's hot window the poll never blocks.
     pub fn turn(&mut self) {
-        let wait = self
-            .idle
-            .timeout_ns(self.worked, now_ns(), self.rt.timers.next_deadline());
+        let early = self.pump_commands(now_ns());
+        let hot = self.idle.is_hot(now_ms());
+        let wait = if hot {
+            0
+        } else {
+            self.idle
+                .timeout_ns(self.worked | early, now_ns(), self.rt.timers.next_deadline())
+        };
         let failed = self.poll_io(wait);
         let now = now_ns();
         let mut worked = false;
@@ -1978,7 +2022,77 @@ impl HlGateway {
             self.rt.stats.beat(now);
             self.beat_ns = now;
         }
-        self.worked = worked;
+        if !(worked | early) {
+            self.idle_work(now, hot);
+        }
+        self.worked = worked | early;
+    }
+
+    /// **What a quiet turn does** (T2T T1-c, T1-f). Inside the hot window:
+    /// the keep-hot dry run every [`KEEP_HOT_NS`], nothing else, so the
+    /// order path stays warm and no refill delays a take. Outside it: one
+    /// pooled signature's after-the-fact check, else one pool entry — each
+    /// ~40–80 µs, a quiet turn's slack (a command arriving meanwhile waits
+    /// that long, as it would for today's park).
+    fn idle_work(&mut self, now: u64, hot: bool) {
+        if hot {
+            if now.saturating_sub(self.hot_ns) >= KEEP_HOT_NS {
+                self.hot_ns = now;
+                self.dry_seal();
+            }
+            return;
+        }
+        match self.signer.check_one() {
+            Some(false) => self.halt(HALT_SIGNER, now),
+            Some(true) => {}
+            None => {
+                let _ = self.signer.refill_one();
+            }
+        }
+    }
+
+    /// **T2T T1-f — the keep-hot dry run:** a dummy IoC encoded, hashed,
+    /// signed by the pool's arithmetic on its throwaway entry, rendered
+    /// and enveloped in the gateway's own buffers, then left there. Nothing
+    /// is admitted or sent; no nonce is drawn, no counter or rate moves.
+    /// It keeps the order path's code, buffers and branch history warm for
+    /// the one real take a window may bring.
+    fn dry_seal(&mut self) {
+        let w = [HlCmd::place(0, 1, DRY_ASSET, true, 95_000_000, 25_000_000_000, Tif::Ioc)
+            .order_wire()];
+        let Ok(mp_n) = encode_order(&mut self.mp, &w, GROUPING) else {
+            return;
+        };
+        let nonce = now_ms();
+        let Some(sig) = dry_sign_action(&self.signer, &self.mp[..mp_n], nonce, self.network)
+        else {
+            return;
+        };
+        let tx = &mut self.tx[ROOM..];
+        let Ok(pfx) = ws_post_open(tx, 0) else {
+            return;
+        };
+        let Ok(head) = envelope_open(&mut tx[pfx..]) else {
+            return;
+        };
+        let Ok(aj) = order_json(&mut tx[pfx + head..], &w, GROUPING) else {
+            return;
+        };
+        let Ok(env_len) = envelope_close(&mut tx[pfx..], head + aj, nonce, &sig, None, None)
+        else {
+            return;
+        };
+        if ws_post_close(tx, pfx + env_len).is_ok() {
+            self.rt.counters.keep_hot += 1;
+        }
+    }
+
+    /// T2T T1-a, TEST-ONLY (`testvenue`, never in a shipping build): the
+    /// idle policy replaced between turns — the alloc gate's keep-hot
+    /// phase. The boot passes its policy in [`GatewayCfg::idle`].
+    #[cfg(feature = "testvenue")]
+    pub fn set_idle(&mut self, idle: Idle) {
+        self.idle = idle;
     }
 
     /// Ask for the active connection to be replaced make-before-break.
@@ -2257,8 +2371,9 @@ impl HlGateway {
         self.rt.stats.set_congestion(level);
     }
 
-    /// XH4f (D11): publish the gateway's own counters and its rate windows'
-    /// sums for the arm's report ([`pw`]), each stored on change.
+    /// XH4f (D11): publish the gateway's own counters, its rate windows'
+    /// sums and (T2T T1-c) its signer's for the arm's report ([`pw`]), each
+    /// stored on change.
     fn publish_counters(&self) {
         let c = &self.rt.counters;
         let s = &self.rt.stats;
@@ -2281,6 +2396,13 @@ impl HlGateway {
         s.publish(pw::TTL_FULL, c.ttl_full);
         s.publish(pw::RATE_IP, self.ip.sum());
         s.publish(pw::RATE_WS, self.ws.sum());
+        let sc = self.signer.counters();
+        s.publish(pw::SIGNS_POOLED, sc.pooled);
+        s.publish(pw::SIGNS_FALLBACK, sc.fallback);
+        s.publish(
+            pw::POOL_READY,
+            u64::try_from(self.signer.ready()).unwrap_or(u64::MAX),
+        );
     }
 
     // ---- commands -----------------------------------------------------
@@ -2597,8 +2719,8 @@ impl HlGateway {
         } else {
             Some(ms + u64::from(h.min_exp))
         };
-        let sig = sign_action(
-            &self.sk,
+        let sig = sign_action_prenonce(
+            &mut self.signer,
             &self.mp[..mp_n],
             nonce,
             Vault::None,
@@ -2728,9 +2850,13 @@ impl HlGateway {
             self.rt.fail_all(id, EV_REJECTED, REASON_LOCAL, now);
             return;
         };
-        let written = now_ns();
         match self.conns[a].send(&self.tx[start..ROOM + s.ws_len]) {
             Ok(()) => {
+                // T2T T0: stamped once the socket took the frame — rustls'
+                // seal and `write(2)` included. It was taken before the
+                // send, so `push_to_write` (and `post_rtt`'s origin) left out
+                // ~15 µs a post on the Mac (the t2t harness, 2026-10-25).
+                let written = now_ns();
                 self.conns[a].note_post();
                 if k != CLASS_READ {
                     self.rt.stats.note_action_sent();

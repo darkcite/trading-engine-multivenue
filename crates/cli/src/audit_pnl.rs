@@ -208,6 +208,47 @@ const CLASS_FILL: u8 = 3;
 const CLASS_COMMIT: u8 = 4;
 const CLASS_ORDER: u8 = 5;
 
+/// PMJ J10: Polymarket's rolling captures (`pm15-*` for the 15-minute
+/// families, `pm5-*` for the 5-minute ones) — their own spawn labels,
+/// deliberately NOT `VENUE_LABELS` entries: that list is the frozen
+/// `backtest` stream's and sizes the stale judge's lanes.
+const PM_ROLLING_LABELS: [&str; 2] = ["pm15", "pm5"];
+/// PMJ J10: the rolling tick lanes' lords (`VENUE_LABELS` ticks take
+/// 0..9, events 100+, synthetic lanes 200+).
+const PM_ROLLING_TICK_LORD: usize = 10;
+
+/// PMJ J10: a RAW sym that is one of Polymarket's rolling up / down legs
+/// (never a family's `[mark]` slot).
+fn is_pm_rolling_leg(sym: u32) -> bool {
+    match core_types::pm_roll::pm_rolling_of(sym) {
+        Some((_, off)) => off < core_types::pm_roll::PM_OFF_MARK,
+        None => matches!(
+            core_types::pm_roll::pm5_rolling_of(sym),
+            Some((_, off)) if off < core_types::pm_roll::PM5_OFF_MARK
+        ),
+    }
+}
+
+/// PMJ J10: a rolling Up leg's descriptor → its Down twin, by name
+/// (`…[up1]` → `…[down1]`); `None` for anything else.
+fn pm_down_descriptor_of(up: &str) -> Option<String> {
+    if !up.starts_with("polymarket-rolling:") {
+        return None;
+    }
+    let open = up.rfind("[up")?;
+    let pair = up[open + 3..].strip_suffix(']')?;
+    if pair.len() != 1 || !pair.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    Some(format!("{}[down{pair}]", &up[..open]))
+}
+
+/// PMJ J10: a dense descriptor that is a Polymarket rolling up / down
+/// leg (its fills pay the venue's p-dependent taker law).
+fn is_pm_rolling_leg_descriptor(desc: &str) -> bool {
+    desc.starts_with("polymarket-rolling:") && (desc.contains("[up") || desc.contains("[down"))
+}
+
 #[derive(Copy, Clone, Debug)]
 enum Payload {
     Tick(Tick),
@@ -267,7 +308,14 @@ impl SymInterner {
         if let Some(d) = self.by_desc.get(descriptor) {
             return Ok(*d);
         }
-        let ord = self.next_ordinal[venue_byte as usize];
+        let mut ord = self.next_ordinal[venue_byte as usize];
+        // PMJ J10 (review r1 #2): dense id 7 on venue byte 0 IS
+        // `LEGACY_BN_ANCHOR_SYM`, which `fill::model_venue_byte` judges as
+        // Binance (Δ, venue column) — a Polymarket descriptor issued it
+        // would be judged on the wrong venue. Never issue it.
+        if venue_byte == 0 && ord + 1 == core_config::universe::LEGACY_BN_ANCHOR_SYM {
+            ord += 1;
+        }
         if ord >= 0x00FF_FFFF {
             return Err(HarnessError::Capture(format!(
                 "descriptor space overflow on venue byte {venue_byte}"
@@ -278,6 +326,13 @@ impl SymInterner {
         self.by_desc.insert(descriptor.to_owned(), dense);
         self.desc_by_dense.insert(dense, descriptor.to_owned());
         Ok(dense)
+    }
+
+    /// PMJ J10: the dense id of a descriptor this root ALREADY interned —
+    /// never a new one, so a schedule pass cannot reorder the ids every
+    /// other number is keyed by.
+    fn get(&self, descriptor: &str) -> Option<u32> {
+        self.by_desc.get(descriptor).copied()
     }
 
     fn descriptor(&self, dense: u32) -> &str {
@@ -447,6 +502,52 @@ struct AuditBinOut {
     /// the capture names a family whose manifest rows are incomplete,
     /// and its positions will mark out instead of settling.
     rolls_unpaired: u64,
+    /// PMJ J10 (R-PMJ-S42): Polymarket's rolling windows on a slot this
+    /// root traded, settled on the venue's own result (the capture's
+    /// SETTLED roll row) — or at 0 / 0 when it retired the window
+    /// unresolved, or when the run re-created the pair before any row
+    /// came (`pm_flattened`). Its own pass, like HIP-4's: nothing enters
+    /// the event stream.
+    pm: Vec<crate::backtest::binary::VenueBinarySettle>,
+    /// Windows already scheduled, root-wide, by (Up descriptor, instance):
+    /// the instance alone is a window index and a family ORDER, which a
+    /// boot can reorder.
+    pm_seen: std::collections::BTreeSet<(String, u32)>,
+    /// Windows some run saw RESOLVE (a settled row), root-wide.
+    pm_resolved: std::collections::BTreeSet<(String, u32)>,
+    /// Windows on a traded slot a run ended with no result for — settled
+    /// once every run is in (review r1 #1): by a later run's settled row
+    /// when one saw it, else flattened at 0 at the next run's first
+    /// instant (the member's unknown law), else (the root's last run)
+    /// left open to mark out.
+    pm_pending: Vec<PmPending>,
+    /// Settled rows read (every slot, traded or not).
+    pm_rolls_settled: u64,
+    /// Scheduled windows the venue retired unresolved (`v0` 0).
+    pm_retired: u64,
+    /// Windows with no settled row, flattened at 0 at the instant their
+    /// pair was re-created in the same run.
+    pm_flattened: u64,
+    /// Windows on a traded slot no run of the root saw resolve, open at
+    /// the root's last run's end: their positions mark out.
+    pm_open_at_end: u64,
+    /// Windows on a traded slot a run ended with no result for and no
+    /// later run resolved: flattened at 0 at the next run's first instant.
+    pm_flattened_run_end: u64,
+    /// Settled rows whose Up / Down legs the manifest does not pair.
+    pm_unpaired: u64,
+    /// Roll rows whose kind byte is neither created nor settled.
+    pm_refused: u64,
+}
+
+/// PMJ J10: a window on a traded Polymarket slot its run ended without a
+/// result for (resolved once every run is loaded).
+struct PmPending {
+    up_desc: String,
+    instance: u32,
+    run_epoch_ns: u64,
+    sym_up: Option<u32>,
+    sym_down: Option<u32>,
 }
 
 /// Per-run load stats (stderr surface).
@@ -494,6 +595,15 @@ struct RunLoad {
     /// and the post-only placements they can fill.
     trades: u64,
     queue_orders: u64,
+    /// PMJ J10: orders placed on a Polymarket rolling leg, and the
+    /// rolling ticks loaded for exactly those legs (`pm15-ticks` /
+    /// `pm5-ticks`), inside the run's tick span.
+    rolling_orders: u64,
+    rolling_ticks: u64,
+    /// PMJ J10: the run's last WALL instant (0 for a run with no tick) —
+    /// where its own unresolved windows are flattened when a later run
+    /// follows (the loss stays with the run, and the day, that held it).
+    last_wall_ns: u64,
     /// BIN15 S2: `(venue_time − ts, first sampled stamp)` over the run's
     /// first Hyperliquid stamps — the SAME fit and law as `backtest`
     /// (`backtest::clock`); `None` = the old anchor law (or a refused fit).
@@ -772,11 +882,26 @@ fn load_run_events(
     }
 
     // Order intents (M4.1; absent on pre-M4.1 runs).
+    // PMJ J10: the RAW Polymarket rolling legs this run placed on — the
+    // only legs whose `pm15` / `pm5` ticks are loaded below.
+    let mut rolling_syms: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let orders_path = run.path.join("engine-orders.pmlr");
     if let Some(reader) = open_checked::<Order>(&orders_path, SlotKind::Order, run.epoch_ns)? {
         for (i, o) in reader.records().iter().enumerate() {
+            if o.verb == core_types::ORDER_VERB_PLACE && is_pm_rolling_leg(o.sym) {
+                rolling_syms.insert(o.sym);
+                load.rolling_orders += 1;
+            }
             let mut order = *o;
             order.sym = resolve(o.sym, interner, &mut load)?;
+            // PMJ J10 (review r1 #3): the M1 anchor id 7 interns under
+            // Binance (`model_venue_byte`) while its orders carry the
+            // Polymarket byte; name the venue the dense id carries, so a
+            // debug replay of a real root is not stopped by the intake
+            // assert (release judges on `model_venue_byte` either way).
+            if o.sym == core_config::universe::LEGACY_BN_ANCHOR_SYM {
+                order.venue = core_types::VenueId::Binance as u8;
+            }
             if o.verb == core_types::ORDER_VERB_PLACE
                 && core_fill::judged_by_queue(core_types::symbol_venue_byte(o.sym), o.kind, o.flags)
             {
@@ -902,6 +1027,37 @@ fn load_run_events(
                 payload: Payload::Funding(ev),
             });
             load.funding_events += 1;
+        }
+    }
+    // PMJ J10: Polymarket's rolling legs tick in their own captures
+    // (`pm15-ticks` / `pm5-ticks`, not a `VENUE_LABELS` lane). Without
+    // them a slot 9 / 11 intent can never fill here. Loaded only for the
+    // legs this run placed on and only inside its tick span — so the
+    // anchor, the window's end and every other run report exactly as
+    // before (the XMM XH3 precedent). The ingress's own stale flag rides
+    // in the tick (a withdrawn touch); the per-lane re-judge is a
+    // `VENUE_LABELS` lane's and does not apply.
+    if !rolling_syms.is_empty() {
+        for (k, label) in PM_ROLLING_LABELS.iter().enumerate() {
+            let path = run.path.join(format!("{label}-ticks.pmlr"));
+            let Some(reader) = open_checked::<Tick>(&path, SlotKind::Tick, run.epoch_ns)? else {
+                continue;
+            };
+            for (i, t) in reader.records().iter().enumerate() {
+                if !rolling_syms.contains(&t.sym) || t.ts_ns < tick_anchor || t.ts_ns > tick_last {
+                    continue;
+                }
+                let mut tick = *t;
+                tick.sym = resolve(t.sym, interner, &mut load)?;
+                evs.push(Ev {
+                    ts_ns: t.ts_ns,
+                    class: CLASS_TICK,
+                    lord: (PM_ROLLING_TICK_LORD + k) as u8,
+                    idx: i as u64,
+                    payload: Payload::Tick(tick),
+                });
+                load.rolling_ticks += 1;
+            }
         }
     }
     let (frames, dropped) = load_set_regime_frames(&run.path, run.epoch_ns, tick_anchor)?;
@@ -1081,6 +1237,124 @@ fn load_run_events(
                 }
             }
         }
+        // PMJ J10 (R-PMJ-S42): Polymarket's rolling windows. The venue
+        // publishes each result itself (`market_resolved`), and the
+        // ingress writes it as the window's SETTLED roll row: `v0` +1 Up,
+        // −1 Down, 0 retired unresolved — which pays 0 on both legs, as
+        // the member books it. Only legs this root already interned can
+        // hold a position, so nothing new is interned here.
+        load.last_wall_ns = wall_of(evs[evs.len() - 1].ts_ns);
+        let legs =
+            |raw_up: u32, interner: &SymInterner| -> Option<(String, Option<u32>, Option<u32>)> {
+                let m = manifest.as_ref()?;
+                let up = m.get(&raw_up)?;
+                let down = pm_down_descriptor_of(up)?;
+                if m.get(&(raw_up + 1)) != Some(&down) {
+                    return None;
+                }
+                Some((up.clone(), interner.get(up), interner.get(&down)))
+            };
+        for label in PM_ROLLING_LABELS {
+            let path = run.path.join(format!("{label}-events.pmlr"));
+            let Some(reader) = open_checked::<ChannelEvent>(&path, SlotKind::Event, run.epoch_ns)?
+            else {
+                continue;
+            };
+            // Created rows per Up slot, in file order: (wall, instance).
+            let mut created: BTreeMap<u32, Vec<(u64, u32)>> = BTreeMap::new();
+            let mut settled_here: std::collections::BTreeSet<u32> =
+                std::collections::BTreeSet::new();
+            for e in reader.records() {
+                if e.venue != core_types::VenueId::Polymarket as u8
+                    || e.channel != ChannelId::InstrumentRoll as u8
+                    || e.sym == SYMBOL_ID_NONE
+                {
+                    continue;
+                }
+                let Some(is_settled) = core_types::roll_kind_strict(e.venue_seq) else {
+                    bin_out.pm_refused += 1;
+                    continue;
+                };
+                let (instance, _, _, _) = crate::backtest::binary::unpack_roll_seq(e.venue_seq);
+                if !is_settled {
+                    created.entry(e.sym).or_default().push((wall_of(e.ts_ns), instance));
+                    continue;
+                }
+                bin_out.pm_rolls_settled += 1;
+                settled_here.insert(instance);
+                let Some((up_desc, up, down)) = legs(e.sym, interner) else {
+                    // Counted only on a leg this run traded (a slot it never
+                    // traded cannot matter, and must not print the table).
+                    if rolling_syms.contains(&e.sym) || rolling_syms.contains(&(e.sym + 1)) {
+                        bin_out.pm_unpaired += 1;
+                    }
+                    continue;
+                };
+                if up.is_none() && down.is_none() {
+                    continue; // a slot this root never traded
+                }
+                let key = (up_desc, instance);
+                bin_out.pm_resolved.insert(key.clone());
+                if !bin_out.pm_seen.insert(key) {
+                    continue; // one settled row per window
+                }
+                let winner = match e.v0 {
+                    core_types::pm_roll::PM_SETTLED_UP => core_types::pm_roll::PM_SETTLED_UP,
+                    core_types::pm_roll::PM_SETTLED_DOWN => core_types::pm_roll::PM_SETTLED_DOWN,
+                    _ => {
+                        bin_out.pm_retired += 1;
+                        core_types::pm_roll::PM_SETTLED_UNKNOWN
+                    }
+                };
+                bin_out.pm.push(crate::backtest::binary::VenueBinarySettle {
+                    sym_up: up,
+                    sym_down: down,
+                    instance,
+                    settle_ns: wall_of(e.ts_ns),
+                    winner,
+                });
+            }
+            // A window this run created and never saw resolve. When its
+            // pair is re-created later in the run, its position cannot
+            // ride into the next window: flattened at 0 there (the
+            // member's "unknown pays nothing"). Else the run ended with it
+            // open — settled once every run is in (`PmPending`).
+            for (raw_up, list) in &created {
+                for (k, (_, instance)) in list.iter().enumerate() {
+                    if settled_here.contains(instance) {
+                        continue;
+                    }
+                    let Some((up_desc, up, down)) = legs(*raw_up, interner) else {
+                        continue;
+                    };
+                    if up.is_none() && down.is_none() {
+                        continue;
+                    }
+                    match list.get(k + 1) {
+                        Some((next_wall, _)) => {
+                            if !bin_out.pm_seen.insert((up_desc, *instance)) {
+                                continue;
+                            }
+                            bin_out.pm_flattened += 1;
+                            bin_out.pm.push(crate::backtest::binary::VenueBinarySettle {
+                                sym_up: up,
+                                sym_down: down,
+                                instance: *instance,
+                                settle_ns: *next_wall,
+                                winner: core_types::pm_roll::PM_SETTLED_UNKNOWN,
+                            });
+                        }
+                        None => bin_out.pm_pending.push(PmPending {
+                            up_desc,
+                            instance: *instance,
+                            run_epoch_ns: run.epoch_ns,
+                            sym_up: up,
+                            sym_down: down,
+                        }),
+                    }
+                }
+            }
+        }
     }
     Ok((evs, load))
 }
@@ -1198,6 +1472,15 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     // moves far more slowly).
     opt_out.index_book.seal();
 
+    // PMJ J10: Polymarket's rolling up / down legs — the venue's
+    // p-dependent taker fee and a free settlement (R-PMJ-S42).
+    let pm_fee_syms: Vec<u32> = interner
+        .desc_by_dense
+        .iter()
+        .filter(|(_, desc)| is_pm_rolling_leg_descriptor(desc))
+        .map(|(dense, _)| *dense)
+        .collect();
+
     // XSD-F: dense sym → fee class over the whole root's descriptor set.
     let sym_class: BTreeMap<u32, core_types::InstrumentClass> = interner
         .desc_by_dense
@@ -1222,6 +1505,39 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     // BIN15 S1: each instance's successor strike — the venue's own
     // settlement price — linked across runs, once every run is in.
     crate::backtest::binary::link_successors(&mut bin_out.instances);
+    // PMJ J10 (review r1 #1): a window a run ended without a result for.
+    // Its position sits on a REUSED slot sym, so leaving it open would let
+    // the next window's settlement on that sym close it at the wrong
+    // winner. A later run that saw the window resolve settles it there
+    // (its settled row is already scheduled); else, when a later run with
+    // events follows, it is flattened at 0 at its own run's last instant
+    // (the member's unknown law; the loss stays with that run and day);
+    // only in the root's last run is it left open, to mark out.
+    for p in std::mem::take(&mut bin_out.pm_pending) {
+        if bin_out.pm_resolved.contains(&(p.up_desc.clone(), p.instance)) {
+            continue;
+        }
+        let later = loads
+            .iter()
+            .any(|l| l.epoch_ns > p.run_epoch_ns && l.last_wall_ns > 0);
+        let own_end = loads
+            .iter()
+            .find(|l| l.epoch_ns == p.run_epoch_ns)
+            .map_or(0, |l| l.last_wall_ns);
+        match (later, own_end) {
+            (true, wall) if wall > 0 => {
+                bin_out.pm_flattened_run_end += 1;
+                bin_out.pm.push(crate::backtest::binary::VenueBinarySettle {
+                    sym_up: p.sym_up,
+                    sym_down: p.sym_down,
+                    instance: p.instance,
+                    settle_ns: wall,
+                    winner: core_types::pm_roll::PM_SETTLED_UNKNOWN,
+                });
+            }
+            _ => bin_out.pm_open_at_end += 1,
+        }
+    }
     for l in &loads {
         report(&format!(
             "audit-pnl: run-{}: ticks={} orders={} fills={} commits={} manifest={}{}{}{}",
@@ -1260,6 +1576,14 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             report(&format!(
                 "audit-pnl: run-{}: opt-synth-ticks={} (D-7 mark books)",
                 l.epoch_ns, l.opt_synth_ticks
+            ));
+        }
+        // PMJ J10: emitted only when a slot traded a Polymarket rolling
+        // leg, so every other run reports exactly as before.
+        if l.rolling_orders > 0 {
+            report(&format!(
+                "audit-pnl: run-{}: pm rolling orders={} ticks={} (pm15 / pm5 legs traded)",
+                l.epoch_ns, l.rolling_orders, l.rolling_ticks
             ));
         }
         // XMM XH3: emitted only when a post-only maker traded, so a run
@@ -1526,6 +1850,13 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             &bin_out.underlying_of,
             window_end_ns,
         );
+        // PMJ J10 (R-PMJ-S42): Polymarket's rolling legs pay the venue's
+        // p-dependent taker fee, and each window settles on the venue's
+        // own result, on the same per-sym queue as a HIP-4 slot.
+        for sym in &pm_fee_syms {
+            e.set_pm_fee_sym(*sym);
+        }
+        crate::backtest::binary::apply_venue_settlements(&mut e, &bin_out.pm, window_end_ns);
         for sym in &queue_syms {
             e.track_queue_sym(*sym);
         }
@@ -1565,6 +1896,26 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let mut paper_adopted: u64 = 0;
     let mut paper_unpriced: BTreeMap<u32, i64> = BTreeMap::new();
     let mut marks_1e6: BTreeMap<u32, i64> = BTreeMap::new();
+    // PMJ J10: the paper view settles Polymarket's rolling windows on the
+    // same schedule (the venue's result at its settled row), in wall
+    // order — a slot's paper fill becomes cash at its payout instead of
+    // a position the next window's book would mark. No fee, as for every
+    // venue in this view.
+    let mut paper_pm: Vec<(u64, u32, i64)> = Vec::new();
+    for w in &bin_out.pm {
+        if w.settle_ns > window_end_ns {
+            continue;
+        }
+        let (up, down) = w.values_1e6();
+        for (sym, v) in [(w.sym_up, up), (w.sym_down, down)] {
+            if let Some(sym) = sym {
+                paper_pm.push((w.settle_ns, sym, v));
+            }
+        }
+    }
+    paper_pm.sort_unstable();
+    let mut paper_pm_next = 0usize;
+    let mut paper_pm_settled: u64 = 0;
 
     // Per-UTC-day equity snapshots per strategy engine.
     let mut day_equity: BTreeMap<u8, Vec<(u64, i128)>> = BTreeMap::new();
@@ -1576,6 +1927,17 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let mut order_event = OrderEvent::ZERO;
 
     for ev in &merged {
+        while paper_pm_next < paper_pm.len() && paper_pm[paper_pm_next].0 <= ev.wall_ns {
+            let (_, sym, value) = paper_pm[paper_pm_next];
+            if let Some(q) = paper_qty.get_mut(&sym) {
+                if *q != 0 {
+                    paper_cash_1e12 += value as i128 * *q as i128;
+                    *q = 0;
+                    paper_pm_settled += 1;
+                }
+            }
+            paper_pm_next += 1;
+        }
         let day = ev.wall_ns / DAY_NS;
         if let Some(prev) = cur_day {
             if day != prev {
@@ -1726,6 +2088,45 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 .or_default()
                 .push((prev, eng.oos_equity_1e12()));
         }
+    }
+
+    // PMJ J10: the Polymarket settlement table — SILENT when the root
+    // carries no rolling roll on a traded slot, so every other report is
+    // unchanged. Its own prefix: `pnl_report` parses the bin15 line, and
+    // `vrp_shadow` the strategy blocks and their three-space rows.
+    let pm_applied: Vec<&crate::backtest::binary::VenueBinarySettle> =
+        bin_out.pm.iter().filter(|w| w.settle_ns <= window_end_ns).collect();
+    let pm_up = pm_applied
+        .iter()
+        .filter(|w| w.winner == core_types::pm_roll::PM_SETTLED_UP)
+        .count();
+    let pm_down = pm_applied
+        .iter()
+        .filter(|w| w.winner == core_types::pm_roll::PM_SETTLED_DOWN)
+        .count();
+    let pm_after = bin_out.pm.len() - pm_applied.len();
+    let pm_any = !bin_out.pm.is_empty() || bin_out.pm_open_at_end > 0 || bin_out.pm_unpaired > 0;
+    if pm_any {
+        report(&format!(
+            "audit-pnl: pm settlement table: {} window(s) on traded slots settled ({pm_up} up, \
+             {pm_down} down on the venue's result; {} at 0: {} retired unresolved + {} \
+             flattened when their pair was re-created with no result + {} flattened at their \
+             run's end, the run having ended with no result and a later run following; windows \
+             on traded slots, with or without a position); {pm_after} settle after the window \
+             (never applied); {} window(s) on traded slots, with or without a position, still \
+             open at the root's end (mark out); {} settled row(s) read; {} settled row(s) on a traded leg without a \
+             manifest leg pair; {} roll row(s) of no known kind; paper view: \
+             {paper_pm_settled} position(s) settled",
+            pm_applied.len(),
+            pm_applied.len() - pm_up - pm_down,
+            bin_out.pm_retired,
+            bin_out.pm_flattened,
+            bin_out.pm_flattened_run_end,
+            bin_out.pm_open_at_end,
+            bin_out.pm_rolls_settled,
+            bin_out.pm_unpaired,
+            bin_out.pm_refused,
+        ));
     }
 
     // Paper mark-out.
@@ -1990,6 +2391,25 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         }
         json.push_str("]},");
     }
+    // PMJ J10: additive and conditional, like `binary_fills` — a root
+    // with no Polymarket rolling roll on a traded slot is byte-identical.
+    if pm_any {
+        json.push_str(&format!(
+            "\"pm_settlement\":{{\"windows\":{},\"up\":{pm_up},\"down\":{pm_down},\
+             \"unknown\":{},\"retired\":{},\"flattened\":{},\"flattened_run_end\":{},\
+             \"after_window\":{pm_after},\
+             \"open_at_end\":{},\"unpaired\":{},\"refused\":{},\
+             \"paper_settled\":{paper_pm_settled}}},",
+            pm_applied.len(),
+            pm_applied.len() - pm_up - pm_down,
+            bin_out.pm_retired,
+            bin_out.pm_flattened,
+            bin_out.pm_flattened_run_end,
+            bin_out.pm_open_at_end,
+            bin_out.pm_unpaired,
+            bin_out.pm_refused,
+        ));
+    }
     json.push_str("\"strategies\":[");
     for (i, (sid, row)) in rows.iter().enumerate() {
         if i > 0 {
@@ -2171,11 +2591,58 @@ mod tests {
         }
         assert_eq!(strategy_label(8), "pine");
         assert_eq!(strategy_label(9), "pm15");
+        assert_eq!(strategy_label(11), "pmj");
         for id in 10..MAX_STRATEGY_SLOTS {
-            assert_eq!(strategy_label(id), "reserved", "slot {id}");
+            if id != 11 {
+                assert_eq!(strategy_label(id), "reserved", "slot {id}");
+            }
         }
         assert_eq!(strategy_label(MAX_STRATEGY_SLOTS), "unknown");
         assert_eq!(strategy_label(0xFE), "unknown");
         assert_eq!(strategy_label(0xFF), "unattributed");
+    }
+
+    /// PMJ J10 (review r1 #2): the seventh Polymarket descriptor is NOT
+    /// issued dense id 7 — the legacy anchor's, which the model judges as
+    /// Binance — so it keeps Polymarket's Δ and venue column.
+    #[test]
+    fn a_polymarket_descriptor_never_takes_the_legacy_anchor_id() {
+        let mut i = SymInterner::default();
+        let ids: Vec<u32> = (0..9).map(|k| i.intern(0, &format!("pm:{k}")).unwrap()).collect();
+        assert_eq!(&ids[..6], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&ids[6..], &[8, 9, 10], "7 is skipped");
+        assert!(!ids.contains(&core_config::universe::LEGACY_BN_ANCHOR_SYM));
+        for d in &ids {
+            assert_eq!(
+                crate::backtest::fill::model_venue_byte(*d),
+                core_types::VenueId::Polymarket as u8
+            );
+        }
+        // Another venue's ordinal 7 is untouched.
+        let b: Vec<u32> = (0..7).map(|k| i.intern(1, &format!("bn:{k}")).unwrap()).collect();
+        assert_eq!(b[6], (1 << 24) | 7);
+        assert_eq!(i.get("pm:6"), Some(8));
+        assert_eq!(i.get("pm:99"), None);
+    }
+
+    /// PMJ J10: the rolling-leg predicates — raw pool syms (never a
+    /// `[mark]`), and the descriptor law the fee set is built from.
+    #[test]
+    fn rolling_legs_are_named_by_pool_and_by_descriptor() {
+        use core_types::pm_roll::{pm5_rolling_sym, pm_mark_sym, pm_rolling_sym};
+        assert!(is_pm_rolling_leg(pm_rolling_sym(0, 0, 0)));
+        assert!(is_pm_rolling_leg(pm_rolling_sym(6, 1, 1)));
+        assert!(is_pm_rolling_leg(pm5_rolling_sym(3, 2, 0)));
+        assert!(!is_pm_rolling_leg(pm_mark_sym(0)));
+        assert!(!is_pm_rolling_leg(42));
+        assert_eq!(
+            pm_down_descriptor_of("polymarket-rolling:updown:btc:5m[up2]").as_deref(),
+            Some("polymarket-rolling:updown:btc:5m[down2]")
+        );
+        assert_eq!(pm_down_descriptor_of("polymarket-rolling:updown:btc:5m[down2]"), None);
+        assert_eq!(pm_down_descriptor_of("hyperliquid:out:BTC:15m[yes]"), None);
+        assert!(is_pm_rolling_leg_descriptor("polymarket-rolling:updown:eth:15m[down1]"));
+        assert!(!is_pm_rolling_leg_descriptor("polymarket-rolling:updown:eth:15m[mark]"));
+        assert!(!is_pm_rolling_leg_descriptor("PMTOK"));
     }
 }

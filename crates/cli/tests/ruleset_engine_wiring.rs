@@ -39,7 +39,7 @@ use strategy_set::{StrategySet, BIT_VM};
 // tick lanes and four opt lanes since HC1 added Hypercall, after MX2's
 // MEXC and WS9's Bybit; five fill lanes since BX3 gave Binance lane 4);
 // break the build loudly if that drifts.
-const _: () = assert!(NUM_TICK_LANES == 9 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
+const _: () = assert!(NUM_TICK_LANES == 10 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
 
 /// Raw Polymarket SymbolId (venue byte 0) — the boot-universe shape
 /// `build_ai_universe` produces for `--polymarket-sym-id`.
@@ -149,6 +149,8 @@ fn harness(tag: &str) -> Harness {
     let (_t7p, t7) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     // PM15: lane 8, the rolling families.
     let (_t8p, t8) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // PMJ J1b: lane 9, the 5-minute families.
+    let (_t9p, t9) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     // WS10-A: venue-event lanes ride in every engine (producers
     // dropped — the lanes read empty; this harness exercises the
     // ruleset plumbing, not funding).
@@ -170,9 +172,14 @@ fn harness(tag: &str) -> Harness {
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e8p, e8) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e9p, e9) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     // WS10-B: depth lanes ride in every engine (producers dropped).
     let (_d0p, d0) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     let (_d1p, d1) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
+    // PMJ J8: the rolling legs' depth lanes.
+    let (_d2p, d2) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
+    let (_d3p, d3) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     // VM2 V2: opt lanes ride in every engine (producers dropped).
     let (_o0p, o0) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_o1p, o1) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
@@ -189,9 +196,9 @@ fn harness(tag: &str) -> Harness {
     let mut eng = Engine::new(
         StrategySet::new(BIT_VM),
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5, t6, t7, t8],
-        [e0, e1, e2, e3, e4, e5, e6, e7, e8],
-        [d0, d1],
+        [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9],
+        [e0, e1, e2, e3, e4, e5, e6, e7, e8, e9],
+        [d0, d1, d2, d3],
         [o0, o1, o2, o3],
         sc,
         [f0, f1, f2, f3, f4],

@@ -81,7 +81,8 @@ if [ "$#" -eq 0 ]; then
            crates/clob-dispatcher crates/cli/src/bn_live.rs crates/cli/src/xmm_live.rs \
            crates/cli/src/bin15_live.rs crates/strategy-bin15 crates/core-twaplock \
            crates/exec-polymarket crates/cli/src/pm15_live.rs crates/cli/src/pm15_boot.rs \
-           crates/strategy-pm15 \
+           crates/strategy-pm15 crates/exec-jupiter crates/strategy-pmj crates/cli/src/pmj_boot.rs \
+           crates/cli/src/pmj_live.rs \
            crates/core-net \
            crates/core-ring crates/ingress-binance crates/ingress-okx crates/ingress-deribit \
            crates/ingress-hyperliquid crates/ingress-mexc crates/ingress-bybit \

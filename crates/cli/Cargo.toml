@@ -41,6 +41,8 @@ core-amm             = { workspace = true }
 strategy-ev          = { workspace = true }
 strategy-bin15       = { workspace = true }
 strategy-pm15        = { workspace = true }
+# PMJ J4: the slot-11 member (paper).
+strategy-pmj         = { workspace = true }
 core-twaplock        = { workspace = true }
 # HYPARB H5: the slot-0 member's params, built by `hyparb_boot`.
 strategy-hyparb      = { workspace = true }
@@ -73,6 +75,11 @@ exec-hypercall       = { workspace = true }
 # engine ⇄ pm-gw duplex.
 exec-polymarket      = { workspace = true }
 exec-gateway         = { workspace = true }
+# PMJ J16: slot 11's Jupiter arm (JupArm, jup-gw, the guard) and the
+# wallet's Ed25519 signer (`from_solana_keypair`, the mlock'd page) — both
+# workspace crates, already in the graph through bench and exec-binance.
+exec-jupiter         = { workspace = true }
+signer-ed25519       = { workspace = true }
 # HYPARB H8: the HyperEVM write path, TESTNET ONLY (O-H5) — the shadow of
 # each paper AMM decision (O-H12) and the `evm-testnet` operator verbs.
 exec-hyperevm        = { workspace = true }

@@ -17,6 +17,9 @@ core-time   = { workspace = true }
 secp256k1   = { workspace = true }
 tiny-keccak = { workspace = true }
 zeroize     = { workspace = true }
+# T2T T1-c: the nonce pool's OS CSPRNG and its mlock'd page.
+getrandom   = "0.2"
+libc        = "0.2"
 
 [dev-dependencies]
 proptest = { workspace = true }

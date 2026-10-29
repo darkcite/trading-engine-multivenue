@@ -6,7 +6,10 @@
 # (re)bootstraps the agents (engine, daily-restart, caffeinate,
 # candles, regime — RG5 added the 5-minute regime cycle; news — the
 # NEWS lane's 60 s aggregation cycle; dashboard — RG6 added the 9292
-# page server; llm — the NEWS lane's local model sidecar). Re-running =
+# page server; llm — the NEWS lane's local model sidecar; pm-pnl — the PMJ
+# P&L lane's 15-minute pass; notify — the NOTIFY lane's one-way Telegram
+# notifier, which exits 0 and stays down while ~/multivenue/notify.toml is
+# absent). Re-running =
 # graceful restart of the standing engine (bootout sends SIGTERM per
 # ExitTimeOut).
 #
@@ -53,7 +56,7 @@ if [ ! -f "$HOME/multivenue/pm-dailies.toml" ]; then
   cp "$REPO/pm-dailies.toml.example" "$HOME/multivenue/pm-dailies.toml"
 fi
 
-for label in com.multivenue.engine com.multivenue.daily-restart com.multivenue.caffeinate com.multivenue.candles com.multivenue.regime com.multivenue.news com.multivenue.llm com.multivenue.dashboard com.multivenue.archive; do
+for label in com.multivenue.engine com.multivenue.daily-restart com.multivenue.caffeinate com.multivenue.candles com.multivenue.regime com.multivenue.news com.multivenue.llm com.multivenue.dashboard com.multivenue.archive com.multivenue.pm-pnl com.multivenue.notify; do
   sed -e "s|@REPO@|$REPO|g" -e "s|@HOME@|$HOME|g" \
     "$REPO/launchd/$label.plist" > "$AGENTS/$label.plist"
   launchctl bootout "gui/$UID/$label" 2>/dev/null || true
@@ -62,7 +65,7 @@ done
 
 sleep 2
 echo "--- launchd state ---"
-for label in com.multivenue.engine com.multivenue.daily-restart com.multivenue.caffeinate com.multivenue.candles com.multivenue.regime com.multivenue.news com.multivenue.llm com.multivenue.dashboard com.multivenue.archive; do
+for label in com.multivenue.engine com.multivenue.daily-restart com.multivenue.caffeinate com.multivenue.candles com.multivenue.regime com.multivenue.news com.multivenue.llm com.multivenue.dashboard com.multivenue.archive com.multivenue.pm-pnl com.multivenue.notify; do
   launchctl print "gui/$UID/$label" 2>/dev/null | grep -E "^\s*(state|pid)" | head -2 |
     sed "s|^|$label: |"
 done

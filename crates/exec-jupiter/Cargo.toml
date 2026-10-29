@@ -1,0 +1,42 @@
+[package]
+name         = "exec-jupiter"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "PMJ J3: the slot-11 Jupiter Predict order arm — the Solana transaction guard (never sign a server-built transaction blind), the raw Ed25519 signature in place, the Prediction API's build / execute / status / claim scanners and renders, the 64 B intent and event records. Socket-free and rig-tested; never live in this pass."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# J3b: OrderDispatch, Retired, HaltSignal, CancelAllState (the arm's trait).
+clob-dispatcher = { workspace = true }
+# J3b: the IoC kind the arm admits.
+core-fill      = { workspace = true }
+# J3b: HttpsReq (jup-gw's request cycle), Header, Method, PostErr.
+core-net       = { workspace = true }
+# J3b: the discovery tee's spec ring.
+core-ring      = { workspace = true }
+# J3b: the request round trips.
+core-time      = { workspace = true }
+# J3b: the engine ⇄ jup-gw duplex, the halt word, the latency series.
+exec-gateway   = { workspace = true }
+# J3b: PmWindowSpec (the window table's input) and its ring.
+ingress-polymarket = { workspace = true }
+# J3b: the API key is wiped on drop.
+zeroize        = { workspace = true }
+# The base64 transaction codec and base58 keys (dependency-free).
+core-crypto    = { workspace = true }
+# The in-place JSON scanners (find_field, skip_string, scan_u64).
+core-parse     = { workspace = true }
+core-types     = { workspace = true }
+# The wallet's Ed25519 signer (ring, O-BX5) and verification.
+signer-ed25519 = { workspace = true }
+
+[dev-dependencies]
+# PMJ W5: the create-order reader's and the build extras' property tests
+# (already in the workspace graph: no new crate).
+proptest       = { workspace = true }

@@ -155,6 +155,9 @@ const BINANCE_KEYS: [&str; 24] = [
 ///
 /// HC1 (plan §3 HC1): `hypercall` is RESERVED the same way — data-only
 /// under O-HC1; its exec arm (HC9) waits for its own ruling.
+///
+/// PMJ J3 (R-PMJ-S2): `jupiter` is byte 10 — slot 11's execution route;
+/// a live slot naming it is refused until the `PMJ-DUST-GATE` ruling.
 const VENUE_NAMES: [(&str, u8); core_types::VENUE_COUNT] = [
     ("polymarket", 0),
     ("binance", 1),
@@ -166,6 +169,7 @@ const VENUE_NAMES: [(&str, u8); core_types::VENUE_COUNT] = [
     ("mexc", 7),
     ("hyperevm", 8),
     ("hypercall", 9),
+    ("jupiter", 10),
 ];
 
 /// Resolve a venue spelling to its `VenueId` byte.
@@ -1921,14 +1925,17 @@ mode = "paper"
         }
         assert_eq!(venue_id_from_name("nope"), None);
         // MX2: `mexc` is byte 7. HYPARB: `hyperevm` is byte 8. HC1:
-        // `hypercall` is byte 9; the first unassigned byte is now 10.
+        // `hypercall` is byte 9. PMJ J3: `jupiter` is byte 10; the first
+        // unassigned byte is now 11.
         assert_eq!(venue_id_from_name("mexc"), Some(7));
         assert_eq!(venue_name_from_id(7), Some("mexc"));
         assert_eq!(venue_id_from_name("hyperevm"), Some(8));
         assert_eq!(venue_name_from_id(8), Some("hyperevm"));
         assert_eq!(venue_id_from_name("hypercall"), Some(9));
         assert_eq!(venue_name_from_id(9), Some("hypercall"));
-        assert_eq!(venue_name_from_id(10), None);
+        assert_eq!(venue_id_from_name("jupiter"), Some(10));
+        assert_eq!(venue_name_from_id(10), Some("jupiter"));
+        assert_eq!(venue_name_from_id(11), None);
         // Every name is the byte `core_types::VenueId` decodes it to.
         for (_, id) in VENUE_NAMES {
             assert!(core_types::VenueId::from_u8(id).is_some(), "byte {id}");

@@ -30,7 +30,7 @@ use clob_dispatcher::{
     CancelAllState, DispatchError, DispatchStats, HaltSignal, LiveArmCounters, OrderDispatch,
     Retired,
 };
-use core_types::{CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, SymbolId, Tick};
+use core_types::{CancelReq, ChannelEvent, DepthTopK, Fill, ModifyReq, NsTs, Order, SymbolId, Tick};
 
 /// **XMM XH4i-5 — the slot a split names when it names none**: every verb
 /// goes to `a`. The engine composes slot 3's gateway arm innermost —
@@ -172,6 +172,13 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
     fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         self.a.observe_tick(tick, now_ns);
         self.b.observe_tick(tick, now_ns);
+    }
+
+    /// PMJ J8: both arms see every rolling depth record, like every tick.
+    #[inline]
+    fn observe_depth(&mut self, depth: &DepthTopK, now_ns: NsTs) {
+        self.a.observe_depth(depth, now_ns);
+        self.b.observe_depth(depth, now_ns);
     }
 
     #[inline]

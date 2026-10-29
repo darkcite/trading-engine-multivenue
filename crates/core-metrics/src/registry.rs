@@ -29,7 +29,10 @@ pub const MAX_COUNTERS: usize = 768;
 /// gateway boot alone overflowed 384. 16 KiB more (a gauge is 128 B).
 /// 512 → 640 at PM15-2 (2026-10-17): the worst case sat at ≈ 471 and the
 /// PM15 ingress family alone is 29. 16 KiB more.
-pub const MAX_GAUGES: usize = 640;
+/// 640 → 768 at T2T T0 (2026-10-25): the worst case sat at 638 and the
+/// engine's stage family adds 20 (`engine_latency_<stage>_*`, the latency
+/// capture's pair). 16 KiB more.
+pub const MAX_GAUGES: usize = 768;
 /// Maximum metric-name length (bytes). 63 ASCII + a NUL terminator
 /// keeps `[u8; 64]` aligned on cache lines.
 pub const NAME_MAX: usize = 63;
@@ -154,7 +157,7 @@ pub struct MetricsRegistry {
 // size above is stated in these units.
 const _: () = assert!(core::mem::size_of::<Counter>() == 128);
 const _: () = assert!(core::mem::size_of::<Gauge>() == 128);
-const _: () = assert!(core::mem::size_of::<MetricsRegistry>() == 180_288);
+const _: () = assert!(core::mem::size_of::<MetricsRegistry>() == 196_672);
 
 impl MetricsRegistry {
     /// Build an empty registry: 176 KiB of zero-init data (768 counters and

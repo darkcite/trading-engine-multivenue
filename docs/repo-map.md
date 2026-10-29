@@ -21,6 +21,11 @@ summary). Update it when a crate is added, linked or unlinked.
   `options-select`, `research-artifacts`.
 - `crates/engine` — the single-threaded loop; `crates/engine-snapshot` —
   the seqlock `/state` snapshot; `crates/tui`.
+- `crates/notify` — `multivenue-notify`, the one-way Telegram notifier
+  (NOTIFY lane, N-DOCTRINE): its own launchd job per instance, reading
+  `/state` and the run captures, relaying the AI-session inbox; never
+  linked into the engine. Contract `notify.toml.example`; risk policy
+  "NOTIFY — N-DOCTRINE".
 - `crates/exec-router` + `crates/exec-hyperliquid` + `crates/signer-eip712`
   + `crates/clob-dispatcher` — the execution lane (see CURRENT STATE).
   `crates/exec-gateway` — the venue-agnostic async order-gateway kit (XMM

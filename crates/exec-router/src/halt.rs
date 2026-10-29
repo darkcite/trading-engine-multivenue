@@ -14,8 +14,25 @@
 //! | asset-id refusal streak | `halt_on_asset_refusal_streak` | LAW E-4 — a member quoting an instance that has rolled |
 //! | request budget floor | `request_budget_floor` (E4) | the address allowance is spent; the next order may not go |
 //! | reconciliation drift | `halt_on_recon_drift_usd_1e6` | our position and the venue's disagree by real money |
-//! | reconciliation stale | `halt_on_recon_stale_ms` | the reconciler has not AGREED with the venue for this long — the safety net is dark |
-//! | user-event stream gap | `halt_on_ws_gap_ms` | LAW E-5 — the WS is the FILL, so a gap is trading blind |
+//!
+//! **O-WSG1..4 (operator rulings, 2026-10-20) — the two connectivity
+//! conditions HOLD, they do not halt.** A venue whose WebSocket goes
+//! silent for minutes (Hyperliquid, 10-17 21:21Z and 10-18 05:14Z) is not
+//! an arm that has become untrustworthy; it is an arm that cannot see.
+//! The slot stops PLACING while it cannot see, and trades again by itself
+//! once it can — the stream back (its gap under the number again) AND a
+//! reconciliation built from reads issued since then agreeing with the
+//! venue ([`hold_clear`]). Nothing is
+//! written to `exec.HALT` and no operator is needed:
+//!
+//! | hold | threshold | what it means |
+//! |---|---|---|
+//! | user-event stream gap | `halt_on_ws_gap_ms` (5 s on slot 3, O-WSG2) | LAW E-5 — the WS is the FILL, so a gap is trading blind until it ends and the arm has re-read |
+//! | reconciliation stale | `halt_on_recon_stale_ms` | the reconciler has not AGREED with the venue for this long — the safety net is dark until it agrees again (O-WSG3) |
+//!
+//! The keys keep their names so every artifact still parses; what they
+//! now drive is the hold. A real DISAGREEMENT with the venue after the
+//! re-read is still `ReconDrift` — sticky, for a human.
 //!
 //! **BX3** — two venue VERDICTS are tested first, with no threshold: the
 //! venue restricted the account (`VenueLock`), or the arm judged its
@@ -53,6 +70,10 @@
 //!
 //! ## Sticky
 //!
+//! (The two holds above are the one exception, by operator ruling
+//! O-WSG1: a hold is not a halt, is never latched and never written to
+//! the file. Everything below is about the halt.)
+//!
 //! Nothing clears a halt in-process. There is no timeout, no
 //! half-open state and no automatic retry of the condition: a member
 //! that halted because the venue rejected fifty orders must not
@@ -62,7 +83,7 @@
 //! would otherwise resume trading into the condition, overnight,
 //! unattended.
 //!
-//! ## What a halted slot may still do
+//! ## What a halted (or held) slot may still do
 //!
 //! Cancel. Nothing else. A modify places a new order and can raise
 //! price and size — it is a submit wearing a different name — while a
@@ -89,6 +110,9 @@ pub enum HaltReason {
     /// Reconciliation drift reached `halt_on_recon_drift_usd_1e6`.
     ReconDrift = 3,
     /// The user-event stream has been quiet past `halt_on_ws_gap_ms`.
+    /// **Since O-WSG1 a HOLD** ([`hold_for`]): no trigger latches it. The
+    /// word stays so a halt file naming it — an older binary's, or an
+    /// operator's — still parses as the halt it says.
     WsGap = 4,
     /// Consecutive LAW E-4 refusals reached
     /// `halt_on_asset_refusal_streak`.
@@ -97,7 +121,8 @@ pub enum HaltReason {
     /// path. Never decided by a trigger.
     Operator = 6,
     /// No reconciliation has AGREED with the venue for
-    /// `halt_on_recon_stale_ms`.
+    /// `halt_on_recon_stale_ms`. **Since O-WSG3 a HOLD**, like
+    /// [`Self::WsGap`]; the word stays for the file.
     ReconStale = 7,
     /// E7 session bound: the account's equity at cost reached the
     /// anchor plus `halt_on_gain_usd_1e6` (judged whether or not the
@@ -341,26 +366,8 @@ pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
     if lim.recon_drift_usd_1e6 > 0 && sig.recon_drift_usd_1e6 >= lim.recon_drift_usd_1e6 {
         return HaltReason::ReconDrift;
     }
-    // `recon_age_ns == 0` is "never agreed", which the seeding
-    // interlock already refuses on — the same sentinel rule as
-    // `ws_gap_ns`. Once it HAS agreed, silence from the reconciler is
-    // the safety net going dark and is measured here.
-    if lim.recon_stale_ms > 0 && sig.recon_age_ns > 0 {
-        let age_ms = (sig.recon_age_ns / 1_000_000) as i64;
-        if age_ms >= lim.recon_stale_ms {
-            return HaltReason::ReconStale;
-        }
-    }
-    // `ws_gap_ns == 0` is "no observation", not "no gap": an arm that
-    // has never connected is not an arm that has gone quiet, and
-    // halting before the first connect would make the engine
-    // unstartable.
-    if lim.ws_gap_ms > 0 && sig.ws_gap_ns > 0 {
-        let gap_ms = (sig.ws_gap_ns / 1_000_000) as i64;
-        if gap_ms >= lim.ws_gap_ms {
-            return HaltReason::WsGap;
-        }
-    }
+    // O-WSG1/O-WSG3: a stream gap and a stale reconciliation are HOLDS
+    // (`hold_for`), judged beside this function, never latched here.
     // E7 session bound — last, because it is the operator's stopping
     // rule and not a fault: when a fault and the bound coincide the
     // fault is the thing to read. Judged whenever the arm reports
@@ -377,6 +384,62 @@ pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
         }
     }
     HaltReason::None
+}
+
+/// **O-WSG1** [`hold_for`]: the user-event stream has been down past
+/// `halt_on_ws_gap_ms`.
+pub const HOLD_WS_GAP: u8 = 1;
+/// **O-WSG3** [`hold_for`]: no reconciliation has agreed for
+/// `halt_on_recon_stale_ms`.
+pub const HOLD_RECON_STALE: u8 = 1 << 1;
+
+/// **O-WSG1..3 — the holds this signal calls for**, as `HOLD_*` bits
+/// (`0` = none).
+///
+/// The same sentinels as the halt's: `ws_gap_ns == 0` is "no observation"
+/// (an arm that never connected has not gone quiet — holding before the
+/// first connect would leave a boot unable to trade), and
+/// `recon_age_ns == 0` is "never agreed", which the seeding interlock
+/// already refuses on. A threshold of `0` is unset and holds nothing.
+/// Branch-free: both comparisons are evaluated and masked.
+#[inline]
+#[must_use]
+pub fn hold_for(sig: &HaltSignal, lim: &HaltLimits) -> u8 {
+    let gap = (lim.ws_gap_ms > 0)
+        & (sig.ws_gap_ns > 0)
+        & ((sig.ws_gap_ns / 1_000_000) as i64 >= lim.ws_gap_ms);
+    let stale = (lim.recon_stale_ms > 0)
+        & (sig.recon_age_ns > 0)
+        & ((sig.recon_age_ns / 1_000_000) as i64 >= lim.recon_stale_ms);
+    (u8::from(gap) * HOLD_WS_GAP) | (u8::from(stale) * HOLD_RECON_STALE)
+}
+
+/// **O-WSG1 — the hold's word** for `/state` and the log: the `HOLD_*`
+/// bits spelled, `"none"` for `0`.
+#[inline]
+#[must_use]
+pub const fn hold_word(bits: u8) -> &'static str {
+    match bits & (HOLD_WS_GAP | HOLD_RECON_STALE) {
+        0 => "none",
+        HOLD_WS_GAP => "ws-gap",
+        HOLD_RECON_STALE => "recon-stale",
+        _ => "ws-gap+recon-stale",
+    }
+}
+
+/// **O-WSG1 — may a held slot trade again?** No hold condition stands —
+/// the stream's gap is back under the slot's number, which a gap does only
+/// once the stream is up again (it grows while the stream is down and
+/// restarts when it returns: every arm measures it from its last good
+/// moment, and some never read exactly 0 while healthy, so "== 0" would
+/// hold them for ever) — and the arm owes no reconciliation since the
+/// stream came back (`resync_pending == 0`: what happened while it was
+/// blind has been RE-READ, orders and sheet, and agreed). The caller also
+/// waits out the slot's cancel ([`HaltState::release`]).
+#[inline]
+#[must_use]
+pub fn hold_clear(sig: &HaltSignal, lim: &HaltLimits) -> bool {
+    (sig.resync_pending == 0) & (hold_for(sig, lim) == 0)
 }
 
 /// No cancel owed for this slot.
@@ -438,21 +501,35 @@ pub struct HaltState {
     /// landed and still left orders working at the venue, which is
     /// the number an operator actually wants after an incident.
     pub cancel_all_stranded: u64,
+    /// **O-WSG1** — slots HELD on a stream gap, bit `1 << strategy_id`.
+    /// A hold is not a halt: no file, no operator, it lifts by itself
+    /// ([`Self::release`]).
+    held_gap: u16,
+    /// **O-WSG3** — slots held on a stale reconciliation, same layout.
+    held_stale: u16,
+    /// Hold edges, total — one per hold, however long it lasted.
+    pub holds: u32,
 }
 
 /// One cache line, and it must stay that way: the router reads it on
 /// every dispatch (`risk_check` step 0a) and on every idle poll, so a
 /// second line here is a second miss on the hot path.
 ///
-/// S16-3: at sixteen slots the payload is 56 of the 64 B — `reasons`
+/// S16-3: at sixteen slots the payload was 56 of the 64 B — `reasons`
 /// (16 B) at 0, `pending_cancel` (16 B) at 16, the three `u64`
-/// counters at 32..56 (at eight slots: 40 B). Thirty-two slots would be
-/// 64 + 24 = 88 B, two lines: one of the three ceilings behind S16-R1.
+/// counters at 32..56 (at eight slots: 40 B). O-WSG1 fills the line: the
+/// two hold masks at 56 and 58 and the hold edges at 60, so the hold is
+/// judged on the same line as the halt (`risk_check` step 0a). Thirty-two
+/// slots would not fit — one of the three ceilings behind S16-R1, and the
+/// `u16` masks are a fourth.
 const _: () = assert!(core::mem::size_of::<HaltState>() == 64);
 const _: () = assert!(core::mem::align_of::<HaltState>() == 64);
 const _: () = assert!(core::mem::offset_of!(HaltState, pending_cancel) == EXEC_SLOTS);
 const _: () = assert!(core::mem::offset_of!(HaltState, halts) == 32);
 const _: () = assert!(core::mem::offset_of!(HaltState, cancel_all_stranded) + 8 == 56);
+const _: () = assert!(core::mem::offset_of!(HaltState, held_gap) == 56);
+const _: () = assert!(core::mem::offset_of!(HaltState, holds) == 60);
+const _: () = assert!(EXEC_SLOTS <= 16, "the hold masks are u16");
 
 impl Default for HaltState {
     #[inline]
@@ -472,6 +549,9 @@ impl HaltState {
             halts: 0,
             cancel_all_failures: 0,
             cancel_all_stranded: 0,
+            held_gap: 0,
+            held_stale: 0,
+            holds: 0,
         }
     }
 
@@ -611,6 +691,62 @@ impl HaltState {
         self.cancel_all_stranded = self.cancel_all_stranded.saturating_add(1);
     }
 
+    // --- O-WSG1: the hold -------------------------------------------
+
+    /// **Hold `slot` for `bits` (`HOLD_*`). Returns `true` on the EDGE**
+    /// (trading → held). On the edge the slot's resting orders are asked
+    /// back exactly as a halt's are: blind, the arm cannot see them fill.
+    /// Bits met later in the same hold are added, so `/state` names every
+    /// condition the hold saw.
+    pub fn hold(&mut self, slot: usize, bits: u8) -> bool {
+        if slot >= EXEC_SLOTS || bits == 0 {
+            return false;
+        }
+        let m = 1u16 << slot;
+        let was = (self.held_gap | self.held_stale) & m != 0;
+        self.held_gap |= m * u16::from(bits & HOLD_WS_GAP != 0);
+        self.held_stale |= m * u16::from(bits & HOLD_RECON_STALE != 0);
+        if was {
+            return false;
+        }
+        if self.pending_cancel[slot] == CANCEL_NONE {
+            self.pending_cancel[slot] = CANCEL_WANTED;
+        }
+        self.holds = self.holds.saturating_add(1);
+        true
+    }
+
+    /// **Lift `slot`'s hold. Returns `true` on the edge.** Refused while
+    /// the slot's cancel is still owed or in flight: a sweep that landed
+    /// after the slot traded again would take back its first orders.
+    pub fn release(&mut self, slot: usize) -> bool {
+        if !self.is_held(slot) || self.pending_cancel[slot] != CANCEL_NONE {
+            return false;
+        }
+        let keep = !(1u16 << slot);
+        self.held_gap &= keep;
+        self.held_stale &= keep;
+        true
+    }
+
+    /// Is this slot held?
+    #[inline]
+    #[must_use]
+    pub fn is_held(&self, slot: usize) -> bool {
+        slot < EXEC_SLOTS && (self.held_gap | self.held_stale) & (1u16 << slot) != 0
+    }
+
+    /// The `HOLD_*` bits this slot is held on; `0` = not held.
+    #[inline]
+    #[must_use]
+    pub fn held_bits(&self, slot: usize) -> u8 {
+        if slot >= EXEC_SLOTS {
+            return 0;
+        }
+        let m = 1u16 << slot;
+        (u8::from(self.held_gap & m != 0) * HOLD_WS_GAP)
+            | (u8::from(self.held_stale & m != 0) * HOLD_RECON_STALE)
+    }
 }
 
 // ---------------------------------------------------------------
@@ -659,25 +795,75 @@ mod tests {
         assert_eq!(trigger_for(&s, &lim()), HaltReason::ReconDrift);
     }
 
+    /// **O-WSG3** — a stale reconciliation HOLDS (only after it has
+    /// agreed once) and never latches.
     #[test]
-    fn a_stale_reconciliation_halts_only_after_it_has_agreed_once() {
+    fn a_stale_reconciliation_holds_only_after_it_has_agreed_once_and_never_halts() {
         let mut s = healthy();
-        s.recon_age_ns = 0; // never agreed: the interlock's case, not this trigger's
-        assert_eq!(trigger_for(&s, &lim()), HaltReason::None);
+        s.recon_age_ns = 0; // never agreed: the interlock's case, not this hold's
+        assert_eq!(hold_for(&s, &lim()), 0);
         s.recon_age_ns = 299_999_000_000;
-        assert_eq!(trigger_for(&s, &lim()), HaltReason::None);
+        assert_eq!(hold_for(&s, &lim()), 0);
         s.recon_age_ns = 300_000_000_000;
-        assert_eq!(trigger_for(&s, &lim()), HaltReason::ReconStale);
+        assert_eq!(hold_for(&s, &lim()), HOLD_RECON_STALE);
+        assert_eq!(trigger_for(&s, &lim()), HaltReason::None, "a hold, not a halt");
+        assert!(!hold_clear(&s, &lim()));
+        // The word still parses: a halt file naming it is still a halt.
         assert_eq!(HaltReason::from_word("recon-stale"), HaltReason::ReconStale);
     }
 
+    /// **O-WSG1/O-WSG2** — a stream gap HOLDS at the slot's number and
+    /// never latches; the hold ends once the gap is back under it (the
+    /// stream returned) AND the arm has re-read since.
     #[test]
-    fn a_user_stream_gap_halts() {
+    fn a_user_stream_gap_holds_and_never_halts() {
+        let five = HaltLimits::new(5, 5_000_000, 5_000, 3, 300_000);
         let mut s = healthy();
-        s.ws_gap_ns = 29_999_000_000; // 29.999 s
-        assert_eq!(trigger_for(&s, &lim()), HaltReason::None);
-        s.ws_gap_ns = 30_000_000_000; // 30 s
-        assert_eq!(trigger_for(&s, &lim()), HaltReason::WsGap);
+        s.ws_gap_ns = 4_999_000_000; // 4.999 s
+        assert_eq!(hold_for(&s, &five), 0);
+        s.ws_gap_ns = 5_000_000_000; // 5 s
+        assert_eq!(hold_for(&s, &five), HOLD_WS_GAP);
+        s.ws_gap_ns = 600_000_000_000; // ten minutes of a dead venue
+        assert_eq!(hold_for(&s, &five), HOLD_WS_GAP);
+        assert_eq!(trigger_for(&s, &five), HaltReason::None, "a hold, not a halt");
+        assert_eq!(HaltReason::from_word("ws-gap"), HaltReason::WsGap);
+
+        // Back, but nothing re-read since it came back: still held.
+        s.ws_gap_ns = 0;
+        s.resync_pending = 1;
+        assert!(!hold_clear(&s, &five), "blind until re-read");
+        s.resync_pending = 0;
+        assert!(hold_clear(&s, &five));
+        // An arm that measures from its last event never reads exactly 0
+        // while healthy: under the number is back.
+        s.ws_gap_ns = 1_000_000;
+        assert!(hold_clear(&s, &five), "1 ms since the last event is a live stream");
+        s.ws_gap_ns = 5_000_000_000;
+        assert!(!hold_clear(&s, &five), "at the number it still holds");
+    }
+
+    /// A gap and a stale reconciliation at once: both bits, both words.
+    #[test]
+    fn both_holds_at_once_are_both_reported() {
+        let mut s = healthy();
+        s.ws_gap_ns = 30_000_000_000;
+        s.recon_age_ns = 300_000_000_000;
+        assert_eq!(hold_for(&s, &lim()), HOLD_WS_GAP | HOLD_RECON_STALE);
+        assert_eq!(hold_word(0), "none");
+        assert_eq!(hold_word(HOLD_WS_GAP), "ws-gap");
+        assert_eq!(hold_word(HOLD_RECON_STALE), "recon-stale");
+        assert_eq!(hold_word(HOLD_WS_GAP | HOLD_RECON_STALE), "ws-gap+recon-stale");
+    }
+
+    /// **The real faults still halt while a hold stands**: a drift found
+    /// by the re-read is the reconciler doing its job, and it is sticky.
+    #[test]
+    fn a_drift_during_a_gap_still_halts() {
+        let mut s = healthy();
+        s.ws_gap_ns = 30_000_000_000;
+        s.recon_drift_usd_1e6 = 5_000_000;
+        assert_eq!(trigger_for(&s, &lim()), HaltReason::ReconDrift);
+        assert_eq!(hold_for(&s, &lim()), HOLD_WS_GAP);
     }
 
     #[test]
@@ -765,6 +951,65 @@ mod tests {
         let none = HaltLimits::none();
         let s = HaltSignal::new(u64::MAX, i64::MAX, u32::MAX, u32::MAX, false, true, u64::MAX);
         assert_eq!(trigger_for(&s, &none), HaltReason::None);
+        assert_eq!(hold_for(&s, &none), 0, "an unset threshold holds nothing either");
+    }
+
+    /// A stream that never came up holds nothing: `0` is "no observation".
+    #[test]
+    fn a_stream_that_has_never_been_up_does_not_hold() {
+        let mut s = healthy();
+        s.ws_gap_ns = 0;
+        assert_eq!(hold_for(&s, &lim()), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // O-WSG1: the hold state
+    // -----------------------------------------------------------------
+
+    /// A hold is an edge once, asks the slot's cancel once, adds the bits
+    /// it meets, and lifts only once the cancel is confirmed.
+    #[test]
+    fn a_hold_cancels_on_its_edge_and_lifts_only_once_the_cancel_is_confirmed() {
+        let mut h = HaltState::new();
+        assert!(h.hold(3, HOLD_WS_GAP), "the edge");
+        assert!(!h.hold(3, HOLD_WS_GAP), "not twice");
+        assert!(!h.hold(3, HOLD_RECON_STALE), "a second condition is no new edge");
+        assert_eq!(h.held_bits(3), HOLD_WS_GAP | HOLD_RECON_STALE);
+        assert_eq!(h.holds, 1);
+        assert!(h.is_held(3) && !h.is_halted(3), "held, not halted");
+        assert_eq!(h.cancel_phase(3), CancelPhase::Wanted, "blind: the quotes come back");
+
+        assert!(!h.release(3), "not while the cancel is owed");
+        h.cancel_requested(3);
+        assert!(!h.release(3), "not while it is in flight");
+        h.cancel_cleared(3);
+        assert!(h.release(3), "the venue holds nothing of ours: trade again");
+        assert!(!h.is_held(3));
+        assert_eq!(h.held_bits(3), 0);
+        assert!(!h.release(3), "one edge");
+        assert!(h.reasons().iter().all(|r| !r.is_halted()), "nothing for the file");
+
+        // The next hold is a new edge.
+        assert!(h.hold(3, HOLD_RECON_STALE));
+        assert_eq!(h.holds, 2);
+    }
+
+    /// Holds are per slot, and a halt over a hold is still a halt.
+    #[test]
+    fn holds_are_per_slot_and_a_halt_outranks_a_hold() {
+        let mut h = HaltState::new();
+        assert!(h.hold(15, HOLD_WS_GAP));
+        assert!(!h.is_held(14) && !h.is_held(0));
+        assert!(!h.hold(16, HOLD_WS_GAP), "16 is out of range");
+        assert!(!h.is_held(16));
+        assert_eq!(h.held_bits(16), 0);
+        assert!(!h.hold(2, 0), "no bits, no hold");
+
+        assert!(h.latch(15, HaltReason::ReconDrift));
+        h.cancel_requested(15);
+        h.cancel_cleared(15);
+        assert!(h.release(15), "the hold lifts");
+        assert!(h.is_halted(15), "the halt does not");
     }
 
     /// The budget floor and the gateway halt are the two triggers with

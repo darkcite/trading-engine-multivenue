@@ -153,6 +153,7 @@ dependencies = [
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
+ "exec-jupiter",
  "exec-polymarket",
  "exec-router",
  "ingress-ai",
@@ -165,6 +166,8 @@ dependencies = [
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
+ "libc",
+ "memchr",
  "mio 0.8.11",
  "opt-registry",
  "pine-broker",
@@ -190,6 +193,7 @@ dependencies = [
  "strategy-latency-arb",
  "strategy-pine",
  "strategy-pm15",
+ "strategy-pmj",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -366,6 +370,7 @@ dependencies = [
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
+ "exec-jupiter",
  "exec-polymarket",
  "exec-router",
  "ingress-ai",
@@ -393,6 +398,7 @@ dependencies = [
  "research-artifacts",
  "rustls",
  "rustls-pki-types",
+ "signer-ed25519",
  "signer-eip712",
  "strategy-bin15",
  "strategy-core",
@@ -402,6 +408,7 @@ dependencies = [
  "strategy-icdp",
  "strategy-pine",
  "strategy-pm15",
+ "strategy-pmj",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -823,6 +830,7 @@ dependencies = [
  "core-latency",
  "core-net",
  "core-ring",
+ "core-time",
  "proptest",
 ]
 
@@ -882,6 +890,25 @@ dependencies = [
  "rustls",
  "secp256k1",
  "signer-eip712",
+ "zeroize",
+]
+
+[[package]]
+name = "exec-jupiter"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-crypto",
+ "core-fill",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "exec-gateway",
+ "ingress-polymarket",
+ "proptest",
+ "signer-ed25519",
  "zeroize",
 ]
 
@@ -1419,6 +1446,20 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "notify"
+version = "0.1.0"
+dependencies = [
+ "core-io",
+ "core-net",
+ "core-types",
+ "engine",
+ "engine-snapshot",
+ "exec-hyperliquid",
+ "ingress-hyperliquid",
+ "rustls",
 ]
 
 [[package]]
@@ -2132,6 +2173,8 @@ version = "0.1.0"
 dependencies = [
  "core-time",
  "core-types",
+ "getrandom 0.2.17",
+ "libc",
  "proptest",
  "secp256k1",
  "tiny-keccak",
@@ -2287,6 +2330,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-pmj"
+version = "0.1.0"
+dependencies = [
+ "core-fill",
+ "core-time",
+ "core-twaplock",
+ "core-types",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-rule-tree"
 version = "0.1.0"
 dependencies = [
@@ -2314,6 +2368,7 @@ dependencies = [
  "strategy-hyparb",
  "strategy-pine",
  "strategy-pm15",
+ "strategy-pmj",
  "strategy-vm",
  "strategy-vrp",
  "strategy-xmm",

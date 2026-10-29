@@ -159,6 +159,8 @@ pub const ACTIVATION_NS_DEFAULT: [u64; core_types::VENUE_COUNT] = [
     150 * MS, // mexc (spot binds; futures 130)
     1_000 * MS, // hyperevm — ONE BLOCK (0.983 s measured, rounded up)
     130 * MS,   // hypercall — quote-stamp feed 64 + RTT 114/2 (HC0)
+    0,          // jupiter — no book of its own (PMJ J3): slot 11's paper
+                // fills are the held law's, at the order's own delay (J4)
 ];
 
 /// Venues whose post-only makers are judged by the queue law (module
@@ -178,6 +180,7 @@ pub const QUEUE_VENUE: [bool; core_types::VENUE_COUNT] = [
     false, // mexc (data-only)
     false, // hyperevm (AMM law)
     false, // hypercall (data-only)
+    false, // jupiter (execution route, no prints)
 ];
 
 /// Whether post-only makers on model venue byte `venue` are judged by
@@ -620,7 +623,8 @@ mod tests {
                 60 * MS,
                 150 * MS,
                 1_000 * MS,
-                130 * MS
+                130 * MS,
+                0
             ]
         );
         assert_eq!(

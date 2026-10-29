@@ -24,6 +24,8 @@ fn a_set_prints_its_mask_and_its_members_in_slot_order() {
         ("vrp+ai", "50\tvrp+ai-exec+vm\n"),
         ("ai+vm", "48\tai-exec+vm\n"),
         ("bin15+xmm", "72\tbin15+xmm\n"),
+        // PMJ J4: slot 11 resolves by name (bit 11 = 2048), after slot 3.
+        ("pmj+bin15", "2056\tbin15+pmj\n"),
         ("all", "255\thyparb+vrp+xsd+bin15+ai-exec+vm+xmm+hcv\n"),
     ] {
         let out = strategy_mask(value);

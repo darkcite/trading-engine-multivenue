@@ -253,6 +253,8 @@ pub struct PmRollLaw {
     pub cmc_asset_len: u8,
     /// `cryptoMarketConfig.duration` was `"15m"`.
     pub cmc_15m: bool,
+    /// PMJ J1b: `cryptoMarketConfig.duration` was `"5m"`.
+    pub cmc_5m: bool,
     /// `cryptoMarketConfig.twapEnabled`.
     pub cmc_twap_enabled: bool,
     /// `cryptoMarketConfig.twapLookbackSeconds` ×1e9.
@@ -261,6 +263,10 @@ pub struct PmRollLaw {
     pub slug: [u8; PM_LAW_SLUG_MAX],
     /// Valid prefix of `slug`.
     pub slug_len: u8,
+    /// PMJ J1b: the market's Gamma `id` (a quoted decimal string on the
+    /// wire), 0 when absent or not one — the `<id>` of Jupiter Predict's
+    /// `POLY-<id>-<outcome>` market ids.
+    pub market_id: u64,
 }
 
 /// Longest `cryptoMarketConfig.asset` captured.
@@ -286,10 +292,12 @@ impl PmRollLaw {
         cmc_asset: [0; PM_LAW_NAME_MAX],
         cmc_asset_len: 0,
         cmc_15m: false,
+        cmc_5m: false,
         cmc_twap_enabled: false,
         cmc_twap_s_1e9: 0,
         slug: [0; PM_LAW_SLUG_MAX],
         slug_len: 0,
+        market_id: 0,
     };
 
     /// The captured `cryptoMarketConfig.asset`.
@@ -341,7 +349,8 @@ pub(crate) fn next_member<'a>(
 }
 
 /// The value at `i` must open an object; returns the position after `{`.
-fn open_object(body: &[u8], i: usize) -> Result<usize, PmDiscoveryErr> {
+/// PM15-9b: shared with [`crate::clob_law`].
+pub(crate) fn open_object(body: &[u8], i: usize) -> Result<usize, PmDiscoveryErr> {
     if body.get(i) != Some(&b'{') {
         return Err(PmDiscoveryErr::BadRow);
     }
@@ -454,6 +463,35 @@ pub(crate) fn parse_row(
             b"feeSchedule" => {
                 i = parse_fee_schedule(body, open_object(body, i)?, law)?;
             }
+            // PMJ J1b: the Gamma market id, for the rolling law only. A
+            // value that is not a quoted decimal of ≤ 19 digits leaves it
+            // 0 and is skipped — the static rows never read it, so it can
+            // never refuse one.
+            b"id" => {
+                let mut v = 0u64;
+                let mut ok = false;
+                if body.get(i) == Some(&b'"') {
+                    if let Ok((s, end)) = quoted_span(body, i) {
+                        ok = !s.is_empty() && s.len() <= 19;
+                        let mut k = 0usize;
+                        while ok && k < s.len() {
+                            let d = s[k];
+                            if d.is_ascii_digit() {
+                                v = v * 10 + u64::from(d - b'0');
+                            } else {
+                                ok = false;
+                            }
+                            k += 1;
+                        }
+                        i = end;
+                    } else {
+                        i = skip_json_value(body, i).ok_or(PmDiscoveryErr::BadRow)?;
+                    }
+                } else {
+                    i = skip_json_value(body, i).ok_or(PmDiscoveryErr::BadRow)?;
+                }
+                law.market_id = if ok { v } else { 0 };
+            }
             b"cryptoMarketConfig" => {
                 i = parse_crypto_config(body, open_object(body, i)?, law)?;
             }
@@ -554,6 +592,7 @@ fn parse_crypto_config(
             b"duration" => {
                 let (s, end) = quoted_span(body, i)?;
                 law.cmc_15m = s == b"15m";
+                law.cmc_5m = s == b"5m";
                 i = end;
             }
             b"twapEnabled" => {
@@ -630,7 +669,8 @@ fn raw_quoted_span(body: &[u8], pos: usize) -> Result<(&[u8], usize), PmDiscover
 /// [`raw_quoted_span`] for captured plain-string fields
 /// (`conditionId`): those never contain escapes on this wire, so a
 /// backslash inside the span is rejected rather than unescaped.
-fn quoted_span(body: &[u8], pos: usize) -> Result<(&[u8], usize), PmDiscoveryErr> {
+/// PM15-9b: shared with [`crate::clob_law`].
+pub(crate) fn quoted_span(body: &[u8], pos: usize) -> Result<(&[u8], usize), PmDiscoveryErr> {
     let (span, end) = raw_quoted_span(body, pos)?;
     if span.contains(&b'\\') {
         return Err(PmDiscoveryErr::BadRow);
@@ -640,8 +680,8 @@ fn quoted_span(body: &[u8], pos: usize) -> Result<(&[u8], usize), PmDiscoveryErr
 
 /// Read a bare JSON boolean at `pos`. Anything but exactly `true` /
 /// `false` (including `null` — a captured flag must be a real bool)
-/// is `BadRow`.
-fn bare_bool(body: &[u8], pos: usize) -> Result<(bool, usize), PmDiscoveryErr> {
+/// is `BadRow`. PM15-9b: shared with [`crate::clob_law`].
+pub(crate) fn bare_bool(body: &[u8], pos: usize) -> Result<(bool, usize), PmDiscoveryErr> {
     if body.len() >= pos + 4 && &body[pos..pos + 4] == b"true" {
         return Ok((true, pos + 4));
     }

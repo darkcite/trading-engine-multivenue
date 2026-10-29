@@ -14,7 +14,9 @@ single-threaded, READ-ONLY. Routes:
                              regime history (24 h) + ``declared.json`` + the
                              ``regime.toml`` bands, the latest ``pnl-<day>.json``
                              (per strategy, per regime, per ruleset) + the day
-                             series, candidates, the events ledger tail, positions
+                             series, the PMJ P&L lane's slot 9 / 11 since-start
+                             book (``worker/pm/paper-pnl.json``), candidates,
+                             the events ledger tail, positions
                              from the fills tail of the CURRENT run (the
                              ``positions`` verb's code path, marks carried at
                              cost), the config snapshot (``strategy.conf``,
@@ -62,6 +64,7 @@ import claude_worker.news.cycle
 import claude_worker.news.local_llm
 import claude_worker.news.resolve
 import claude_worker.news.store
+import claude_worker.pm_paper_pnl
 import claude_worker.pnl_report
 import claude_worker.regime
 import claude_worker.state
@@ -590,6 +593,13 @@ def news_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
     return payload
 
 
+def pm_pnl_section(multivenue_dir: pathlib.Path) -> dict[str, object] | None:
+    """The PMJ P&L lane's summary (``claude_worker.pm_paper_pnl``): slots 9
+    and 11's paper book since start, rewritten every 15 minutes; ``None``
+    before its first pass."""
+    return _load_json(multivenue_dir / "worker" / claude_worker.pm_paper_pnl.SUMMARY_FILE)
+
+
 def pnl_section(reports_dir: pathlib.Path) -> dict[str, object]:
     latest = claude_worker.pnl_report.latest_report(reports_dir)
     latest_obj = _load_json(latest) if latest is not None else None
@@ -888,6 +898,7 @@ def worker_payload(
         "compositions": compositions,
         "regime": regime_section(inputs, ts),
         "pnl": pnl_section(inputs.reports_dir),
+        "pm_pnl": pm_pnl_section(inputs.multivenue_dir),
         "candidates": candidates_section(inputs.candidates_dir),
         "events": events_tail(inputs.db_path),
         "positions": positions_section(inputs.replay_dir) if positions is None else positions,

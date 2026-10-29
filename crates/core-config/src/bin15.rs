@@ -73,7 +73,7 @@ fn err(msg: impl Into<String>) -> Bin15Error {
 /// Every key the grammar accepts. An unknown key is a REFUSAL: a
 /// typo'd `e_take_1e6` that silently took the default is a member
 /// trading an edge nobody chose.
-const BIN15_KEYS: [&str; 23] = [
+const BIN15_KEYS: [&str; 29] = [
     "families",
     "underlying",
     "tau_ns",
@@ -110,6 +110,15 @@ const BIN15_KEYS: [&str; 23] = [
     "late_usd_1e6",
     "late_sigma_k_1e3",
     "late_phi_lut",
+    // BIN15 fills (2026-10-23): absent = 0 = the law as it was.
+    "late_refire_fresh",
+    "late_limit_bound",
+    "late_max_quote_age_ms",
+    "late_lead",
+    // G26: the lead's guard; absent = 0 = no guard.
+    "late_lead_guard_1e6",
+    // PR-BIN15-P2: the price cap; absent = 0 = no cap.
+    "late_limit_max_1e6",
 ];
 
 /// BIN15 H90 G3 (2026-10-16, ruling O-GL-2): the keys of the retired arms
@@ -191,6 +200,33 @@ pub struct Bin15File {
     /// pricer's Gaussian table, cut by `claude_worker.bin15_fit late`.
     /// Empty when absent, which `late_enabled = 1` refuses.
     pub late_phi_lut: Vec<u32>,
+    /// BIN15 fills B-1: `1` = after an unfilled late IoC, fire again only
+    /// on another touch of the leg it bought on. Absent = 0.
+    pub late_refire_fresh: u8,
+    /// BIN15 fills B-3: `1` = the IoC's limit is the law's bound `p − e`
+    /// on the grid, sweeping every level up to it. Absent = 0 (the touch).
+    pub late_limit_bound: u8,
+    /// BIN15 fills B-2: the oldest favoured-leg ask (since it moved to its
+    /// price) the law fires on, ns, from `late_max_quote_age_ms` in
+    /// `[0, LATE_MAX_QUOTE_AGE_MS_LIMIT]`.
+    /// Absent = 0 = no limit.
+    pub late_max_quote_age_ns: u64,
+    /// BIN15 fills B-4 (ruling F-6): the lead book per underlying, in
+    /// `underlying`'s order — a descriptor the engine subscribes to
+    /// (`binance-usdm:btcusdt`). Its mid, through a 60 s basis onto the
+    /// mark, replaces the HL perp in the late nowcast. Empty when absent:
+    /// no lead, the law as it was. An entry may be [`LATE_LEAD_NONE`]
+    /// (`"none"`): that underlying has no lead and keeps the HL perp; an
+    /// empty string is still refused.
+    pub late_lead: Vec<String>,
+    /// BIN15 fills B-4 guard (G26): with a lead, the late law fires only
+    /// if the HL-perp nowcast agrees on the side with at least this ×1e6,
+    /// in `[0, 1_000_000)`. Absent = 0 = no guard. A guard without a lead
+    /// (no `late_lead`, or every entry `"none"`) is refused.
+    pub late_lead_guard_1e6: u32,
+    /// PR-BIN15-P2 (Anton, 2026-10-24): the dearest price ×1e6 the late law
+    /// pays, in `[0, 1e6)`. Absent = 0 = no cap.
+    pub late_limit_max_1e6: u32,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES so the
@@ -304,6 +340,15 @@ pub const LATE_SIGMA_K_1E3_DEFAULT: i64 = 1_550;
 /// short-horizon RMS.
 pub const LATE_SIGMA_K_1E3_RANGE: (i64, i64) = (250, 4_000);
 
+/// BIN15 fills B-2: the largest stated `late_max_quote_age_ms` — the
+/// late window's own ceiling ([`LATE_TAU_MAX_NS_LIMIT`]).
+pub const LATE_MAX_QUOTE_AGE_MS_LIMIT: i64 = 60_000;
+
+/// BIN15 fills B-4: the `late_lead` entry that names NO lead for its
+/// underlying — the boot leaves that underlying's lead sym `SYMBOL_ID_NONE`
+/// (the HL perp drives its late nowcast, the law as it was).
+pub const LATE_LEAD_NONE: &str = "none";
+
 /// One optional 0/1 flag; absent = 0.
 fn opt_flag(kv: &[(String, Value, usize)], key: &str) -> Result<u8, Bin15Error> {
     match opt_int(kv, key, 0)? {
@@ -379,6 +424,54 @@ fn late_keys(kv: &[(String, Value, usize)], file: &mut Bin15File) -> Result<(), 
         return Err(err(format!(
             "`late_sigma_k_1e3` must be in [{klo}, {khi}] (got {})",
             file.late_sigma_k_1e3
+        )));
+    }
+    file.late_refire_fresh = opt_flag(kv, "late_refire_fresh")?;
+    file.late_limit_bound = opt_flag(kv, "late_limit_bound")?;
+    let age_ms = opt_int(kv, "late_max_quote_age_ms", 0)?;
+    if !(0..=LATE_MAX_QUOTE_AGE_MS_LIMIT).contains(&age_ms) {
+        return Err(err(format!(
+            "`late_max_quote_age_ms` must be in [0, {LATE_MAX_QUOTE_AGE_MS_LIMIT}] (got {age_ms}) \
+             — 0 is no limit"
+        )));
+    }
+    file.late_max_quote_age_ns = age_ms as u64 * 1_000_000;
+    if kv.iter().any(|(k, _, _)| k == "late_lead") {
+        file.late_lead = strs(kv, "late_lead")?;
+        if file.late_lead.len() != file.underlying.len()
+            || file.late_lead.iter().any(String::is_empty)
+        {
+            return Err(err(format!(
+                "`late_lead` must name one lead book per `underlying` entry, in its order \
+                 (got {} for {})",
+                file.late_lead.len(),
+                file.underlying.len()
+            )));
+        }
+    }
+    let cap = opt_int(kv, "late_limit_max_1e6", 0)?;
+    file.late_limit_max_1e6 = match u32::try_from(cap) {
+        Ok(c) if c < 1_000_000 => c,
+        _ => {
+            return Err(err(format!(
+                "`late_limit_max_1e6` must be in [0, 1000000) (got {cap}) — 0 is no cap"
+            )))
+        }
+    };
+    let guard = opt_int(kv, "late_lead_guard_1e6", 0)?;
+    file.late_lead_guard_1e6 = match u32::try_from(guard) {
+        Ok(g) if g < 1_000_000 => g,
+        _ => {
+            return Err(err(format!(
+                "`late_lead_guard_1e6` must be in [0, 1000000) (got {guard})"
+            )))
+        }
+    };
+    if file.late_lead_guard_1e6 > 0 && file.late_lead.iter().all(|l| l == LATE_LEAD_NONE) {
+        return Err(err(format!(
+            "`late_lead_guard_1e6 = {}` needs a lead: `late_lead` is absent or every entry \
+             is \"{LATE_LEAD_NONE}\" — a guard on no lead guards nothing",
+            file.late_lead_guard_1e6
         )));
     }
     if kv.iter().any(|(k, _, _)| k == "late_phi_lut") {
@@ -572,6 +665,12 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         late_usd_1e6: LATE_USD_1E6_DEFAULT,
         late_sigma_k_1e3: LATE_SIGMA_K_1E3_DEFAULT,
         late_phi_lut: Vec::new(),
+        late_refire_fresh: 0,
+        late_limit_bound: 0,
+        late_max_quote_age_ns: 0,
+        late_lead: Vec::new(),
+        late_lead_guard_1e6: 0,
+        late_limit_max_1e6: 0,
     };
 
     if file.families.is_empty() || file.families.len() > BIN15_MAX_FAMILIES {
@@ -1025,6 +1124,11 @@ mod tests {
         assert_eq!(f.late_usd_1e6, 100_000_000);
         assert_eq!(f.late_sigma_k_1e3, 1_550);
         assert!(f.late_phi_lut.is_empty());
+        assert_eq!((f.late_refire_fresh, f.late_limit_bound), (0, 0), "the fills keys");
+        assert_eq!(f.late_max_quote_age_ns, 0);
+        assert!(f.late_lead.is_empty(), "no lead");
+        assert_eq!(f.late_lead_guard_1e6, 0, "no guard");
+        assert_eq!(f.late_limit_max_1e6, 0, "no cap");
         // The committed example carries none of them, so it is off too.
         let ex = parse(EXAMPLE).expect("example");
         assert_eq!(ex.late_enabled, 0);
@@ -1049,6 +1153,45 @@ mod tests {
         assert_eq!(f.late_sigma_k_1e3, 1_250);
         assert_eq!(f.late_phi_lut.len(), LATE_PHI_POINTS);
         assert_eq!(f.late_phi_lut[LATE_PHI_POINTS - 1], 1_000_000);
+    }
+
+    /// BIN15 fills (2026-10-23): the re-fire, bound and age keys round-trip
+    /// and are bounded.
+    #[test]
+    fn the_late_fills_keys_round_trip_and_are_bounded() {
+        let src = format!(
+            "{}late_refire_fresh = 1\nlate_limit_bound = 1\nlate_max_quote_age_ms = 1500\n\
+             late_limit_max_1e6 = 985000\n",
+            artifact()
+        );
+        let f = parse(&src).expect("the fills keys parse");
+        assert_eq!((f.late_refire_fresh, f.late_limit_bound), (1, 1));
+        assert_eq!(f.late_max_quote_age_ns, 1_500_000_000);
+        assert_eq!(f.late_limit_max_1e6, 985_000, "PR-BIN15-P2's cap");
+        let n = f.underlying.len();
+        let leads = vec!["\"binance-usdm:btcusdt\""; n].join(", ");
+        let g = parse(&format!("{}late_lead = [{leads}]\n", artifact())).expect("a lead per underlying");
+        assert_eq!(g.late_lead.len(), n);
+        let all_none = vec!["\"none\""; n].join(", ");
+        let h = parse(&format!("{}late_lead = [{all_none}]\n", artifact())).expect("all `none` parses");
+        assert!(h.late_lead.iter().all(|l| l == LATE_LEAD_NONE));
+        let empty = vec!["\"\""; n].join(", ");
+        let e = parse(&format!("{}late_lead = [{empty}]\n", artifact())).expect_err("an empty lead");
+        assert!(e.0.contains("one lead book per"), "{}", e.0);
+        let more = vec!["\"binance-usdm:btcusdt\""; n + 1].join(", ");
+        let e = parse(&format!("{}late_lead = [{more}]\n", artifact())).expect_err("a lead too many");
+        assert!(e.0.contains("one lead book per"), "{}", e.0);
+        for (line, want) in [
+            ("late_refire_fresh = 2", "0 or 1"),
+            ("late_limit_bound = -1", "0 or 1"),
+            ("late_max_quote_age_ms = -1", "[0, 60000]"),
+            ("late_max_quote_age_ms = 60001", "[0, 60000]"),
+            ("late_limit_max_1e6 = 1000000", "[0, 1000000)"),
+            ("late_limit_max_1e6 = -1", "[0, 1000000)"),
+        ] {
+            let e = parse(&format!("{}{line}\n", artifact())).expect_err(line);
+            assert!(e.0.contains(want), "{line}: {}", e.0);
+        }
     }
 
     /// BIN15 H90: on without a table is a refusal, and every bound holds
@@ -1099,5 +1242,44 @@ mod tests {
         assert_eq!((f.late_enabled, f.late_usd_1e6), (0, 40_000_000));
         let e = parse(&format!("{small}late_usd_1e6 = 100000000\n")).expect_err("over the cap");
         assert!(e.0.contains("cap_instance_usd_1e6 40000000"), "{}", e.0);
+    }
+
+    /// G26: `late_lead_guard_1e6` round-trips, is bounded to
+    /// `[0, 1_000_000)`, and is refused without a lead.
+    #[test]
+    fn the_lead_guard_round_trips_is_bounded_and_needs_a_lead() {
+        let n = parse(&artifact()).expect("base").underlying.len();
+        let leads = vec!["\"binance-usdm:btcusdt\""; n].join(", ");
+        let with = |extra: &str| format!("{}late_lead = [{leads}]\n{extra}\n", artifact());
+        let f = parse(&with("late_lead_guard_1e6 = 800000")).expect("a guard");
+        assert_eq!(f.late_lead_guard_1e6, 800_000);
+        let f = parse(&with("late_lead_guard_1e6 = 0")).expect("zero");
+        assert_eq!(f.late_lead_guard_1e6, 0);
+        let f = parse(&with("late_lead_guard_1e6 = 999999")).expect("the top");
+        assert_eq!(f.late_lead_guard_1e6, 999_999);
+        for bad in ["late_lead_guard_1e6 = 1000000", "late_lead_guard_1e6 = -1"] {
+            let e = parse(&with(bad)).expect_err(bad);
+            assert!(e.0.contains("[0, 1000000)"), "{}", e.0);
+        }
+        let e = parse(&format!("{}late_lead_guard_1e6 = 800000\n", artifact()))
+            .expect_err("no late_lead");
+        assert!(e.0.contains("needs a lead"), "{}", e.0);
+        let none = vec!["\"none\""; n].join(", ");
+        let e = parse(&format!(
+            "{}late_lead = [{none}]\nlate_lead_guard_1e6 = 800000\n",
+            artifact()
+        ))
+        .expect_err("every lead none");
+        assert!(e.0.contains("needs a lead"), "{}", e.0);
+        // One real lead among `none`s carries a guard.
+        let mut mixed = vec!["\"none\""; n];
+        mixed[0] = "\"binance-usdm:btcusdt\"";
+        let mixed = mixed.join(", ");
+        let f = parse(&format!(
+            "{}late_lead = [{mixed}]\nlate_lead_guard_1e6 = 800000\n",
+            artifact()
+        ))
+        .expect("one lead");
+        assert_eq!(f.late_lead_guard_1e6, 800_000);
     }
 }

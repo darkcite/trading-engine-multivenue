@@ -135,6 +135,7 @@ use exec_binance::testvenue::{
     cid, jfield, now_ms, venue_fee_1e8, SpotOrder, VOrder, VState, Venue, CM_FACE_1E6, DAPI, EPOCH, FAPI, FAPI_DUST, HMAC_SECRET,
     KEY, OLD_EPOCH, PX_MARK, SEED, SLOT, SPOT,
 };
+use exec_router::halt::{HOLD_RECON_STALE, HOLD_WS_GAP};
 use exec_router::{
     ExecMode, ExecRoute, HaltLimits, HaltReason, InstrumentSpec, RoutedDispatcher, SlotCaps, LAW_INVERSE, LAW_LINEAR, LAW_SPOT,
 };
@@ -971,13 +972,14 @@ fn an_anchor_the_journal_refused_is_flagged_and_offered_until_it_lands() {
 /// **BX11 drill — the gateway dies** (plan §5 BX11): two makers rest under
 /// the venue's dead-man (a 1 s countdown, renewed every 200 ms heartbeat);
 /// the gateway thread stops WITHOUT its sweep. Its pulse stops: the slot
-/// halts `WsGap` at its 600 ms `ws_gap_ms`; and the venue's countdown,
+/// HOLDS on the gap at its 600 ms `ws_gap_ms` (O-WSG1: a hold, never a
+/// halt); and the venue's countdown,
 /// renewed no more, fires and cancels both — the BX13 R0 bar "the
 /// dead-man fired", on the loopback. Break-and-watch: a venue whose
 /// countdown never fires leaves both resting (the drill's own check), and
 /// an arm that kept its last pulse fresh would not halt.
 #[test]
-fn a_dead_gateway_halts_ws_gap_and_the_venues_countdown_cancels_the_makers() {
+fn a_dead_gateway_holds_on_the_gap_and_the_venues_countdown_cancels_the_makers() {
     let venue = Venue::start();
     let o = Opts { countdown_ms: 1_000, halts: HaltLimits::new(0, 0, 600, 0, 0), ..Opts::new(60_000_000_000, 300) };
     let rig = Rig::boot_full(&venue, o);
@@ -994,7 +996,8 @@ fn a_dead_gateway_halts_ws_gap_and_the_venues_countdown_cancels_the_makers() {
         thread::sleep(Duration::from_millis(5));
     }
     let died = Instant::now();
-    e.until("the WsGap halt", |e| e.d.halt().reason(SLOT as usize) == HaltReason::WsGap);
+    e.until("the gap hold", |e| e.d.halt().held_bits(SLOT as usize) & HOLD_WS_GAP != 0);
+    assert_eq!(e.d.halt().reason(SLOT as usize), HaltReason::None, "a hold, not a halt");
     e.until_within("the countdown fired", Duration::from_secs(5), |_| {
         venue.with(|v| v.countdown_fired == 1 && !v.orders.iter().any(|o| o.open() && !o.cm))
     });
@@ -1004,12 +1007,12 @@ fn a_dead_gateway_halts_ws_gap_and_the_venues_countdown_cancels_the_makers() {
 
 /// **BX11 drill — reconciliation withheld** (plan §5 BX11): a classic
 /// arm whose cycle cannot read the open orders (the listing answers 500):
-/// the cycles fail, none reconciles, and the slot halts `ReconStale` at its
-/// 1.5 s `recon_stale_ms` — the router-level halt for a classic account (a
-/// unified one's is the test above's). Break-and-watch: a failed listing
+/// the cycles fail, none reconciles, and the slot HOLDS stale at its
+/// 1.5 s `recon_stale_ms` (O-WSG3: a hold, never a halt) — the router-level
+/// hold for a classic account (a unified one's is the test above's). Break-and-watch: a failed listing
 /// judged as an empty one would keep the cycles reconciling.
 #[test]
-fn a_withheld_reconciliation_halts_a_classic_arm_stale() {
+fn a_withheld_reconciliation_holds_a_classic_arm_stale() {
     let venue = Venue::start();
     let rig = Rig::boot_full(&venue, Opts { halts: HaltLimits::new(0, 0, 0, 0, 1_500), ..Opts::new(60_000_000_000, 300) });
     let mut e = rig.e;
@@ -1021,7 +1024,8 @@ fn a_withheld_reconciliation_halts_a_classic_arm_stale() {
     venue.with(|v| v.recon_down = true);
     e.until("the cycles fail", |e| gw(e, exec_binance::arm::GW_RECON_FAILED) >= f0 + 2);
     let ok1 = gw(&e, exec_binance::arm::GW_RECON_OK);
-    e.until("the stale halt", |e| e.d.halt().reason(SLOT as usize) == HaltReason::ReconStale);
+    e.until("the stale hold", |e| e.d.halt().held_bits(SLOT as usize) & HOLD_RECON_STALE != 0);
+    assert_eq!(e.d.halt().reason(SLOT as usize), HaltReason::None, "a hold, not a halt");
     assert!(gw(&e, exec_binance::arm::GW_RECON_OK) <= ok1 + 1, "no cycle reconciles without the listing");
     venue.with(|v| v.recon_down = false);
     let rig = Rig { e, ..rig };
@@ -2065,10 +2069,10 @@ fn unified_venue(venue: &Venue, mode: AccountMode) -> Opts {
 /// BX7 (the risk review's R2, N8): the unified account is the cycle's last
 /// step — papi's in Portfolio Margin, SAPI's in PM Pro — and an answer that
 /// is not a 200 that scans fails the cycle, so it never reports reconciled
-/// on a margin and a status unread and the slot halts as stale.
+/// on a margin and a status unread and the slot holds as stale (O-WSG3).
 /// Break-and-watch: judging the cycle before the read kept it reconciled
 /// through the outage.
-fn an_unread_unified_account_halts_stale(mode: AccountMode) {
+fn an_unread_unified_account_holds_stale(mode: AccountMode) {
     let venue = Venue::start();
     let o = unified_venue(&venue, mode);
     let rig = Rig::boot_full(&venue, Opts { halts: HaltLimits::new(0, 0, 0, 0, 1_500), ..o });
@@ -2081,7 +2085,8 @@ fn an_unread_unified_account_halts_stale(mode: AccountMode) {
     venue.with(|v| v.unified_down = true);
     e.until("the cycles fail", |e| gw(e, exec_binance::arm::GW_RECON_FAILED) >= f0 + 2);
     let ok1 = gw(&e, exec_binance::arm::GW_RECON_OK);
-    e.until("the stale halt", |e| e.d.halt().reason(SLOT as usize) == HaltReason::ReconStale);
+    e.until("the stale hold", |e| e.d.halt().held_bits(SLOT as usize) & HOLD_RECON_STALE != 0);
+    assert_eq!(e.d.halt().reason(SLOT as usize), HaltReason::None, "a hold, not a halt");
     assert!(gw(&e, exec_binance::arm::GW_RECON_OK) <= ok1 + 1, "no cycle reconciles without the unified account");
     venue.with(|v| v.unified_down = false);
     let rig = Rig { e, ..rig };
@@ -2089,13 +2094,13 @@ fn an_unread_unified_account_halts_stale(mode: AccountMode) {
 }
 
 #[test]
-fn an_unread_unified_account_fails_the_cycle_and_halts_stale() {
-    an_unread_unified_account_halts_stale(AccountMode::Pm);
+fn an_unread_unified_account_fails_the_cycle_and_holds_stale() {
+    an_unread_unified_account_holds_stale(AccountMode::Pm);
 }
 
 #[test]
-fn an_unread_pm_pro_unified_account_fails_the_cycle_and_halts_stale() {
-    an_unread_unified_account_halts_stale(AccountMode::PmPro);
+fn an_unread_pm_pro_unified_account_fails_the_cycle_and_holds_stale() {
+    an_unread_unified_account_holds_stale(AccountMode::PmPro);
 }
 
 /// BX7 (the risk review's N5): a refused boot judges nothing more — a

@@ -51,7 +51,8 @@ files predate it (see `docs/migration.md`).
 |     40 |     8 | ask_qty       | `i64` Qty        | fixed-point ×1e6                       |
 |     48 |     1 | venue         | `u8` VenueId     | producing venue (v2+; garbage in v1)   |
 |     49 |     1 | flags         | `u8`             | v3: bit0 `TICK_FLAG_STALE` (the ingress judged the quote stale against the venue's `stale_after_ms` — captured, but never a signal, a fill, or a mark), bit1 `TICK_FLAG_VENUE_TIME_SENTINEL` (venue time inherited from the connection's sentinel stream — Binance spot `aggTrade` — not this message). v2: zeroed pad; v1: garbage |
-|     50 |     6 | _pad          | `[u8; 6]`        | explicit, zeroed                       |
+|     50 |     2 | _pad          | `[u8; 2]`        | explicit, zeroed (was `[u8; 6]` at 50 until T2T T0) |
+|     52 |     4 | rx_lag_ns     | `u32`            | **T2T T0 (2026-10-25)**: ns from the ingress read turn that delivered the quote's frame to `ts_ns` — the read, the TLS decrypt, the WebSocket deframe and the parse, plus any frame parsed ahead of it in the same turn. 0 = not measured: every venue but Hyperliquid, and every capture written before T0 (the bytes were zeroed pad). Saturates at `u32::MAX` (~4.3 s). Wire-additive; the header version stays 3 |
 |     56 |     8 | venue_time_ms | `u64`            | v3: venue timestamp ms (venue clock); 0 = unknown (VT2 lists the per-venue source field). v2: zeroed pad; v1: garbage |
 
 Constructors: `Tick::new` (venue time unknown, flags 0 — the v2 shape,
@@ -122,6 +123,31 @@ first (a member takes the repeat as a no-op).
 |     30 |     1 | kind          | `u8`           | 1 RESTING (a post-only ACK) · 2 REJECTED · 3 CANCELED · 4 FILLED (terminal); 0 never produced |
 |     31 |     1 | reason        | `u8`           | 0 none · 1 cancel requested · 2 replaced · 3 expired · 4 bad ALO px · 5 self-trade · 6 margin · 7 open-interest cap · 8 scheduled cancel · 9 reduce-only · 10 tick or lot · 11 min notional · 255 other |
 |     32 |    32 | _pad          | `[u8; 32]`     | explicit, zeroed                             |
+
+### `T2tRecord` — 64 bytes (T2T T0, 2026-10-25; PMLR `slot_kind = 10`, `engine-latency.pmlr`)
+
+One order's in-process path, engine side: the engine stamps one in
+`EngineCtx::submit` for every order a dispatcher TOOK (refusals are
+counters only, as for `engine-orders.pmlr`), on the engine's monotonic
+clock; a 0 stamp was not measured. The stages, in order: `rx_ns` →
+`tick_ns` the ingress parse; → `deq_ns` the ring and the engine's pop; →
+`submit_ns` the member; → `routed_ns` the dispatcher (live: the router's
+clamps and the arm's ring push; paper: the paper book). The same stages
+are histograms on `/metrics` (`engine_latency_<stage>_{p50,p99,p999,max}_ns`).
+
+| offset | bytes | field       | type           | notes                                        |
+| -----: | ----: | ----------- | -------------- | -------------------------------------------- |
+|      0 |     8 | submit_ns   | `u64` NsTs     | `ctx.submit` entry — the ordering key at offset 0, as in every slot kind (append order is submit order) |
+|      8 |     8 | client_oid  | `u64`          | the order's client id                        |
+|     16 |     8 | rx_ns       | `u64` NsTs     | the read turn of the triggering tick (`ts_ns − rx_lag_ns`); 0 when the callback was not a tick or the venue does not stamp it |
+|     24 |     8 | tick_ns     | `u64` NsTs     | the triggering tick's `ts_ns`; 0 when the callback was not a tick |
+|     32 |     8 | deq_ns      | `u64` NsTs     | the engine's clock at the pop of the item the callback ran on (`ctx.now`) |
+|     40 |     8 | routed_ns   | `u64` NsTs     | the dispatcher returned, having taken the order |
+|     48 |     8 | order_ns    | `u64` NsTs     | `Order::ts_ns`, the member's own stamp (bin15: the tick's; most members: `ctx.now_ns()`) |
+|     56 |     4 | sym         | `u32` SymbolId | the order's symbol                           |
+|     60 |     1 | venue       | `u8` VenueId   | the order's venue                            |
+|     61 |     1 | strategy_id | `u8`           | the order's strategy slot                    |
+|     62 |     2 | _pad        | `[u8; 2]`      | explicit, zeroed                             |
 
 ### `Fill` — 64 bytes (layout amended X1, pre-first-capture — see docs/migration.md)
 
@@ -722,7 +748,9 @@ Engine-side single-file sinks (`core_io::SlotCapture`) in the same
 run dir: `engine-fills.pmlr` (kind 2, Phase 8f — every fill
 dispatched to `Strategy::on_fill`, venue lanes + dispatcher pump),
 `engine-orders.pmlr` (kind 3, M4.1 — every order ACCEPTED by the
-dispatcher via `ctx.submit`; refusals are counters only), and
+dispatcher via `ctx.submit`; refusals are counters only),
+`engine-latency.pmlr` (kind 10, T2T T0 — one `T2tRecord` per accepted
+order, the same set as `engine-orders.pmlr`), and
 `ai-cmds.pmlr` (kind 4, written by `ingress-ai`).
 
 BX0, appended 2026-09-23 — **Binance (`bn`) market data re-lit; no
@@ -961,7 +989,7 @@ Header:
 | -----: | ----: | ------------ | ---------------------------------------- |
 |      0 |     4 | magic        | `b"PMLR"`                                |
 |      4 |     2 | version      | `u16` — current = **3** (VT1); readers accept ≤ 3 |
-|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e), 6=OptSummary (M2.3), 7=DepthTopK (WS10-B), 8=ExecRecord (BX6), 9=OrderEvent (XMM XH5d) |
+|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e), 6=OptSummary (M2.3), 7=DepthTopK (WS10-B), 8=ExecRecord (BX6), 9=OrderEvent (XMM XH5d), 10=T2tRecord (T2T T0) |
 |      7 |     1 | _pad0        |                                          |
 |      8 |     8 | epoch_ns     | wall-clock ns at file open               |
 |     16 |    48 | _reserved    |                                          |

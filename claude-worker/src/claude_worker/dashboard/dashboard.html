@@ -92,7 +92,7 @@ const VALUES = {
 // reserved (no member). Every per-slot array is walked by ITS OWN length,
 // never by this table's.
 const SLOT_NAMES = ['hyparb','vrp','xsd','bin15','ai-exec','vm','xmm','hcv',
-  'reserved','pm15','reserved','reserved','reserved','reserved','reserved','reserved'];
+  'reserved','pm15','reserved','pmj','reserved','reserved','reserved','reserved'];
 // Slots 0–7 keep their colours; 8–15 got eight distinguishable new ones.
 const SLOT_COLORS = ['#e2b13c','#8a93a6','#5b9cf5','#39c26c','#e25b4c','#c78cf5','#4cc3e2','#8a93a6',
   '#f08c3c','#e26fae','#9fd356','#3cc9a0','#b5895a','#7a7ff0','#d4d46a','#f2a2a2'];
@@ -234,6 +234,15 @@ function renderRegime() {
 
 // ---- strategies ----
 function pnlByLabel() { const out = {}; const L = W && W.pnl && W.pnl.latest; if (L && L.strategies) for (const r of L.strategies) out[r.label] = r; return out; }
+// PMJ J9: slots 9 / 11 are binaries Polymarket settles; audit-pnl's day report
+// settles only HIP-4 rolls (it marks these out), so their fills and net come
+// from the settled ledger (W.pm_pnl), one value per fill-law segment.
+function pmLedgerSlot(slot) { const L = W && W.pm_pnl; return L && L.slots ? L.slots[String(slot)] || null : null; }
+function pmSegCells(S) {
+  const g = S.segments || [];
+  return [g.map(x => `<span class="dim">${esc(x.segment)}</span> ${n(x.settled, 0)}`).join(' · '),
+          g.map(x => `<span class="dim">${esc(x.segment)}</span> ${usd(x.net_usd)}`).join(' · ') + ' <span class="dim">settled</span>'];
+}
 function renderStrategies() {
   if (!E) { set('strat', '<span class="muted">n/a</span>'); return; }
   const by = pnlByLabel();
@@ -241,16 +250,39 @@ function renderStrategies() {
   const idle = E.slots.length - shown.length;
   const rows = shown.map(s => {
     const p = by[s.name];
-    const ladder = p && p.fee_ladder_net_usd ? p.fee_ladder_net_usd.map(v => usd(v)).join(' / ') : '<span class="dim">—</span>';
+    const led = (s.slot === 9 || s.slot === 11) ? pmLedgerSlot(s.slot) : null;
+    const cells = led ? pmSegCells(led) : null;
+    const ladder = cells ? cells[1] : p && p.fee_ladder_net_usd ? p.fee_ladder_net_usd.map(v => usd(v)).join(' / ') : '<span class="dim">—</span>';
     return [s.slot, esc(s.name), s.configured ? 'yes' : '<span class="dim">no</span>', s.enabled ? '<span class="ok">on</span>' : '<span class="dim">off</span>',
       `<span class="${s.gate === 0 ? 'ok' : s.gate === 2 ? 'bad' : 'warn'}">${GATE[s.gate]}</span>${s.label_terms ? ` <span class="dim">(${s.label_terms} terms, ${s.label_off ? 'hard' : 'soft'})</span>` : ''}`,
       n(s.orders_emitted, 0), n(s.orders_dropped, 0),
       s.name === 'vm' ? n(E.vm.fires, 0) : s.name === 'xmm' && E.xmm ? n(E.xmm.placed, 0) : '<span class="dim">—</span>',
-      p ? n(p.fills, 0) : '<span class="dim">—</span>', ladder];
+      cells ? cells[0] : p ? n(p.fills, 0) : '<span class="dim">—</span>', ladder];
   });
   set('strat-sub', `${E.boot.strategy_kind} · latest report ${W && W.pnl && W.pnl.latest ? esc(W.pnl.latest.day) : '—'}`);
   const idleNote = idle ? `<div class="muted">+${idle} reserved slot${idle === 1 ? '' : 's'} idle (/state v${esc(String(E.v))})</div>` : '';
-  set('strat', table(['slot','member','cfg','on','gate','orders','drop','fires','fills','net @0/1/tier'], rows, [5,6,7,8]) + idleNote + xmmBlock() + pm15Block());
+  set('strat', table(['slot','member','cfg','on','gate','orders','drop','fires','fills','net @0/1/2 bps'], rows, [5,6,7,8]) + idleNote + xmmBlock() + pm15Block() + pmjBlock());
+}
+
+// ---- pmj (slot 11, PMJ J4: H90 on the 5-minute families through Jupiter;
+// PAPER) — from /metrics: the member's and the 5-minute ingress's counters
+// (engine_pmj_*, engine_ingress_pm5_*) ----
+function pmjBlock() {
+  if (!PM || PM.engine_pmj_rolls_total === undefined) return '<div class="muted" style="margin-top:6px">pmj: <span class="dim">n/a (no engine_pmj_* on /metrics)</span></div>' + `<div class="kv">${pmLedger('11')}</div>`;
+  const g = k => PM['engine_pmj_' + k];
+  const i = k => PM['engine_ingress_pm5_' + k];
+  const c = v => n(v, 0);
+  const d = v => n(v / 1e6, 2);
+  const must0 = v => v ? `<span class="bad">${c(v)}</span>` : '0';
+  return `<div class="kv" style="margin-top:6px"><div>pmj (slot 11, Jupiter · PAPER)</div><div>markets live ${c(g('markets_live'))} · rolls ${c(g('rolls_total'))}, settled ${c(g('rolls_settled_total'))} · ${g('halted') ? '<span class="bad">HALTED</span>' : '<span class="ok">running</span>'}</div>` +
+    `<div>strikes computed / missing</div><div>${c(g('strikes_computed_total'))} / ${c(g('strikes_missing_total'))}</div>` +
+    `<div>priced · skipped: persist / book / book old / law / price (floor) / cap / side cap</div><div>${c(g('reprices_total'))} · ${c(g('skip_persist_total'))} / ${c(g('skip_book_total'))} / ${c(g('skip_book_old_total'))} / ${c(g('skip_law_total'))} / ${c(g('skip_price_total'))} / ${c(g('skip_cap_total'))} / ${c(g('skip_side_total'))}</div>` +
+    `<div>takes submitted / filled / unfilled · fills (late)</div><div>${c(g('takes_submitted_total'))} / ${c(g('takes_filled_total'))} / ${c(g('takes_unfilled_total'))} · ${c(g('fills_total'))} (${c(g('late_fills_total'))})</div>` +
+    `<div>settled won / lost / unknown</div><div>${c(g('settled_won_total'))} / ${c(g('settled_lost_total'))} / ${c(g('settled_unknown_total'))}</div>` +
+    `<div>session P&amp;L (this boot) · fees (2×) · bought · open cost</div><div>${usd(g('pnl_usd_1e6') / 1e6)} · ${d(g('fees_usd_1e6'))} · ${d(g('bought_usd_1e6'))} · ${d(g('open_cost_usd_1e6'))}</div>` +
+    `<div>5 m ingress: slots bound · ticks · marks · reconnects market / rtds</div><div>${c(i('slots_bound'))} · ${c(i('ticks_total'))} · ${c(i('marks_total'))} · ${c(i('market_reconnects_total'))} / ${c(i('rtds_reconnects_total'))}</div>` +
+    `<div>must stay 0: parse errors / unknown fills / refused submits / unknown rolls</div><div>${must0(i('parse_errors_total'))} / ${must0(g('unknown_fills_total'))} / ${must0(g('submit_refused_total'))} / ${must0(g('rolls_unknown_total'))}</div>` +
+    `<div>arm</div><div class="dim">paper — the Jupiter arm is not built (PAPER only until a PMJ-DUST-GATE ruling)</div>` + pmLedger('11') + '</div>';
 }
 
 // ---- xmm (slot 6, XMM XH3; /state schema 2 — tolerant of an older engine) ----
@@ -287,12 +319,50 @@ function parseProm(text) {
     const sp = line.lastIndexOf(' ');
     if (sp < 0) continue;
     const name = line.slice(0, sp);
-    if (name.startsWith('engine_pm15_') || name.startsWith('engine_ingress_pm15_')) out[name] = Number(line.slice(sp + 1));
+    if (name.startsWith('engine_pm15_') || name.startsWith('engine_ingress_pm15_') ||
+        name.startsWith('engine_pmj_') || name.startsWith('engine_ingress_pm5_')) out[name] = Number(line.slice(sp + 1));
   }
   return out;
 }
+// ---- PMJ P&L lane: slot 9 / 11 paper book since start, settled on the venue's
+// result every 15 min (claude_worker.pm_paper_pnl → worker/pm/paper-pnl.json,
+// served as W.pm_pnl). One line per fill-law segment, never summed across. ----
+// R-PMJ-S62: fills at or above the 0.90 entry floor apart from those below it
+// (bought after the price fell during the judge delay).
+function pmFloorCell(g) {
+  const a = g.at_or_above, b = g.below_floor;
+  if (!a || !b) return '<span class="dim">—</span>';
+  return `≥0.90 ${n(a.settled, 0)} (${n(a.won, 0)}/${n(a.lost, 0)}) ${usd(a.net_usd)} · <0.90 ${n(b.settled, 0)} (${n(b.won, 0)}/${n(b.lost, 0)}) ${usd(b.net_usd)}`;
+}
+function pmLedger(sid) {
+  const L = W && W.pm_pnl;
+  const S = L && L.slots && L.slots[sid];
+  if (!S) return '<div>ledger since start</div><div class="dim">n/a (no worker/pm/paper-pnl.json yet)</div>';
+  const out = [];
+  for (const g of S.segments || []) {
+    const ev = g.ev_pct === null || g.ev_pct === undefined ? '' : ` · ${n(g.ev_pct, 2)} %/$`;
+    out.push(`<div>ledger · ${esc(g.segment)} <span class="dim">since ${esc(g.from_utc)}</span></div>` +
+      `<div>${n(g.settled, 0)} settled (${n(g.won, 0)} won / ${n(g.lost, 0)} lost) · stake $${n(g.stake_usd, 2)} · fees ${n(g.fees_usd, 2)} · net ${usd(g.net_usd)}${ev} · max DD ${n(g.max_drawdown_usd, 2)} · open ${n(g.open, 0)} ($${n(g.open_cost_usd, 2)})</div>`);
+    if (g.below_floor && g.at_or_above) out.push(`<div class="dim">&nbsp;&nbsp;${pmFloorCell(g)}</div>`);
+    if ((g.by_family || []).length) {
+      out.push(`<div class="dim">&nbsp;&nbsp;by family</div><div class="dim">${g.by_family.map(f => `${esc(f.family)} ${n(f.settled, 0)}: ${usd(f.net_usd)}`).join(' · ')}</div>`);
+    }
+  }
+  const c = S.counts || {};
+  const flag = (v, cls) => v ? `<span class="${cls}">${n(v, 0)}</span>` : '0';
+  // A pass every 15 min: older than 40 min means the lane stopped (refused, crashed, unloaded).
+  const ageMin = (Date.now() - Date.parse(L.generated_utc || '')) / 60000;
+  const pass = `<span class="${ageMin > 40 || isNaN(ageMin) ? 'warn' : 'dim'}">pass ${esc(L.generated_utc || '?')}</span>`;
+  out.push(`<div>labels capture / Gamma · disagree · awaiting / unlabelled · must stay 0: unmapped / venue fills / unreadable runs</div>` +
+    `<div>${n(c.label_capture || 0, 0)} / ${n(c.label_gamma || 0, 0)} · ${flag(c.gamma_disagree, 'bad')} · ${n(c.awaiting || 0, 0)} / ${flag(c.unlabelled, 'warn')} · ${flag(c.unmapped, 'bad')} / ${flag(c.venue_fills, 'bad')} / ${flag((L.unreadable || []).length, 'bad')} · ${pass}</div>`);
+  if ((S.recent || []).length) {
+    out.push(`<div class="dim">&nbsp;&nbsp;last settled</div><div class="dim">${S.recent.map(r => `${esc(String(r.window_end_utc).slice(11, 16))} ${esc(r.family)} ${esc(r.leg)} ${n(r.qty, 2)}@${n(r.px, 3)} ${r.won ? 'won' : 'lost'} ${usd(r.pnl_usd)}`).join(' · ')}</div>`);
+  }
+  return out.join('');
+}
+
 function pm15Block() {
-  if (!PM || PM.engine_pm15_rolls_total === undefined) return '<div class="muted" style="margin-top:6px">pm15: <span class="dim">n/a (no engine_pm15_* on /metrics)</span></div>';
+  if (!PM || PM.engine_pm15_rolls_total === undefined) return '<div class="muted" style="margin-top:6px">pm15: <span class="dim">n/a (no engine_pm15_* on /metrics)</span></div>' + `<div class="kv">${pmLedger('9')}</div>`;
   const g = k => PM['engine_pm15_' + k];
   const i = k => PM['engine_ingress_pm15_' + k];
   const c = v => n(v, 0);
@@ -306,12 +376,12 @@ function pm15Block() {
     `<div>account worth · anchor · drift · redeemed (dropped)</div><div>${d(a('worth_usd_1e6'))} · ${d(a('anchor_usd_1e6'))} · ${d(a('drift_usd_1e6'))} · ${c(w('redeemed_total'))} (${must0(w('redeem_dropped_total'))})</div>`;
   return `<div class="kv" style="margin-top:6px"><div>pm15 (slot 9)</div><div>markets live ${c(g('markets_live'))} · rolls ${c(g('rolls_total'))}, settled ${c(g('rolls_settled_total'))} · ${g('halted') ? '<span class="bad">HALTED</span>' : '<span class="ok">running</span>'}</div>` +
     `<div>strikes computed / missing</div><div>${c(g('strikes_computed_total'))} / ${c(g('strikes_missing_total'))}</div>` +
-    `<div>priced · skipped: persist / book / book old / law / price / cap</div><div>${c(g('reprices_total'))} · ${c(g('skip_persist_total'))} / ${c(g('skip_book_total'))} / ${c(g('skip_book_old_total'))} / ${c(g('skip_law_total'))} / ${c(g('skip_price_total'))} / ${c(g('skip_cap_total'))}</div>` +
+    `<div>priced · skipped: persist / book / book old / law / price / cap / side cap</div><div>${c(g('reprices_total'))} · ${c(g('skip_persist_total'))} / ${c(g('skip_book_total'))} / ${c(g('skip_book_old_total'))} / ${c(g('skip_law_total'))} / ${c(g('skip_price_total'))} / ${c(g('skip_cap_total'))} / ${c(g('skip_side_total'))}</div>` +
     `<div>takes submitted / filled / unfilled · fills (late)</div><div>${c(g('takes_submitted_total'))} / ${c(g('takes_filled_total'))} / ${c(g('takes_unfilled_total'))} · ${c(g('fills_total'))} (${c(g('late_fills_total'))})</div>` +
     `<div>settled won / lost / unknown</div><div>${c(g('settled_won_total'))} / ${c(g('settled_lost_total'))} / ${c(g('settled_unknown_total'))}</div>` +
-    `<div>P&amp;L · fees · bought · open cost</div><div>${usd(g('pnl_usd_1e6') / 1e6)} · ${d(g('fees_usd_1e6'))} · ${d(g('bought_usd_1e6'))} · ${d(g('open_cost_usd_1e6'))}</div>` +
+    `<div>session P&amp;L (this boot) · fees · bought · open cost</div><div>${usd(g('pnl_usd_1e6') / 1e6)} · ${d(g('fees_usd_1e6'))} · ${d(g('bought_usd_1e6'))} · ${d(g('open_cost_usd_1e6'))}</div>` +
     `<div>ingress: slots bound · ticks · marks · reconnects market / rtds</div><div>${c(i('slots_bound'))} · ${c(i('ticks_total'))} · ${c(i('marks_total'))} · ${c(i('market_reconnects_total'))} / ${c(i('rtds_reconnects_total'))}</div>` +
-    `<div>must stay 0: parse errors / unknown fills / refused submits / unknown rolls</div><div>${must0(i('parse_errors_total'))} / ${must0(g('unknown_fills_total'))} / ${must0(g('submit_refused_total'))} / ${must0(g('rolls_unknown_total'))}</div>${arm}</div>`;
+    `<div>must stay 0: parse errors / unknown fills / refused submits / unknown rolls</div><div>${must0(i('parse_errors_total'))} / ${must0(g('unknown_fills_total'))} / ${must0(g('submit_refused_total'))} / ${must0(g('rolls_unknown_total'))}</div>${arm}${pmLedger('9')}</div>`;
 }
 
 // ---- P&L ----
@@ -321,7 +391,10 @@ function renderPnl() {
   if (P && P.latest) {
     const L = P.latest;
     set('pnl-sub', `${esc(L.day)} · ${L.runs} runs · paper fills ${L.paper.fills} · net ${usd(L.paper.net_usd)}`);
-    parts.push(table(['strategy','fills','round trips','net @0','@1 bps','@tier','max DD'], (L.strategies || []).map(r => [esc(r.label), n(r.fills, 0), n(r.round_trips !== undefined ? r.round_trips : r.trades, 0), usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[0] : r.net_usd), usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[1] : null), usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[2] : null), usd(-Math.abs(Number(r.max_drawdown_usd)))]), [1,2,3,4,5,6]));
+    const pmRow = r => (r.label === 'pm15' || r.label === 'pmj') && W.pm_pnl;
+    parts.push(table(['strategy','fills','round trips','net @0','@1 bps','@2 bps','max DD'], (L.strategies || []).map(r => pmRow(r)
+      ? [esc(r.label), n(r.fills, 0), '<span class="dim">—</span>', '<span class="dim">not settled by audit-pnl (Polymarket binaries): see the settled ledger below</span>', '', '', '']
+      : [esc(r.label), n(r.fills, 0), n(r.round_trips !== undefined ? r.round_trips : r.trades, 0), usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[0] : r.net_usd), usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[1] : null), usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[2] : null), usd(-Math.abs(Number(r.max_drawdown_usd)))]), [1,2,3,4,5,6]));
     if (L.vm_by_ruleset && L.vm_by_ruleset.length) parts.push(`<div class="muted" style="margin-top:6px">per ruleset</div>` + table(['hash128','orders','trades','net','max DD'], L.vm_by_ruleset.map(r => [short(r.hash128), n(r.orders, 0), n(r.trades, 0), usd(r.net_usd), usd(-Math.abs(Number(r.max_drawdown_usd)))]), [1,2,3,4]));
     const RG = L.regime;
     if (RG && RG.profiles && RG.profiles.length) {
@@ -332,11 +405,27 @@ function renderPnl() {
             (w.strategies || []).map(r => `${esc(r.label)} ${r.fills}f ${usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[2] : r.net_usd)}`).join(' · ') || '<span class="dim">—</span>']);
         }
       }
-      parts.push(`<div class="muted" style="margin-top:6px">per regime (minutes per word · strategies fills + net @tier; modes ${esc(JSON.stringify(RG.modes || {}))})</div>` + table(['profile','word','min','strategies'], rows, [2]));
+      parts.push(`<div class="muted" style="margin-top:6px">per regime (minutes per word · strategies fills + net @2 bps; modes ${esc(JSON.stringify(RG.modes || {}))})</div>` + table(['profile','word','min','strategies'], rows, [2]));
     }
   } else set('pnl-sub', 'no report yet');
+  const LP = W && W.pm_pnl;
+  if (LP && LP.slots) {
+    const today = new Date().toISOString().slice(0, 10);
+    const rows = [];
+    for (const sid of Object.keys(LP.slots).sort((a, b) => Number(a) - Number(b))) {
+      const S = LP.slots[sid];
+      for (const g of S.segments || []) {
+        const d = (g.days || []).find(x => x.day === today);
+        rows.push([`${esc(sid)} ${esc(S.name)}`, `${esc(g.segment)} <span class="dim">since ${esc(g.from_utc)}</span>`, n(g.settled, 0), `${n(g.won, 0)} / ${n(g.lost, 0)}`,
+          `$${n(g.stake_usd, 2)}`, n(g.fees_usd, 2), usd(g.net_usd), g.ev_pct === null || g.ev_pct === undefined ? '<span class="dim">—</span>' : `${n(g.ev_pct, 2)} %`,
+          usd(-Math.abs(Number(g.max_drawdown_usd))), pmFloorCell(g), d ? usd(d.net_usd) : '<span class="dim">—</span>', `${n(g.open, 0)} ($${n(g.open_cost_usd, 2)})`]);
+      }
+    }
+    parts.push(`<div class="muted" style="margin-top:6px">Polymarket paper (slots 9 / 11) — settled on the venue's result, every 15 min · pass ${esc(LP.generated_utc || '?')} · segments are fill laws, never summed</div>` +
+      table(['slot','segment','settled','won / lost','stake','fees','net','EV/$','max DD','fill ≥0.90 · <0.90', `today (${today})`, 'open'], rows, [2,3,4,5,6,7,8,10]));
+  }
   if (P && P.series && P.series.length) {
-    parts.push(`<div class="muted" style="margin-top:6px">day series (${P.series.length})</div>` + table(['day','runs','fills','paper net', 'per strategy @tier'], P.series.slice().reverse().map(s => [esc(s.day), n(s.runs, 0), n(s.paper_fills, 0), usd(s.paper_net_usd), Object.keys(s.strategies).map(k => `${esc(k)} ${usd(s.strategies[k].fee_ladder_net_usd ? s.strategies[k].fee_ladder_net_usd[2] : s.strategies[k].net_usd)}`).join(' · ')]), [1,2,3]));
+    parts.push(`<div class="muted" style="margin-top:6px">day series (${P.series.length})</div>` + table(['day','runs','fills','paper net', 'per strategy @2 bps'], P.series.slice().reverse().map(s => [esc(s.day), n(s.runs, 0), n(s.paper_fills, 0), usd(s.paper_net_usd), Object.keys(s.strategies).map(k => `${esc(k)} ${usd(s.strategies[k].fee_ladder_net_usd ? s.strategies[k].fee_ladder_net_usd[2] : s.strategies[k].net_usd)}`).join(' · ')]), [1,2,3]));
   }
   set('pnl', parts.join('') || '<span class="muted">n/a</span>');
 }

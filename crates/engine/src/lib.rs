@@ -34,7 +34,7 @@ use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
 use core_types::{
     AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, ModifyReq, OptSummary, Order, OrderEvent,
-    RuleTableSlot, Signal, SignalSource, Tick, TradePrint, VenueId, AI_RING_SIZE,
+    RuleTableSlot, Signal, SignalSource, T2tRecord, Tick, TradePrint, VenueId, AI_RING_SIZE,
     DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE, ORDER_EVENT_RING_SIZE,
     RULE_TABLE_RING_SLOTS, TRADE_RING_SIZE,
 };
@@ -63,6 +63,11 @@ pub const ENGINE_ORDERS_FILE: &str = "engine-orders.pmlr";
 /// the venue's time (`SlotKind::OrderEvent`).
 pub const ENGINE_EVENTS_FILE: &str = "engine-events.pmlr";
 
+/// T2T T0: the engine-thread per-order latency capture — one
+/// [`T2tRecord`] for every order a dispatcher took, staged in
+/// `EngineCtx::submit` after the intent (`SlotKind::Latency`).
+pub const ENGINE_LATENCY_FILE: &str = "engine-latency.pmlr";
+
 // ---------------------------------------------------------------
 // Compile-time ring sizes + lane geometry
 // ---------------------------------------------------------------
@@ -90,7 +95,8 @@ pub const FILL_RING_SIZE: usize = 1_024;
 /// Number of tick lanes: 0 = Polymarket, 1 = Binance, 2 = OKX,
 /// 3 = Deribit, 4 = Hyperliquid, 5 = Bybit (WS9), 6 = MEXC (MX2),
 /// 7 = Hypercall (HC1), 8 = Polymarket's ROLLING 15-minute families
-/// (PM15, [`PM15_LANE`]).
+/// (PM15, [`PM15_LANE`]), 9 = its ROLLING 5-minute families (PMJ J1b,
+/// [`PM5_LANE`]).
 /// Lane indices are BOOT-WIRED and NO LONGER equal `VenueId as usize`
 /// past lane 4:
 /// `VenueId::Ai = 5` has no tick lane (AI commands ride their own
@@ -98,7 +104,7 @@ pub const FILL_RING_SIZE: usize = 1_024;
 /// `VenueId::Mexc = 7` lane 6; `VenueId::HyperEvm = 8` has none (pool
 /// events ride the signal lane), so `VenueId::Hypercall = 9` occupies
 /// lane 7 — see [`tick_lane_of`].
-pub const NUM_TICK_LANES: usize = 9;
+pub const NUM_TICK_LANES: usize = 10;
 
 /// PM15: the lane of Polymarket's ROLLING 15-minute families — ticks and
 /// events of their own ingress thread (`ingress_polymarket::pm15_loop`),
@@ -106,6 +112,13 @@ pub const NUM_TICK_LANES: usize = 9;
 /// byte Polymarket, so [`tick_lane_of`] does not name it: the boot wires
 /// it by index.
 pub const PM15_LANE: usize = 8;
+
+/// PMJ J1b: the lane of Polymarket's ROLLING 5-minute families — the
+/// 5-minute pipeline's own ingress thread (`ingress_polymarket::pm15_loop`
+/// driven for `PmPeriod::M5`), one writer per lane as for
+/// [`PM15_LANE`]. Venue byte Polymarket; wired by index at boot. Empty
+/// (the unspawned shape) without a `[polymarket] rolling` `:5m` key.
+pub const PM5_LANE: usize = 9;
 
 /// Tick-lane index for a market-data venue (WS9 — the lane↔venue
 /// identity broke when Bybit's discriminant landed past `Ai`).
@@ -124,7 +137,8 @@ pub const fn tick_lane_of(venue: VenueId) -> Option<usize> {
         // HC1: option BBO ticks off the indicative (quote-provider) feed.
         VenueId::Hypercall => Some(7),
         // HYPARB: HyperEVM pool events ride the signal lane — no ticks.
-        VenueId::Ai | VenueId::HyperEvm => None,
+        // PMJ J3: Jupiter is an execution route — no market data.
+        VenueId::Ai | VenueId::HyperEvm | VenueId::Jupiter => None,
     }
 }
 
@@ -141,7 +155,26 @@ pub const NUM_EVENT_LANES: usize = NUM_TICK_LANES;
 /// [`DepthTopK`] slots, [`DEPTH_RING_SIZE`] capacity, mapped by
 /// [`depth_lane_of`]. Extending to another venue grows this constant
 /// and the map — mechanical, like the tick lanes.
-pub const NUM_DEPTH_LANES: usize = 2;
+///
+/// PMJ J8 (R-PMJ-S23): lanes 2 and 3 carry the Polymarket rolling legs'
+/// top five per side — [`PM15_DEPTH_LANE`], [`PM5_DEPTH_LANE`], one per
+/// rolling ingress thread (Polymarket is one venue byte with two
+/// producers, so they are named, not mapped). They reach the dispatcher
+/// only, for the paper fill law; members see the venue lanes alone
+/// ([`NUM_VENUE_DEPTH_LANES`]).
+pub const NUM_DEPTH_LANES: usize = 4;
+
+/// PMJ J8: the depth lanes whose records also reach the members (OKX,
+/// Deribit) — the lanes before the rolling ones.
+pub const NUM_VENUE_DEPTH_LANES: usize = 2;
+
+/// PMJ J8: the 15-minute rolling legs' depth lane (`ingress-pm15`).
+pub const PM15_DEPTH_LANE: usize = 2;
+
+/// PMJ J8: the 5-minute rolling legs' depth lane (`ingress-pm5`).
+pub const PM5_DEPTH_LANE: usize = 3;
+
+const _: () = assert!(PM15_DEPTH_LANE >= NUM_VENUE_DEPTH_LANES && PM5_DEPTH_LANE < NUM_DEPTH_LANES);
 
 /// Depth-lane index for a venue with an L2 subscription; `None` for
 /// every other venue. Cold-path helper for boot wiring.
@@ -161,7 +194,8 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
         | VenueId::HyperEvm
         // HC1: Hypercall's book is RFQ-provider indicative quotes — a
         // touch per instrument, no L2 depth to stream.
-        | VenueId::Hypercall => None,
+        | VenueId::Hypercall
+        | VenueId::Jupiter => None,
     }
 }
 
@@ -189,7 +223,8 @@ pub const fn opt_lane_of(venue: VenueId) -> Option<usize> {
         | VenueId::Ai
         | VenueId::Bybit
         | VenueId::Mexc
-        | VenueId::HyperEvm => None,
+        | VenueId::HyperEvm
+        | VenueId::Jupiter => None,
     }
 }
 
@@ -231,11 +266,14 @@ pub const fn fill_lane_of(venue: VenueId) -> Option<usize> {
         // O-H12 testnet sends are a shadow and never reach the book.
         // HC1: Hypercall is data-only by operator ruling O-HC1 — no exec
         // arm (HC9 waits for its own ruling), no fill lane.
+        // PMJ J3: Jupiter's fills come from its arm (`exec-jupiter`)
+        // through the dispatcher, never a fill lane.
         VenueId::Ai
         | VenueId::Bybit
         | VenueId::Mexc
         | VenueId::HyperEvm
-        | VenueId::Hypercall => None,
+        | VenueId::Hypercall
+        | VenueId::Jupiter => None,
     }
 }
 
@@ -347,8 +385,9 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Cumulative venue events dispatched to `on_venue_event`
     /// (WS10-A, all event lanes combined).
     pub events_dispatched: u64,
-    /// Cumulative depth snapshots dispatched to `on_depth`
-    /// (WS10-B, both depth lanes combined).
+    /// Cumulative depth snapshots drained from every depth lane (WS10-B;
+    /// PMJ J8: the rolling legs' lanes too — those reach the dispatcher
+    /// only, the venue lanes the members as well).
     pub depths_dispatched: u64,
     /// Cumulative options records dispatched to `on_opt_summary`
     /// (VM2 V2, all opt lanes combined).
@@ -365,13 +404,12 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     // engine's `now_ns()` when the strategy callback is about to
     // fire. Captures ring + drain latency.
     //
-    // `strategy_to_submit` is recorded inside `EngineCtx::submit`
-    // — gap between the order's `ts_ns` (strategy stamped it when
-    // it decided) and `now_ns()` at the dispatcher boundary.
-    //
     // `submit_to_ack` is recorded on every consumed fill.
+    //
+    // The order path's stages (parse, member, decide, route) and the
+    // per-order record live in `lat` — see [`LatStage`].
     ingest_lat: LatencyTracker<24>,
-    decide_lat: LatencyTracker<24>,
+    lat: StageLat,
     ack_lat: LatencyTracker<24>,
 
     /// Per-bucket last-tick timestamps. Each bucket holds the
@@ -448,7 +486,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             trades_dispatched: 0,
             order_events_dispatched: 0,
             ingest_lat: LatencyTracker::new(),
-            decide_lat: LatencyTracker::new(),
+            lat: StageLat::new(),
             ack_lat: LatencyTracker::new(),
             last_tick_ns_per_sym: [0u64; SYM_BUCKETS],
             sym_populated: 0,
@@ -459,7 +497,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     pub fn start(&mut self) -> Result<(), StrategyError> {
         let mut ctx = EngineCtx {
             disp: &mut self.disp,
-            decide_lat: &self.decide_lat,
+            lat: &mut self.lat,
+            trig: Trigger::NONE,
             order_capture: self.order_capture.as_mut(),
             recent_orders: &mut self.recent_orders,
             lifecycle: &mut self.lifecycle,
@@ -484,10 +523,11 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     /// drain), then the AI command lane.
     ///
     /// **Latency recording.** Every drained tick samples the
-    /// `now - tick.ts_ns` gap into the `ingest_lat` tracker. Every
-    /// `ctx.submit` samples the `now - order.ts_ns` gap into the
-    /// `decide_lat` tracker via [`EngineCtx::submit`]. Both record
-    /// paths are zero-alloc.
+    /// `now - tick.ts_ns` gap into the `ingest_lat` tracker, and a
+    /// Hyperliquid tick's `rx_lag_ns` into the parse stage. Every
+    /// `ctx.submit` samples the decide, member and route stages and
+    /// stages one per-order record ([`LatStage`]). Every record path is
+    /// zero-alloc.
     ///
     /// **Read in place (ZC pass A).** Every lane drains with
     /// `try_pop_ref`: the item is read in its ring slot through the
@@ -532,6 +572,12 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         consumed += 1;
                         let now = now_ns();
                         self.ingest_lat.record(now.saturating_sub(t.ts_ns));
+                        // T2T T0: the ingress parse, where the venue
+                        // stamps its read turn (0 = not measured). One
+                        // predictable branch per lane.
+                        if t.rx_lag_ns != 0 {
+                            self.lat.parse.record(u64::from(t.rx_lag_ns));
+                        }
                         Self::touch_sym_bucket(
                             &mut self.sym_populated,
                             &mut self.last_tick_ns_per_sym,
@@ -556,7 +602,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         self.disp.observe_tick(&t, now);
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
-                            decide_lat: &self.decide_lat,
+                            lat: &mut self.lat,
+                            trig: Trigger::of(&t),
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
                             lifecycle: &mut self.lifecycle,
@@ -593,7 +640,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         self.disp.observe_trade(&t, now);
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
-                            decide_lat: &self.decide_lat,
+                            lat: &mut self.lat,
+                            trig: Trigger::NONE,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
                             lifecycle: &mut self.lifecycle,
@@ -616,7 +664,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     consumed += 1;
                     let mut ctx = EngineCtx {
                         disp: &mut self.disp,
-                        decide_lat: &self.decide_lat,
+                        lat: &mut self.lat,
+                        trig: Trigger::NONE,
                         order_capture: self.order_capture.as_mut(),
                         recent_orders: &mut self.recent_orders,
                         lifecycle: &mut self.lifecycle,
@@ -643,7 +692,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         consumed += 1;
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
-                            decide_lat: &self.decide_lat,
+                            lat: &mut self.lat,
+                            trig: Trigger::NONE,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
                             lifecycle: &mut self.lifecycle,
@@ -698,7 +748,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         self.disp.on_fill_booked(&f);
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
-                            decide_lat: &self.decide_lat,
+                            lat: &mut self.lat,
+                            trig: Trigger::NONE,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
                             lifecycle: &mut self.lifecycle,
@@ -742,7 +793,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     self.disp.on_fill_booked(&f);
                     let mut ctx = EngineCtx {
                         disp: &mut self.disp,
-                        decide_lat: &self.decide_lat,
+                        lat: &mut self.lat,
+                        trig: Trigger::NONE,
                         order_capture: self.order_capture.as_mut(),
                         recent_orders: &mut self.recent_orders,
                         lifecycle: &mut self.lifecycle,
@@ -774,7 +826,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             }
             let mut ctx = EngineCtx {
                 disp: &mut self.disp,
-                decide_lat: &self.decide_lat,
+                lat: &mut self.lat,
+                trig: Trigger::NONE,
                 order_capture: self.order_capture.as_mut(),
                 recent_orders: &mut self.recent_orders,
                 lifecycle: &mut self.lifecycle,
@@ -808,7 +861,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         }
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
-                            decide_lat: &self.decide_lat,
+                            lat: &mut self.lat,
+                            trig: Trigger::NONE,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
                             lifecycle: &mut self.lifecycle,
@@ -854,7 +908,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         if e.flags & core_types::EVENT_FLAG_EXEC_ONLY == 0 {
                             let mut ctx = EngineCtx {
                                 disp: &mut self.disp,
-                                decide_lat: &self.decide_lat,
+                                lat: &mut self.lat,
+                                trig: Trigger::NONE,
                                 order_capture: self.order_capture.as_mut(),
                                 recent_orders: &mut self.recent_orders,
                                 lifecycle: &mut self.lifecycle,
@@ -883,15 +938,22 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     Some(d) => {
                         consumed += 1;
                         let now = now_ns();
-                        let mut ctx = EngineCtx {
-                            disp: &mut self.disp,
-                            decide_lat: &self.decide_lat,
-                            order_capture: self.order_capture.as_mut(),
-                            recent_orders: &mut self.recent_orders,
-                            lifecycle: &mut self.lifecycle,
-                            now,
-                        };
-                        self.strat.on_depth(&d, &mut ctx);
+                        // PMJ J8: the dispatcher first, as a tick — a
+                        // PAPER one judges its due rolling IoCs against
+                        // the book before this record, then holds it.
+                        self.disp.observe_depth(&d, now);
+                        if lane < NUM_VENUE_DEPTH_LANES {
+                            let mut ctx = EngineCtx {
+                                disp: &mut self.disp,
+                                lat: &mut self.lat,
+                                trig: Trigger::NONE,
+                                order_capture: self.order_capture.as_mut(),
+                                recent_orders: &mut self.recent_orders,
+                                lifecycle: &mut self.lifecycle,
+                                now,
+                            };
+                            self.strat.on_depth(&d, &mut ctx);
+                        }
                         self.depths_dispatched = self.depths_dispatched.wrapping_add(1);
                     }
                     None => break,
@@ -923,7 +985,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         self.disp.on_opt_summary(&o);
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
-                            decide_lat: &self.decide_lat,
+                            lat: &mut self.lat,
+                            trig: Trigger::NONE,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
                             lifecycle: &mut self.lifecycle,
@@ -998,7 +1061,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     } else {
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
-                            decide_lat: &self.decide_lat,
+                            lat: &mut self.lat,
+                            trig: Trigger::NONE,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
                             lifecycle: &mut self.lifecycle,
@@ -1021,7 +1085,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 self.last_timer_ns = now;
                 let mut ctx = EngineCtx {
                     disp: &mut self.disp,
-                    decide_lat: &self.decide_lat,
+                    lat: &mut self.lat,
+                    trig: Trigger::NONE,
                     order_capture: self.order_capture.as_mut(),
                     recent_orders: &mut self.recent_orders,
                     lifecycle: &mut self.lifecycle,
@@ -1062,36 +1127,19 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         self.disp.on_idle()
     }
 
-    /// p50 ingest→strategy latency (ns). 0 if no samples.
+    /// One stage's histogram (ns). Read with `percentile` (a bucket's
+    /// upper bound, 0 without samples) and `max_bound`.
     #[inline]
-    pub fn ingest_p50_ns(&self) -> u64 {
-        self.ingest_lat.percentile(0.50)
-    }
-    /// p99 ingest→strategy latency.
-    #[inline]
-    pub fn ingest_p99_ns(&self) -> u64 {
-        self.ingest_lat.percentile(0.99)
-    }
-    /// p50 strategy→submit latency.
-    #[inline]
-    pub fn decide_p50_ns(&self) -> u64 {
-        self.decide_lat.percentile(0.50)
-    }
-    /// p99 strategy→submit latency.
-    #[inline]
-    pub fn decide_p99_ns(&self) -> u64 {
-        self.decide_lat.percentile(0.99)
-    }
-    /// p50 submit→ack latency (populated whenever any fill source
-    /// delivers).
-    #[inline]
-    pub fn ack_p50_ns(&self) -> u64 {
-        self.ack_lat.percentile(0.50)
-    }
-    /// p99 submit→ack latency.
-    #[inline]
-    pub fn ack_p99_ns(&self) -> u64 {
-        self.ack_lat.percentile(0.99)
+    #[must_use]
+    pub fn stage_lat(&self, stage: LatStage) -> &LatencyTracker<24> {
+        match stage {
+            LatStage::Parse => &self.lat.parse,
+            LatStage::Ingest => &self.ingest_lat,
+            LatStage::Member => &self.lat.member,
+            LatStage::Decide => &self.lat.decide,
+            LatStage::Route => &self.lat.route,
+            LatStage::Ack => &self.ack_lat,
+        }
     }
 
     /// Touch the per-symbol last-tick bucket. Zero-alloc. The venue
@@ -1171,14 +1219,17 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         self.sym_populated
     }
 
-    /// Write all three LatencyTracker histograms to `out` as
+    /// Write every stage's LatencyTracker histogram to `out` as
     /// human-readable text. Used by the cli's periodic dump.
     /// Allocation is OK here — this is not on the hot path.
     pub fn write_latency_hgrm(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        self.lat.parse.write_hgrm(out, "engine.read_to_tick")?;
         self.ingest_lat
             .write_hgrm(out, "engine.ingest_to_strategy")?;
-        self.decide_lat
+        self.lat.member.write_hgrm(out, "engine.pop_to_submit")?;
+        self.lat.decide
             .write_hgrm(out, "engine.strategy_to_submit")?;
+        self.lat.route.write_hgrm(out, "engine.submit_to_routed")?;
         self.ack_lat.write_hgrm(out, "engine.submit_to_ack")?;
         Ok(())
     }
@@ -1243,6 +1294,13 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         self.order_capture = Some(cap);
     }
 
+    /// T2T T0: attach the per-order latency capture (boot-only, before
+    /// [`Self::start`]). The cli opens [`ENGINE_LATENCY_FILE`] inside the
+    /// per-run capture directory and hands it over here.
+    pub fn set_latency_capture(&mut self, cap: SlotCapture<T2tRecord>) {
+        self.lat.capture = Some(cap);
+    }
+
     /// XMM XH5d: attach the engine-thread order-event capture (boot-only,
     /// before [`Self::start`]). The cli opens [`ENGINE_EVENTS_FILE`]
     /// inside the per-run capture directory and hands it over here.
@@ -1267,6 +1325,15 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     #[inline]
     pub fn maybe_flush_order_capture(&mut self, now_ns: u64) {
         if let Some(cap) = self.order_capture.as_mut() {
+            cap.maybe_flush(now_ns);
+        }
+    }
+
+    /// T2T T0: drain staged latency records on the same caller cadence
+    /// (cli 5 s report tick). No-op without a capture.
+    #[inline]
+    pub fn maybe_flush_latency_capture(&mut self, now_ns: u64) {
+        if let Some(cap) = self.lat.capture.as_mut() {
             cap.maybe_flush(now_ns);
         }
     }
@@ -1323,6 +1390,27 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         }
     }
 
+    /// T2T T0: latency records staged since boot (0 without a
+    /// capture). Mirrored into the `engine_latency_capture_records` gauge.
+    #[inline]
+    pub fn latency_capture_records(&self) -> u64 {
+        match self.lat.capture.as_ref() {
+            Some(cap) => cap.records(),
+            None => 0,
+        }
+    }
+
+    /// T2T T0: latency-capture I/O errors (the first one sticky-disables;
+    /// 0 without a capture). Mirrored into the
+    /// `engine_latency_capture_io_errors` gauge.
+    #[inline]
+    pub fn latency_capture_io_errors(&self) -> u64 {
+        match self.lat.capture.as_ref() {
+            Some(cap) => cap.io_errors(),
+            None => 0,
+        }
+    }
+
     /// Fills staged to the capture since boot (0 without a capture).
     /// Mirrored into the `engine_fills_capture_records` gauge.
     #[inline]
@@ -1357,7 +1445,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     pub fn stop(&mut self) {
         let mut ctx = EngineCtx {
             disp: &mut self.disp,
-            decide_lat: &self.decide_lat,
+            lat: &mut self.lat,
+            trig: Trigger::NONE,
             order_capture: self.order_capture.as_mut(),
             recent_orders: &mut self.recent_orders,
             lifecycle: &mut self.lifecycle,
@@ -1376,6 +1465,10 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         }
         if let Some(cap) = self.event_capture.as_mut() {
             // And for XMM XH5d's order events.
+            let _ = cap.flush_all();
+        }
+        if let Some(cap) = self.lat.capture.as_mut() {
+            // And for T2T T0's latency records.
             let _ = cap.flush_all();
         }
     }
@@ -1452,10 +1545,110 @@ const ZERO_FILL: Fill = Fill::new(
     0,
 );
 
+/// **T2T T0 — one in-process latency stage**, as [`Engine::stage_lat`]
+/// reads it. In path order; every one is a histogram of ns.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LatStage {
+    /// The ingress read turn → the tick's stamp: the TLS decrypt, the
+    /// WebSocket deframe and the parse (`Tick::rx_lag_ns`; Hyperliquid
+    /// only).
+    Parse,
+    /// The tick's (or signal's) stamp → the engine's pop: the ring.
+    Ingest,
+    /// The engine's pop → `ctx.submit`: the member.
+    Member,
+    /// `Order::ts_ns` → `ctx.submit`: ingest + member for a member that
+    /// stamps its order with the tick (bin15), the callback alone for one
+    /// that stamps `ctx.now_ns()`.
+    Decide,
+    /// `ctx.submit` → the dispatcher took the order: live, the router's
+    /// clamps and the arm's ring push; paper, the paper book. Accepted
+    /// orders only.
+    Route,
+    /// The fill's stamp → the engine's pop of it.
+    Ack,
+}
+
+impl LatStage {
+    /// Every stage, in path order.
+    pub const ALL: [Self; 6] = [
+        Self::Parse,
+        Self::Ingest,
+        Self::Member,
+        Self::Decide,
+        Self::Route,
+        Self::Ack,
+    ];
+
+    /// The stage's metric name (`engine_latency_<name>_*`).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Parse => "parse",
+            Self::Ingest => "ingest",
+            Self::Member => "member",
+            Self::Decide => "decide",
+            Self::Route => "route",
+            Self::Ack => "ack",
+        }
+    }
+}
+
+/// The order path's stage histograms and the per-order record sink. One
+/// owner (the engine thread); a callback's ctx reborrows it.
+struct StageLat {
+    parse: LatencyTracker<24>,
+    member: LatencyTracker<24>,
+    decide: LatencyTracker<24>,
+    route: LatencyTracker<24>,
+    /// → [`ENGINE_LATENCY_FILE`]; `None` when the cli wired no capture.
+    capture: Option<SlotCapture<T2tRecord>>,
+}
+
+impl StageLat {
+    fn new() -> Self {
+        Self {
+            parse: LatencyTracker::new(),
+            member: LatencyTracker::new(),
+            decide: LatencyTracker::new(),
+            route: LatencyTracker::new(),
+            capture: None,
+        }
+    }
+}
+
+/// The tick a callback runs on, as the per-order record needs it: its read
+/// turn and its stamp. Zero for every other callback.
+#[derive(Copy, Clone)]
+struct Trigger {
+    rx_ns: NsTs,
+    tick_ns: NsTs,
+}
+
+impl Trigger {
+    const NONE: Self = Self {
+        rx_ns: 0,
+        tick_ns: 0,
+    };
+
+    /// `rx_ns` is 0 when the venue does not stamp its read turn.
+    #[inline(always)]
+    fn of(t: &Tick) -> Self {
+        let measured = u64::from(t.rx_lag_ns != 0);
+        Self {
+            rx_ns: t.ts_ns.saturating_sub(u64::from(t.rx_lag_ns)) * measured,
+            tick_ns: t.ts_ns,
+        }
+    }
+}
+
 /// Concrete `Ctx` passed into strategy callbacks.
 struct EngineCtx<'a, D: OrderDispatch> {
     disp: &'a mut D,
-    decide_lat: &'a LatencyTracker<24>,
+    /// T2T T0: the stage histograms and the per-order record sink.
+    lat: &'a mut StageLat,
+    /// T2T T0: the tick this callback runs on ([`Trigger::NONE`] if none).
+    trig: Trigger,
     /// M4.1 intent log — reborrowed from the engine per callback;
     /// `None` when the cli wired no capture (tests, replay tooling).
     order_capture: Option<&'a mut SlotCapture<Order>>,
@@ -1543,12 +1736,32 @@ fn submit_err_of(e: DispatchError) -> SubmitErr {
 impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
     #[inline(always)]
     fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
-        // Strategy stamps `order.ts_ns` from `ctx.now_ns()` so the
-        // gap here equals the time spent inside the strategy
-        // callback. Atomic record — never blocks.
-        self.decide_lat.record(now_ns().saturating_sub(order.ts_ns));
+        // `decide`: from the member's own stamp on the order (bin15: the
+        // tick's; most members: `ctx.now_ns()`). `member`: from the
+        // engine's pop of the item this callback runs on. Atomic records
+        // — never block.
+        let t_submit = now_ns();
+        self.lat.decide.record(t_submit.saturating_sub(order.ts_ns));
+        self.lat.member.record(t_submit.saturating_sub(self.now));
         match self.disp.submit(&order) {
             Ok(()) => {
+                // T2T T0: `route` and the per-order record, accepted
+                // orders only (capture-what-was-accepted, as below).
+                let t_routed = now_ns();
+                self.lat.route.record(t_routed.saturating_sub(t_submit));
+                if let Some(cap) = self.lat.capture.as_mut() {
+                    // COPY: one 64 B record built on the stack and staged
+                    // into the capture buffer (SlotCapture policy) — the
+                    // record exists only once these stamps are taken.
+                    cap.append(&T2tRecord::of(
+                        &order,
+                        self.trig.rx_ns,
+                        self.trig.tick_ns,
+                        self.now,
+                        t_submit,
+                        t_routed,
+                    ));
+                }
                 // M4.1: capture-what-was-accepted — stage the intent
                 // to engine-orders.pmlr AFTER the dispatcher takes
                 // it; refusals stay counters. Staged copy of one
@@ -1576,7 +1789,7 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
     /// A refused cancel left the book alone, so a record of it would
     /// describe something that did not happen.
     ///
-    /// No decide-latency record — `decide_lat` measures the time a
+    /// No decide-latency record — `decide` measures the time a
     /// strategy spent between `ctx.now_ns()` and its submit, and a
     /// `CancelReq`'s `ts_ns` is bookkeeping the strategy is free to
     /// set from anywhere. Recording it would fold a made-up number
@@ -2529,6 +2742,82 @@ mod tests {
         assert_eq!(eng.depths_dispatched, 2);
     }
 
+    /// PMJ J8: a dispatcher that counts the depth records it is shown.
+    #[derive(Debug, Default)]
+    struct DepthWitness {
+        depths: usize,
+        rolling: usize,
+    }
+    impl OrderDispatch for DepthWitness {
+        fn cancel(&mut self, _r: &core_types::CancelReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
+        fn modify(&mut self, _r: &core_types::ModifyReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> DispatchStats {
+            DispatchStats::default()
+        }
+        fn observe_depth(&mut self, d: &DepthTopK, _now_ns: NsTs) {
+            self.depths += 1;
+            if d.venue == VenueId::Polymarket as u8 {
+                self.rolling += 1;
+            }
+        }
+    }
+
+    /// PMJ J8 (R-PMJ-S23): every depth lane reaches the dispatcher; only the
+    /// venue lanes (OKX, Deribit) reach the members — the rolling legs'
+    /// lanes are the paper fill law's alone.
+    #[test]
+    fn rolling_depth_reaches_the_dispatcher_and_never_a_member() {
+        let (_tp, tc) = split_tick_lanes();
+        let (_ep, ec) = split_event_lanes();
+        let (mut dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
+        let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            Counter::default(),
+            DepthWitness::default(),
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+        let none = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+        let pm = |ts: u64| DepthTopK::new(ts, VenueId::Polymarket, 4_096, 0, none, none);
+        assert!(dp[PM15_DEPTH_LANE].try_push_ref(&pm(1)));
+        assert!(dp[PM5_DEPTH_LANE].try_push_ref(&pm(2)));
+        eng.tick(16);
+        assert_eq!((eng.disp.depths, eng.disp.rolling), (2, 2));
+        assert_eq!(eng.strategy().depths, 0, "no member sees a rolling leg's depth");
+        assert_eq!(eng.depths_dispatched, 2);
+        let okx = DepthTopK::new(3, VenueId::Okx, 7, 0, none, none);
+        assert!(dp[depth_lane_of(VenueId::Okx).unwrap()].try_push_ref(&okx));
+        // A Deribit record by name: `DepthTopK::EMPTY`'s venue byte is 0,
+        // which is Polymarket's.
+        let deribit = DepthTopK::new(4, VenueId::Deribit, 7, 0, none, none);
+        assert!(dp[depth_lane_of(VenueId::Deribit).unwrap()].try_push_ref(&deribit));
+        eng.tick(16);
+        assert_eq!((eng.disp.depths, eng.disp.rolling), (4, 2));
+        assert_eq!(eng.strategy().depths, 2, "the venue lanes reach both");
+    }
+
     #[test]
     fn depth_lane_map_matches_layout() {
         assert_eq!(depth_lane_of(VenueId::Okx), Some(0));
@@ -2736,15 +3025,18 @@ mod tests {
         assert_eq!(tick_lane_of(VenueId::Bybit), Some(5));
         assert_eq!(tick_lane_of(VenueId::Mexc), Some(6));
         assert_eq!(tick_lane_of(VenueId::Hypercall), Some(7));
-        // PM15: the rolling families' lane is the last, and no venue maps
-        // to it (its records carry the Polymarket byte; boot wires it).
-        assert_eq!(PM15_LANE, NUM_TICK_LANES - 1);
+        // PM15: the rolling families' lanes are the last two, and no venue
+        // maps to either (their records carry the Polymarket byte; boot
+        // wires them): 15 m on 8, PMJ J1b's 5 m on 9.
+        assert_eq!(PM15_LANE, 8);
+        assert_eq!(PM5_LANE, NUM_TICK_LANES - 1);
         assert_ne!(tick_lane_of(VenueId::Polymarket), Some(PM15_LANE));
+        assert_ne!(tick_lane_of(VenueId::Polymarket), Some(PM5_LANE));
         assert_eq!(tick_lane_of(VenueId::Ai), None);
         assert_eq!(tick_lane_of(VenueId::HyperEvm), None);
         // The last market venue occupies lane 7, PM15's rolling families
-        // lane 8 (`PM15_LANE`) — no gaps.
-        assert_eq!(NUM_TICK_LANES, 9);
+        // lane 8 (`PM15_LANE`), the 5-minute ones lane 9 — no gaps.
+        assert_eq!(NUM_TICK_LANES, 10);
         assert_eq!(NUM_EVENT_LANES, NUM_TICK_LANES);
     }
 
@@ -3833,13 +4125,14 @@ mod tests {
 
     fn lifecycle_ctx<'a>(
         d: &'a mut LifecycleDispatcher,
-        lat: &'a LatencyTracker<24>,
+        lat: &'a mut StageLat,
         recent: &'a mut RecentRing<Order, RECENT_ORDERS>,
         lc: &'a mut LifecycleCounters,
     ) -> EngineCtx<'a, LifecycleDispatcher> {
         EngineCtx {
             disp: d,
-            decide_lat: lat,
+            lat,
+            trig: Trigger::NONE,
             order_capture: None,
             recent_orders: recent,
             lifecycle: lc,
@@ -3872,7 +4165,7 @@ mod tests {
     /// cannot apply it before the place it refers to.
     #[test]
     fn a_performed_lifecycle_verb_is_appended_to_the_intent_capture() {
-        let lat = LatencyTracker::<24>::new();
+        let mut lat = StageLat::new();
         let mut recent = RecentRing::new(ZERO_ORDER);
         let mut lc = LifecycleCounters::new();
         let mut d = LifecycleDispatcher {
@@ -3880,7 +4173,7 @@ mod tests {
             modify_ok: true,
         };
         {
-            let mut ctx = lifecycle_ctx(&mut d, &lat, &mut recent, &mut lc);
+            let mut ctx = lifecycle_ctx(&mut d, &mut lat, &mut recent, &mut lc);
             assert_eq!(ctx.cancel(a_cancel()), Ok(()));
             assert_eq!(ctx.modify(7, an_order()), Ok(()));
         }
@@ -3912,7 +4205,7 @@ mod tests {
     /// capture-what-was-accepted law a refused submit obeys.
     #[test]
     fn a_refused_lifecycle_verb_appends_nothing() {
-        let lat = LatencyTracker::<24>::new();
+        let mut lat = StageLat::new();
         let mut recent = RecentRing::new(ZERO_ORDER);
         let mut lc = LifecycleCounters::new();
         let mut d = LifecycleDispatcher {
@@ -3920,7 +4213,7 @@ mod tests {
             modify_ok: false,
         };
         {
-            let mut ctx = lifecycle_ctx(&mut d, &lat, &mut recent, &mut lc);
+            let mut ctx = lifecycle_ctx(&mut d, &mut lat, &mut recent, &mut lc);
             assert_eq!(ctx.cancel(a_cancel()), Err(SubmitErr::NoSuchOrder));
             assert_eq!(ctx.modify(7, an_order()), Err(SubmitErr::Refused));
         }
@@ -3938,7 +4231,7 @@ mod tests {
     /// constructor's good intentions.
     #[test]
     fn a_modify_is_never_recorded_as_a_second_place() {
-        let lat = LatencyTracker::<24>::new();
+        let mut lat = StageLat::new();
         let mut recent = RecentRing::new(ZERO_ORDER);
         let mut lc = LifecycleCounters::new();
         let mut d = LifecycleDispatcher {
@@ -3946,7 +4239,7 @@ mod tests {
             modify_ok: true,
         };
         {
-            let mut ctx = lifecycle_ctx(&mut d, &lat, &mut recent, &mut lc);
+            let mut ctx = lifecycle_ctx(&mut d, &mut lat, &mut recent, &mut lc);
             assert_eq!(ctx.submit(an_order()), Ok(()));
             assert_eq!(ctx.modify(8, an_order()), Ok(()));
         }

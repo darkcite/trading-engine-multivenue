@@ -250,6 +250,13 @@ const READ_GRACE_NS: u64 = 5_000_000_000;
 const WANT_HOLD_NS: u64 = 30_000_000_000;
 /// A gateway heartbeat older than this is a gateway that stopped turning.
 const ALIVE_NS: u64 = 2_000_000_000;
+/// O-WSG1: a stream down at least this long comes back to a sheet read AT
+/// ONCE (and an orders re-read), not at the cadence — the router holds a
+/// slot whose stream was down past its threshold (5 s on slot 3) until a
+/// reconciliation from reads issued since agrees, so this is the resume
+/// latency. Shorter blips (the gateway's sub-second redials) keep the
+/// cadence; their re-read is the gap event's.
+const RESYNC_NOW_NS: u64 = ALIVE_NS;
 /// The largest clock skew a boot takes (the venue's 5 s lead).
 const MAX_SKEW_MS: u64 = 5_000;
 /// The largest post timeout, read period, join and gone window a boot
@@ -894,6 +901,10 @@ pub struct HlGatewayArm {
     asset_refusal_streak: u32,
     // Liveness: when the stream was last seen alive (0 = never).
     up_ns: u64,
+    /// O-WSG1: the stream was alive at the last idle pass.
+    alive_prev: bool,
+    /// O-WSG1: when the stream last came (back) up (0 = never).
+    came_up_ns: u64,
     snapshot: bool,
     // Boot and reads.
     boot: u8,
@@ -937,6 +948,13 @@ pub struct HlGatewayArm {
     sheet_ns: u64,
     orders_ns: u64,
     last_agree_ns: u64,
+    /// O-WSG1: when the last sheet read and the last orders read that
+    /// ended were ISSUED, and the earlier of the two at the last agreement
+    /// — the agreement is about the venue as of then. One older than
+    /// [`Self::came_up_ns`] says nothing of the gap: a resync is owed.
+    sheet_issued_ns: u64,
+    orders_issued_ns: u64,
+    agree_basis_ns: u64,
     anchor_1e8: i64,
     account_1e8: i64,
     /// XH5b-1: the spot sheet's USDC `total` — the worth's second half on
@@ -1030,15 +1048,18 @@ pub struct HlGatewayArm {
     priority_spent_1e6: u32,
 }
 
-// The arm's inline state, 1 792 B — what `new` moves into its owner (the
+// The arm's inline state, 1 856 B — what `new` moves into its owner (the
 // tables are boxed); XH5b-1's spot half and its counter (32 B) took one more
 // 64 B line; XH5b-2's kept flag, its keeper's handle (the anchor word itself
 // lives behind it) and `spot_failed` (17 B) fit that line's padding; XMM
 // XH5c-2's top-ups — the governor (40 B), the keeper's handle, the phase,
 // five words, five flags and three counters (118 B) — took two more lines;
 // XMM XH5d-3a's priority cap and tally (two u32s, 8 B) fit their padding;
-// XH4i-3a's outcome state (an 8 B `Option<Box<_>>`) fit it too.
-const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_792);
+// XH4i-3a's outcome state (an 8 B `Option<Box<_>>`) fit it too. O-WSG1's
+// resync clock — when the stream came back, the two reads' issue instants
+// and the agreement's basis (four u64s) and the last pass's liveness —
+// took one more line: 1 856 B.
+const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_856);
 
 /// XMM XH5d: what a place bidding ALO priority `p` (×1e8 of resting
 /// notional; 0 none) commits — `sz` at `px` (wire units, ×1e8) — in USD
@@ -1161,6 +1182,8 @@ impl HlGatewayArm {
             reject_streak: 0,
             asset_refusal_streak: 0,
             up_ns: 0,
+            alive_prev: false,
+            came_up_ns: 0,
             snapshot: false,
             boot: BOOT_SNAPSHOT,
             boot_held: false,
@@ -1208,6 +1231,9 @@ impl HlGatewayArm {
             sheet_ns: 0,
             orders_ns: 0,
             last_agree_ns: 0,
+            sheet_issued_ns: 0,
+            orders_issued_ns: 0,
+            agree_basis_ns: 0,
             anchor_1e8: cfg.anchor_1e6.saturating_mul(WIRE_PER_ENGINE),
             account_1e8: 0,
             spot_1e8: 0,
@@ -2990,6 +3016,7 @@ impl HlGatewayArm {
         self.exclusive = !self.others && self.read_ns >= self.excl_lost_ns;
         self.orders_ok = self.unknown_this_read == 0 || self.boot != BOOT_DONE;
         self.orders_ns = now;
+        self.orders_issued_ns = self.read_ns;
         self.note_agreement(now);
         if self.boot == BOOT_ORDERS {
             self.boot = BOOT_DONE;
@@ -2999,6 +3026,7 @@ impl HlGatewayArm {
     fn state_done(&mut self, account_1e8: i64, venue_ms: u64, now: u64) {
         self.account_1e8 = account_1e8;
         self.sheet_ns = now;
+        self.sheet_issued_ns = self.read_ns;
         // XH5b-1: the worth's spot half is read next, and the anchor waits
         // for it; a shared account's worth is every slot's — never read,
         // never anchored. XH4i-4: an outcome arm's legs live in the spot
@@ -3222,7 +3250,16 @@ impl HlGatewayArm {
             && now.saturating_sub(self.orders_ns) <= fresh
         {
             self.last_agree_ns = now;
+            self.agree_basis_ns = self.sheet_issued_ns.min(self.orders_issued_ns);
         }
+    }
+
+    /// **O-WSG1** — the stream came back since the last agreement's reads
+    /// were issued: what happened while the arm was blind is not re-read
+    /// yet. The router keeps a held slot held while this is `true`.
+    #[inline]
+    fn resync_pending(&self) -> bool {
+        self.came_up_ns > self.agree_basis_ns
     }
 
     // --- idle -------------------------------------------------------
@@ -3237,9 +3274,22 @@ impl HlGatewayArm {
             self.retired.release();
         }
         let mut worked = self.pump(now);
-        if self.stream_alive(now) {
+        let alive = self.stream_alive(now);
+        if alive {
+            // O-WSG1: the edge back up. A stream down long enough for the
+            // router to have held the slot gets its sheet and its orders
+            // re-read now; every edge restarts the resync clock.
+            if !self.alive_prev {
+                if self.up_ns != 0 && now.saturating_sub(self.up_ns) >= RESYNC_NOW_NS {
+                    self.next_state_ns = self.next_state_ns.min(now);
+                    self.reread = true;
+                    worked = true;
+                }
+                self.came_up_ns = now;
+            }
             self.up_ns = now;
         }
+        self.alive_prev = alive;
         // XH5b-2: a fresh anchor is durable once its keeper says so (one
         // load a pass until then).
         if self.fresh_anchor && !self.anchor_kept {
@@ -3504,6 +3554,7 @@ impl HlGatewayArm {
         .with_pnl(judged, delta)
         .with_alo_reject_permille(self.alo_reject_permille())
         .with_gateway_halted(self.end.stats.halt_reason() != HALT_NONE)
+        .with_resync_pending(self.resync_pending())
     }
 
     /// E7: the session's P&L, USD ×1e6 — judged on the slot's own account
@@ -3986,7 +4037,7 @@ impl OrderDispatch for HlGatewayArm {
             .outcome
             .as_deref()
             .map_or(&OutcomeCounters::ZERO, |st| &st.counters);
-        // COPY: the 1 016 B report written once into the caller's block —
+        // COPY: the 1 040 B report written once into the caller's block —
         // cold, once a second; the out-param keeps it off the return path.
         *out = GatewayArmReport {
             present: 1,
@@ -4059,6 +4110,8 @@ impl OrderDispatch for HlGatewayArm {
             gw_throttled: s.published(pw::THROTTLED),
             gw_ttl_cancels: s.published(pw::TTL_CANCELS),
             gw_ttl_full: s.published(pw::TTL_FULL),
+            gw_signs_pooled: s.published(pw::SIGNS_POOLED),
+            gw_signs_fallback: s.published(pw::SIGNS_FALLBACK),
             // XMM XH4i-5: the outcome mode's (0 on a perps arm).
             outcome_rolls_bound: o.rolls_bound,
             outcome_rolls_settled: o.rolls_settled,
@@ -4129,6 +4182,7 @@ impl OrderDispatch for HlGatewayArm {
             },
             topup_day_used: self.topup.used(),
             topup_cost_usd_1e6: self.topup.cost_1e6(),
+            signer_pool_ready: s.published(pw::POOL_READY),
         };
         true
     }
@@ -6891,6 +6945,86 @@ mod tests {
         v.send(read_end(&od, 0, 0));
         let _ = arm.idle(t + 5 * S + 3);
         assert!(arm.exclusive, "a read issued after the gap does");
+    }
+
+    /// **O-WSG1 — the resync clock.** A stream back from a gap owes a
+    /// reconciliation from reads issued SINCE: the signal says so until one
+    /// agrees. An agreement on the sheet read before the gap does not
+    /// clear it; a stream down 2 s or more gets that sheet at once, not at
+    /// the cadence, so a held slot resumes within the same instant's reads.
+    #[test]
+    fn a_stream_back_from_a_gap_owes_a_resync_until_reads_issued_since_agree() {
+        let (mut arm, mut v, t) = booted();
+        let at = t + 5 * S;
+        v.gw.stats.beat(at);
+        recon(&mut arm, &mut v, at, None, &[]);
+        assert_eq!(arm.signal(at).resync_pending, 0, "agreed since the boot's connect");
+
+        // The venue goes dark: no socket, eight seconds.
+        v.gw.stats.set_gauges(0, false);
+        v.gw.stats.beat(at + S);
+        let _ = arm.idle(at + S);
+        let dark = arm.signal(at + 6 * S);
+        assert!(dark.ws_gap_ns >= 5 * S, "the gap the router holds on");
+
+        // Back: the gap ends, and the arm still owes the re-read.
+        v.gw.stats.set_gauges(0, true);
+        let back = at + 9 * S;
+        v.gw.stats.beat(back);
+        let _ = arm.idle(back);
+        let sig = arm.signal(back);
+        assert_eq!(sig.ws_gap_ns, 0, "up");
+        assert_eq!(sig.resync_pending, 1, "blind until re-read");
+
+        // Answer whatever the arm reads, at the SAME instant: the orders
+        // (the gap's re-read), the sheet (pulled forward) and its spot half.
+        let mut orders = 0u32;
+        let mut sheets = 0u32;
+        let mut passes = 0u32;
+        while arm.signal(back).resync_pending != 0 && passes < 8 {
+            if let Some(od) = v.take(CMD_READ_ORDERS) {
+                orders += 1;
+                v.send(read_end(&od, 0, 0));
+                let _ = arm.idle(back);
+                if sheets == 0 {
+                    assert_eq!(
+                        arm.signal(back).resync_pending,
+                        1,
+                        "an agreement on the sheet read before the gap says nothing of it"
+                    );
+                }
+            }
+            if let Some(st) = v.take(CMD_READ_STATE) {
+                sheets += 1;
+                v.send(read_end(&st, 1_000 * E8, 2));
+            }
+            if let Some(sp) = v.take(CMD_READ_SPOT) {
+                v.send(read_end(&sp, 0, 0));
+            }
+            let _ = arm.idle(back);
+            passes += 1;
+        }
+        assert_eq!(arm.signal(back).resync_pending, 0, "re-read and agreed");
+        assert!(orders >= 1 && sheets >= 1, "orders {orders}, sheets {sheets}");
+        assert!(arm.signal(back).recon_age_ns <= S, "the agreement is fresh");
+    }
+
+    /// A sub-second blip (the gateway's redial) keeps the read cadence: no
+    /// sheet pulled forward — only the gap's orders re-read.
+    #[test]
+    fn a_blip_keeps_the_sheet_cadence() {
+        let (mut arm, mut v, t) = booted();
+        let at = t + 5 * S;
+        v.gw.stats.beat(at);
+        recon(&mut arm, &mut v, at, None, &[]);
+        v.gw.stats.set_gauges(0, false);
+        let _ = arm.idle(at + S / 10);
+        v.gw.stats.set_gauges(0, true);
+        let back = at + S / 2;
+        v.gw.stats.beat(back);
+        let _ = arm.idle(back);
+        assert_eq!(arm.signal(back).resync_pending, 1, "every edge restarts the clock");
+        assert!(v.take(CMD_READ_STATE).is_none(), "no sheet before its cadence");
     }
 
     #[test]

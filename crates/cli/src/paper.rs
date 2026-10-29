@@ -48,13 +48,14 @@ use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
     make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, OptSummary, Order,
-    OrderEvent, RuleTableSlot, Signal, SlotMask, SymbolId, Tick, TradePrint, VenueId,
+    OrderEvent, RuleTableSlot, Signal, SlotMask, SymbolId, T2tRecord, Tick, TradePrint, VenueId,
     AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE,
     MAX_STRATEGY_SLOTS, OPT_RING_SIZE, RULE_TABLE_RING_SLOTS, TRADE_RING_SIZE,
 };
 use engine::{
-    Engine, ENGINE_EVENTS_FILE, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE,
-    NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE,
+    Engine, LatStage, ENGINE_EVENTS_FILE, ENGINE_FILLS_FILE, ENGINE_LATENCY_FILE,
+    ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE,
+    TICK_RING_SIZE,
 };
 use engine_snapshot::{BootInfo, EngineSnapshot, SnapshotCell, SNAPSHOT_VENUES};
 use ingress_ai::{AiCmdCapture, AiIngressCfg, RulesetSidePath};
@@ -659,9 +660,10 @@ pub struct Rings {
     /// push (§3.3 unspawned shape — the engine drains them empty).
     pub event: [Arc<Ring<ChannelEvent, EVENT_RING_SIZE>>; engine::NUM_EVENT_LANES],
     /// WS10-B: one depth ring per depth lane (`engine::depth_lane_of`
-    /// order: 0 = OKX, 1 = Deribit). Producers ride into the two
-    /// depth-capable spawns; without a depth subscription the lane
-    /// reads empty forever (§3.3).
+    /// order: 0 = OKX, 1 = Deribit; PMJ J8: 2 = the 15-minute rolling
+    /// legs, 3 = the 5-minute ones). Producers ride into the depth-capable
+    /// spawns; without a depth subscription the lane reads empty forever
+    /// (§3.3).
     pub depth: [Arc<Ring<DepthTopK, DEPTH_RING_SIZE>>; engine::NUM_DEPTH_LANES],
     /// VM2 V2: one options-summary ring per opt lane
     /// (`engine::opt_lane_of` order: 0 = OKX, 1 = Deribit,
@@ -685,6 +687,8 @@ impl Rings {
                 Ring::new(),
                 Ring::new(),
                 // PM15: lane 8, the rolling families.
+                Ring::new(),
+                // PMJ J1b: lane 9, the 5-minute families.
                 Ring::new(),
             ],
             rpc_signal: Ring::new(),
@@ -710,8 +714,10 @@ impl Rings {
                 Ring::new(),
                 // PM15: lane 8 — the roll, the order law, the Chainlink mark.
                 Ring::new(),
+                // PMJ J1b: lane 9 — the same for the 5-minute families.
+                Ring::new(),
             ],
-            depth: [Ring::new(), Ring::new()],
+            depth: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             opt: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
         }
     }
@@ -779,6 +785,14 @@ pub struct IngressStatusSet {
     /// PM15-8c: slot 9's arm and pm-gw (with its redeemer) — zero unless
     /// slot 9 boots live.
     pub pm15x: Arc<exec_polymarket::stats::PmExecStats>,
+    /// PMJ J1b: the 5-minute families' ingress thread (its market socket).
+    /// Down unless `[polymarket] rolling` names a `:5m` family.
+    pub pm5: Arc<IngressStatus>,
+    /// PMJ J1b: the 5-minute families' own counters (ingress + discovery).
+    pub pm5c: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
+    /// PMJ J16: slot 11's arm and jup-gw — zero unless slot 11 boots live
+    /// (and only then mirrored: [`register_pmjx_metrics`]).
+    pub pmjx: Arc<exec_jupiter::stats::JupExecStats>,
 }
 
 impl IngressStatusSet {
@@ -802,6 +816,9 @@ impl IngressStatusSet {
             pm15: Arc::new(IngressStatus::new()),
             pm15c: Arc::new(ingress_polymarket::pm15_loop::Pm15Counters::new()),
             pm15x: Arc::new(exec_polymarket::stats::PmExecStats::new()),
+            pm5: Arc::new(IngressStatus::new()),
+            pm5c: Arc::new(ingress_polymarket::pm15_loop::Pm15Counters::new()),
+            pmjx: Arc::new(exec_jupiter::stats::JupExecStats::new()),
         }
     }
 }
@@ -840,22 +857,139 @@ pub const PM15_RTDS_WS: core_net::WsCfg = core_net::WsCfg {
 
 /// PM15: spawn the rolling families' two threads (`ingress_polymarket`
 /// crate docs): `pm15-discovery` (Gamma, blocking, unpinned) and
-/// `ingress-pm15` (the market and RTDS sockets on one poll, pinned to
+/// `ingress-pm15` (the market sockets — PMJ J7: min(`sockets.n`, families)
+/// of them, the families spread over them — and RTDS on one poll, pinned to
 /// `core_id`), feeding `engine::PM15_LANE` — `tick_tx` and `event_tx` are
 /// that lane's producers. `assets` are the families' assets in
 /// `[polymarket] rolling` order. Opens the `pm15` capture and resolves
-/// all three hosts BEFORE spawning: a failure is a boot error.
+/// all four hosts BEFORE spawning — Gamma (`gamma-api.polymarket.com`),
+/// the CLOB (`clob.polymarket.com`, PM15-9b), the market sockets
+/// (`ws-subscriptions-clob.polymarket.com`) and RTDS
+/// (`ws-live-data.polymarket.com`): a failure is a boot error.
 ///
 /// # Errors
 /// The capture could not be opened, or a host did not resolve.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_pm15(
     assets: Vec<String>,
+    depth: core_config::universe::RollingDepth,
+    sockets: core_config::universe::RollingMarketSockets,
+    tls_config: RustlsConfig,
+    wall_anchor: core_time::WallAnchor,
+    stale_after_ms: u32,
+    tick_tx: Producer<Tick, TICK_RING_SIZE>,
+    event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    counters: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
+    core_id: usize,
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+    tee: Option<
+        Producer<
+            ingress_polymarket::gamma15::PmWindowSpec,
+            { ingress_polymarket::pm15_loop::PM15_SPEC_RING },
+        >,
+    >,
+) -> io::Result<Vec<JoinHandle<()>>> {
+    spawn_rolling(
+        core_types::pm_roll::PmPeriod::M15,
+        "pm15",
+        assets,
+        depth,
+        sockets,
+        tls_config,
+        wall_anchor,
+        stale_after_ms,
+        tick_tx,
+        event_tx,
+        depth_tx,
+        status,
+        counters,
+        core_id,
+        run_dir,
+        epoch_ns,
+        tap_cfg,
+        capture_metrics,
+        tee,
+    )
+}
+
+/// PMJ J1b: spawn the 5-minute families' two threads — the 15-minute
+/// pipeline's code driven for `PmPeriod::M5` (`pm5-discovery`,
+/// `ingress-pm5`), feeding `engine::PM5_LANE`, with the `pm5` capture.
+/// `assets` are the `:5m` keys' assets in `[polymarket] rolling` order.
+/// Slot 9's arm never reads a 5-minute window (R-PMJ-3); PMJ J16: `tee`
+/// feeds slot 11's jup-gw every window the discovery finds, when slot 11
+/// is live (`None` otherwise: paper unchanged).
+///
+/// # Errors
+/// The capture could not be opened, or a host did not resolve.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_pm5(
+    assets: Vec<String>,
+    depth: core_config::universe::RollingDepth,
+    sockets: core_config::universe::RollingMarketSockets,
+    tls_config: RustlsConfig,
+    wall_anchor: core_time::WallAnchor,
+    stale_after_ms: u32,
+    tick_tx: Producer<Tick, TICK_RING_SIZE>,
+    event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    counters: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
+    core_id: usize,
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+    tee: Option<
+        Producer<
+            ingress_polymarket::gamma15::PmWindowSpec,
+            { ingress_polymarket::pm15_loop::PM15_SPEC_RING },
+        >,
+    >,
+) -> io::Result<Vec<JoinHandle<()>>> {
+    spawn_rolling(
+        core_types::pm_roll::PmPeriod::M5,
+        "pm5",
+        assets,
+        depth,
+        sockets,
+        tls_config,
+        wall_anchor,
+        stale_after_ms,
+        tick_tx,
+        event_tx,
+        depth_tx,
+        status,
+        counters,
+        core_id,
+        run_dir,
+        epoch_ns,
+        tap_cfg,
+        capture_metrics,
+        tee,
+    )
+}
+
+/// The rolling pipeline of one period (`spawn_pm15`, `spawn_pm5`): the
+/// capture `label`, the threads `<label>-discovery` / `ingress-<label>`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_rolling(
+    period: core_types::pm_roll::PmPeriod,
+    label: &'static str,
+    assets: Vec<String>,
+    depth: core_config::universe::RollingDepth,
+    sockets: core_config::universe::RollingMarketSockets,
     tls_config: RustlsConfig,
     wall_anchor: core_time::WallAnchor,
     stale_after_ms: u32,
     mut tick_tx: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mut depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: Arc<IngressStatus>,
     counters: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
     core_id: usize,
@@ -872,31 +1006,65 @@ pub fn spawn_pm15(
 ) -> io::Result<Vec<JoinHandle<()>>> {
     use ingress_polymarket::pm15_loop as p15;
     let mut capture = GaugedCapture::new(
-        PmlrCapture::open(run_dir, "pm15", epoch_ns, tap_cfg)?,
+        PmlrCapture::open(run_dir, label, epoch_ns, tap_cfg)?,
         capture_metrics,
     );
     if tap_cfg.mode != TapMode::Off {
-        capture.set_tap_venue_byte(run_dir, "pm15", VenueId::Polymarket.to_u8())?;
+        capture.set_tap_venue_byte(run_dir, label, VenueId::Polymarket.to_u8())?;
     }
     let refs: Vec<&[u8]> = assets.iter().map(|a| a.as_bytes()).collect();
-    let mut discovery =
-        ingress_polymarket::pm15_discovery::Pm15Discovery::new(tls_config.clone(), &refs)
-            .map_err(|e| io::Error::other(format!("pm15: gamma client: {e:?}")))?;
+    let mut discovery = ingress_polymarket::pm15_discovery::Pm15Discovery::new_for(
+        period,
+        tls_config.clone(),
+        &refs,
+    )
+    .map_err(|e| io::Error::other(format!("{label}: discovery clients (gamma, clob): {e:?}")))?;
     // PM15-6c: slot 9's gateway reads every window too, when it is live.
     if let Some(t) = tee {
         discovery.set_tee(t);
     }
     let seed = now_ns();
-    let market = core_net::WsConn::new(
-        p15::PM15_MARKET_HOST,
-        443,
-        p15::PM15_MARKET_PATH,
-        tls_config.clone(),
-        PM15_MARKET_WS,
-        p15::PM15_MARKET_TOKEN,
-        seed,
-    )
-    .map_err(|e| io::Error::other(format!("pm15: market socket: {e}")))?;
+    // PMJ J7 (R-PMJ-S17..S19): one market socket per shard of the families,
+    // never more than there are families (a socket with no family would
+    // never dial); shard 0 keeps the pre-J7 seed. Allocated here, at boot.
+    let n_market = (sockets.n as usize).min(assets.len()).max(1);
+    let mut market = Vec::with_capacity(n_market);
+    let mut k = 0usize;
+    while k < n_market {
+        let mut tries = 0u32;
+        let ws = loop {
+            match core_net::WsConn::new(
+                p15::PM15_MARKET_HOST,
+                443,
+                p15::PM15_MARKET_PATH,
+                tls_config.clone(),
+                PM15_MARKET_WS,
+                p15::pm15_market_token(k),
+                seed.wrapping_add((k as u64) << 32),
+            ) {
+                Ok(w) => break w,
+                // Shard 0 resolved the host a moment ago: a later shard's
+                // lookup that fails is retried (cold, boot only) before it
+                // can fail the boot.
+                Err(core_net::WsErr::Dns) if k > 0 && tries < 3 => {
+                    tries += 1;
+                    tracing::warn!(shard = k, tries, "{label}: market socket lookup failed; retrying");
+                    thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => {
+                    return Err(io::Error::other(format!("{label}: market socket {k}: {e}")));
+                }
+            }
+        };
+        market.push(ws);
+        k += 1;
+    }
+    tracing::info!(
+        families = assets.len(),
+        market_sockets = n_market,
+        configured = sockets.n,
+        "{label}: the families ride {n_market} market socket(s)"
+    );
     let rtds = core_net::WsConn::new(
         ingress_polymarket::rtds::RTDS_HOST,
         443,
@@ -906,22 +1074,28 @@ pub fn spawn_pm15(
         p15::PM15_RTDS_TOKEN,
         seed.rotate_left(17),
     )
-    .map_err(|e| io::Error::other(format!("pm15: rtds socket: {e}")))?;
-    let mut driver = p15::Pm15Driver::new(&refs, stale_after_ms);
+    .map_err(|e| io::Error::other(format!("{label}: rtds socket: {e}")))?;
+    // R-PMJ-S15: the depth capture's policy (`[polymarket] rolling_depth*`).
+    // PMJ J7: the families spread over the market sockets.
+    let mut driver = p15::Pm15Driver::new_for(period, &refs, stale_after_ms)
+        .with_depth_policy(depth.on, depth.min_ms)
+        .with_market_sockets(n_market);
     drop(refs);
     let (mut spec_tx, mut spec_rx) =
         Ring::<ingress_polymarket::gamma15::PmWindowSpec, { p15::PM15_SPEC_RING }>::new().split();
     let disc_counters = counters.clone();
+    let disc_name: &'static str = if label == "pm15" { "pm15-discovery" } else { "pm5-discovery" };
+    let ing_name: &'static str = if label == "pm15" { "ingress-pm15" } else { "ingress-pm5" };
     let h_disc = spawn_or_die(
-        thread::Builder::new().name("pm15-discovery".into()),
-        "pm15-discovery",
+        thread::Builder::new().name(disc_name.into()),
+        disc_name,
         move || discovery.run(wall_anchor, &mut spec_tx, &disc_counters, &SHUTDOWN),
     );
     let h_ing = spawn_or_die(
-        thread::Builder::new().name("ingress-pm15".into()),
-        "ingress-pm15",
+        thread::Builder::new().name(ing_name.into()),
+        ing_name,
         move || {
-            log_pin_outcome("pm15", core_id);
+            log_pin_outcome(label, core_id);
             let mut socks = p15::Pm15Sockets { market, rtds };
             let mut out = p15::Pm15Out {
                 tick: &mut tick_tx,
@@ -930,6 +1104,8 @@ pub fn spawn_pm15(
                 status: &status,
                 counters: &counters,
                 capture: &mut capture,
+                // PMJ J8: the paper book's levels.
+                depth: Some(&mut depth_tx),
             };
             if let Err(e) = p15::run_pm15(
                 &mut driver,
@@ -940,7 +1116,7 @@ pub fn spawn_pm15(
                 seed,
                 &SHUTDOWN,
             ) {
-                tracing::error!(error = ?e, "pm15: poll failed; the rolling ingress stops");
+                tracing::error!(error = ?e, "{label}: poll failed; the rolling ingress stops");
                 status.set_state(IngressState::Down);
             }
         },
@@ -2646,6 +2822,7 @@ pub fn spawn_hyperliquid(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
     trade_route: &'static [core_types::SymbolId],
+    hot: Arc<core_time::HotCell>,
 ) -> io::Result<JoinHandle<()>> {
     let mut capture = GaugedCapture::new(
         PmlrCapture::open(run_dir, "hl", epoch_ns, tap_cfg)?,
@@ -2659,6 +2836,8 @@ pub fn spawn_hyperliquid(
         "ingress-hyperliquid",
         move || {
             log_pin_outcome("hyperliquid", core_id);
+            // T2T T1-b: the order path's ingress stays on the P-cores.
+            log_qos_outcome("hyperliquid");
             let server_name = match TlsTransport::server_name_from_host(&ep.host) {
                 Ok(n) => n,
                 Err(e) => {
@@ -2685,6 +2864,8 @@ pub fn spawn_hyperliquid(
             driver.set_trade_lane(trade_tx);
             // PVM B'1 T5: the pine slot's Trade route (empty = none).
             driver.set_trade_route(trade_route);
+            // T2T T1-b: never block inside the window the boot publishes.
+            driver.set_hot_cell(hot);
             // VM2 V2: HL funding rides AssetCtx — the lane mask carries
             // both bits (feature-engine law). BIN15 O2: with rolling
             // families configured the lane also carries the roll and the
@@ -3199,6 +3380,18 @@ pub fn open_events_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCapt
     )
 }
 
+/// T2T T0: open the engine-thread per-order latency capture
+/// (`<run_dir>/engine-latency.pmlr`, `SlotKind::Latency`). Boot-only; the
+/// bin hands the result to [`Observability::with_latency_capture`] and
+/// the engine loop takes ownership from there.
+pub fn open_latency_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCapture<T2tRecord>> {
+    SlotCapture::open(
+        run_dir.join(ENGINE_LATENCY_FILE),
+        SlotKind::Latency,
+        epoch_ns,
+    )
+}
+
 /// Parse `AI_INGRESS_HMAC_KEY` (64 hex chars) into the 32-byte HMAC
 /// key (Phase 8f §4.1). The error strings deliberately carry **no key
 /// material** — this value must never reach a log. Returns `Err` on
@@ -3433,6 +3626,8 @@ pub struct RawTapConfig {
     /// PM15: tap config for the rolling families' ingress (both sockets'
     /// text payloads; label `pm15`).
     pub pm15: TapCfg,
+    /// PMJ J1b: tap config for the 5-minute families' ingress (label `pm5`).
+    pub pm5: TapCfg,
 }
 
 /// Parse `--raw-tap <CSV|all>` + `--raw-tap-mode <rejects|all>` +
@@ -3473,6 +3668,7 @@ pub fn parse_raw_tap_flags(
         hyperevm: TapCfg::off(),
         hypercall: TapCfg::off(),
         pm15: TapCfg::off(),
+        pm5: TapCfg::off(),
     };
 
     let spec = match raw_tap.map(str::trim).filter(|s| !s.is_empty()) {
@@ -3492,10 +3688,11 @@ pub fn parse_raw_tap_flags(
         cfg.hyperevm = enabled_cfg;
         cfg.hypercall = enabled_cfg;
         cfg.pm15 = enabled_cfg;
+        cfg.pm5 = enabled_cfg;
         return Ok(cfg);
     }
 
-    let mut seen: [&str; 11] = [""; 11];
+    let mut seen: [&str; 12] = [""; 12];
     for (n_seen, item) in spec.split(',').enumerate() {
         let label = item.trim();
         if label.is_empty() {
@@ -3520,6 +3717,7 @@ pub fn parse_raw_tap_flags(
             "hyperevm" => cfg.hyperevm = enabled_cfg,
             "hypercall" => cfg.hypercall = enabled_cfg,
             "pm15" => cfg.pm15 = enabled_cfg,
+            "pm5" => cfg.pm5 = enabled_cfg,
             _ => return Err("--raw-tap: unknown venue label"),
         }
     }
@@ -3803,6 +4001,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     har: Option<&crate::har_boot::HarBoot>,
     pine: Option<crate::pine_boot::PineBoot>,
     pm15: Option<&crate::pm15_boot::Pm15Boot>,
+    pmj: Option<&crate::pmj_boot::PmjBoot>,
 ) -> EngineLoopResult {
     let mut configured = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
     // PVM impl-08 T19: slot 8 is configured exactly when `--pine` built its boot (F19 both ways
@@ -3812,6 +4011,9 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     }
     if pm15.is_some() {
         configured |= strategy_set::BIT_PM15;
+    }
+    if pmj.is_some() {
+        configured |= strategy_set::BIT_PMJ;
     }
     if hyparb.is_some() {
         configured |= strategy_set::BIT_HYPARB;
@@ -4122,6 +4324,17 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             return EngineLoopResult::Failed("engine_loop_set: pm15 configure rejected");
         }
         tracing::info!("{}", crate::pm15_boot::render_boot_tell(boot));
+    }
+    if let Some(boot) = pmj {
+        // PMJ J4: the same law as slot 9's — one wall anchor taken here,
+        // the Φ table cloned out of the boot struct, once. Slot 11 is
+        // PAPER: the dispatcher already carries the boot's keeper delay.
+        let anchor = core_time::WallAnchor::now();
+        if let Err(e) = set.pmj_mut().configure(boot.params, Box::new((*boot.lut).clone()), anchor) {
+            tracing::error!(error = ?e, "pmj: configure failed");
+            return EngineLoopResult::Failed("engine_loop_set: pmj configure rejected");
+        }
+        tracing::info!("{}", crate::pmj_boot::render_boot_tell(boot));
     }
     if let Some(boot) = hyparb {
         // HYPARB H5. The wall anchor is taken HERE, once — the member's
@@ -4565,24 +4778,25 @@ impl Observability {
             let orders_dropped = reg
                 .register_counter("engine_orders_dropped_total")
                 .map_err(|_| "register engine_orders_dropped_total")?;
-            let ingest_p50_ns = reg
-                .register_gauge("engine_latency_ingest_p50_ns")
-                .map_err(|_| "register engine_latency_ingest_p50_ns")?;
-            let ingest_p99_ns = reg
-                .register_gauge("engine_latency_ingest_p99_ns")
-                .map_err(|_| "register engine_latency_ingest_p99_ns")?;
-            let decide_p50_ns = reg
-                .register_gauge("engine_latency_decide_p50_ns")
-                .map_err(|_| "register engine_latency_decide_p50_ns")?;
-            let decide_p99_ns = reg
-                .register_gauge("engine_latency_decide_p99_ns")
-                .map_err(|_| "register engine_latency_decide_p99_ns")?;
-            let ack_p50_ns = reg
-                .register_gauge("engine_latency_ack_p50_ns")
-                .map_err(|_| "register engine_latency_ack_p50_ns")?;
-            let ack_p99_ns = reg
-                .register_gauge("engine_latency_ack_p99_ns")
-                .map_err(|_| "register engine_latency_ack_p99_ns")?;
+            // T2T T0: `engine_latency_<stage>_{p50,p99,p999,max}_ns`, every
+            // stage in path order. Boot-only: the names are formatted here.
+            let mut latency_ns = [[GaugeId::default(); LAT_QUANTILES.len()]; LatStage::ALL.len()];
+            let mut si = 0;
+            while si < LatStage::ALL.len() {
+                let mut qi = 0;
+                while qi < LAT_QUANTILES.len() {
+                    let name = format!(
+                        "engine_latency_{}_{}_ns",
+                        LatStage::ALL[si].name(),
+                        LAT_QUANTILES[qi].0
+                    );
+                    latency_ns[si][qi] = reg
+                        .register_gauge(&name)
+                        .map_err(|_| "register engine_latency_<stage>_<q>_ns")?;
+                    qi += 1;
+                }
+                si += 1;
+            }
             let strategy_hyparb = reg
                 .register_gauge("engine_strategy_hyparb_active")
                 .map_err(|_| "register engine_strategy_hyparb_active")?;
@@ -4670,6 +4884,10 @@ impl Observability {
             let ingress_pm15_state = reg
                 .register_gauge("engine_ingress_pm15_state")
                 .map_err(|_| "register engine_ingress_pm15_state")?;
+            // PMJ J1b: the 5-minute families' market socket.
+            let ingress_pm5_state = reg
+                .register_gauge("engine_ingress_pm5_state")
+                .map_err(|_| "register engine_ingress_pm5_state")?;
             // T1(c) (outage 2026-08-27 §5.5): per-venue last-TICK age
             // in seconds. `*_state` lies on a 1 Hz-churning lane (a
             // sampler nearly always catches it mid-cycle at Up) and
@@ -4750,6 +4968,7 @@ impl Observability {
             let ingress_hyperevm = register_ingress_counters(&mut reg, "hyperevm")?;
             let ingress_hypercall = register_ingress_counters(&mut reg, "hypercall")?;
             let ingress_pm15 = register_ingress_counters(&mut reg, "pm15")?;
+            let ingress_pm5 = register_ingress_counters(&mut reg, "pm5")?;
 
             // §6.5 capture-health gauges, one pair per spawnable
             // ingress thread (short capture-venue labels — see
@@ -4769,6 +4988,7 @@ impl Observability {
             let capture_hyperevm = register_capture_gauges(&mut reg, "hyperevm")?;
             let capture_hypercall = register_capture_gauges(&mut reg, "hypercall")?;
             let capture_pm15 = register_capture_gauges(&mut reg, "pm15")?;
+            let capture_pm5 = register_capture_gauges(&mut reg, "pm5")?;
 
             // §6.1 boot-discovery coverage gauges — PM/OKX/Deribit/HL
             // + Binance since M1 (exchangeInfo audit); RPC alone has
@@ -4801,9 +5021,20 @@ impl Observability {
             // PM15: the rolling families' own family (gauges mirrored
             // from `Pm15Counters`).
             let pm15 = register_pm15_metrics(&mut reg)?;
+            // PMJ J1b: the 5-minute families' own family, same shape.
+            let pm5 = register_rolling_metrics(&mut reg, "pm5")?;
             // PM15-8c: slot 9's arm and pm-gw (gauges mirrored from
             // `PmExecStats`).
             let pm15x = register_pm15x_metrics(&mut reg)?;
+            // PMJ J16: slot 11's arm and jup-gw — registered only when the
+            // artifact marks slot 11 live (a paper boot builds no arm and
+            // names none of them).
+            let pmjx = match exec_modes.as_ref() {
+                Some(spec) if spec.modes.get(crate::exec_boot::PMJ_SLOT) == Some(&1) => {
+                    Some(register_pmjx_metrics(&mut reg)?)
+                }
+                _ => None,
+            };
 
             // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
             // (mirrored centrally from the shared status slot), the
@@ -4824,6 +5055,7 @@ impl Observability {
             let xsd = register_xsd_metrics(&mut reg)?;
             let bin15 = register_bin15_metrics(&mut reg)?;
             let pm15_member = register_pm15_member_metrics(&mut reg)?;
+            let pmj_member = register_pmj_member_metrics(&mut reg)?;
             let hyparb = register_hyparb_metrics(&mut reg)?;
             let hyparb_evm = register_hyparb_evm_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
@@ -4854,6 +5086,15 @@ impl Observability {
                     .map_err(|_| "register engine_orders_capture_records")?;
                 CaptureGaugeIds { io_errors, records }
             };
+            let latency_capture = {
+                let io_errors = reg
+                    .register_gauge("engine_latency_capture_io_errors")
+                    .map_err(|_| "register engine_latency_capture_io_errors")?;
+                let records = reg
+                    .register_gauge("engine_latency_capture_records")
+                    .map_err(|_| "register engine_latency_capture_records")?;
+                CaptureGaugeIds { io_errors, records }
+            };
             let events_capture = {
                 let io_errors = reg
                     .register_gauge("engine_events_capture_io_errors")
@@ -4873,12 +5114,7 @@ impl Observability {
                 signals,
                 orders_emitted,
                 orders_dropped,
-                ingest_p50_ns,
-                ingest_p99_ns,
-                decide_p50_ns,
-                decide_p99_ns,
-                ack_p50_ns,
-                ack_p99_ns,
+                latency_ns,
                 strategy_hyparb,
                 strategy_vrp,
                 strategy_rule_tree,
@@ -4904,6 +5140,7 @@ impl Observability {
                 ingress_hyperevm_state,
                 ingress_hypercall_state,
                 ingress_pm15_state,
+                ingress_pm5_state,
                 ingress_last_tick_age,
                 restart_stamp_age,
                 max_tick_age_ns,
@@ -4919,6 +5156,7 @@ impl Observability {
                 ingress_hyperevm,
                 ingress_hypercall,
                 ingress_pm15,
+                ingress_pm5,
                 capture_pm,
                 capture_bn,
                 capture_okx,
@@ -4930,6 +5168,7 @@ impl Observability {
                 capture_hyperevm,
                 capture_hypercall,
                 capture_pm15,
+                capture_pm5,
                 coverage_pm,
                 coverage_okx,
                 coverage_deribit,
@@ -4944,12 +5183,15 @@ impl Observability {
                 hypercall_options_selected,
                 hypercall,
                 pm15,
+                pm5,
                 pm15x,
+                pmjx,
                 ingress_ai,
                 capture_ai,
                 fills_capture,
                 orders_capture,
                 events_capture,
+                latency_capture,
                 strategy_enabled_mask,
                 vm,
                 xmm,
@@ -4959,6 +5201,7 @@ impl Observability {
                 xsd,
                 bin15,
                 pm15_member,
+                pmj_member,
                 hyparb,
                 hyparb_evm,
                 regime,
@@ -5119,6 +5362,13 @@ pub struct Observability {
     /// `fills_capture` (bin opens, engine loop takes ownership). `None` in
     /// tests and in tools that replay rather than run.
     pub events_capture: Option<SlotCapture<OrderEvent>>,
+    /// T2T T0: the engine-thread per-order latency capture, same lifecycle
+    /// as `fills_capture` (bin opens, engine loop takes ownership). `None`
+    /// in tests and in tools that replay rather than run.
+    pub latency_capture: Option<SlotCapture<T2tRecord>>,
+    /// T2T T1-b: the late law's hot window (the same cell the HL ingress
+    /// reads); `None` = never hot, the loop yields every iteration as before.
+    pub hot: Option<Arc<core_time::HotCell>>,
     /// VRP V8a: where the VRP member's persisted state is written.
     /// `None` = no VRP member is configured, and the engine writes
     /// nothing. Set by the set builder from the boot bundle.
@@ -5242,6 +5492,19 @@ impl Observability {
         self
     }
 
+    /// Attach T2T T0's per-order latency capture. Boot-only; called from
+    /// the bin after the per-run capture directory exists.
+    pub fn with_latency_capture(mut self, cap: SlotCapture<T2tRecord>) -> Self {
+        self.latency_capture = Some(cap);
+        self
+    }
+
+    /// T2T T1-b: the hot window the engine loop reads. Boot-only.
+    pub fn with_hot_cell(mut self, cell: Arc<core_time::HotCell>) -> Self {
+        self.hot = Some(cell);
+        self
+    }
+
     /// RG6: attach the boot identity the `/state` snapshot carries.
     /// Boot-only; the bin fills it once the run directory exists.
     pub fn with_boot_info(mut self, boot: BootInfo) -> Self {
@@ -5256,6 +5519,11 @@ impl Observability {
     }
 }
 
+/// T2T T0: the quantiles every stage gauge exports, by metric suffix. A
+/// quantile of 1.0 reads the histogram's top bucket (`max_bound`).
+pub const LAT_QUANTILES: [(&str, f64); 4] =
+    [("p50", 0.50), ("p99", 0.99), ("p999", 0.999), ("max", 1.0)];
+
 /// CounterId + GaugeId handles for the engine-loop hot path. Built
 /// once at boot inside `Observability::build`.
 #[derive(Copy, Clone, Debug)]
@@ -5268,18 +5536,9 @@ pub struct EngineCounters {
     pub orders_emitted: core_metrics::CounterId,
     /// Orders the dispatcher rejected.
     pub orders_dropped: core_metrics::CounterId,
-    /// p50 ingest→strategy latency (ns).
-    pub ingest_p50_ns: core_metrics::GaugeId,
-    /// p99 ingest→strategy latency (ns).
-    pub ingest_p99_ns: core_metrics::GaugeId,
-    /// p50 strategy→submit latency (ns).
-    pub decide_p50_ns: core_metrics::GaugeId,
-    /// p99 strategy→submit latency (ns).
-    pub decide_p99_ns: core_metrics::GaugeId,
-    /// p50 submit→ack latency (ns).
-    pub ack_p50_ns: core_metrics::GaugeId,
-    /// p99 submit→ack latency (ns).
-    pub ack_p99_ns: core_metrics::GaugeId,
+    /// T2T T0: one gauge per [`LatStage`] (path order) and per
+    /// [`LAT_QUANTILES`] entry, in ns.
+    pub latency_ns: [[core_metrics::GaugeId; LAT_QUANTILES.len()]; LatStage::ALL.len()],
     /// Active-strategy indicator — hyparb (slot 0; was latency-arb
     /// before HYPARB H0).
     pub strategy_hyparb: core_metrics::GaugeId,
@@ -5331,6 +5590,8 @@ pub struct EngineCounters {
     pub ingress_hypercall_state: core_metrics::GaugeId,
     /// PM15: per-ingress state gauge, the rolling families' market socket.
     pub ingress_pm15_state: core_metrics::GaugeId,
+    /// PMJ J1b: the same for the 5-minute families' market socket.
+    pub ingress_pm5_state: core_metrics::GaugeId,
     /// T1(c): per-venue last-tick-age gauges in seconds
     /// (`engine_ingress_<venue>_last_tick_age_seconds`; -1 = no tick
     /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc, mexc,
@@ -5370,6 +5631,8 @@ pub struct EngineCounters {
     pub ingress_hypercall: IngressCounterIds,
     /// PM15: §6.4 loss-accounting counters, the rolling families' thread.
     pub ingress_pm15: IngressCounterIds,
+    /// PMJ J1b: the same for the 5-minute families' thread.
+    pub ingress_pm5: IngressCounterIds,
     /// §6.5 capture-health gauges, Polymarket thread.
     pub capture_pm: CaptureGaugeIds,
     /// §6.5 capture-health gauges, Binance thread.
@@ -5393,6 +5656,8 @@ pub struct EngineCounters {
     pub capture_hypercall: CaptureGaugeIds,
     /// PM15: capture-health gauges, the rolling families (`pm15`).
     pub capture_pm15: CaptureGaugeIds,
+    /// PMJ J1b: capture-health gauges, the 5-minute families (`pm5`).
+    pub capture_pm5: CaptureGaugeIds,
     /// §6.1 boot-discovery coverage gauge, Polymarket (always runs).
     pub coverage_pm: GaugeId,
     /// §6.1 boot-discovery coverage gauge, OKX (0 when unconfigured).
@@ -5414,8 +5679,13 @@ pub struct EngineCounters {
     pub hypercall: HcMetricIds,
     /// PM15: the rolling families' family ([`register_pm15_metrics`]).
     pub pm15: Pm15MetricIds,
+    /// PMJ J1b: the 5-minute families' family (`engine_ingress_pm5_*`).
+    pub pm5: Pm15MetricIds,
     /// PM15-8c: slot 9's arm and pm-gw ([`register_pm15x_metrics`]).
     pub pm15x: Pm15xMetricIds,
+    /// PMJ J16: slot 11's arm and jup-gw ([`register_pmjx_metrics`]) —
+    /// `None` unless slot 11 is live.
+    pub pmjx: Option<PmjxMetricIds>,
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
@@ -5450,6 +5720,10 @@ pub struct EngineCounters {
     /// (`engine_events_capture_{io_errors,records}`). Mirrored centrally
     /// from the engine loop like the fills pair.
     pub events_capture: CaptureGaugeIds,
+    /// T2T T0 capture-health gauges, the per-order latency capture
+    /// (`engine_latency_capture_{io_errors,records}`). Mirrored centrally
+    /// from the engine loop like the fills pair.
+    pub latency_capture: CaptureGaugeIds,
     /// Phase-8g §9: the set's live enable mask
     /// (`engine_strategy_enabled_mask` — the G0 demo finding: the
     /// flip was only inferable from order-flow deltas). Read via the
@@ -5474,6 +5748,9 @@ pub struct EngineCounters {
     pub bin15: Bin15MetricIds,
     /// PM15-5: the `engine_pm15_*` family (slot 9).
     pub pm15_member: Pm15MemberMetricIds,
+    /// PMJ J4: the `engine_pmj_*` family (slot 11; the same tallies and
+    /// levels as slot 9's).
+    pub pmj_member: Pm15MemberMetricIds,
     /// HYPARB H6: the `engine_hyparb_*` family (slot 0).
     pub hyparb: HyparbMetricIds,
     /// HYPARB H8: the `engine_hyparb_evm_*` family (the testnet shadow).
@@ -5496,7 +5773,8 @@ pub struct EngineCounters {
 ///
 /// `core-metrics` registers FIXED names — there is no label mechanism
 /// (`MAX_COUNTERS = 768` since PM15-2 — 640 at XMM XH4f, 512 at E7, 256 before —,
-/// `MAX_GAUGES = 640` — 512 at XH4f, 384 before —, `NAME_MAX = 63`), so the
+/// `MAX_GAUGES = 768` since T2T T0 — 640 at PM15-2, 512 at XH4f, 384 before —,
+/// `NAME_MAX = 63`), so the
 /// per-slot names are generated as whole strings at boot, one
 /// `register_counter` call each, and never formatted again. The
 /// per-slot family is registered for LIVE slots ONLY: an all-paper
@@ -5552,6 +5830,19 @@ pub struct ExecMetricIds {
     pub retired: core_metrics::CounterId,
     /// `engine_exec_halts_total` (E6 c4) — halt EDGES. **The alarm.**
     pub halts: core_metrics::CounterId,
+    /// `engine_exec_holds_total` (O-WSG1) — hold EDGES: a slot that
+    /// stopped placing because its stream went down or its reconciliation
+    /// went stale, and resumes by itself. Not an alarm; its RATE is the
+    /// venue's connectivity.
+    pub holds: core_metrics::CounterId,
+    /// `engine_exec_refused_held_total` (O-WSG1) — requests refused
+    /// because their slot was HELD.
+    pub refused_held: core_metrics::CounterId,
+    /// `engine_exec_held_mask` (gauge, O-WSG1) — bit `1 << slot` for every
+    /// slot held now (slot 3 alone reads 8). One gauge, not one a slot: the
+    /// fixed registry's worst case (every slot live) has no sixteen gauges
+    /// to spare. `/state` `exec.held` spells each slot's reason.
+    pub held_mask: GaugeId,
     /// `engine_exec_cancel_all_failures_total` (E6 c4) — cancel-all
     /// requests the arm would not accept.
     pub cancel_all_failures: core_metrics::CounterId,
@@ -6209,6 +6500,12 @@ fn register_vrp_metrics(
     })
 }
 
+/// PMJ J8: the classes of slot 11's verdict tallies (`MatcherCounters::pmj_*`
+/// index order).
+pub const PMJ_MATCHER_CLASSES: [&str; 3] = ["shadow350ms", "shadow1s", "real"];
+/// PMJ J8: the words of slot 11's verdict tallies.
+pub const PMJ_MATCHER_WORDS: [&str; 4] = ["judged", "filled", "qty_1e6", "usd_1e6"];
+
 /// X1: the paper matcher's family. Boot-only.
 #[derive(Copy, Clone, Debug)]
 pub struct PaperMatcherMetricIds {
@@ -6275,6 +6572,12 @@ pub struct PaperMatcherMetricIds {
     /// canceled,fills}_total` — the queue law's own tally, in that order —
     /// and `engine_paper_matcher_order_events_overflow_total` (must stay 0).
     pub queue: [core_metrics::CounterId; 6],
+    /// PMJ J8: `engine_paper_matcher_held_swept_deeper_total`,
+    /// `…_held_levels_lagged_total`, `…_pmj_shadow_refused_total`, then
+    /// `engine_paper_matcher_pmj_<class>_<word>_total` for class
+    /// `shadow350ms`, `shadow1s`, `real` × word `judged`, `filled`,
+    /// `qty_1e6`, `usd_1e6` ([`PMJ_MATCHER_CLASSES`] × [`PMJ_MATCHER_WORDS`]).
+    pub pmj: [core_metrics::CounterId; 3 + 12],
     /// XMM XH2: `engine_set_order_events_unrouted_total` — order events
     /// that reached the set for a slot not enabled or not built, or
     /// attributed to none. Counted, never fanned out.
@@ -6321,9 +6624,26 @@ fn register_paper_matcher_metrics(
         one("engine_paper_matcher_order_events_overflow_total")?,
     ];
     let order_events_unrouted = one("engine_set_order_events_unrouted_total")?;
+    let mut pmj = [core_metrics::CounterId::default(); 3 + 12];
+    pmj[0] = one("engine_paper_matcher_held_swept_deeper_total")?;
+    pmj[1] = one("engine_paper_matcher_held_levels_lagged_total")?;
+    pmj[2] = one("engine_paper_matcher_pmj_shadow_refused_total")?;
+    let mut w = 0usize;
+    while w < PMJ_MATCHER_WORDS.len() {
+        let mut c = 0usize;
+        while c < PMJ_MATCHER_CLASSES.len() {
+            pmj[3 + w * 3 + c] = one(&format!(
+                "engine_paper_matcher_pmj_{}_{}_total",
+                PMJ_MATCHER_CLASSES[c], PMJ_MATCHER_WORDS[w]
+            ))?;
+            c += 1;
+        }
+        w += 1;
+    }
     Ok(PaperMatcherMetricIds {
         amm,
         queue,
+        pmj,
         order_events_unrouted,
         intake,
         fills,
@@ -6472,6 +6792,8 @@ fn register_exec_metrics(
     let refused_unpriced = one("engine_exec_refused_unpriced_total")?;
     let retired = one("engine_exec_retired_total")?;
     let halts = one("engine_exec_halts_total")?;
+    let holds = one("engine_exec_holds_total")?;
+    let refused_held = one("engine_exec_refused_held_total")?;
     let cancel_all_failures = one("engine_exec_cancel_all_failures_total")?;
     let cancel_all_stranded = one("engine_exec_cancel_all_stranded_total")?;
     let cancel_on_off = one("engine_exec_cancel_on_off_total")?;
@@ -6486,6 +6808,9 @@ fn register_exec_metrics(
     let seeded = reg
         .register_gauge("engine_exec_seeded")
         .map_err(|_| "register engine_exec_seeded")?;
+    let held_mask = reg
+        .register_gauge("engine_exec_held_mask")
+        .map_err(|_| "register engine_exec_held_mask")?;
     let budget_remaining = reg
         .register_gauge("engine_exec_hl_budget_remaining")
         .map_err(|_| "register engine_exec_hl_budget_remaining")?;
@@ -6563,6 +6888,9 @@ fn register_exec_metrics(
         refused_unpriced,
         retired,
         halts,
+        holds,
+        refused_held,
+        held_mask,
         cancel_all_failures,
         cancel_all_stranded,
         cancel_on_off,
@@ -6611,6 +6939,15 @@ fn mirror_exec_metrics(
         .inc(retired_cur.saturating_sub(retired_last));
     reg.counter(ids.halts)
         .inc(cur.halts.saturating_sub(last.halts));
+    reg.counter(ids.holds)
+        .inc(cur.holds.saturating_sub(last.holds));
+    reg.counter(ids.refused_held)
+        .inc(cur.refused_held.saturating_sub(last.refused_held));
+    let mut held_mask = 0i64;
+    for (s, h) in cur.held.iter().enumerate() {
+        held_mask |= i64::from(*h != 0) << s;
+    }
+    reg.gauge(ids.held_mask).set(held_mask);
     reg.counter(ids.cancel_all_failures)
         .inc(cur.cancel_all_failures.saturating_sub(last.cancel_all_failures));
     reg.counter(ids.cancel_all_stranded)
@@ -6667,6 +7004,23 @@ fn mirror_exec_metrics(
         let Some(slot) = slot else { continue };
         reg.gauge(slot.mode).set(i64::from(cur.modes[s]));
         reg.gauge(slot.halted).set(i64::from(cur.halted[s]));
+        // O-WSG1: the hold's edges, told once each (cold: the mirror's
+        // cadence). A hold that began and ended between two mirrors shows
+        // in `engine_exec_holds_total` alone.
+        if cur.held[s] != 0 && last.held[s] == 0 {
+            tracing::warn!(
+                slot = s,
+                reason = exec_router::halt::hold_word(cur.held[s]),
+                holds = cur.holds,
+                "exec: slot HELD — no new orders until the stream is back and re-read; resumes by itself (O-WSG1)"
+            );
+        } else if cur.held[s] == 0 && last.held[s] != 0 {
+            tracing::info!(
+                slot = s,
+                was = exec_router::halt::hold_word(last.held[s]),
+                "exec: slot RESUMED — the stream is back and the re-read agreed"
+            );
+        }
         reg.counter(slot.live_submits).inc(
             cur.live_submits_by_slot[s].saturating_sub(last.live_submits_by_slot[s]),
         );
@@ -6681,9 +7035,9 @@ fn mirror_exec_metrics(
 // ---------------------------------------------------------------
 
 /// The hlgw family's counters.
-const HLGW_COUNTERS: usize = 88;
+const HLGW_COUNTERS: usize = 90;
 /// The hlgw family's level gauges (the tell's gauge is registered apart).
-const HLGW_GAUGES: usize = 37;
+const HLGW_GAUGES: usize = 38;
 
 /// The counter rows of the hlgw family, in [`hlgw_counter_values`] order
 /// — which is what pins the two together.
@@ -6756,6 +7110,8 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
     "engine_exec_hlgw_gateway_throttled_total",
     "engine_exec_hlgw_gateway_ttl_cancels_total",
     "engine_exec_hlgw_gateway_ttl_full_total",
+    "engine_exec_hlgw_gateway_signs_pooled_total",
+    "engine_exec_hlgw_gateway_signs_fallback_total",
     "engine_exec_hlgw_outcome_rolls_bound_total",
     "engine_exec_hlgw_outcome_rolls_settled_total",
     "engine_exec_hlgw_outcome_rolls_refused_total",
@@ -6779,7 +7135,7 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
 ];
 
 /// `GatewayArmReport`'s totals in [`HLGW_COUNTER_NAMES`] order.
-// COPY: [u64; 88] (704 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 90] (720 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -6853,6 +7209,8 @@ fn hlgw_counter_values(r: &clob_dispatcher::GatewayArmReport) -> [u64; HLGW_COUN
         r.gw_throttled,
         r.gw_ttl_cancels,
         r.gw_ttl_full,
+        r.gw_signs_pooled,
+        r.gw_signs_fallback,
         r.outcome_rolls_bound,
         r.outcome_rolls_settled,
         r.outcome_rolls_refused,
@@ -6915,12 +7273,13 @@ const HLGW_GAUGE_NAMES: [&str; HLGW_GAUGES] = [
     "engine_exec_hlgw_topup_weight",
     "engine_exec_hlgw_topup_day_used",
     "engine_exec_hlgw_topup_cost_usd_1e6",
+    "engine_exec_hlgw_signer_pool_ready",
 ];
 
 /// `GatewayArmReport`'s levels in [`HLGW_GAUGE_NAMES`] order; an unsigned
 /// level past `i64::MAX` — a heartbeat not yet seen, a top-up day read as
 /// spent (XMM XH5c-2) — reads −1.
-// COPY: [i64; 37] (296 B) returned by value — cold, as above.
+// COPY: [i64; 38] (304 B) returned by value — cold, as above.
 fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES] {
     let g = |v: u64| i64::try_from(v).unwrap_or(-1);
     [
@@ -6961,6 +7320,7 @@ fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES
         g(r.topup_weight),
         g(r.topup_day_used),
         r.topup_cost_usd_1e6,
+        g(r.signer_pool_ready),
     ]
 }
 
@@ -7411,6 +7771,25 @@ fn mirror_paper_matcher_metrics(
         .inc(cur.queue_fills.saturating_sub(last.queue_fills));
     reg.counter(ids.queue[5])
         .inc(cur.order_events_overflow.saturating_sub(last.order_events_overflow));
+    // PMJ J8: the sweep's depth, and slot 11's verdicts by delay class.
+    reg.counter(ids.pmj[0])
+        .inc(cur.held_swept_deeper.saturating_sub(last.held_swept_deeper));
+    reg.counter(ids.pmj[1])
+        .inc(cur.held_levels_lagged.saturating_sub(last.held_levels_lagged));
+    reg.counter(ids.pmj[2])
+        .inc(cur.pmj_shadow_refused.saturating_sub(last.pmj_shadow_refused));
+    let mut c = 0usize;
+    while c < 3 {
+        reg.counter(ids.pmj[3 + c])
+            .inc(cur.pmj_judged[c].saturating_sub(last.pmj_judged[c]));
+        reg.counter(ids.pmj[6 + c])
+            .inc(cur.pmj_filled[c].saturating_sub(last.pmj_filled[c]));
+        reg.counter(ids.pmj[9 + c])
+            .inc(cur.pmj_qty_1e6[c].saturating_sub(last.pmj_qty_1e6[c]));
+        reg.counter(ids.pmj[12 + c])
+            .inc(cur.pmj_usd_1e6[c].saturating_sub(last.pmj_usd_1e6[c]));
+        c += 1;
+    }
     // E5: the engine-level tally, which counts verbs on BOTH arms —
     // the matcher family above sees only the paper one, so a live
     // slot's cancels would otherwise be invisible here.
@@ -8227,6 +8606,10 @@ pub struct Bin15MetricIds {
     pub late_skipped_persist: core_metrics::CounterId,
     /// `engine_bin15_late_skipped_cap_total` (BIN15 H90)
     pub late_skipped_cap: core_metrics::CounterId,
+    /// `engine_bin15_late_skipped_refire_total` (BIN15 fills B-1)
+    pub late_skipped_refire: core_metrics::CounterId,
+    /// `engine_bin15_late_skipped_age_total` (BIN15 fills B-2)
+    pub late_skipped_age: core_metrics::CounterId,
     /// Per family: `p_hat_1e6`, `pos_yes_1e6`, `pos_no_1e6`,
     /// `live_outcome`, in that order.
     pub families: [[core_metrics::GaugeId; BIN15_FAMILY_GAUGES]; BIN15_METRIC_FAMILIES],
@@ -8383,6 +8766,8 @@ fn register_bin15_metrics(
     let late_skipped_price = one("engine_bin15_late_skipped_price_total")?;
     let late_skipped_persist = one("engine_bin15_late_skipped_persist_total")?;
     let late_skipped_cap = one("engine_bin15_late_skipped_cap_total")?;
+    let late_skipped_refire = one("engine_bin15_late_skipped_refire_total")?;
+    let late_skipped_age = one("engine_bin15_late_skipped_age_total")?;
     let mut families = [[core_metrics::GaugeId::default(); BIN15_FAMILY_GAUGES];
         BIN15_METRIC_FAMILIES];
     let mut f = 0usize;
@@ -8422,6 +8807,8 @@ fn register_bin15_metrics(
         late_skipped_price,
         late_skipped_persist,
         late_skipped_cap,
+        late_skipped_refire,
+        late_skipped_age,
         families,
     })
 }
@@ -8509,6 +8896,60 @@ fn mirror_pm15_member_metrics<S: strategy_core::StrategyCounters>(
     *last = cur;
 }
 
+/// PMJ J4: the `engine_pmj_*` family's level gauges (slot 11).
+pub const PMJ_LEVEL_NAMES: [&str; PM15_LEVELS] = [
+    "engine_pmj_pnl_usd_1e6",
+    "engine_pmj_fees_usd_1e6",
+    "engine_pmj_bought_usd_1e6",
+    "engine_pmj_open_cost_usd_1e6",
+    "engine_pmj_markets_live",
+    "engine_pmj_halted",
+];
+
+/// PMJ J4: register the slot-11 member family — `engine_pmj_<name>_total`
+/// for every [`strategy_core::PM15_COUNTER_NAMES`] entry and the
+/// [`PMJ_LEVEL_NAMES`] gauges (boot-only; names rendered once). The ids
+/// type is slot 9's: the two members report the same H90 tallies.
+fn register_pmj_member_metrics(reg: &mut MetricsRegistry) -> Result<Pm15MemberMetricIds, &'static str> {
+    let mut tallies = [core_metrics::CounterId::default(); strategy_core::PM15_TALLIES];
+    let mut i = 0usize;
+    while i < strategy_core::PM15_TALLIES {
+        let name = format!("engine_pmj_{}_total", strategy_core::PM15_COUNTER_NAMES[i]);
+        tallies[i] = reg.register_counter(&name).map_err(|_| "register pmj counter")?;
+        i += 1;
+    }
+    let mut levels = [GaugeId::default(); PM15_LEVELS];
+    let mut k = 0usize;
+    while k < PM15_LEVELS {
+        levels[k] = reg.register_gauge(PMJ_LEVEL_NAMES[k]).map_err(|_| "register pmj gauge")?;
+        k += 1;
+    }
+    Ok(Pm15MemberMetricIds { tallies, levels })
+}
+
+/// PMJ J4: mirror the slot-11 member family (5 s cadence — cold path).
+fn mirror_pmj_member_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &Pm15MemberMetricIds,
+    strat: &S,
+    last: &mut strategy_core::Pm15Counters,
+) {
+    let cur = strat.pmj_counters();
+    let (now, before) = (cur.tallies(), last.tallies());
+    let mut i = 0usize;
+    while i < strategy_core::PM15_TALLIES {
+        reg.counter(ids.tallies[i]).inc(now[i].saturating_sub(before[i]));
+        i += 1;
+    }
+    let lv = pm15_levels(&cur);
+    let mut k = 0usize;
+    while k < PM15_LEVELS {
+        reg.gauge(ids.levels[k]).set(lv[k]);
+        k += 1;
+    }
+    *last = cur;
+}
+
 /// Mirror the BIN15 family as monotonic deltas of the cumulative
 /// strategy counters, plus the per-family levels. 5 s cadence — cold
 /// path.
@@ -8569,6 +9010,10 @@ fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.late_skipped_persist.saturating_sub(last.late_skipped_persist));
     reg.counter(ids.late_skipped_cap)
         .inc(cur.late_skipped_cap.saturating_sub(last.late_skipped_cap));
+    reg.counter(ids.late_skipped_refire)
+        .inc(cur.late_skipped_refire.saturating_sub(last.late_skipped_refire));
+    reg.counter(ids.late_skipped_age)
+        .inc(cur.late_skipped_age.saturating_sub(last.late_skipped_age));
     *last = cur;
     // The levels. A family the member does not configure keeps its row
     // at zero rather than disappearing: a missing series reads as a
@@ -9240,8 +9685,13 @@ fn fill_snapshot<S, D>(
     k.ai_dispatched = eng.ai_dispatched;
     k.ai_drain_malformed = eng.ai_drain_malformed;
 
-    out.latency.p50_ns = [eng.ingest_p50_ns(), eng.decide_p50_ns(), eng.ack_p50_ns()];
-    out.latency.p99_ns = [eng.ingest_p99_ns(), eng.decide_p99_ns(), eng.ack_p99_ns()];
+    let (ingest, decide, ack) = (
+        eng.stage_lat(LatStage::Ingest),
+        eng.stage_lat(LatStage::Decide),
+        eng.stage_lat(LatStage::Ack),
+    );
+    out.latency.p50_ns = [ingest.percentile(0.50), decide.percentile(0.50), ack.percentile(0.50)];
+    out.latency.p99_ns = [ingest.percentile(0.99), decide.percentile(0.99), ack.percentile(0.99)];
 
     out.regime = Sc::regime_counters(strat);
     out.regime_rel = Sc::regime_rel_view(strat);
@@ -9302,6 +9752,10 @@ fn fill_snapshot<S, D>(
     ex.file_present = ec.halt_file_present;
     ex.halts = ec.halts;
     ex.refused_halted = ec.refused_halted;
+    // O-WSG1: the hold beside the halt.
+    ex.held = ec.held;
+    ex.holds = ec.holds;
+    ex.refused_held = ec.refused_held;
     ex.refused_unseeded = ec.refused_unseeded;
     ex.cancel_all_failures = ec.cancel_all_failures;
     ex.cancel_all_stranded = ec.cancel_all_stranded;
@@ -9708,33 +10162,55 @@ pub struct Pm15MetricIds {
     pub gauges: [GaugeId; PM15_METRICS],
 }
 
-/// Size of the PM15 family: the tallies, the bound-slot gauge, and (PM15-5b)
-/// the two sockets' last failure (`core_net::WsErr` + 1; 0 = none yet).
-pub const PM15_METRICS: usize = ingress_polymarket::pm15_loop::PM15_COUNTERS + 3;
+/// Size of the PM15 family: the tallies, the bound-slot gauge, (PM15-5b)
+/// the two sockets' last failure (`core_net::WsErr` + 1; 0 = none yet), and
+/// (PMJ J7) the market sockets open.
+pub const PM15_METRICS: usize = ingress_polymarket::pm15_loop::PM15_COUNTERS + 4;
+
+// PMJ J7: the universe parser's bound on `rolling_market_sockets` is the
+// driver's (`Pm15Driver::with_market_sockets` panics past it).
+const _: () = assert!(
+    core_config::universe::ROLLING_MARKET_SOCKETS_MAX as usize
+        == ingress_polymarket::pm15_loop::PM15_MARKET_SOCKETS_MAX
+);
 
 /// Register the PM15 family (boot-only; the names are rendered once).
 fn register_pm15_metrics(reg: &mut MetricsRegistry) -> Result<Pm15MetricIds, &'static str> {
+    register_rolling_metrics(reg, "pm15")
+}
+
+/// PMJ J1b: register one rolling pipeline's family under `label`
+/// (`engine_ingress_<label>_<name>_total`, `…_slots_bound`,
+/// `…_last_market_err`, `…_last_rtds_err`, PMJ J7 `…_market_sockets_open`).
+/// Boot-only.
+fn register_rolling_metrics(
+    reg: &mut MetricsRegistry,
+    label: &str,
+) -> Result<Pm15MetricIds, &'static str> {
     let mut gauges = [GaugeId::default(); PM15_METRICS];
     let mut i = 0usize;
     while i < ingress_polymarket::pm15_loop::PM15_COUNTERS {
         let name = format!(
-            "engine_ingress_pm15_{}_total",
+            "engine_ingress_{label}_{}_total",
             ingress_polymarket::pm15_loop::PM15_COUNTER_NAMES[i]
         );
         gauges[i] = reg
             .register_gauge(&name)
-            .map_err(|_| "register pm15 gauge")?;
+            .map_err(|_| "register rolling ingress gauge")?;
         i += 1;
     }
     gauges[i] = reg
-        .register_gauge("engine_ingress_pm15_slots_bound")
-        .map_err(|_| "register pm15 gauge")?;
+        .register_gauge(&format!("engine_ingress_{label}_slots_bound"))
+        .map_err(|_| "register rolling ingress gauge")?;
     gauges[i + 1] = reg
-        .register_gauge("engine_ingress_pm15_last_market_err")
-        .map_err(|_| "register pm15 gauge")?;
+        .register_gauge(&format!("engine_ingress_{label}_last_market_err"))
+        .map_err(|_| "register rolling ingress gauge")?;
     gauges[i + 2] = reg
-        .register_gauge("engine_ingress_pm15_last_rtds_err")
-        .map_err(|_| "register pm15 gauge")?;
+        .register_gauge(&format!("engine_ingress_{label}_last_rtds_err"))
+        .map_err(|_| "register rolling ingress gauge")?;
+    gauges[i + 3] = reg
+        .register_gauge(&format!("engine_ingress_{label}_market_sockets_open"))
+        .map_err(|_| "register rolling ingress gauge")?;
     Ok(Pm15MetricIds { gauges })
 }
 
@@ -9756,7 +10232,50 @@ pub fn pm15_metric_values(c: &ingress_polymarket::pm15_loop::Pm15Counters) -> [u
         };
         k += 1;
     }
+    v[i + 3] = c.market_sockets_open();
     v
+}
+
+/// PM15-9b: one `warn!` when `c`'s `venue_law_changed` tally rose since
+/// `last` (which it then advances) — the pipeline `label`, the new total,
+/// the rise, and the change's family index and cause (`last_law_change`:
+/// the family is its `[polymarket] rolling` index; the asset is named on
+/// the discovery's stderr line). `true` when it warned. The engine's 5 s
+/// report block: cold, and a rise is a rare event.
+fn warn_venue_law_changed(
+    label: &str,
+    c: &ingress_polymarket::pm15_loop::Pm15Counters,
+    last: &mut u64,
+) -> bool {
+    use ingress_polymarket::gamma15::PmLawErr;
+    use ingress_polymarket::pm15_loop::Pm15Counter;
+    let total = c.of(Pm15Counter::VenueLawChanged);
+    if total <= *last {
+        return false;
+    }
+    let rise = total - *last;
+    *last = total;
+    // One load: the family and the cause name come from the same record
+    // (best-effort against the tally, `Pm15Counters::note_law_change`).
+    let change = c.last_law_change();
+    let (family, cause) = match change {
+        Some((f, k)) => (f as i64, i64::from(k)),
+        None => (-1, -1),
+    };
+    let cause_name = change.and_then(|(_, k)| PmLawErr::from_code(k));
+    tracing::warn!(
+        pipeline = label,
+        venue_law_changed_total = total,
+        rise,
+        family,
+        cause,
+        cause_name = ?cause_name,
+        last_law_refusal = ?c.last_law_refusal(),
+        "{label}: VENUE LAW CHANGED on the CLOB — the family's windows are refused \
+         (dormant per window) until the law holds again; the discovery's stderr line \
+         names the asset and the record"
+    );
+    true
 }
 
 /// PM15-8c: slot 9's arm (`engine_pm15_arm_*`) and pm-gw
@@ -9806,6 +10325,58 @@ pub fn pm15x_metric_values(s: &exec_polymarket::stats::PmExecStats) -> [i64; PM1
     let mut v = [0i64; PM15X_METRICS];
     let mut i = 0usize;
     while i < PM15X_METRICS {
+        v[i] = if i < arm { s.arm(i) } else { s.gw(i - arm) };
+        i += 1;
+    }
+    v
+}
+
+/// PMJ J16: slot 11's arm (`engine_pmj_arm_*`) and jup-gw
+/// (`engine_pmj_gw_*`) — one gauge per word of
+/// `exec_jupiter::stats::JupExecStats`, a tally `…_total`, a level bare.
+/// Registered only when slot 11 is live.
+#[derive(Copy, Clone, Debug)]
+pub struct PmjxMetricIds {
+    /// The arm's words, then jup-gw's.
+    pub gauges: [GaugeId; PMJX_METRICS],
+}
+
+/// Size of the slot-11 arm family.
+pub const PMJX_METRICS: usize = exec_jupiter::stats::ARM_WORDS + exec_jupiter::stats::GW_WORDS;
+
+/// Register the slot-11 arm family (boot-only; the names are rendered once).
+fn register_pmjx_metrics(reg: &mut MetricsRegistry) -> Result<PmjxMetricIds, &'static str> {
+    use exec_jupiter::stats::{ARM_LEVELS, ARM_NAMES, ARM_WORDS, GW_LEVELS, GW_NAMES, GW_WORDS};
+    let mut gauges = [GaugeId::default(); PMJX_METRICS];
+    let mut i = 0usize;
+    while i < PMJX_METRICS {
+        let (who, name, level) = if i < ARM_WORDS {
+            ("arm", ARM_NAMES[i], i >= ARM_WORDS - ARM_LEVELS)
+        } else {
+            let k = i - ARM_WORDS;
+            ("gw", GW_NAMES[k], k >= GW_WORDS - GW_LEVELS)
+        };
+        let full = if level {
+            format!("engine_pmj_{who}_{name}")
+        } else {
+            format!("engine_pmj_{who}_{name}_total")
+        };
+        gauges[i] = reg
+            .register_gauge(&full)
+            .map_err(|_| "register pmj arm gauge")?;
+        i += 1;
+    }
+    Ok(PmjxMetricIds { gauges })
+}
+
+/// The slot-11 arm family's current values, in [`register_pmjx_metrics`]
+/// order.
+#[must_use]
+pub fn pmjx_metric_values(s: &exec_jupiter::stats::JupExecStats) -> [i64; PMJX_METRICS] {
+    let arm = exec_jupiter::stats::ARM_WORDS;
+    let mut v = [0i64; PMJX_METRICS];
+    let mut i = 0usize;
+    while i < PMJX_METRICS {
         v[i] = if i < arm { s.arm(i) } else { s.gw(i - arm) };
         i += 1;
     }
@@ -9936,6 +10507,9 @@ fn mirror_ingress_counters(
     *last = cur;
 }
 
+/// T2T T1-b: how often the engine loop re-reads the hot window.
+const HOT_CHECK_NS: u64 = 100_000;
+
 /// PVM impl-08 (lead ruling 2026-10-17, the typed path): work an arm does on its CONCRETE
 /// strategy right after `eng.start()` and on the 5 s report cadence — without a strategy-core
 /// or strategy-set trait change. Boot-time and cold; never on the decision path.
@@ -10034,6 +10608,10 @@ where
     if let Some(cap) = obs.events_capture.take() {
         eng.set_event_capture(cap);
     }
+    // T2T T0: and the per-order latency capture.
+    if let Some(cap) = obs.latency_capture.take() {
+        eng.set_latency_capture(cap);
+    }
     // XMM XH4f (D11): slot 6's gateway-arm tell — what the last run left
     // unconfirmed, read back once (a gauge and an ERROR line); then written
     // anew: it stands until THIS run's shutdown confirms (`gateway_shutdown_
@@ -10109,7 +10687,7 @@ where
     // hypercall, pm15) so registry counters get monotonic deltas.
     // Append-only: existing indices are load-bearing, new venues go at
     // the end.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 11];
+    let mut ingress_last = [IngressCountersSnapshot::default(); 12];
     // T1(c): last-tick-age derivation state per venue —
     // (ticks_total last seen, wall ns when it last advanced);
     // wall ns 0 = never ticked. Order pairs with
@@ -10148,6 +10726,7 @@ where
     let mut bin15_last = strategy_core::Bin15Counters::default();
     // PM15-5: slot 9's counter baseline.
     let mut pm15_last = strategy_core::Pm15Counters::default();
+    let mut pmj_last = strategy_core::Pm15Counters::default();
     let mut hyparb_last = strategy_core::HyparbCounters::default();
     // HYPARB H8: the testnet shadow's tap, owned by this thread from here.
     let mut hyparb_shadow = obs.hyparb_shadow.take();
@@ -10251,6 +10830,9 @@ where
         }};
     }
     let mut regime_last = strategy_core::RegimeCounters::default();
+    // PM15-9b: the `venue_law_changed` tallies the 5 s report last saw,
+    // `[pm15, pm5]` (`warn_venue_law_changed`).
+    let mut venue_law_changed_last = [0u64; 2];
     // HAR H3.5: the gauges' row scratch (boot-allocated, reused).
     let mut har_rows = [strategy_core::HarSeriesView::default(); strategy_core::HAR_VIEW_SERIES];
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
@@ -10262,6 +10844,14 @@ where
 
     // E6: paces the dispatcher's idle moment. See `IdlePacer`.
     let mut idle_pacer = IdlePacer::new();
+
+    // T2T T1-b: the engine thread stays on the P-cores, and never yields
+    // its core inside the late law's hot window (read every
+    // `HOT_CHECK_NS`, not per iteration).
+    log_qos_outcome("engine");
+    let hot_cell = obs.hot.clone();
+    let mut hot = false;
+    let mut next_hot_ns = 0u64;
 
     while !shutdown_requested() {
         let drained = eng.tick(DRAIN_BATCH);
@@ -10345,6 +10935,7 @@ where
             eng.maybe_flush_fill_capture(now);
             eng.maybe_flush_order_capture(now);
             eng.maybe_flush_event_capture(now);
+            eng.maybe_flush_latency_capture(now);
             // F21: and the members' own persisted state, for the same
             // reason. It used to sit inside `if let (Some(reg),
             // Some(ids)) = (obs.metrics, obs.counter_ids)`, which made
@@ -10386,6 +10977,13 @@ where
             if let Some(tap) = hyparb_shadow.as_mut() {
                 tap.drain(eng.strategy());
             }
+            // PM15-9b: a rolling family's venue law changed on the CLOB —
+            // warned HERE, in the engine's own log, on every rise of the
+            // tally, whatever `--metrics` says (the F21 lesson above).
+            if let Some(ing) = obs.ingress.as_ref() {
+                warn_venue_law_changed("pm15", &ing.pm15c, &mut venue_law_changed_last[0]);
+                warn_venue_law_changed("pm5", &ing.pm5c, &mut venue_law_changed_last[1]);
+            }
 
             let ticks = eng.ticks_dispatched;
             let signals = eng.signals_dispatched;
@@ -10409,12 +11007,18 @@ where
                 let total_dropped = dropped;
                 let _ = total_dropped;
                 // Latency gauges are full snapshots, not deltas.
-                reg.gauge(ids.ingest_p50_ns).set(eng.ingest_p50_ns() as i64);
-                reg.gauge(ids.ingest_p99_ns).set(eng.ingest_p99_ns() as i64);
-                reg.gauge(ids.decide_p50_ns).set(eng.decide_p50_ns() as i64);
-                reg.gauge(ids.decide_p99_ns).set(eng.decide_p99_ns() as i64);
-                reg.gauge(ids.ack_p50_ns).set(eng.ack_p50_ns() as i64);
-                reg.gauge(ids.ack_p99_ns).set(eng.ack_p99_ns() as i64);
+                let mut si = 0;
+                while si < LatStage::ALL.len() {
+                    let h = eng.stage_lat(LatStage::ALL[si]);
+                    let mut qi = 0;
+                    while qi < LAT_QUANTILES.len() {
+                        let q = LAT_QUANTILES[qi].1;
+                        let v = if q >= 1.0 { h.max_bound() } else { h.percentile(q) };
+                        reg.gauge(ids.latency_ns[si][qi]).set(v as i64);
+                        qi += 1;
+                    }
+                    si += 1;
+                }
 
                 // Active-strategy gauges — flip exactly one to 1.
                 let kind = strategy_core::StrategyCounters::strategy_kind(eng.strategy());
@@ -10453,6 +11057,7 @@ where
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
                 mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
                 mirror_pm15_member_metrics(reg, &ids.pm15_member, eng.strategy(), &mut pm15_last);
+                mirror_pmj_member_metrics(reg, &ids.pmj_member, eng.strategy(), &mut pmj_last);
                 mirror_hyparb_metrics(reg, &ids.hyparb, eng.strategy(), &mut hyparb_last);
                 mirror_hyparb_evm_metrics(
                     reg,
@@ -10560,11 +11165,20 @@ where
                         .set(ing.hypercall.state() as i64);
                     reg.gauge(ids.ingress_pm15_state)
                         .set(ing.pm15.state() as i64);
+                    reg.gauge(ids.ingress_pm5_state)
+                        .set(ing.pm5.state() as i64);
                     // PM15: the rolling families' tallies — plain stores.
                     let pm = pm15_metric_values(&ing.pm15c);
                     let mut k = 0usize;
                     while k < PM15_METRICS {
                         reg.gauge(ids.pm15.gauges[k]).set(pm[k] as i64);
+                        k += 1;
+                    }
+                    // PMJ J1b: the 5-minute families' tallies.
+                    let pm = pm15_metric_values(&ing.pm5c);
+                    let mut k = 0usize;
+                    while k < PM15_METRICS {
+                        reg.gauge(ids.pm5.gauges[k]).set(pm[k] as i64);
                         k += 1;
                     }
                     // PM15-8c: slot 9's arm and pm-gw — plain stores.
@@ -10573,6 +11187,15 @@ where
                     while k < PM15X_METRICS {
                         reg.gauge(ids.pm15x.gauges[k]).set(px[k]);
                         k += 1;
+                    }
+                    // PMJ J16: slot 11's arm and jup-gw (live only).
+                    if let Some(jx) = ids.pmjx.as_ref() {
+                        let v = pmjx_metric_values(&ing.pmjx);
+                        let mut k = 0usize;
+                        while k < PMJX_METRICS {
+                            reg.gauge(jx.gauges[k]).set(v[k]);
+                            k += 1;
+                        }
                     }
                     // HC5: the venue family — plain stores (see
                     // `HcMetricIds`).
@@ -10641,6 +11264,12 @@ where
                         &ing.pm15,
                         &mut ingress_last[10],
                     );
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_pm5,
+                        &ing.pm5,
+                        &mut ingress_last[11],
+                    );
 
                     // T1(c): per-venue last-tick age from the stamps
                     // the 1 s gate keeps. A lane that stops moving
@@ -10696,6 +11325,11 @@ where
                     .set(eng.event_capture_io_errors() as i64);
                 reg.gauge(ids.events_capture.records)
                     .set(eng.event_capture_records() as i64);
+                // T2T T0 latency capture pair — same central mirror.
+                reg.gauge(ids.latency_capture.io_errors)
+                    .set(eng.latency_capture_io_errors() as i64);
+                reg.gauge(ids.latency_capture.records)
+                    .set(eng.latency_capture_records() as i64);
 
                 // Max tick age — surfaces silenced markets.
                 reg.gauge(ids.max_tick_age_ns)
@@ -10741,7 +11375,17 @@ where
         // returns to us promptly. Net effect: tick-to-decide
         // latency tracks the ingress producer cadence, not the
         // kernel HZ.
-        std::thread::yield_now();
+        //
+        // T2T T1-b: except inside the hot window, where a yield would hand
+        // the core away with a take due: the measured pickup was 2.2 µs
+        // p50 / 30 µs p99 against a ~50 ns ring.
+        if now >= next_hot_ns {
+            hot = hot_cell.as_ref().is_some_and(|c| c.is_hot_now());
+            next_hot_ns = now.saturating_add(HOT_CHECK_NS);
+        }
+        if !hot {
+            std::thread::yield_now();
+        }
     }
 
     // F18: THE DRAIN LAW. The restart lane SIGTERMs five times a UTC
@@ -11056,6 +11700,14 @@ fn restart_stamp_age_secs() -> i64 {
     match std::time::SystemTime::now().duration_since(m) {
         Ok(d) => d.as_secs() as i64,
         Err(_) => 0,
+    }
+}
+
+/// T2T T1-b: [`crate::pinning::prefer_performance_cores`] for an order-path
+/// thread, logged once.
+pub(crate) fn log_qos_outcome(thread_label: &str) {
+    if crate::pinning::prefer_performance_cores() {
+        tracing::info!(thread = thread_label, "QoS user-interactive (performance cores)");
     }
 }
 
@@ -13564,6 +14216,76 @@ mod tests {
         assert!(parse_ai_hmac_key(bad).is_err(), "non-hex nibble");
     }
 
+    /// PMJ J4: slot 11's member family is pm15's shape under its own
+    /// prefix — 32 counters (31, and J13's `skip_side`) and 6 gauges, every
+    /// name within `NAME_MAX`, none
+    /// shared with slot 9's — and both families register in one registry
+    /// (the worst-case boot below counts them in the budget).
+    #[test]
+    fn the_pmj_member_family_is_32_counters_and_6_gauges_beside_pm15s() {
+        let mut reg = core_metrics::MetricsRegistry::new();
+        register_pm15_member_metrics(&mut reg).expect("register pm15");
+        let (c0, g0) = (reg.counters_len(), reg.gauges_len());
+        let ids = register_pmj_member_metrics(&mut reg).expect("register pmj");
+        assert_eq!((reg.counters_len() - c0, reg.gauges_len() - g0), (strategy_core::PM15_TALLIES, PM15_LEVELS));
+        assert_eq!((ids.tallies.len(), ids.levels.len()), (32, 6));
+        let mut k = 0usize;
+        while k < PM15_LEVELS {
+            let n = PMJ_LEVEL_NAMES[k];
+            assert!(n.starts_with("engine_pmj_") && n.len() <= core_metrics::NAME_MAX, "{n}");
+            assert_eq!(n.strip_prefix("engine_pmj_"), PM15_LEVEL_NAMES[k].strip_prefix("engine_pm15_"), "positional");
+            k += 1;
+        }
+        let mut i = 0usize;
+        while i < strategy_core::PM15_TALLIES {
+            let n = format!("engine_pmj_{}_total", strategy_core::PM15_COUNTER_NAMES[i]);
+            assert!(n.len() <= core_metrics::NAME_MAX, "{n}");
+            i += 1;
+        }
+    }
+
+    /// **PMJ J16** — slot 11's arm family (`engine_pmj_arm_*`,
+    /// `engine_pmj_gw_*`: 21 + 36 gauges, a tally `…_total`, a level bare)
+    /// registers only when the artifact marks slot 11 live: a boot with no
+    /// `--exec`, or with slot 11 paper, names none of it.
+    #[test]
+    fn the_pmj_arm_family_registers_only_with_slot_11_live() {
+        let names = |obs: &Observability| {
+            let reg = obs.metrics.as_ref().expect("metrics on");
+            let mut buf = vec![0u8; 256 * 1024];
+            let n = reg.encode_prometheus(&mut buf).expect("fits");
+            String::from_utf8(buf[..n].to_vec()).unwrap()
+        };
+        let paper = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
+        for exec in [None, Some(ExecObs { modes: paper, binance: false, gateway: false })] {
+            let obs = Observability::build(true, exec).expect("builds");
+            let text = names(&obs);
+            assert!(!text.contains("engine_pmj_arm_") && !text.contains("engine_pmj_gw_"));
+            assert!(obs.counter_ids.as_ref().unwrap().pmjx.is_none());
+        }
+        let mut live = paper;
+        live[crate::exec_boot::PMJ_SLOT] = 1;
+        let obs = Observability::build(true, Some(ExecObs { modes: live, binance: false, gateway: false }))
+            .expect("builds");
+        let text = names(&obs);
+        for n in [
+            "engine_pmj_arm_submitted_total",
+            "engine_pmj_arm_over_limit_total",
+            "engine_pmj_arm_halted",
+            "engine_pmj_arm_usdc_usd_1e6",
+            "engine_pmj_gw_debit_halts_total",
+            "engine_pmj_gw_unknown_positions_total",
+            "engine_pmj_gw_halt_reason",
+            "engine_pmj_gw_debit_allow_micro",
+        ] {
+            assert!(text.contains(&format!("{n} ")) || text.contains(&format!("{n}\n")), "{n}");
+        }
+        assert!(!text.contains("engine_pmj_arm_halted_total") && !text.contains("engine_pmj_gw_submitted"));
+        assert!(obs.counter_ids.as_ref().unwrap().pmjx.is_some());
+        let s = exec_jupiter::stats::JupExecStats::new();
+        assert_eq!(pmjx_metric_values(&s), [0i64; PMJX_METRICS], "a stats block never written reads 0");
+    }
+
     /// O4b: the family's SIZE, and the headroom it leaves.
     ///
     /// The registry is a fixed array (`MAX_COUNTERS` 256, `MAX_GAUGES`
@@ -13702,7 +14424,12 @@ mod tests {
         // slots 8–15 (`engine_strategy_regime_gate_8` … `_15`): measured
         // 595 / 468 of 640 / 512 with them (the lanes since BX11 the rest).
         // HK42 three gauges, the Binance options connections' own
-        // (`engine_ingress_binance_options_*`).
+        // (`engine_ingress_binance_options_*`). O-WSG1 two counters and ONE
+        // gauge (`engine_exec_held_mask`): a gauge a slot did not fit.
+        // T2T T0 twenty gauges, the engine's stage family: measured 706 /
+        // 658 of 768 / 768 (638 before, MAX_GAUGES 640 → 768). PMJ J16
+        // fifty-seven gauges, slot 11's arm family (live slot 11 only, so
+        // in this worst case): ≈ 715 of 768.
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
@@ -14008,13 +14735,43 @@ mod tests {
         );
     }
 
+    /// PM15-9b: the 5 s report warns once per rise of a pipeline's
+    /// `venue_law_changed` tally, never on a flat one.
     #[test]
-    fn the_bin15_family_is_25_counters_and_80_gauges() {
+    fn a_venue_law_change_is_warned_once_per_rise() {
+        use ingress_polymarket::gamma15::PmLawErr;
+        use ingress_polymarket::pm15_loop::{Pm15Counter, Pm15Counters};
+        let c = Pm15Counters::new();
+        let mut last = 0u64;
+        assert!(!warn_venue_law_changed("pm15", &c, &mut last), "nothing changed");
+        c.note_law_change(2, PmLawErr::ClobFee);
+        c.inc(Pm15Counter::VenueLawChanged);
+        assert!(warn_venue_law_changed("pm15", &c, &mut last));
+        assert_eq!(last, 1);
+        assert!(!warn_venue_law_changed("pm15", &c, &mut last), "the same change");
+        c.inc(Pm15Counter::VenueLawChanged);
+        c.inc(Pm15Counter::VenueLawChanged);
+        assert!(warn_venue_law_changed("pm5", &c, &mut last));
+        assert_eq!(last, 3);
+        // A rise with no change record (never written before its tally in
+        // the discovery, but the mirror must not care) still warns.
+        let bare = Pm15Counters::new();
+        bare.inc(Pm15Counter::VenueLawChanged);
+        let mut l = 0u64;
+        assert!(warn_venue_law_changed("pm5", &bare, &mut l));
+    }
+
+    #[test]
+    fn the_bin15_family_is_27_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let before_c = reg.counters_len();
         let before_g = reg.gauges_len();
         let ids = register_bin15_metrics(&mut reg).expect("register bin15");
-        assert_eq!(reg.counters_len() - before_c, 25, "the counter block");
+        assert_eq!(reg.counters_len() - before_c, 27, "the counter block");
+        assert!(
+            reg.counters_len() <= core_metrics::MAX_COUNTERS,
+            "the block must fit the fixed registry"
+        );
         assert_eq!(reg.gauges_len() - before_g, 80, "8 families x 10 levels");
         assert!(
             reg.gauges_len() <= core_metrics::MAX_GAUGES,
@@ -14627,6 +15384,7 @@ mod tests {
             cfg.hyperevm,
             cfg.hypercall,
             cfg.pm15,
+            cfg.pm5,
         ] {
             assert_eq!(c.mode, TapMode::All);
             assert_eq!(c.budget_bytes, want_bytes);
@@ -14653,6 +15411,7 @@ mod tests {
             cfg.hyperevm,
             cfg.hypercall,
             cfg.pm15,
+            cfg.pm5,
         ] {
             assert_eq!(c.mode, TapMode::Off);
             assert_eq!(c.budget_bytes, 0);
@@ -14663,7 +15422,7 @@ mod tests {
     #[test]
     fn raw_tap_flags_every_known_venue_label_accepted() {
         let cfg = parse_raw_tap_flags(
-            Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall,pm15"),
+            Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall,pm15,pm5"),
             "all",
             1,
         )
@@ -14680,6 +15439,7 @@ mod tests {
             cfg.hyperevm,
             cfg.hypercall,
             cfg.pm15,
+            cfg.pm5,
         ] {
             assert_eq!(c.mode, TapMode::All);
         }
@@ -14719,16 +15479,16 @@ mod tests {
         );
     }
 
-    /// More than ten comma-separated labels trips the defensive
-    /// capacity guard — there are only ten capture labels (WS9 added
-    /// bybit, MX6 mexc, HYPARB H3b hyperevm, HC5 hypercall), so this
-    /// branch is a pure defense-in-depth backstop reached here by
-    /// listing all ten plus an eleventh item.
+    /// More labels than there are capture labels trips the defensive
+    /// capacity guard — twelve since PMJ J1b (WS9 added bybit, MX6 mexc,
+    /// HYPARB H3b hyperevm, HC5 hypercall, PM15 pm15, PMJ pm5), so this
+    /// branch is a pure defense-in-depth backstop reached here by listing
+    /// all twelve plus a thirteenth item.
     #[test]
     fn raw_tap_flags_rejects_more_labels_than_known_venues() {
         assert_eq!(
             parse_raw_tap_flags(
-                Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall,pm15,pm2"),
+                Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall,pm15,pm5,pm2"),
                 "rejects",
                 64
             )
@@ -15091,6 +15851,10 @@ mod tests {
             "engine_exec_slot3_live_submits_total",
             "engine_exec_slot3_refused_total",
             "engine_exec_slot3_halted",
+            // O-WSG1 — the hold family.
+            "engine_exec_holds_total",
+            "engine_exec_refused_held_total",
+            "engine_exec_held_mask",
         ] {
             assert!(text.contains(name), "missing exec row {name}");
         }
@@ -15468,6 +16232,9 @@ mod tests {
             "engine_exec_refused_unpriced_total",
             "engine_exec_retired_total",
             "engine_exec_halts_total",
+            "engine_exec_holds_total",
+            "engine_exec_refused_held_total",
+            "engine_exec_held_mask",
             "engine_exec_cancel_all_failures_total",
             "engine_exec_cancel_all_stranded_total",
             "engine_exec_seeded",

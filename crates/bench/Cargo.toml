@@ -21,6 +21,8 @@ dhat       = { workspace = true }
 
 [dev-dependencies]
 criterion            = { workspace = true }
+memchr               = { workspace = true }
+libc                 = "0.2"
 # Pulled in ONLY by the alloc_assertions integration test so we can
 # round-trip real frames through the zero-alloc path.
 # core-crypto: gate 34 hashes ruleset fixture bytes (§4.2 rule 1).
@@ -53,6 +55,8 @@ strategy-bin15       = { workspace = true }
 # PM15 gate 114: the rolling 15m ingress driver and slot 9's member.
 strategy-pm15        = { workspace = true }
 core-twaplock        = { workspace = true }
+# PMJ J4 gate 136: slot 11's member on the 5-minute pool.
+strategy-pmj         = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }
@@ -71,6 +75,8 @@ exec-hypercall       = { workspace = true }
 # PM15-6a gate 115: the Polymarket arm's amounts, sign, render, L2 MAC,
 # answer and user-channel scans.
 exec-polymarket      = { workspace = true }
+# PMJ J3 gate 134: the slot-11 arm's guard, signature, scanners and renders.
+exec-jupiter         = { workspace = true }
 # HYPARB H1 gate 63: the AMM walk + arb solve.
 core-amm             = { workspace = true }
 # HYPARB H7 gate 64: the EVM sign + hash + hex render.
@@ -136,4 +142,10 @@ harness = false
 # impl-08 section 7.11: the slot-8 runtime (bar confirms, tick evaluations, reconcile, ns per unit).
 [[bench]]
 name = "pine_runtime"
+harness = false
+
+# T2T T0-C: the order path's stage harness (custom main; not in
+# `make bench-check`). `T2T_FRAMES=<vault file> cargo bench -p bench --bench t2t`.
+[[bench]]
+name = "t2t"
 harness = false

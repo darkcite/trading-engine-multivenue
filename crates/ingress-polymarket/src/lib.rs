@@ -45,7 +45,10 @@
 //! (`core_types::pm_roll` is the data model):
 //!
 //! - [`pm15_discovery`] — a cold thread that looks each window's market
-//!   up on Gamma by slug and checks it under the venue law ([`gamma15`]);
+//!   up on Gamma by slug and checks it under the venue law ([`gamma15`]),
+//!   then (PM15-9b) reads the same market's record from the CLOB and
+//!   checks it under the CLOB law ([`clob_law`]: the taker hold, the fee,
+//!   the live tick);
 //! - [`rolling`] — the bindings and the roll schedule (pure state);
 //! - [`book15`] — a full 0.001 ladder per token, so a touch carries its
 //!   size;
@@ -66,6 +69,7 @@
 )]
 
 pub mod book15;
+pub mod clob_law;
 pub mod discovery;
 pub mod gamma15;
 pub mod pm15_discovery;

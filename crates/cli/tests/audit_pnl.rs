@@ -1235,3 +1235,314 @@ fn prints_change_nothing_for_a_run_without_a_post_only_maker() {
     assert_eq!(bare_lines, with_lines, "nor the stderr surface");
     assert!(!with_lines.iter().any(|l| l.contains("queue-orders=")));
 }
+
+// ---------------------------------------------------------------
+// PMJ J10 (R-PMJ-S42): Polymarket's rolling windows settle on the
+// venue's own result, and their taker fills pay the p-dependent fee.
+// ---------------------------------------------------------------
+
+/// BTC 15m, family 0, pair 0 — the pool syms the ingress binds.
+const PM15_UP: u32 = core_types::pm_roll::pm_rolling_sym(0, 0, 0);
+const PM15_DOWN: u32 = core_types::pm_roll::pm_rolling_sym(0, 0, 1);
+/// BTC 5m, family 0, pair 0.
+const PM5_UP: u32 = core_types::pm_roll::pm5_rolling_sym(0, 0, 0);
+const PM5_DOWN: u32 = core_types::pm_roll::pm5_rolling_sym(0, 0, 1);
+/// The static anchor lane every run needs (a run with no `VENUE_LABELS`
+/// tick has no anchor and contributes nothing).
+const PM_STATIC: u32 = 42;
+/// The settled row, 120 s into the run; the run's last tick after it.
+const PM_SETTLE_TS: u64 = 120_000_000_000;
+const PM_END_TS: u64 = 130_000_000_000;
+
+fn pm_roll(label_pool5: bool, ts: u64, up_sym: u32, settled: bool, winner: i64) -> core_types::ChannelEvent {
+    let instance: u32 = if label_pool5 {
+        core_types::pm_roll::PM5_INSTANCE_FLAG | 5_000
+    } else {
+        5_000
+    };
+    core_types::ChannelEvent::new(
+        ts,
+        VenueId::Polymarket,
+        core_types::ChannelId::InstrumentRoll,
+        up_sym,
+        core_types::pack_roll_seq(instance, 60, 0, settled),
+        0,
+        if settled { winner } else { 0 },
+        0,
+    )
+}
+
+fn write_events_as(dir: &Path, label: &str, epoch: u64, evs: &[core_types::ChannelEvent]) {
+    let mut w = PmlrWriter::open(dir.join(format!("{label}-events.pmlr")), SlotKind::Event, epoch)
+        .unwrap();
+    for e in evs {
+        w.append(e).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+fn pm_ioc(ts: u64, venue: VenueId, sym: u32, px: i64, qty: i64, strategy: u8) -> Order {
+    let mut o = Order::new(
+        ts,
+        venue,
+        sym,
+        Side::Bid,
+        core_fill::ORDER_KIND_IOC,
+        Price::from_raw(px),
+        Qty::from_raw(qty),
+        77,
+    );
+    o.strategy_id = strategy;
+    o
+}
+
+/// One run: the static anchor lane at the start and the end, the rolling
+/// leg's book, one IoC buy on `leg`, and the window's roll rows.
+#[allow(clippy::too_many_arguments)]
+fn pm_root(
+    tag: &str,
+    pool5: bool,
+    leg: u32,
+    venue: VenueId,
+    strategy: u8,
+    ask: i64,
+    qty: i64,
+    winner: i64,
+) -> PathBuf {
+    let root = tmp_root(tag);
+    let dir = run_dir(&root, EPOCH_1);
+    let (label, up, down, period) = if pool5 {
+        ("pm5", PM5_UP, PM5_DOWN, "5m")
+    } else {
+        ("pm15", PM15_UP, PM15_DOWN, "15m")
+    };
+    let up_desc = format!("polymarket-rolling:updown:btc:{period}[up0]");
+    let down_desc = format!("polymarket-rolling:updown:btc:{period}[down0]");
+    manifest(&dir, &[(PM_STATIC, "PMTOK"), (up, &up_desc), (down, &down_desc)]);
+    write_ticks(
+        &dir,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, PM_STATIC, 400_000, 1, 600_000, 1),
+            pm_tick(PM_END_TS, PM_STATIC, 400_000, 1, 600_000, 1),
+        ],
+    );
+    write_ticks(
+        &dir,
+        label,
+        EPOCH_1,
+        &[
+            pm_tick(1_500, leg, ask - 20_000, 1_000_000, ask, 100_000_000),
+            pm_tick(2_000 + PM_DELTA + 10, leg, ask - 20_000, 1_000_000, ask, 100_000_000),
+            // A last book far from either payout: a mark-out cannot pass
+            // for the settlement.
+            pm_tick(PM_SETTLE_TS + 5_000_000_000, leg, 400_000, 1_000_000, 600_000, 1_000_000),
+        ],
+    );
+    write_orders(&dir, EPOCH_1, &[pm_ioc(2_000, venue, leg, 970_000, qty, strategy)]);
+    write_events_as(
+        &dir,
+        label,
+        EPOCH_1,
+        &[pm_roll(pool5, 500, up, false, 0), pm_roll(pool5, PM_SETTLE_TS, up, true, winner)],
+    );
+    root
+}
+
+fn strategy_row<'a>(json: &'a str, label: &str) -> &'a str {
+    let at = json
+        .find(&format!("\"label\":\"{label}\""))
+        .unwrap_or_else(|| panic!("no {label} row: {json}"));
+    let end = json[at..].find('}').map_or(json.len(), |e| at + e);
+    &json[at..end]
+}
+
+#[test]
+fn a_slot_9_take_settles_at_the_venues_result_with_the_p_law_fee() {
+    // 20 shares at the 0.96 touch (limit 0.97); Up wins → $20.
+    // Fee 0.07 × 0.96 × 0.04 × 20 = $0.05376 (the flat 350 bps would be
+    // $0.672); cost $19.20 → net $0.74624. A mark-out at the last 0.50
+    // mid would read −$9.25376.
+    let root = pm_root("pm15-settle", false, PM15_UP, VenueId::Polymarket, 9, 960_000, 20_000_000,
+                       core_types::pm_roll::PM_SETTLED_UP);
+    let (json, lines) = run_report(&root);
+    let row = strategy_row(&json, "pm15");
+    assert!(row.contains("\"fills\":1"), "{row}");
+    assert!(row.contains("\"net_usd\":\"0.74624\""), "{row}");
+    assert!(json.contains("\"pm_settlement\":{\"windows\":1,\"up\":1,\"down\":0,\"unknown\":0"), "{json}");
+    let table = lines
+        .iter()
+        .find(|l| l.contains("pm settlement table"))
+        .unwrap_or_else(|| panic!("no table: {lines:#?}"));
+    assert!(table.contains("1 window(s) on traded slots"), "{table}");
+    assert!(lines.iter().any(|l| l.contains("pm rolling orders=1 ticks=3")), "{lines:#?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_slot_11_take_through_jupiter_pays_twice_the_fee_and_settles() {
+    // Slot 11 routes through Jupiter (`VenueId::Jupiter` on a Polymarket
+    // sym). 10 shares of Down at 0.94; Down wins → $10. Fee at twice the
+    // rate: 0.14 × 0.94 × 0.06 × 10 = $0.07896; net $10 − $9.40 − $0.07896.
+    let root = pm_root("pm5-settle", true, PM5_DOWN, VenueId::Jupiter, 11, 940_000, 10_000_000,
+                       core_types::pm_roll::PM_SETTLED_DOWN);
+    let (json, _) = run_report(&root);
+    let row = strategy_row(&json, "pmj");
+    assert!(row.contains("\"fills\":1"), "{row}");
+    assert!(row.contains("\"net_usd\":\"0.52104\""), "{row}");
+    assert!(json.contains("\"pm_settlement\":{\"windows\":1,\"up\":0,\"down\":1,\"unknown\":0"), "{json}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_window_retired_unresolved_pays_nothing_as_the_member_books_it() {
+    let root = pm_root("pm15-retired", false, PM15_UP, VenueId::Polymarket, 9, 960_000, 20_000_000,
+                       core_types::pm_roll::PM_SETTLED_UNKNOWN);
+    let (json, _) = run_report(&root);
+    // −$19.20 cost − $0.05376 fee.
+    assert!(strategy_row(&json, "pm15").contains("\"net_usd\":\"-19.25376\""), "{json}");
+    assert!(json.contains("\"unknown\":1,\"retired\":1,\"flattened\":0"), "{json}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_paper_view_settles_a_rolling_paper_fill_at_the_payout() {
+    let root = pm_root("pm15-paper", false, PM15_UP, VenueId::Polymarket, 9, 960_000, 20_000_000,
+                       core_types::pm_roll::PM_SETTLED_UP);
+    let dir = root.join(format!("run-{EPOCH_1}"));
+    // The engine's own paper fill of the same take (no fees in this view).
+    let f = Fill::new(
+        2_000 + PM_DELTA + 10,
+        PM15_UP,
+        Side::Bid,
+        Price::from_raw(960_000),
+        Qty::from_raw(20_000_000),
+        77,
+    )
+    .with_attribution(9, core_types::FILL_ORIGIN_PAPER);
+    write_fills(&dir, EPOCH_1, &[f]);
+    let (json, lines) = run_report(&root);
+    // 20 × (1.00 − 0.96) = $0.80, not the 0.50 mark's −$9.20.
+    assert!(json.contains("\"paper\":{\"fills\":1,\"net_usd\":\"0.8\"}"), "{json}");
+    assert!(lines.iter().any(|l| l.contains("paper view: 1 position(s) settled")), "{lines:#?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_root_without_a_rolling_trade_carries_no_pm_settlement() {
+    // The rolls are there, but no slot traded the legs: nothing is
+    // scheduled, nothing is printed, the JSON has no key.
+    let root = tmp_root("pm15-untraded");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(PM_STATIC, "PMTOK"),
+                     (PM15_UP, "polymarket-rolling:updown:btc:15m[up0]"),
+                     (PM15_DOWN, "polymarket-rolling:updown:btc:15m[down0]")]);
+    write_ticks(&dir, "pm", EPOCH_1, &[pm_tick(1_000, PM_STATIC, 400_000, 1, 600_000, 1),
+                                       pm_tick(PM_END_TS, PM_STATIC, 400_000, 1, 600_000, 1)]);
+    write_events_as(&dir, "pm15", EPOCH_1, &[pm_roll(false, 500, PM15_UP, false, 0),
+        pm_roll(false, PM_SETTLE_TS, PM15_UP, true, core_types::pm_roll::PM_SETTLED_UP)]);
+    let (json, lines) = run_report(&root);
+    assert!(!json.contains("pm_settlement"), "{json}");
+    assert!(!lines.iter().any(|l| l.contains("pm settlement table") || l.contains("pm rolling")), "{lines:#?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A paper fill of slot 9's take (no fees in the paper view).
+fn pm_paper_fill(ts: u64, sym: u32) -> Fill {
+    Fill::new(ts, sym, Side::Bid, Price::from_raw(960_000), Qty::from_raw(20_000_000), 77)
+        .with_attribution(9, core_types::FILL_ORIGIN_PAPER)
+}
+
+/// Review r1 #1: a window run A ended without a result for sits on a slot
+/// sym run B reuses for a later window. B's settlement of THAT window must
+/// not close A's position at its winner: A's is flattened at 0 at A's own
+/// last instant (the member's unknown law), in the strategy row and in the
+/// paper view alike.
+#[test]
+fn a_window_a_run_ended_without_a_result_is_flattened_at_its_runs_end() {
+    let root = tmp_root("pm15-two-runs");
+    let up_desc = "polymarket-rolling:updown:btc:15m[up0]";
+    let down_desc = "polymarket-rolling:updown:btc:15m[down0]";
+    // Run A: buys 20 Up of window 5000, and ends before its result.
+    let a = run_dir(&root, EPOCH_1);
+    manifest(&a, &[(PM_STATIC, "PMTOK"), (PM15_UP, up_desc), (PM15_DOWN, down_desc)]);
+    write_ticks(&a, "pm", EPOCH_1, &[pm_tick(1_000, PM_STATIC, 400_000, 1, 600_000, 1),
+                                     pm_tick(90_000_000_000, PM_STATIC, 400_000, 1, 600_000, 1)]);
+    write_ticks(&a, "pm15", EPOCH_1, &[
+        pm_tick(1_500, PM15_UP, 940_000, 1_000_000, 960_000, 100_000_000),
+        pm_tick(2_000 + PM_DELTA + 10, PM15_UP, 940_000, 1_000_000, 960_000, 100_000_000),
+    ]);
+    write_orders(&a, EPOCH_1, &[pm_ioc(2_000, VenueId::Polymarket, PM15_UP, 970_000, 20_000_000, 9)]);
+    write_fills(&a, EPOCH_1, &[pm_paper_fill(2_000 + PM_DELTA + 10, PM15_UP)]);
+    write_events_as(&a, "pm15", EPOCH_1, &[pm_roll(false, 500, PM15_UP, false, 0)]);
+    // Run B: the pair's later window (instance 5016) is created and
+    // settles UP — the winner A's Up leg would wrongly be paid at.
+    let b = run_dir(&root, EPOCH_2);
+    manifest(&b, &[(PM_STATIC, "PMTOK"), (PM15_UP, up_desc), (PM15_DOWN, down_desc)]);
+    write_ticks(&b, "pm", EPOCH_2, &[pm_tick(1_000, PM_STATIC, 400_000, 1, 600_000, 1),
+                                     pm_tick(60_000_000_000, PM_STATIC, 400_000, 1, 600_000, 1)]);
+    let later = |settled: bool| core_types::ChannelEvent::new(
+        if settled { 50_000_000_000 } else { 2_000 },
+        VenueId::Polymarket,
+        core_types::ChannelId::InstrumentRoll,
+        PM15_UP,
+        core_types::pack_roll_seq(5_016, 60, 0, settled),
+        0,
+        if settled { core_types::pm_roll::PM_SETTLED_UP } else { 0 },
+        0,
+    );
+    write_events_as(&b, "pm15", EPOCH_2, &[later(false), later(true)]);
+    let (json, lines) = run_report(&root);
+    // −$19.20 − $0.05376: paid 0, not the later window's $20.
+    assert!(strategy_row(&json, "pm15").contains("\"net_usd\":\"-19.25376\""), "{json}");
+    assert!(json.contains("\"flattened_run_end\":1"), "{json}");
+    assert!(json.contains("\"paper\":{\"fills\":1,\"net_usd\":\"-19.2\"}"), "{json}");
+    assert!(lines.iter().any(|l| l.contains("1 flattened at their run's end")), "{lines:#?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Within one run: a window with no settled row whose pair is re-created
+/// is flattened at 0 at that instant; the re-created one, open at the
+/// root's end, marks out (counted).
+#[test]
+fn a_window_whose_pair_is_re_created_with_no_result_is_flattened_there() {
+    let root = pm_root("pm15-flatten", false, PM15_UP, VenueId::Polymarket, 9, 960_000, 20_000_000,
+                       core_types::pm_roll::PM_SETTLED_UP);
+    let dir = root.join(format!("run-{EPOCH_1}"));
+    let next = core_types::ChannelEvent::new(
+        60_000_000_000,
+        VenueId::Polymarket,
+        core_types::ChannelId::InstrumentRoll,
+        PM15_UP,
+        core_types::pack_roll_seq(5_016, 60, 0, false),
+        0,
+        0,
+        0,
+    );
+    // No settled row for 5000; the pair's next window created at 60 s.
+    write_events_as(&dir, "pm15", EPOCH_1, &[pm_roll(false, 500, PM15_UP, false, 0), next]);
+    let (json, _) = run_report(&root);
+    assert!(strategy_row(&json, "pm15").contains("\"net_usd\":\"-19.25376\""), "{json}");
+    assert!(json.contains("\"unknown\":1,\"retired\":0,\"flattened\":1,\"flattened_run_end\":0"), "{json}");
+    assert!(json.contains("\"open_at_end\":1"), "{json}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A settled row past the window's last instant is never applied: the
+/// position marks out at the last mid, and the row is counted.
+#[test]
+fn a_settled_row_after_the_window_is_counted_and_never_applied() {
+    let root = pm_root("pm15-after", false, PM15_UP, VenueId::Polymarket, 9, 960_000, 20_000_000,
+                       core_types::pm_roll::PM_SETTLED_UP);
+    let dir = root.join(format!("run-{EPOCH_1}"));
+    let late = pm_roll(false, PM_END_TS + 10_000_000_000, PM15_UP, true,
+                       core_types::pm_roll::PM_SETTLED_UP);
+    write_events_as(&dir, "pm15", EPOCH_1, &[pm_roll(false, 500, PM15_UP, false, 0), late]);
+    let (json, _) = run_report(&root);
+    // 20 × (0.50 mid − 0.96) − $0.05376: the mark-out, not the $20 payout.
+    assert!(strategy_row(&json, "pm15").contains("\"net_usd\":\"-9.25376\""), "{json}");
+    assert!(json.contains("\"windows\":0,"), "{json}");
+    assert!(json.contains("\"after_window\":1,"), "{json}");
+    let _ = std::fs::remove_dir_all(&root);
+}

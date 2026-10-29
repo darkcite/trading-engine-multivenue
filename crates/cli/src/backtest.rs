@@ -589,6 +589,8 @@ pub fn parse_model_params(
     if let Some(ns) = latency_global {
         p.latency_ns = [ns; VENUE_COUNT];
         p.latency_ns[VenueId::Ai as usize] = 0; // dead slot stays dead
+        // PMJ J3: Jupiter is an execution route with no book — dead too.
+        p.latency_ns[VenueId::Jupiter as usize] = 0;
     }
     for spec in latency_specs {
         let mut it = spec.split(':');
@@ -3488,7 +3490,8 @@ mod tests {
                 60 * MS,
                 150 * MS,
                 1_000 * MS,
-                130 * MS
+                130 * MS,
+                0
             ]
         );
         assert_eq!(p.stale_after_ms[VenueId::Mexc as usize], 400);
@@ -3520,10 +3523,11 @@ mod tests {
         // Global latency replaced every TRADEABLE slot (the Ai dead
         // slot stays 0 — WS9), then deribit won on top. The MEXC and
         // Hypercall slots take it too (a Δ column exists; both venues
-        // are data-only).
+        // are data-only). PMJ J3: Jupiter (10) stays 0 with the Ai slot —
+        // an execution route has no book to be late to.
         assert_eq!(
             p.latency_ns,
-            [1_000, 1_000, 1_000, 42, 1_000, 0, 1_000, 1_000, 1_000, 1_000]
+            [1_000, 1_000, 1_000, 42, 1_000, 0, 1_000, 1_000, 1_000, 1_000, 0]
         );
         // XSD-F: a bare `<venue>:` spec sets every class of the venue.
         assert_eq!(

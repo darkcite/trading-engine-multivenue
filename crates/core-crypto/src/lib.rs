@@ -25,6 +25,9 @@
 //!   ([`base64_decode`], once at boot) and `POLY_SIGNATURE` is the
 //!   URL-safe, `=`-padded base64 of `HMAC-SHA256(ts + METHOD + path +
 //!   body)` ([`base64url_encode`]).
+//! * Jupiter Predict on Solana (PMJ J2): the wallet's keypair and every
+//!   public key are base58 ([`base58_decode`], [`base58_encode`]; boot and
+//!   cold paths); the transaction travels as standard base64.
 //!
 //! ## Hot-path posture
 //!
@@ -588,6 +591,152 @@ fn b64_put<const PCT: bool>(c: u8, dst: &mut [u8]) -> usize {
 }
 
 // ---------------------------------------------------------------
+// Base58 (PMJ J2): the Bitcoin alphabet, which Solana uses for keys
+// ---------------------------------------------------------------
+
+const B58_ALPHA: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/// Upper bound of [`base58_encode`]'s output for `n` input bytes
+/// (log 256 / log 58 < 1.366, rounded up, plus the carry digit).
+#[inline(always)]
+#[must_use]
+pub const fn base58_encoded_max_len(n: usize) -> usize {
+    n * 1_366 / 1_000 + 1
+}
+
+/// A base58 text or buffer the codec refuses.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum B58Err {
+    /// A byte outside the alphabet (`0`, `O`, `I`, `l`, anything not
+    /// alphanumeric).
+    Char,
+    /// `dst` cannot hold the result.
+    Dst,
+}
+
+#[inline(always)]
+const fn b58_value(c: u8) -> Option<u8> {
+    match c {
+        b'1'..=b'9' => Some(c - b'1'),
+        b'A'..=b'H' => Some(c - b'A' + 9),
+        b'J'..=b'N' => Some(c - b'J' + 17),
+        b'P'..=b'Z' => Some(c - b'P' + 22),
+        b'a'..=b'k' => Some(c - b'a' + 33),
+        b'm'..=b'z' => Some(c - b'm' + 44),
+        _ => None,
+    }
+}
+
+/// Decode base58 `input` into `dst` (big-endian bytes); returns the bytes
+/// written. Each leading `1` is a leading zero byte. `dst` is the working
+/// number as well as the output, so nothing else is written. O(n²) in the
+/// text's length — boot and cold paths (a 64-byte keypair is 88 digits).
+/// Zero-alloc.
+///
+/// # Errors
+/// [`B58Err`] — nothing in `dst` is meaningful then.
+pub fn base58_decode(input: &[u8], dst: &mut [u8]) -> Result<usize, B58Err> {
+    let mut zeros = 0usize;
+    while zeros < input.len() && input[zeros] == b'1' {
+        zeros += 1;
+    }
+    // dst[..n] holds the number little-endian while it is built.
+    let mut n = 0usize;
+    let mut i = zeros;
+    while i < input.len() {
+        let Some(v) = b58_value(input[i]) else {
+            return Err(B58Err::Char);
+        };
+        let mut carry = u32::from(v);
+        let mut j = 0usize;
+        while j < n {
+            carry += u32::from(dst[j]) * 58;
+            dst[j] = carry as u8;
+            carry >>= 8;
+            j += 1;
+        }
+        while carry > 0 {
+            if n >= dst.len() {
+                return Err(B58Err::Dst);
+            }
+            dst[n] = carry as u8;
+            n += 1;
+            carry >>= 8;
+        }
+        i += 1;
+    }
+    let total = zeros + n;
+    if total > dst.len() {
+        return Err(B58Err::Dst);
+    }
+    // Big-endian, then shifted right past the leading zero bytes.
+    dst[..n].reverse();
+    let mut k = n;
+    while k > 0 {
+        k -= 1;
+        dst[zeros + k] = dst[k];
+    }
+    let mut k = 0usize;
+    while k < zeros {
+        dst[k] = 0;
+        k += 1;
+    }
+    Ok(total)
+}
+
+/// Encode `input` as base58 into `dst`; returns the bytes written. Each
+/// leading zero byte is a leading `1`. `dst` is the working number as
+/// well as the output. Cold paths; zero-alloc. `dst` needs at most
+/// [`base58_encoded_max_len`]`(input.len())` bytes.
+///
+/// # Errors
+/// [`B58Err::Dst`] — `dst` cannot hold the text.
+pub fn base58_encode(input: &[u8], dst: &mut [u8]) -> Result<usize, B58Err> {
+    let mut zeros = 0usize;
+    while zeros < input.len() && input[zeros] == 0 {
+        zeros += 1;
+    }
+    // dst[..n] holds base-58 digits little-endian while they are built.
+    let mut n = 0usize;
+    let mut i = zeros;
+    while i < input.len() {
+        let mut carry = u32::from(input[i]);
+        let mut j = 0usize;
+        while j < n {
+            carry += u32::from(dst[j]) << 8;
+            dst[j] = (carry % 58) as u8;
+            carry /= 58;
+            j += 1;
+        }
+        while carry > 0 {
+            if n >= dst.len() {
+                return Err(B58Err::Dst);
+            }
+            dst[n] = (carry % 58) as u8;
+            n += 1;
+            carry /= 58;
+        }
+        i += 1;
+    }
+    let total = zeros + n;
+    if total > dst.len() {
+        return Err(B58Err::Dst);
+    }
+    dst[..n].reverse();
+    let mut k = n;
+    while k > 0 {
+        k -= 1;
+        dst[zeros + k] = B58_ALPHA[dst[k] as usize % 58];
+    }
+    let mut k = 0usize;
+    while k < zeros {
+        dst[k] = b'1';
+        k += 1;
+    }
+    Ok(total)
+}
+
+// ---------------------------------------------------------------
 // Tests — NIST FIPS 180-4 / RFC 4231 / RFC 4648 vectors
 // ---------------------------------------------------------------
 
@@ -1026,5 +1175,108 @@ mod tests {
             i += 1;
         }
         assert_eq!(hmac_sha256_parts(key, &[]), hmac_sha256(key, b""));
+    }
+
+    /// Hex text → bytes (the base58 tests' vectors).
+    fn unhex(s: &str) -> Vec<u8> {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len() / 2);
+        let mut i = 0usize;
+        while i + 1 < b.len() {
+            out.push(u8::from_str_radix(&s[i..i + 2], 16).expect("hex"));
+            i += 2;
+        }
+        out
+    }
+
+    /// PMJ J2: Bitcoin Core's `base58_encode_decode.json` vectors, both
+    /// ways, and Solana's program ids (the Token program's bytes as Anton's
+    /// J0 probe pins them; the System program is 32 zero bytes).
+    #[test]
+    fn base58_round_trips_the_reference_vectors() {
+        let v: [(&str, &str); 12] = [
+            ("", ""),
+            ("61", "2g"),
+            ("626262", "a3gV"),
+            ("636363", "aPEr"),
+            ("73696d706c792061206c6f6e6720737472696e67", "2cFupjhnEsSn59qHXstmK2ffpLv2"),
+            ("00eb15231dfceb60925886b67d065299925915aeb172c06647", "1NS17iag9jJgTHD1VXjvLCEnZuQ3rJDE9L"),
+            ("516b6fcd0f", "ABnLTmg"),
+            ("bf4f89001e670274dd", "3SEo3LWLoPntC"),
+            ("572e4794", "3EFU7m"),
+            ("ecac89cad93923c02321", "EJDM8drfXA6uyA"),
+            ("10c8511e", "Rt5zm"),
+            ("00000000000000000000", "1111111111"),
+        ];
+        let mut i = 0usize;
+        while i < v.len() {
+            let raw = unhex(v[i].0);
+            let mut t = [0u8; 64];
+            let n = base58_encode(&raw, &mut t).expect("fits");
+            assert_eq!(&t[..n], v[i].1.as_bytes(), "encode {}", v[i].0);
+            let mut b = [0u8; 64];
+            let m = base58_decode(v[i].1.as_bytes(), &mut b).expect("fits");
+            assert_eq!(&b[..m], raw.as_slice(), "decode {}", v[i].1);
+            i += 1;
+        }
+        let mut b = [0u8; 32];
+        assert_eq!(base58_decode(b"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", &mut b), Ok(32));
+        assert_eq!(b.to_vec(), unhex("06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9"));
+        assert_eq!(base58_decode(b"11111111111111111111111111111111", &mut b), Ok(32));
+        assert_eq!(b, [0u8; 32]);
+        // RFC 8032 TEST 1's key pair as a Solana wallet exports it.
+        let mut kp = [0u8; 64];
+        assert_eq!(
+            base58_decode(
+                b"49W385L4rePHy6PAaQUovbD2aacgN4HsKXSMeUzRg4fmwXszN91JuMFrQRj3vMDpZuRF3ZknQBuRBoWQJEfXstMw",
+                &mut kp
+            ),
+            Ok(64)
+        );
+        assert_eq!(kp[..32].to_vec(), unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"));
+        assert_eq!(kp[32..].to_vec(), unhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"));
+        let mut t = [0u8; 44];
+        let n = base58_encode(&kp[32..], &mut t).expect("fits");
+        assert_eq!(&t[..n], b"FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z");
+    }
+
+    /// PMJ J2: the refusals, and a deterministic sweep of encode → decode.
+    #[test]
+    fn base58_refuses_what_it_cannot_hold_and_round_trips_any_bytes() {
+        let mut b = [0u8; 64];
+        for bad in [&b"0abc"[..], b"O", b"Il", b"ab+c", b"a b"] {
+            assert_eq!(base58_decode(bad, &mut b), Err(B58Err::Char), "{bad:?}");
+        }
+        let mut small = [0u8; 31];
+        assert_eq!(
+            base58_decode(b"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", &mut small),
+            Err(B58Err::Dst)
+        );
+        let mut tiny = [0u8; 3];
+        assert_eq!(base58_encode(&[0xff; 32], &mut tiny), Err(B58Err::Dst));
+        assert_eq!(base58_encode(&[0, 0, 0, 0], &mut tiny), Err(B58Err::Dst));
+        // Every length 0..=64 with a few patterns, leading zeros included.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut len = 0usize;
+        while len <= 64 {
+            let mut k = 0usize;
+            while k < 4 {
+                let mut raw = [0u8; 64];
+                let mut j = 0usize;
+                while j < len {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                    raw[j] = if k == 0 && j < 3 { 0 } else { (x >> 56) as u8 };
+                    j += 1;
+                }
+                let mut t = [0u8; 96];
+                let n = base58_encode(&raw[..len], &mut t).expect("fits");
+                assert!(n <= base58_encoded_max_len(len), "len {len}: {n}");
+                let mut back = [0u8; 64];
+                let m = base58_decode(&t[..n], &mut back).expect("decodes");
+                assert_eq!(&back[..m], &raw[..len], "len {len} pattern {k}");
+                k += 1;
+            }
+            len += 1;
+        }
     }
 }

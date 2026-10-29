@@ -1,0 +1,31 @@
+[package]
+name         = "notify"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "NOTIFY: the one-way Telegram notifier (`multivenue-notify`) — an out-of-process consumer of /state and the run captures, plus the AI-session inbox. Never linked into the engine (N-DOCTRINE)."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "multivenue-notify"
+path = "src/bin/multivenue-notify.rs"
+
+[dependencies]
+core-io    = { workspace = true }
+core-net   = { workspace = true }
+core-types = { workspace = true }
+rustls     = { workspace = true }
+
+[dev-dependencies]
+# Pins only: the file names, the reason bytes, the rolling ordinal base and
+# the /state words are copied here so the notifier links nothing the engine
+# loop runs; these tests fail the build if a copy drifts.
+engine              = { workspace = true }
+engine-snapshot     = { workspace = true }
+exec-hyperliquid    = { workspace = true }
+ingress-hyperliquid = { workspace = true }

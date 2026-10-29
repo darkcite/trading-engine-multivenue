@@ -186,6 +186,38 @@ fn fee_ceil_tenth_bps_1e12(notional_1e12: i128, tenth_bps: u32) -> i128 {
     (notional_1e12 * tenth_bps as i128 + 99_999) / 100_000
 }
 
+/// PMJ J10 (R-PMJ-S42): Polymarket's taker fee on its crypto up/down
+/// markets, `rate · p · (1 − p)` per share — price-dependent, so no flat
+/// bps is right everywhere (fees.toml's pm caveat). ×1e12 USD, ceiled as
+/// every fee here is (a fee never rounds in our favor):
+/// `rate_1e6 · px_1e6 · (1e6 − px_1e6) · qty_1e6` is 1e24-scaled, so the
+/// ×1e12 value is that over 1e12. A price at or past 1 pays nothing
+/// (`1 − p` clamps at 0). The members truncate the same product at ×1e6
+/// (`strategy_pm15::book_fill`), so this is at or above the member's fee by
+/// less than one micro-dollar per fill.
+#[inline]
+#[must_use]
+pub fn pm_taker_fee_ceil_1e12(rate_1e6: i64, px_1e6: i64, qty_1e6: i64) -> i128 {
+    debug_assert!(rate_1e6 >= 0 && px_1e6 >= 0 && qty_1e6 >= 0);
+    let rest = (1_000_000 - px_1e6).max(0);
+    let n = i128::from(rate_1e6) * i128::from(px_1e6) * i128::from(rest) * i128::from(qty_1e6);
+    (n + 999_999_999_999) / 1_000_000_000_000
+}
+
+/// PMJ J10: the paper fee rate ×1e6 a member's Polymarket taker fill is
+/// charged — each member's own law: slot 11 (`pmj`, through Jupiter)
+/// twice Polymarket's 0.07 until J0 measures the real fee, every other
+/// strategy Polymarket's own rate.
+#[inline]
+#[must_use]
+pub fn pm_fee_rate_1e6(strategy_id: u8) -> i64 {
+    if strategy_id == core_types::STRATEGY_SLOT_PMJ {
+        strategy_pmj::FEE_RATE_1E6
+    } else {
+        strategy_pm15::FEE_RATE_1E6
+    }
+}
+
 // ---------------------------------------------------------------
 // Open-order table (§4.1)
 // ---------------------------------------------------------------
@@ -923,6 +955,12 @@ pub struct FillEngine {
     /// `settled` that this engine put there and will take back out
     /// when the instance settles.
     binary_halted: BTreeSet<u32>,
+    /// PMJ J10: Polymarket's rolling up/down legs. A taker fill on one
+    /// pays the venue's p-dependent law ([`pm_taker_fee_ceil_1e12`]) in
+    /// place of the flat bps, a maker fill nothing, and its settlement
+    /// nothing (the venue charges no settlement; the flat fallback would
+    /// take 350 bps of every winning payout).
+    pm_fee_syms: BTreeSet<u32>,
     prediction_grid_refused: u64,
     /// BIN15 P4a (F3): see [`ModelOutcome::prediction_short_refused_1e6`].
     prediction_short_refused_1e6: i64,
@@ -1104,6 +1142,7 @@ impl FillEngine {
             binary_settle: BTreeMap::new(),
             binary_due_ns: u64::MAX,
             binary_halted: BTreeSet::new(),
+            pm_fee_syms: BTreeSet::new(),
             lifecycle: LifecycleReplay::default(),
             pine: None,
             delta_by_symbol_venue: false,
@@ -1235,7 +1274,7 @@ impl FillEngine {
                     // mark the last pool event set).
                     let mark = self.marks_1e6.get(&o.sym).copied().unwrap_or(px_1e6);
                     let row = FeeRowId::NONE;
-                    self.book_fill(&o, px_1e6, qty_1e6, 0, row, mark, wall_ns, out);
+                    self.book_fill(&o, px_1e6, qty_1e6, 0, false, row, mark, wall_ns, out);
                     self.amm_replay.fills += 1;
                     if qty_1e6 < o.remaining_1e6 {
                         self.amm_replay.partial += 1;
@@ -1545,7 +1584,7 @@ impl FillEngine {
                 let opening = self.is_opening_fill(e.sym, e.side);
                 let maker_bps = self.fee_rate_for(venue, e.sym, opening).0;
                 let row = self.fee_row(venue, e.sym, opening, false);
-                self.book_fill(&o, e.px_1e6, e.qty_1e6, maker_bps, row, mark, wall_ns, out);
+                self.book_fill(&o, e.px_1e6, e.qty_1e6, maker_bps, false, row, mark, wall_ns, out);
                 self.queue_replay.fills += 1;
                 continue;
             }
@@ -1610,9 +1649,13 @@ impl FillEngine {
     /// stamps `t_active = emit + Δ_venue`. Rejections are counted,
     /// never surfaced to the vm (module docs: the vm sees `Ok`).
     fn intake_place(&mut self, order: &Order, emit_virt: u64) {
-        debug_assert_eq!(
-            order.venue,
-            symbol_venue_byte(order.sym),
+        // PMJ J10: slot 11 routes a Polymarket leg's order through
+        // Jupiter (`VenueId::Jupiter` on a Polymarket sym); the model
+        // judges it on the sym's venue, which is the book it fills on.
+        debug_assert!(
+            order.venue == symbol_venue_byte(order.sym)
+                || (order.venue == core_types::VenueId::Jupiter as u8
+                    && symbol_venue_byte(order.sym) == core_types::VenueId::Polymarket as u8),
             "vm derives Order.venue from the sym namespace"
         );
         // Model venue (Δ / fee column), not the wire byte — the M1
@@ -1902,7 +1945,7 @@ impl FillEngine {
                 let taker_bps = self.fee_rate_for(o.venue, o.sym, opening).1;
                 let row = self.fee_row(o.venue, o.sym, opening, true);
                 let q = o.remaining_1e6;
-                self.book_fill(&o, fill_px, q, taker_bps, row, mark, wall_ns, out);
+                self.book_fill(&o, fill_px, q, taker_bps, true, row, mark, wall_ns, out);
                 self.mark_fills += 1;
                 // Full fill: compact (FIFO preserved).
                 self.retire(i, DoneReason::Filled);
@@ -1973,7 +2016,7 @@ impl FillEngine {
                         let opening = self.is_opening_fill(o.sym, o.side);
                         let taker_bps = self.fee_rate_for(o.venue, o.sym, opening).1;
                         let row = self.fee_row(o.venue, o.sym, opening, true);
-                        self.book_fill(&o, px_1e6, qty_1e6, taker_bps, row, mark, wall_ns, out);
+                        self.book_fill(&o, px_1e6, qty_1e6, taker_bps, true, row, mark, wall_ns, out);
                         self.ioc_fills += 1;
                     }
                     _ => self.ioc_canceled += 1,
@@ -1995,7 +2038,7 @@ impl FillEngine {
                     let opening = self.is_opening_fill(o.sym, o.side);
                     let maker_bps = self.fee_rate_for(o.venue, o.sym, opening).0;
                     let row = self.fee_row(o.venue, o.sym, opening, false);
-                    self.book_fill(&o, px_1e6, qty_1e6, maker_bps, row, mark, wall_ns, out);
+                    self.book_fill(&o, px_1e6, qty_1e6, maker_bps, false, row, mark, wall_ns, out);
                     let remaining = o.remaining_1e6 - qty_1e6;
                     if remaining > 0 {
                         self.open[i].remaining_1e6 = remaining;
@@ -2446,12 +2489,21 @@ impl FillEngine {
         }
     }
 
+    /// PMJ J10: class `sym` as a Polymarket rolling up/down leg — its
+    /// taker fills pay [`pm_taker_fee_ceil_1e12`] at the order's member
+    /// rate ([`pm_fee_rate_1e6`]), its maker fills and its settlement
+    /// nothing. Offline/boot path (may allocate).
+    pub fn set_pm_fee_sym(&mut self, sym: u32) {
+        self.pm_fee_syms.insert(sym);
+    }
+
     /// BIN15 O3: append one instance's settlement schedule for `sym`.
     ///
     /// Entries are kept sorted by `halt_ns` and consumed oldest-first,
     /// which is what makes a rolling slot replayable: the same sym
     /// halts, settles, and then trades its successor. Offline/boot
-    /// path (may allocate).
+    /// path (may allocate). PMJ J10's Polymarket legs ride the same
+    /// queue (`binary::apply_venue_settlements`).
     pub fn set_binary_settle(&mut self, sym: u32, s: BinarySettle) {
         debug_assert!(s.settle_ns >= s.halt_ns);
         debug_assert!(s.value_1e6 == 0 || s.value_1e6 == 1_000_000);
@@ -2567,9 +2619,17 @@ impl FillEngine {
         // notional. A losing leg's payout is 0, so it pays 0 either way.
         let venue = model_venue_byte(sym);
         let taker = self.fee_settle_rate(venue, sym);
+        // PMJ J10: Polymarket charges no settlement (its taker law at
+        // p = 0 or 1 is 0); the flat fallback would take 350 bps of every
+        // winning payout.
+        let free = self.pm_fee_syms.contains(&sym);
         if qty_full != 0 {
             let n = value as i128 * i128::from(qty_full.unsigned_abs());
-            let (fee, capped) = self.fee_for_row(sym, n, qty_full.abs(), taker, s.settle_ns);
+            let (fee, capped) = if free {
+                (0, false)
+            } else {
+                self.fee_for_row(sym, n, qty_full.abs(), taker, s.settle_ns)
+            };
             if self.pine.is_some() {
                 let row = self.fee_settle_row(venue, sym).with_opt_formula(capped);
                 self.pine_charge(sym, row, taker, n, fee);
@@ -2578,7 +2638,11 @@ impl FillEngine {
         }
         if qty_oos != 0 {
             let n = value as i128 * i128::from(qty_oos.unsigned_abs());
-            let fee = self.fee_for(sym, n, qty_oos.abs(), taker, s.settle_ns);
+            let fee = if free {
+                0
+            } else {
+                self.fee_for(sym, n, qty_oos.abs(), taker, s.settle_ns)
+            };
             self.oos.settle(sym, value, value, fee);
             self.dd.sample(self.oos.equity_1e12());
         }
@@ -2742,12 +2806,14 @@ impl FillEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // one per input the fill law reads
     fn book_fill(
         &mut self,
         o: &OpenOrder,
         fill_px: i64,
         fill_qty: i64,
         fee_bps: u32,
+        taker: bool,
         fee_row: FeeRowId,
         mark: i64,
         wall_ns: u64,
@@ -2785,7 +2851,18 @@ impl FillEngine {
             fill_qty
         };
         let notional_1e12 = fill_px as i128 * fill_qty as i128;
-        let (fee_1e12, capped) = self.fee_for_row(o.sym, notional_1e12, fill_qty, fee_bps, wall_ns);
+        // PMJ J10: a Polymarket rolling leg pays the venue's p-dependent
+        // taker law at its member's rate, and nothing as a maker.
+        let (fee_1e12, capped) = if self.pm_fee_syms.contains(&o.sym) {
+            let f = if taker {
+                pm_taker_fee_ceil_1e12(pm_fee_rate_1e6(o.strategy_id), fill_px, fill_qty)
+            } else {
+                0
+            };
+            (f, false)
+        } else {
+            self.fee_for_row(o.sym, notional_1e12, fill_qty, fee_bps, wall_ns)
+        };
         let fee_row = if fee_row == FeeRowId::NONE {
             fee_row
         } else {
@@ -4481,6 +4558,75 @@ mod tests {
         assert_eq!(o.oos_net_ladder_1e12[0], base);
         assert_eq!(o.oos_net_ladder_1e12[1], base - 1_000_000_000);
         assert_eq!(o.oos_net_ladder_1e12[2], base - 2_000_000_000);
+    }
+
+    /// PMJ J10 (R-PMJ-S42): a Polymarket rolling leg's taker fill pays the
+    /// venue's p-dependent law at its member's rate in place of the flat
+    /// bps (which would charge 350 bps of notional here), and its
+    /// settlement pays nothing.
+    #[test]
+    fn a_polymarket_rolling_leg_pays_the_p_law_taker_fee_and_settles_free() {
+        for (strategy, fee_1e12) in [(core_types::STRATEGY_SLOT_PM15, 40_740_000_000_i128),
+                                     (core_types::STRATEGY_SLOT_PMJ, 81_480_000_000)] {
+            let mut e = engine_fees(0, 0, 350);
+            e.set_pm_fee_sym(PM_SYM);
+            e.set_binary_settle(
+                PM_SYM,
+                BinarySettle { halt_ns: 1_000, settle_ns: 1_000, value_1e6: 1_000_000 },
+            );
+            let mut out = Vec::new();
+            let mut o = ioc(PM_SYM, Side::Bid, 970_000, 20_000_000, 1);
+            o.strategy_id = strategy;
+            e.intake(&o, 0);
+            e.on_record(&tick(PM_SYM, 960_000, 1, 970_000, 100_000_000), 10, 0, &mut out);
+            assert_eq!(out.len(), 1);
+            // 0.07 × 0.97 × 0.03 × 20 shares = $0.04074 (slot 11: twice).
+            assert_eq!(out[0].fee_1e12, fee_1e12, "strategy {strategy}");
+            // The settled row: the 20 shares pay $20, and nothing in fees.
+            e.on_record(&tick(PM_SYM, 960_000, 1, 970_000, 100_000_000), 20, 2_000, &mut out);
+            let r = e.finish();
+            assert_eq!(r.binary_settled, 1);
+            assert_eq!(r.full_fees_1e12, fee_1e12, "the settlement is free");
+            // cost $19.40, payout $20.00, less the fee.
+            assert_eq!(r.full_realized_1e12 - r.full_fees_1e12, 600_000_000_000 - fee_1e12);
+        }
+    }
+
+    /// PMJ J10: the law itself — ceiled, zero past a price of 1, and the
+    /// members' rates.
+    #[test]
+    fn the_polymarket_taker_law_ceils_and_vanishes_at_the_bounds() {
+        // 0.07 × 0.95 × 0.05 × 1 share = 0.003325 → 3_325_000_000 ×1e12.
+        assert_eq!(pm_taker_fee_ceil_1e12(70_000, 950_000, 1_000_000), 3_325_000_000);
+        // One micro-share: 3.325e-9 USD = 3 325 ×1e12 units; a third ceils up.
+        assert_eq!(pm_taker_fee_ceil_1e12(70_000, 950_000, 1), 3_325);
+        assert_eq!(pm_taker_fee_ceil_1e12(70_000, 333_333, 1), 15_556);
+        assert_eq!(pm_taker_fee_ceil_1e12(70_000, 1_000_000, 5_000_000), 0);
+        assert_eq!(pm_taker_fee_ceil_1e12(70_000, 1_200_000, 5_000_000), 0);
+        assert_eq!(pm_fee_rate_1e6(core_types::STRATEGY_SLOT_PMJ), 140_000);
+        assert_eq!(pm_fee_rate_1e6(core_types::STRATEGY_SLOT_PM15), 70_000);
+        assert_eq!(pm_fee_rate_1e6(3), 70_000);
+    }
+
+    /// PMJ J10: a maker fill on a Polymarket rolling leg pays nothing —
+    /// the venue never charges makers — while the same fill on any other
+    /// sym pays the configured maker bps exactly as before.
+    #[test]
+    fn a_polymarket_rolling_maker_fill_is_free_and_other_syms_unchanged() {
+        let other = PM_SYM + 1;
+        for (sym, pm, fee_1e12) in [(PM_SYM, true, 0_i128), (other, false, 50_000_000_000)] {
+            let mut e = engine_fees(0, 50, 350);
+            if pm {
+                e.set_pm_fee_sym(PM_SYM);
+            }
+            let mut out = Vec::new();
+            // A resting bid at 0.50 for 20 (a maker), crossed by an ask at 0.40.
+            e.intake(&order(sym, Side::Bid, 500_000, 20_000_000, 1), 0);
+            e.on_record(&tick(sym, 300_000, 500_000_000, 400_000, 500_000_000), 10, 0, &mut out);
+            assert_eq!(out.len(), 1, "sym {sym}");
+            // $10 notional × 50 bps = $0.05 on the ordinary sym.
+            assert_eq!(out[0].fee_1e12, fee_1e12, "sym {sym}");
+        }
     }
 
     #[test]

@@ -46,8 +46,11 @@ pub mod instrument_class;
 pub mod pine;
 /// PM15 (slot 9): the `pm15.toml` artifact.
 pub mod pm15;
+/// PMJ (slot 11): the `pmj.toml` artifact.
+pub mod pmj;
 /// RG2: the regime detector's parameter artifact (`regime.toml`) + seed file.
 pub mod regime;
+pub mod strike_law;
 pub mod universe;
 /// VRP V4: the VRP member's parameter artifact (`vrp.toml`) + seed rows.
 pub mod vrp;

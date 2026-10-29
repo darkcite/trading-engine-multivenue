@@ -636,7 +636,7 @@ fn slot_masks_encode_whole_and_the_slot_rows_carry_sixteen() {
         body.contains("{\"slot\":3,\"name\":\"bin15\",\"configured\":0,\"enabled\":0,\"gate\":0,")
     );
     assert!(body.contains(
-        "{\"slot\":11,\"name\":\"reserved\",\"configured\":1,\"enabled\":1,\"gate\":2,"
+        "{\"slot\":11,\"name\":\"pmj\",\"configured\":1,\"enabled\":1,\"gate\":2,"
     ));
     assert_eq!(body.matches("{\"slot\":").count(), SNAPSHOT_SLOTS);
     assert!(!body.contains("{\"slot\":16,"));
@@ -644,12 +644,13 @@ fn slot_masks_encode_whole_and_the_slot_rows_carry_sixteen() {
     let h = body.find("\"halted\":[\"").expect("exec.halted");
     let end = h + body[h..].find(']').unwrap();
     assert_eq!(body[h..end].matches(',').count() + 1, SNAPSHOT_SLOTS);
-    // Slots 10–15 are reserved; 0–9 keep their members (slot 8 is the Pine
-    // member since PVM impl-08 T4, slot 9 is PM15 since PM15-5).
+    // Slots 10 and 12–15 are reserved; 0–9 and 11 keep their members (slot 8 is the
+    // Pine member since PVM impl-08 T4, slot 9 is PM15 since PM15-5, slot 11 is PMJ).
     assert_eq!(SLOT_NAMES[8], "pine");
     assert_eq!(SLOT_NAMES[9], "pm15");
+    assert_eq!(SLOT_NAMES[11], "pmj");
     for (i, n) in SLOT_NAMES.iter().enumerate() {
-        let member = i < 10;
+        let member = i < 10 || i == 11;
         assert_eq!(*n != engine_snapshot::RESERVED_SLOT_NAME, member, "slot {i}");
     }
 }

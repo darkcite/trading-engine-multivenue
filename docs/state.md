@@ -19,8 +19,405 @@ affected paragraph at each lane close; the superseded text goes to
   since 2026-10-17 09:22Z (risk-policy "PM15 — slot 9"; rulings R-PM-1..10).
   `BUILT_MASK` = 0x02FF; `ALL_MASK` (= `all`) = 0x00FF, so `all` does not
   include pm15. Slots 8 and 10–15 stay reserved.
+
+## Corrections found 2026-10-18 (they supersede the dated text below — verify on `/state`)
+
+- **Slot 11 (pmj, `strategy-pmj`) is built and runs PAPER in main's engine**
+  since 2026-10-18 13:06Z (`88f70509`; risk-policy "PMJ — slot 11", ### J1b–J4;
+  rulings R-PMJ-0..3, R-PMJ-S1..S14). It trades slot 9's H90 law on
+  Polymarket's **5-minute** up/down families only, addressed to Jupiter Predict
+  (`VenueId::Jupiter` = 10), judged by the paper held-quote law at submit +
+  2 s; a live slot 11 refuses the boot (no `PMJ-DUST-GATE` line yet), and
+  nothing of the Jupiter arm (`exec-jupiter`) is built at boot.
+  `BUILT_MASK` = **0x0AFF**; `ALL_MASK` stays 0x00FF. Slots 8, 10 and 12–15
+  stay reserved.
+- `~/multivenue/universe.toml` `[polymarket] rolling` gained the seven
+  `updown:<asset>:5m` families (btc eth sol xrp hype doge bnb), appended after
+  the 15-minute ones (R-PMJ-S12); `~/multivenue/pmj.toml` (sha256
+  `d82576a2…52e0`, the dust frame: $5 an order, $10 a market, −$50 a session;
+  the H90 values are pm15's, provisional) is read because `STRATEGY` names
+  `pmj` (`…+pm15+pmj`). `scripts/pmj-flip.sh status` shows what the next boot
+  runs for slot 11.
+- The boot at 13:06Z also shipped `a946a668` (SETUP docs). Rollback kit:
+  `~/multivenue/rollback-pmj-20261018/` (the pre-deploy `universe.toml`,
+  `strategy.conf`, the `eee660b` binary and its wrapper).
+- **2026-10-19 04:54Z: the engine boots `b5c263e6` (PMJ J6, ruling
+  R-PMJ-S15):** the rolling legs' depth capture (`pm15-depth.pmlr`,
+  `pm5-depth.pmlr`) keeps at most one record per leg per second
+  (`[polymarket] rolling_depth_ms`, default 1000; the universe names no key,
+  so the default is in force — boot log `depth=RollingDepth { on: true,
+  min_ms: 1000 }`). Runs before this boot are every-change (~1.35 GB/h for
+  the two); after it, ~8 MB/h each. Rollback kit for this boot:
+  `~/multivenue/rollback-pmj-20261019/multivenue-engine.88f70509`.
+- **2026-10-19 06:19Z: the engine boots `4690bcac` (PMJ J7, rulings
+  R-PMJ-S17..S20):** each rolling pipeline spreads its families over one
+  market socket per family (`[polymarket] rolling_market_sockets`, default 8;
+  the universe names no key, so the default is in force — boot log `pm15: the
+  families ride 7 market socket(s)` / `pm5: …`; gauges
+  `engine_ingress_pm15_market_sockets_open` = `engine_ingress_pm5_market_sockets_open`
+  = 7). A market-socket loss now withdraws only that family's touches. Runs
+  before this boot rode one market socket per period. Restart: the `0010`
+  stamp forced at 06:17:38Z (off the 15-minute grid), daily-restart's exec
+  gate, drain and relaunch; masks 2815, `vm rows_active` 2, slots 3 / 9 / 11
+  configured and enabled. Rollback: `rolling_market_sockets = 1` in
+  `universe.toml` and a restart (this binary), or the kit
+  `~/multivenue/rollback-pmj-20261019/multivenue-engine.b5c263e6` (then remove
+  the key if it was added).
+- **2026-10-19 08:35Z: the scheduled `0833` boot (`4690bcac`) took the new
+  paper frames (rulings R-PMJ-S21, S22):** `pm15.toml` session loss −$3 500
+  (per order and per market stay $250); `pmj.toml` $250 deposit (max
+  $250.01), $250 per market, −$3 500 session. Boot tells `frame=$250/order:
+  $250/market:-$3500/session` for both. By R-PM-8 −$3 500 is also slot 9's
+  live session bound once armed; today slot 9 has no arm. Rollback:
+  `~/multivenue/rollback-pmj-20261019/{pm15,pmj}.toml.pre-frame-0710`.
+- **2026-10-19 08:49Z: the engine boots `ed4e14bd` (PMJ J8, rulings
+  R-PMJ-S23..S26):** the rolling legs' paper IoC sweeps the touch and the
+  depth behind it up to its limit (the venue's FAK) at submit + delta; slot 9
+  decides no entry under `price_floor` 0.90 (`pm15.toml price_floor_1e6`,
+  absent = 0.90; boot tell `…:floor0.900:…`); slot 11's IoCs are also judged
+  in shadow at 350 ms and 1 s (`engine_paper_matcher_pmj_*`). **Slot 9 and
+  11 paper P&L before and after this boot are different laws; P0's count is
+  segmented here.** Restart: the `0010` stamp forced at 08:47:21Z (14 min
+  after the `0833` drain, off the 15-minute grid), daily-restart's exec gate,
+  drain and relaunch; boot 08:49:18Z, masks 2815, `vm rows_active` 2, slots
+  3 / 9 / 11 configured and enabled, `market_sockets_open` 7 / 7. Rollback:
+  `price_floor_1e6 = 0` in `pm15.toml` and a restart restores slot 9's
+  frozen law (this binary; the sweep has no switch), or the kit
+  `~/multivenue/rollback-pmj-20261019/multivenue-engine.4690bcac` (then
+  remove the key if it was added).
+- **2026-10-19 09:37Z: PMJ J9 installed (`e4f6b566`, rulings
+  R-PMJ-S27..S30):** launchd `com.multivenue.pm-pnl` (:06, :21, :36, :51
+  and at load) keeps slots 9 and 11's paper P&L since 2026-10-19 00:11Z in
+  `~/multivenue/worker/pm/` (ledger, open fills, summary), settled on the
+  venue's result; the dashboard (`com.multivenue.dashboard` restarted)
+  shows it per fill-law segment in the pm15 and pmj blocks. The engine was
+  not touched (same pid, `ed4e14bd`). Remove:
+  `launchctl bootout gui/$UID/com.multivenue.pm-pnl`.
+- **2026-10-19 11:28Z: `target/release` rebuilt at `dda68846` (PMJ J10, ruling
+  R-PMJ-S42) — no restart.** J10 changes `audit-pnl` only (the nightly day
+  report settles Polymarket's rolling windows, with their p-dependent fee);
+  the engine's runtime code is unchanged. The running engine stays on
+  `ed4e14bd` until the next scheduled restart, which boots `dda68846`;
+  tonight's 00:20Z `pnl_report` already runs it. Rollback kit:
+  `~/multivenue/rollback-pmj-20261019/multivenue-engine.ed4e14bd`.
+- **2026-10-19 16:06Z: the scheduled `1605` restart booted `dda68846`** (run
+  `run-1792425969573319000`) with PMJ J11's config (R-PMJ-S47 / S55):
+  `pmj.toml` `paper_delay_ms` 5000 and `min_tau_s` 6 — slot 11's tell
+  `law=6-20s … paper=+5000ms`, artifact hash `09e53291…`; slot 9's tell is
+  unchanged (`law=2-20s … floor0.900`, `ef485100…`). `/state`: masks 2815,
+  `vm rows_active` 2, `market_sockets_open` 7 / 7 on both periods, depth drops
+  0; `exec.HALT` still present with slot 3 `ws-gap` (unchanged). No run booted
+  between the `pmj.toml` edit (14:07:54Z) and J9's `J11_FROM_NS` (16:00Z), so
+  slot 11's `j11` ledger segment starts exactly at this run. Rollback: restore
+  `~/multivenue/rollback-pmj-20261019/pmj.toml.pre-j11` and restart (plus a J9
+  `SEGMENTS` row).
+- `exec.HALT` is present and slot 3 reads halted (`ws-gap`) on `/state` both
+  BEFORE and after this restart — not changed by the PMJ deploy; the
+  operator's to clear.
 - The binary, boot time, mask and `exec.configured` lines below predate both:
   read `/state` `boot.git_sha` and its `exec` block.
+
+## Corrections found 2026-10-20 (they supersede the dated text above — verify on `/state`)
+
+- **2026-10-20 05:50Z: the engine boots `9a57e345` (EXEC O-WSG1..4, operator
+  rulings 2026-10-20; risk-policy "O-WSG1..4").**
+  - **The hold.** A user-stream gap and a stale reconciliation HOLD a live
+    slot instead of halting it. The slot places nothing and its resting
+    orders are asked back, but no `exec.HALT` is written.
+  - **The resume.** The slot resumes by itself once the gap is back under
+    the threshold, a reconciliation from reads issued since then has agreed
+    (the gateway arm's `resync_pending`), and the hold's cancel is
+    confirmed.
+  - **Slot 3's gap threshold** is `halt_on_ws_gap_ms = 5000` in
+    `~/multivenue/exec.toml` (30000 before; backup `exec.toml.bak-20261020T054906Z-wsg`).
+  - **Boot tell:** `slot 3 HALTS … ws_gap_ms=5000`.
+- **Slot 3's 10-18 05:15Z `ws-gap` latch is archived.** The file is now
+  `~/multivenue/logs/exec.HALT.20261020T054906Z-wsg-archived`, and slot 3
+  booted unhalted and LIVE at the $2 / $5 frame (`/state`: `halted` none,
+  `held` none, seeded 1).
+- **The restart:** the `0010` stamp forced at 05:49:06Z (a safe minute),
+  then daily-restart's exec gate (PASS), the drain and the relaunch.
+- **Watch:**
+  - `/metrics`: `engine_exec_held_mask` (8 = slot 3 held),
+    `engine_exec_holds_total` and `engine_exec_refused_held_total`;
+  - `/state` `exec.held`;
+  - the log: "exec: slot HELD …" and "exec: slot RESUMED …".
+- **Rollback kit:** `~/multivenue/rollback-wsg-20261020/`, holding the
+  dda68846 binary, `exec.toml.pre-wsg` and `exec.HALT.pre-wsg`.
+
+- **2026-10-20 06:39Z: the engine boots `c8d7145b` (the HL gateway's client
+  heartbeat).**
+  - **The fault.** Hyperliquid closes a `/ws` socket 60 s after its last
+    client ping or subscribe (`Close 1000 "Inactive"`), and posts do not
+    count. The gateway pinged only on inbound silence, which its reads
+    never allowed, so it was cut and redialled every 60 s (278 dials in
+    4 h 42 m), and any post in flight at a cut was left in doubt.
+  - **The fix.** `GwConn::maintain` now sends a ping 30 s after the last
+    one it sent, however busy the socket.
+  - **Verified:** 1 dial, 0 drops and 0 failed reads in the first 3.6
+    minutes after the boot (one drop a minute before).
+  - **The restart:** the `0010` stamp forced at 06:37:18Z, then the exec
+    gate (PASS) and the drain at 06:38Z.
+  - **Rollback:** `~/multivenue/rollback-wsg-20261020/multivenue-engine.9a57e345`.
+
+- **2026-10-20 17:50Z: slot 3's late law at persistence 1 (operator ruling
+  O-H90-11; risk-policy "BIN15 H90 O-H90-11", `a39e0228`).**
+  - **The change.** `late_persist_polls = 1` (was 2) in the paper artifact
+    and so in the live cut: the law fires on the first qualifying snapshot
+    of the favoured leg. Every other line is unchanged; slot 3 stays LIVE
+    at the $2 / $5 dust frame on its gateway.
+  - **The flips.** `bin15-flip.sh paper` (SIGTERM 17:39:49Z, venue clear,
+    the 10-20 05:50Z session anchor archived), the edit, then
+    `bin15-flip.sh live --gateway` (exec-smoke PASS 17:42Z, SIGTERM
+    17:49:02Z). Boot 17:50:26Z on `c8d7145b`: the tell reads
+    `late=2-30s:p>=0.90:ask<=p-2c:persist1:$2:k1.550` and "LIVE ARM
+    ARMED"; `bin15-flip.sh status`: slot 3 LIVE, halted none. Every other
+    slot restarted twice with the engine (about 2 minutes each).
+  - **Artifacts:** live cut `3630f7c4…`, paper copy `67ed54a3…`; the
+    pre-change pair `~/multivenue/bin15{,.paper-s7}.toml.bak-20261020T173937Z-o-h90-11`.
+  - **The test.** PR-BIN15-P1 runs on the standalone (`bin15-h90-standalone`,
+    slot 3 LIVE at $250, on persistence 1 since its 17:36:52Z boot); main's
+    slot 3 is read for its fill and miss rates only. Project docs
+    `claude/bin15-p1-spec-2026-10-20.md` (the pre-registration) and
+    `claude/bin15-p1-results-2026-10-20.md` (the evidence).
+  - **Revert:** `bin15-flip.sh paper`, `late_persist_polls = 2`, then
+    `bin15-flip.sh live --gateway`, each at a safe minute.
+- **2026-10-23 16:10Z: the scheduled `1605` restart booted `06c2bcbf` (PMJ
+  J12) with slot 11 on law (iii)** (R-PMJ-S61 / S63 / S64; risk-policy "J12").
+  - **The build.** J12 committed at 12:13Z, release binary rebuilt 12:15Z
+    (no restart then). The previous `c8d7145b` binary is kept in
+    `~/multivenue/rollback-pmj-20261023/`.
+  - **The config.** `~/multivenue/pmj.toml` gained `strike_law = "trap62"`,
+    `sigma_res_ratio_1e3 = 130` and `sigma_res_min_ppm = [3, 5, 6, 5, 6, 6, 3]`
+    at 15:26:32Z (backup `pmj.toml.pre-j12`, also in the rollback kit).
+  - **The boot.** Run `run-1792771848978758000` (epoch 16:10:48Z).
+    - Slot 11's tell: `law=6-20s … k1.550:strike=trap62:res=130/3,5,6,5,6,6,3
+      paper=+5000ms`, artifact hash `4009f98a…`.
+    - Slot 9's tell is unchanged (`law=2-20s … k1.550`, `ef485100…`); it stays
+      on the first law until after 10-28 00:00Z.
+    - `/state`: masks 2815, slots 9 and 11 configured and enabled. Slot 11's
+      member fixed its first trapezoid strikes on the 16:15Z windows.
+  - **Two things this boot did not change.**
+    - `exec.HALT` is present with slot 3 `reject-streak` (written 10-21 14:14Z,
+      adopted at boot). Slot 3 is halted, not trading — the BIN15 / EXEC lane's
+      item.
+    - `vm rows_active` is 0, as since the 08:34Z boot — also that lane's.
+  - **The ledger.** No run booted between the `pmj.toml` edit and J9's
+    `J12_FROM_NS` (16:00Z), so slot 11's `j12` segment starts exactly at this
+    run. The worker's 16:06Z pass already shows it (empty).
+  - **Rollback.** Restore `pmj.toml.pre-j12` and restart (plus a J9 `SEGMENTS`
+    row), or the previous binary.
+
+## Corrections found 2026-10-23 (BIN15 — they supersede the slot 3 text above; verify on `/state`)
+
+- **Slot 3 (bin15) is PAPER** since 2026-10-23 19:34Z (`scripts/bin15-flip.sh paper`,
+  ruling F-10: its API wallet `0x0a1f…54a1` is no longer an agent, every order was
+  refused). `exec.toml` slot 3 `mode = "paper"`, `ARM_LIVE` commented out; the
+  `exec.HALT` `slot=3 reason=reject-streak` line is left for the operator. Slot 3
+  goes live again only with a new API wallet key from Anton.
+- **2026-10-23 20:16Z: main booted `300186e5`** (the 20:15Z drain) — BIN15 fills A
+  + B-1 (plan `claude/bin15-fills-plan-2026-10-23.md`, rulings F-1..F-11):
+  - **The book (O8b).** A HIP-4 outcome leg's touch is composed from both legs'
+    own `bbo` (a leg's ask = 1 − the other leg's bid); an emptied side reaches the
+    engine (ask 0), so a ghost ask can no longer stand. This is every HL outcome
+    reader on main (bin15 slot 3, xmm slot 6; both paper): about 2.2 updates/s per
+    leg instead of the `l2Book`'s ~0.19.
+  - **The law.** `late_refire_fresh = 1` in `~/multivenue/bin15.toml` (backup
+    `bin15.toml.bak-20261023T200630Z-fills-b1`): after a refused IoC the instance
+    fires again only on another touch of its leg. Boot tell
+    `late=2-30s:p>=0.90:ask<=p-2c:persist1:$100:k1.550:fresh`, artifact
+    `545fc348…`.
+  - **Committed, not yet built on main:** `7f5743c8` (B-2 `late_max_quote_age_ms`
+    = the ask's age at its price), `1803a652` (B-4 `late_lead`), `c1920c89`
+    (`late_lead = "none"`). All three keys are unset; main's next release build
+    from committed state carries them with no behaviour change.
+- **2026-10-24 04:06Z: main restarted (forced `0010` slot, 04:04Z) with BIN15
+  fills v2 on slot 3's PAPER artifact** (rulings F-12..F-15, Anton 10-24 ~04:00Z):
+  `late_e_1e6 = 10000` (the 1 c margin) and `late_limit_bound = 1` (the IoC's
+  limit p − 0.01, sweeping every level up to it), beside `late_refire_fresh = 1`.
+  Binary unchanged (`300186e5`). Tell
+  `late=2-30s:p>=0.90:ask<=p-1c:persist1:$100:k1.550:fresh:bound`, artifact
+  `9b893a2e…` (backup `bin15.toml.bak-20261024T040206Z-fills-v2`). No exec arm
+  (`/state` `exec.configured` 0). The slot's retention pass ran with the slot
+  (four 10-22 run dirs archived, verified).
+- **2026-10-24 04:52Z: the standalone LIVE on PR-BIN15-P2** (Anton confirmed
+  the release, ~04:20Z; this lifts F-11 for this change only). Branch
+  `bin15-h90-standalone` G29 `af27572b` (G20–G28: O8b, B-1..B-4, the Binance
+  feed dark, G27's worker clock-domain fix, G28's cap `late_limit_max_1e6`).
+  - **The law:** `late_refire_fresh = 1`, `late_limit_bound = 1`,
+    `late_e_1e6 = 10000` and `late_limit_max_1e6 = 985000`.
+  - **The boots:** `bin15-flip.sh paper` (boot 04:50:20Z, tell checked), then
+    `bin15-flip.sh live --gateway` (exec-smoke PASS, SIGTERM 04:51:03Z,
+    "LIVE ARM ARMED" 04:52:13Z, pid 25575).
+  - **The tell:** `late=2-30s:p>=0.90:ask<=p-1c:persist1:$250:k1.550:fresh:bound:cap0.985`.
+  - **The artifacts:** live cut `677868c2…`, paper copy `b6d148e8…`, backups
+    `~/bin15/multivenue/bin15{,.paper-s7}.toml.bak-20261024T043654Z-p2`.
+  - **The account:** session anchor 1 248.83 USDC.
+  - **Unchanged:** $250 per order and per instance, −$500 session bound, no
+    day cap.
+  - **The forward test and kill rules:** the standalone branch's
+    docs/risk-policy.md "BIN15 fills — PR-BIN15-P2"; project
+    `claude/bin15-p2-spec-2026-10-24.md`.
+  - **Main carries the cap in code** (`5daffac3`), not built. Its paper
+    artifact must not name `late_limit_max_1e6` until a build from committed
+    state boots, because `300186e5` refuses an unknown key.
+  - **Amendment A1, 05:19:25Z:** the 04:52Z boot sent nothing. The router's
+    clamp 3 counts an outcome contract at its $1 payout, so $250 / limit is
+    over 250 contracts, and 90 IoCs were refused locally. Anton: "Fix sizing,
+    redeploy". The standalone now runs G30 `57bcdf6d` (the member sizes inside
+    the clamp; main `5c0a85ca`, not built), pid 33607, armed 05:19:25Z, with
+    the same artifact and tell. The forward test's window starts at this boot.
+- **2026-10-24 05:51Z: main restarted (forced `0010` slot at 05:49:17Z) on
+  `5aab3626`, with slot 3 PAPER on the standalone's P2 config** (Anton: "release
+  the same version on main for paper mode with the identical to standalone
+  config").
+  - **The artifact:** `late_limit_max_1e6 = 985000` added, and the standalone's
+    frame: `late_usd_1e6 = 250000000`, `cap_instance_usd_1e6 = 250000000`,
+    `cap_day_usd_1e6 = 100000000000` (were $100 / $1 000 / $30 000). Every other
+    key was already the standalone's. `families` keeps main's four native 1 d
+    entries, because its universe's `rolling` lists them; the late law prices
+    15 m families only.
+  - **Hash and backup:** artifact `b356bd61…`, backup
+    `bin15.toml.bak-20261024T054526Z-p2`.
+  - **Tell:** `late=2-30s:p>=0.90:ask<=p-1c:persist1:$250:k1.550:fresh:bound:cap0.985`,
+    `cap_instance=$250`, the same as the standalone's.
+  - **Also in this build:** PMJ's committed `61626a59` (J13, `max_side_families`
+    default off; no artifact sets it) and `7b5d2a4f` (slot 9's ledger row
+    from 10-28 00:00Z, date-gated).
+  - **Retention** ran with the slot and stopped at `run-1792703787545938000`
+    (not yet verified in the bucket). Nothing was removed.
+
+## Corrections found 2026-10-24 (NOTIFY — the one-way Telegram notifier; verify with `launchctl print`)
+
+- **Installed in DRY RUN on both engines, 13:53Z; neither engine was
+  restarted** (rulings R-NT-1..9, R-NT-1a, O-NT-A; main `9b2cd9ab` +
+  `68a9dc9a`, the standalone G32 `8af27277` + G33 `26ab33fa`; risk policy
+  "NOTIFY — N-DOCTRINE").
+  - `com.multivenue.bin15-notify` reads `~/bin15/multivenue/notify.toml`:
+    slot 3 live-only, the PR-BIN15-P2 watch from 05:19:25Z,
+    `agent_valid_until` 2027-04-18 07:14Z, no alert threshold set (none
+    has a default). Log `~/bin15/multivenue/logs/launchd/bin15-notify.log`.
+  - `com.multivenue.notify` reads `~/multivenue/notify.toml`: no slot
+    (main's slots stay off until Anton enables them); it relays the AI
+    inboxes `~/multivenue/state/notify/inbox` and both repos'
+    `.notify-inbox/`. Log `~/multivenue/logs/launchd/notify.log`.
+  - **15:32Z the standalone's notifier SENDS** (Anton's bot @Kittrrbot, his
+    private chat): both TELEGRAM_* keys appended to
+    `~/trading-engine-multivenue-bin15/.env` on his ask (still 0600),
+    `dry_run = false` in `~/bin15/multivenue/notify.toml` (backup
+    `notify.toml.bak-20261024T1532Z-dryrun`), label reloaded. Delivering since
+    17:38Z, after Anton's LuLu allow rule for its binary →
+    `api.telegram.org:443` (a rebuild of the binary may ask LuLu again).
+    Since 18:32Z two chats (main `d79a7b17` / standalone G36 `c7a9165f`:
+    `TELEGRAM_CHAT_ID` takes a list): Anton's and Janna's; a test reached both. Main's notifier
+    stays dry run (no keys in main's `.env`).
+  - **Before 15:32Z nothing left the host:** both ran `dry_run = true` and
+    neither `.env` held `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`. Going live is
+    Anton's: paste the two keys into each `.env`, set `dry_run = false`,
+    reload the label, and allow `multivenue-notify` → `api.telegram.org:443`
+    in LuLu.
+
+## Corrections found 2026-10-25 (T2T — verify on `/state` and `/metrics`)
+
+- **2026-10-25 03:50Z: main restarted (forced `0010` slot at 03:49:07Z) on
+  `e3c97e03`, T2T T0: measurement only** (Anton: "T0 only and measure on main
+  - do not deploy to standalone"; plan `claude/t2t-plan-2026-10-25.md`).
+  pid 11073, run `run-1792900209449915000`.
+  - **New readings:** `engine_latency_<stage>_{p50,p99,p999,max}_ns` for parse,
+    ingest, member, decide, route and ack; `engine-latency.pmlr` (slot kind 10,
+    one record per accepted order) in each run dir; `Tick.rx_lag_ns` on HL
+    ticks. `MAX_GAUGES` 768. `/state` is unchanged.
+  - **No artifact, config or behaviour change.** Slot 3's tell is unchanged
+    (`…:fresh:bound:cap0.985`), every slot paper, `exec.configured` 0.
+  - **The HL gateway's `push_to_write`** now ends after the socket took the
+    frame (~15 µs later than before). The standalone runs G30 `57bcdf6d`
+    (pid 81287), which still stamps before the write; it was not touched.
+  - **The harness:** `cargo bench -p bench --bench t2t` (`T2T_FRAMES` = the
+    vault's `research/t2t/frames-*.bin`). Results: vault `research/t2t/`,
+    project `claude/t2t-results-2026-10-25.md`.
+  - **Retention** ran with the slot: `run-1792800679143780000` and
+    `run-1792800763843085000` verified in the bucket and removed locally; it
+    stopped at `run-1792814738124727000` (< 1 d).
+- **2026-10-25 06:37Z: main restarted (forced `0010` slot at 06:35Z) on
+  `11a3458a`, T2T T1** (Anton: "Go do T1"; risk-policy "T2T T1"). pid 46305,
+  run `run-1792910206673201000`. Every slot paper (`requested_mask` =
+  `enabled_mask` 2815); slot 3's tell is unchanged (`…:fresh:bound:cap0.985`).
+  - **What runs on main:** T1-b only. The HL ingress polls without
+    blocking, and the engine loop skips its yield, from 32 s to 1 s before
+    each quarter hour. The boot logs `T2T T1-b: … open_ms=32000
+    close_ms=1000 duty_ppm=34444`, and the `QoS user-interactive` lines for
+    `hyperliquid` and `engine`.
+  - **Not on main:** main has no HL gateway (0 `engine_exec_hlgw_*` rows),
+    so T1-a (the gateway's hot window), T1-c (the precomputed-nonce signer)
+    and T1-f (keep-hot) run on no engine yet. They were verified on testnet:
+    `exec-smoke` A, B and C, and the XH4g battery with 209 actions signed
+    from the pool.
+  - **The standalone** is unchanged: G30 `57bcdf6d`, pid 81287, slot 3 live.
+    T1 reaches it only on Anton's word.
+  - **Retention** ran with the slot: `run-1792814738124727000` and
+    `run-1792821034841283000` verified in the bucket and removed locally; it
+    stopped at `run-1792830884138812000` (< 1 d).
+- **2026-10-25 07:20Z: main restarted (forced `0010` slot at 07:19Z) on
+  `8e8442e1`, the T1-b fix.** pid 68903, run `run-1792912819718598000`;
+  every slot paper, slot 3's tell unchanged.
+  - **Why.** Inside the 06:59Z and 07:14Z windows on `11a3458a`, the HL read
+    turn → first tick stamp was 63–70 µs at the median, against 1.5 µs
+    outside. The spinning ingress read a burst until its last byte.
+  - **The fix:** inside the window each drive step reads once
+    (`core_net::fill_rx_once`). Branch G38 `df78628d` carries it; it is not
+    deployed.
+  - **After it** (the 07:29Z window): 2.8 µs at the median (1.3 / 8.4 µs at
+    p10 / p90); the engine's pickup in the window 0.29 µs p50, 5.4 µs p99.
+  - **Check:** vault `research/t2t/rx_lag_turns.py <run>/hl-ticks.pmlr
+    <wall−mono ns> HH:MM:28 HH:MM:58`.
+
+## Corrections found 2026-10-28 (PMJ — slot 9 on law (iii); verify on `/state`)
+
+- **2026-10-28 00:11Z: the scheduled `0010` restart booted slot 9 (pm15) on
+  law (iii)** (R-PMJ-S61 / S68; runbook `docs/research/pmj/j12/slot9-flip-runbook.md`
+  in the vault). Slot 9 stays **PAPER**.
+  - **The config.** `~/multivenue/pm15.toml` gained `strike_law = "trap62"`,
+    `sigma_res_ratio_1e3 = 130` and `sigma_res_min_ppm = [3, 5, 6, 5, 6, 6, 3]`
+    at 00:02:57Z, after a run that booted before 00:00Z (backup
+    `pm15.toml.pre-j12`, also in `~/multivenue/rollback-pmj-20261023/`).
+  - **The boot.** Run `run-1793146278957505000` (epoch 00:11:18Z), binary
+    `8e8442e1`, `paper` 1, masks 2815, slots 9 and 11 configured and enabled.
+    - Slot 9's tell: `law=2-20s:p>=0.900:ask<=p-0.020:floor0.900:persist2:k1.550:strike=trap62:res=130/3,5,6,5,6,6,3`,
+      artifact hash `5951549f…` (was `ef485100…`).
+    - Slot 11's tell is unchanged (`…:strike=trap62:res=130/3,5,6,5,6,6,3
+      paper=+5000ms`, `4009f98a…`).
+    - `engine_pm15_strikes_computed_total` 7 → 14 across the 00:15Z and 00:30Z
+      windows.
+  - **The ledger.** No run booted between 00:00Z and the edit, so slot 9's `j12`
+    segment (`J12_SLOT9_FROM_NS`, 10-28 00:00Z) starts exactly at this run. It
+    appears in the worker's summary with slot 9's first settled fill.
+  - **Rollback.** Restore `pm15.toml.pre-j12` and restart at a scheduled slot,
+    with a new slot-9 `SEGMENTS` row (runbook §A.6).
+  - **Seen at this check, not this lane's:** `pm-pnl` passes failed on
+    2026-10-27 between about 22:21Z and 23:51Z with `No space left on device`
+    (and `universe-refresh` writes in `engine.err.log`); the Mac had 22 GiB free
+    at 00:21Z.
+
+## Corrections found 2026-10-29 (PMJ / PM15 live-ready round; verify on `/state`)
+
+- **2026-10-29 14:12Z: main booted `3ab7a855` (J14 + J15), PAPER** — a
+  forced `0010`-slot restart through daily-restart (the exec gate first; R-PM-13).
+  Run `run-1793283147479631000` (epoch 14:12:27Z), pid 26516, `paper` 1,
+  masks 2815 / 2815, nothing halted, `exec` configured 0. Checked 14:37Z: pm15
+  and pm5 `discovery_law_refused` 0 and `venue_law_changed` 0, sockets 7 / 7;
+  every family's first CLOB record admitted.
+  - **J9's ledger splits at this boot** (J14: the window's tick and minimum
+    size now come from the CLOB, so slots 9 and 11's paper law reads the
+    venue's values from here on).
+  - J15 changes nothing in paper (`exec-jupiter` is still not in the loop).
+- **PM15 (slot 9): P0's confirmatory score is KILL** (risk-policy `### PM15-9`):
+  slot 9's live-ready work stops (slot 9 keeps running in PAPER); the
+  PM-only patches are parked in the vault.
+- **PMJ (slot 11) J16 is committed, not deployed to a live frame:** the
+  gated live wiring (risk-policy `### J16`). No gate line exists, so no
+  binary can arm slot 11. `scripts/daily-restart.sh` (the pmj gate) has run
+  from the working tree on main's launchd since ~14:46Z and does nothing
+  while slot 11 is not armed. Provisional rulings R-PMJ-S76..S78 await Anton.
 
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 

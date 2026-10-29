@@ -40,7 +40,7 @@
 //! the **paper arm only**.
 
 use crate::counters::{RetireCounters, RiskRefusal, RouteCounters};
-use crate::halt::{trigger_for, CancelPhase, HaltReason, HaltState};
+use crate::halt::{hold_clear, hold_for, trigger_for, CancelPhase, HaltReason, HaltState};
 use crate::ledger::{
     InstProbe, InstRefusal, InstrumentBindErr, InstrumentSpec, Ledger, LedgerError, PerpVenuePos,
 };
@@ -50,7 +50,7 @@ use clob_dispatcher::{
     CancelAllState, DispatchError, DispatchStats, ExecCounters, MatcherCounters, OrderDispatch,
     RouteAliases,
 };
-use core_types::{CancelReq, Fill, ModifyReq, NsTs, Order, Side, SymbolId, Tick};
+use core_types::{CancelReq, DepthTopK, Fill, ModifyReq, NsTs, Order, Side, SymbolId, Tick};
 
 /// **BX3 (F9)** — retirements the router drains per `on_idle`. A bound,
 /// so one arm's burst (a venue cancelling a whole book, a TTL wheel
@@ -915,6 +915,11 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
             // read — two counters for one fact is how they drift.
             return self.refuse(order.strategy_id, RiskRefusal::Halted);
         }
+        // O-WSG1: HELD — the stream is down or the reconciliation stale.
+        // The same line, the same verdict for now; it lifts by itself.
+        if self.halt.is_held(slot) {
+            return self.refuse(order.strategy_id, RiskRefusal::Held);
+        }
 
         // ---- 0b. does this ledger know what the venue holds? --------
         //
@@ -1470,6 +1475,14 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         self.live.observe_tick(tick, now_ns);
     }
 
+    /// PMJ J8: every rolling depth record reaches the paper matcher,
+    /// ungated, for the reason every tick does; the live arm learns its
+    /// fills from the venue.
+    #[inline]
+    fn observe_depth(&mut self, depth: &DepthTopK, now_ns: NsTs) {
+        self.paper.observe_depth(depth, now_ns);
+    }
+
     /// HYPARB H2: every pool event reaches the paper matcher, ungated,
     /// for the same reason every tick does.
     #[inline]
@@ -1499,7 +1512,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     }
 
     /// LAW E-2 — the paper arm's numbers, never the live arm's.
-    // COPY: 176 B by value, the metrics cadence only (the trait's note).
+    // COPY: 296 B by value, the metrics cadence only (the trait's note).
     #[inline]
     fn matcher_counters(&self) -> MatcherCounters {
         self.paper.matcher_counters()
@@ -1642,6 +1655,20 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             if self.halt.latch(here, why) {
                 latched += 1;
             }
+            // **O-WSG1..3 — the hold.** A stream gap or a stale
+            // reconciliation stops the slot PLACING (its resting orders
+            // asked back on the edge, `HaltState::hold`) and lifts by
+            // itself: the stream up, a reconciliation from reads issued
+            // since agreed, nothing holding, and the edge's cancel
+            // confirmed. No file and no operator — a venue that went
+            // dark for minutes resumes the slot the moment it can see
+            // again (operator ruling, 2026-10-20).
+            let hold = hold_for(&sig, &lim);
+            if hold != 0 {
+                self.halt.hold(here, hold);
+            } else if self.halt.is_held(here) && hold_clear(&sig, &lim) {
+                self.halt.release(here);
+            }
         }
         if latched > 0 {
             self.on_halt_edge();
@@ -1762,9 +1789,13 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         for (slot, h) in halted.iter_mut().enumerate() {
             *h = self.halt.reason(slot) as u8;
         }
+        let mut held = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
+        for (slot, h) in held.iter_mut().enumerate() {
+            *h = self.halt.held_bits(slot);
+        }
         let l = self.ledger.counters();
         let bn = self.live.venue_arm_counters(core_types::VenueId::Binance as u8);
-        // COPY: ExecCounters (1 080 B by repr(C) layout since S16-3, const-asserted —
+        // COPY: ExecCounters (1 112 B by repr(C) layout since O-WSG1, const-asserted —
         // two 272 B LiveArmCounters ride inside) returned by value across
         // the OrderDispatch boundary, 1/s for /state + 1/5 s for /metrics
         // (+ once at the drain) —
@@ -1806,6 +1837,9 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             ledger_marks_refused: l.marks_refused,
             ledger_marks_expired: l.marks_expired,
             arm_bn: bn.unwrap_or_default(),
+            refused_held: c.refused_held,
+            holds: u64::from(self.halt.holds),
+            held,
         }
     }
 
@@ -1846,6 +1880,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             ExecMode::Live => {
                 let s = usize::from(slot);
                 let blocked = (u8::from(self.halt.is_halted(s)) * core_types::EXEC_BLOCKED_HALTED)
+                    | (u8::from(self.halt.is_held(s)) * core_types::EXEC_BLOCKED_HELD)
                     | (u8::from(!self.ledger.is_slot_seeded(s))
                         * core_types::EXEC_BLOCKED_UNSEEDED);
                 core_types::ExecHealth::new(blocked, 0, 0)
@@ -3359,11 +3394,121 @@ mod tests {
         );
     }
 
+    /// **O-WSG1 — a stream gap HOLDS.** It cancels and refuses like a
+    /// halt — a submit and a modify, never a cancel — writes nothing a
+    /// restart reads, needs no operator, and the slot trades again by
+    /// itself once the stream is up AND re-read.
     #[test]
-    fn a_user_stream_gap_halts_cancels_and_refuses() {
-        assert_trigger(
-            |s| s.ws_gap_ns = 30_000_000_000,
-            crate::halt::HaltReason::WsGap,
+    fn a_user_stream_gap_holds_cancels_refuses_and_resumes_by_itself() {
+        use core_types::EXEC_BLOCKED_HELD;
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        assert!(d.submit(&leg_order(1, SYM_YES, true, 500_000, 1_000_000)).is_ok());
+        let cancels_before = d.live().cancel_all_calls;
+
+        d.live_mut().sig.ws_gap_ns = 30_000_000_000;
+        d.on_idle();
+        assert!(d.halt().is_held(slot), "held");
+        assert!(!d.halt().is_halted(slot), "a hold, not a halt");
+        assert_eq!(
+            d.live().cancel_all_calls,
+            cancels_before + 1,
+            "blind: the slot's orders are asked back"
+        );
+        assert_eq!(d.ledger().slot_resting(slot), 0);
+        assert_eq!(
+            d.submit(&leg_order(2, SYM_YES, true, 500_000, 1_000_000)),
+            Err(DispatchError::RiskRefused)
+        );
+        let m = core_types::ModifyReq::new(1, leg_order(3, SYM_YES, true, 510_000, 1_000_000));
+        assert_eq!(d.modify(&m), Err(DispatchError::RiskRefused));
+        assert_eq!(d.counters().refused_held, 2);
+        assert_eq!(d.counters().refused_halted, 0, "counted as held, never as halted");
+        let c = core_types::CancelReq::of(&leg_order(1, SYM_YES, true, 500_000, 1_000_000), T0);
+        assert!(d.cancel(&c).is_ok(), "a held slot can always get flat");
+        assert_ne!(d.exec_health(STRATEGY_SLOT_BIN15, T0).blocked & EXEC_BLOCKED_HELD, 0);
+
+        // Minutes of a dead venue: still held, never halted.
+        d.live_mut().sig.ws_gap_ns = 600_000_000_000;
+        d.on_idle();
+        assert!(d.halt().is_held(slot) && !d.halt().is_halted(slot));
+        // The stream is up, but nothing is re-read since: still held.
+        d.live_mut().sig.ws_gap_ns = 0;
+        d.live_mut().sig.resync_pending = 1;
+        d.on_idle();
+        assert!(d.halt().is_held(slot), "blind until re-read");
+        // Re-read and agreed: the slot trades again, by itself.
+        d.live_mut().sig.resync_pending = 0;
+        d.on_idle();
+        assert!(!d.halt().is_held(slot), "resumed with no operator");
+        assert_eq!(d.exec_health(STRATEGY_SLOT_BIN15, T0).blocked & EXEC_BLOCKED_HELD, 0);
+        assert!(d.submit(&leg_order(4, SYM_YES, true, 500_000, 1_000_000)).is_ok());
+        let ec = d.exec_counters();
+        assert_eq!((ec.holds, ec.halts, ec.refused_held), (1, 0, 2));
+        assert_eq!(ec.held[slot], 0);
+        assert_eq!(ec.halted[slot], 0);
+    }
+
+    /// **O-WSG1 — a hold lifts only once its cancel is CONFIRMED**: a
+    /// sweep that landed after the slot traded again would take back its
+    /// first orders.
+    #[test]
+    fn a_hold_waits_out_its_sweep_before_it_lifts() {
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        d.live_mut().sweep_polls = 3;
+        d.live_mut().sig.ws_gap_ns = 30_000_000_000;
+        d.on_idle();
+        assert!(d.halt().is_held(slot));
+        d.live_mut().sig.ws_gap_ns = 0;
+        d.on_idle();
+        assert!(d.halt().is_held(slot), "the sweep is still draining");
+        let mut polls = 0;
+        while d.halt().is_held(slot) && polls < 10 {
+            d.on_idle();
+            polls += 1;
+        }
+        assert!(!d.halt().is_held(slot), "lifted once the venue read clear");
+        assert!(polls >= 1);
+    }
+
+    /// **O-WSG3 — a stale reconciliation HOLDS** and resumes once one
+    /// agrees again; it never latches.
+    #[test]
+    fn a_stale_reconciliation_holds_and_resumes_once_one_agrees() {
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        d.live_mut().sig.recon_age_ns = 300_000_000_000;
+        d.on_idle();
+        assert_eq!(d.halt().held_bits(slot), crate::halt::HOLD_RECON_STALE);
+        assert!(!d.halt().is_halted(slot));
+        assert_eq!(
+            d.submit(&leg_order(2, SYM_YES, true, 500_000, 1_000_000)),
+            Err(DispatchError::RiskRefused)
+        );
+        d.live_mut().sig.recon_age_ns = 1_000_000;
+        d.on_idle();
+        assert!(!d.halt().is_held(slot));
+        assert!(d.submit(&leg_order(3, SYM_YES, true, 500_000, 1_000_000)).is_ok());
+    }
+
+    /// **A drift found by the re-read still HALTS**, hold or no hold: a
+    /// real disagreement with the venue is for a human.
+    #[test]
+    fn a_drift_found_after_a_gap_still_halts() {
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        d.live_mut().sig.ws_gap_ns = 30_000_000_000;
+        d.on_idle();
+        assert!(d.halt().is_held(slot));
+        d.live_mut().sig.ws_gap_ns = 0;
+        d.live_mut().sig.recon_drift_usd_1e6 = 5_000_000;
+        d.on_idle();
+        assert_eq!(d.halt().reason(slot), crate::halt::HaltReason::ReconDrift);
+        assert!(d.halt().is_halted(slot), "sticky");
+        assert_eq!(
+            d.submit(&leg_order(2, SYM_YES, true, 500_000, 1_000_000)),
+            Err(DispatchError::RiskRefused)
         );
     }
 
@@ -3412,16 +3557,18 @@ mod tests {
         assert!(!d.halt().is_halted(slot), "a spent day cap is not a halt");
     }
 
-    /// The halt machine runs on the IDLE path, so a dead venue halts
-    /// even when the member has stopped submitting — which is exactly
-    /// what a member does when the venue is dead.
+    /// The halt machine runs on the IDLE path, so a dead venue holds the
+    /// slot (O-WSG1; a halt before) even when the member has stopped
+    /// submitting — which is exactly what a member does when the venue is
+    /// dead.
     #[test]
-    fn a_dead_venue_halts_with_no_order_flow_at_all() {
+    fn a_dead_venue_holds_with_no_order_flow_at_all() {
         let mut d = haltable();
         let slot = STRATEGY_SLOT_BIN15 as usize;
         d.live_mut().sig.ws_gap_ns = 30_000_000_000;
         d.on_idle();
-        assert!(d.halt().is_halted(slot));
+        assert!(d.halt().is_held(slot));
+        assert!(!d.halt().is_halted(slot));
         assert!(d.live().seen.is_empty(), "nothing was ever submitted");
     }
 
@@ -3835,11 +3982,11 @@ mod tests {
 
         let mut d = haltable();
         d.set_halt_path(path.clone());
-        d.live_mut().sig.ws_gap_ns = 30_000_000_000;
+        d.live_mut().sig.reject_streak = 5;
         d.on_idle();
 
         let text = std::fs::read_to_string(&path).expect("exec.HALT must exist");
-        assert!(text.contains("reason=ws-gap"), "{text}");
+        assert!(text.contains("reason=reject-streak"), "{text}");
         assert!(
             text.contains(&format!("slot={STRATEGY_SLOT_BIN15}")),
             "{text}"
@@ -3853,9 +4000,25 @@ mod tests {
         // halt. Refusing to halt because a file write failed would be
         // the wrong direction entirely.
         let mut d = haltable();
-        d.live_mut().sig.ws_gap_ns = 30_000_000_000;
+        d.live_mut().sig.reject_streak = 5;
         d.on_idle();
         assert!(d.halt().is_halted(STRATEGY_SLOT_BIN15 as usize));
+    }
+
+    /// **O-WSG1 — a hold writes no file**: a restart must not read a
+    /// connectivity blip back as a halt for a human.
+    #[test]
+    fn a_hold_writes_no_halt_file() {
+        let dir = halt_dir("a_hold_writes_no_halt_file");
+        let path = dir.join("exec.HALT");
+        let mut d = haltable();
+        d.set_halt_path(path.clone());
+        d.live_mut().sig.ws_gap_ns = 30_000_000_000;
+        d.live_mut().sig.recon_age_ns = 300_000_000_000;
+        d.on_idle();
+        assert!(d.halt().is_held(STRATEGY_SLOT_BIN15 as usize));
+        assert!(!path.exists(), "no exec.HALT for a hold");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// XMM XH5a: two slots tripping on one poll are two requests, one
@@ -3893,7 +4056,7 @@ mod tests {
         );
 
         // One signal, read by both slots on the same poll.
-        d.live_mut().sig = clob_dispatcher::HaltSignal::new(30_000_000_000, 0, 0, 0, false, true, 1_000_000);
+        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 5, 0, false, true, 1_000_000);
         d.on_idle();
 
         assert!(d.halt().is_halted(a));

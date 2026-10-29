@@ -15,6 +15,7 @@ path = "src/lib.rs"
 core-latency = { workspace = true }
 core-net     = { workspace = true }
 core-ring    = { workspace = true }
+core-time    = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

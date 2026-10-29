@@ -118,6 +118,16 @@ fn resolve_file(
     params.usd_market_1e6 = file.usd_market_1e6;
     params.session_loss_1e6 = file.session_loss_usd_1e6;
     params.order_ttl_ns = file.order_ttl_ns;
+    // PMJ J12: the strike law and law (iii)'s residual.
+    params.strike_law = file.strike_law.law;
+    params.max_side_families = file.max_side_families;
+    params.res_ratio_1e3 = file.strike_law.sigma_res_ratio_1e3;
+    let mut f = 0usize;
+    while f < file.strike_law.sigma_res_min_ppm.len() {
+        params.res_min_ppm[f] = file.strike_law.sigma_res_min_ppm[f];
+        f += 1;
+    }
+    params.price_floor_1e6 = file.price_floor_1e6;
     let mut lut = Box::new(core_twaplock::late::LateLut::flat());
     let mut i = 0usize;
     while i < core_config::pm15::PM15_PHI_POINTS {
@@ -134,8 +144,36 @@ fn resolve_file(
     })
 }
 
+/// PMJ J13: the side cap's tail of the boot tell — empty when off (so the
+/// tell is unchanged), `:side<=3` when on.
+fn side_tell(cap: u8) -> String {
+    if cap == 0 {
+        String::new()
+    } else {
+        format!(":side<={cap}")
+    }
+}
+
+/// PMJ J12: the law's tail of the boot tell — empty under the first law (so
+/// its tell is unchanged), `:strike=trap62:res=130/3,5,…` under law (iii).
+fn strike_tell(law: u8, ratio_1e3: i64, floors: &[i64]) -> String {
+    if law == core_twaplock::report::STRIKE_LAW_MEAN60 {
+        return String::new();
+    }
+    let mut s = format!(":strike=trap62:res={ratio_1e3}/");
+    let mut i = 0usize;
+    while i < floors.len() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&floors[i].to_string());
+        i += 1;
+    }
+    s
+}
+
 /// The boot tell: `pm15: artifact configured hash=… families=btc+eth+…
-/// law=2-20s:p>=0.900:ask<=p-0.020:persist2:k1.550 frame=$250/order:$250/market:-$500/session live=btc+eth`.
+/// law=2-20s:p>=0.900:ask<=p-0.020:floor0.900:persist2:k1.550 frame=$250/order:$250/market:-$500/session live=btc+eth`.
 #[must_use]
 pub fn render_boot_tell(boot: &Pm15Boot) -> String {
     let mut hex = String::with_capacity(64);
@@ -144,15 +182,18 @@ pub fn render_boot_tell(boot: &Pm15Boot) -> String {
     }
     let p = &boot.params;
     format!(
-        "pm15: artifact configured hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:persist{}:k{:.3} \
+        "pm15: artifact configured hash={hex} families={} law={}-{}s:p>={:.3}:ask<=p-{:.3}:floor{:.3}:persist{}:k{:.3}{}{} \
          frame=${}/order:${}/market:-${}/session live={}",
         boot.families.join("+"),
         p.tau_min_ns / 1_000_000_000,
         p.tau_max_ns / 1_000_000_000,
         p.p_min_1e6 as f64 / 1e6,
         p.e_1e6 as f64 / 1e6,
+        p.price_floor_1e6 as f64 / 1e6,
         p.persist,
         p.sigma_k_1e3 as f64 / 1e3,
+        strike_tell(p.strike_law, p.res_ratio_1e3, &p.res_min_ppm[..p.n_families]),
+        side_tell(p.max_side_families),
         p.usd_order_1e6 / 1_000_000,
         p.usd_market_1e6 / 1_000_000,
         p.session_loss_1e6 / 1_000_000,
@@ -182,9 +223,11 @@ pub fn check(universe: Option<&Path>, artifact: Option<&Path>) -> Result<String,
         okx_depth: false,
         deribit_depth: false,
     })?;
-    if boot.pm_rolling.is_empty() {
+    // PMJ J1b: slot 9's families are the 15-minute keys only.
+    let rolling = core_config::universe::pm_rolling_15m(&boot.pm_rolling);
+    if rolling.is_empty() {
         return Err(String::from(
-            "universe: `[polymarket] rolling` is empty — slot 9 has no family",
+            "universe: `[polymarket] rolling` has no 15m family — slot 9 has no family",
         ));
     }
     let table = ingress_ai::DescriptorTable::from_entries(
@@ -201,11 +244,11 @@ pub fn check(universe: Option<&Path>, artifact: Option<&Path>) -> Result<String,
     match load_pm15_boot(
         artifact,
         &|d: &str| table.resolve(d.as_bytes()).map(|(sym, _)| sym),
-        &boot.pm_rolling,
+        &rolling,
     )? {
         Some(b) => Ok(format!(
             "rolling={} {}",
-            boot.pm_rolling.join(","),
+            rolling.join(","),
             render_boot_tell(&b)
         )),
         None => Err(String::from(
@@ -220,6 +263,8 @@ mod tests {
 
     fn file() -> core_config::pm15::Pm15File {
         core_config::pm15::Pm15File {
+            strike_law: core_config::strike_law::StrikeLaw::default(),
+            max_side_families: 0,
             families: vec!["btc".into(), "eth".into()],
             perp: vec!["hyperliquid:BTC".into(), "hyperliquid:ETH".into()],
             tau_min_ns: 2_000_000_000,
@@ -233,6 +278,7 @@ mod tests {
             session_loss_usd_1e6: 500_000_000,
             max_orders_market: 4,
             order_ttl_ns: 1_000_000_000,
+            price_floor_1e6: 900_000,
             live_assets: vec!["btc".into(), "eth".into()],
             phi_lut: vec![500_000; core_config::pm15::PM15_PHI_POINTS],
         }
@@ -261,6 +307,9 @@ mod tests {
             "{tell}"
         );
         assert!(tell.contains("live=btc+eth"), "{tell}");
+        // PMJ J8 (R-PMJ-S24): the floor rides the law.
+        assert_eq!(b.params.price_floor_1e6, 900_000);
+        assert!(tell.contains(":ask<=p-0.020:floor0.900:persist2:"), "{tell}");
         // A permutation, a short list, an unresolvable perp.
         let swapped = vec!["updown:eth:15m".to_string(), "updown:btc:15m".to_string()];
         assert!(resolve_file(file(), [0; 32], PathBuf::from("x"), &resolve, &swapped).is_err());
@@ -270,5 +319,20 @@ mod tests {
         let mut bad = file();
         bad.perp[1] = "hyperliquid:XRP".into();
         assert!(resolve_file(bad, [0; 32], PathBuf::from("x"), &resolve, &rolling).is_err());
+    }
+
+    #[test]
+    fn the_side_cap_tells_itself_only_when_on() {
+        assert_eq!(super::side_tell(0), "", "off: the tell is unchanged");
+        assert_eq!(super::side_tell(2), ":side<=2");
+        let rolling = vec!["updown:btc:15m".to_string(), "updown:eth:15m".to_string()];
+        let mut f = file();
+        f.max_side_families = 2;
+        let b = resolve_file(f, [0; 32], PathBuf::from("x"), &resolve, &rolling).expect("valid");
+        assert_eq!(b.params.max_side_families, 2);
+        assert!(render_boot_tell(&b).contains(":k1.550:side<=2 "), "{}", render_boot_tell(&b));
+        assert!(!render_boot_tell(&resolve_file(file(), [0; 32], PathBuf::from("x"), &resolve, &rolling)
+            .expect("valid"))
+        .contains("side<="));
     }
 }

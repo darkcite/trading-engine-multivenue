@@ -79,6 +79,15 @@ def test_the_law_is_one_key_and_absent_or_off_is_none() -> None:
     assert L.law_of({**LAW_BLOCK, "enabled": 0}) is None
 
 
+def test_the_fills_keys_extend_the_law_only_when_stated() -> None:
+    zero = {**LAW_BLOCK, "refire_fresh": 0, "limit_bound": 0, "max_quote_age_ns": 0}
+    assert L.law_of(zero) == LAW, "stated at 0 is the law as it was"
+    full = {**LAW_BLOCK, "refire_fresh": 1, "limit_bound": 1, "max_quote_age_ns": 1_500_000_000}
+    assert L.law_of(full) == LAW + "_rf_age1500ms_bound"
+    assert L.law_of({**zero, "limit_max_1e6": 0}) == LAW, "no cap is the law as it was"
+    assert L.law_of({**full, "limit_max_1e6": 985_000}) == LAW + "_rf_age1500ms_bound_cap985000"
+
+
 def test_the_blocks_are_read_and_nulls_are_unknown() -> None:
     fires = [
         {"family": 0, "outcome": 9001, "expiry_ns": T0, "ff_ts_ns": T0 - 25_000_000_000,

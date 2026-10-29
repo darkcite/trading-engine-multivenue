@@ -33,3 +33,5 @@ strategy-hcv         = { workspace = true }
 # PVM impl-08 T4: the slot-8 member (Pine scripts — PAPER ONLY, ruling 2026-10-16).
 strategy-pine        = { workspace = true }
 strategy-pm15        = { workspace = true }
+# PMJ J4: the slot-11 member (H90 on the 5-minute families via Jupiter; paper).
+strategy-pmj         = { workspace = true }

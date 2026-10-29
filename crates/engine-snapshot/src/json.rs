@@ -524,7 +524,25 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
         c.quoted(crate::halt_reason_word(ex.halted[i]).as_bytes());
         i += 1;
     }
-    c.put(b"]}");
+    // O-WSG1: the hold beside the halt — an array of words like it, and
+    // its two counters. Additive, after `halted`.
+    c.put(b"]");
+    c.key("held");
+    c.put(b"[");
+    let mut i = 0usize;
+    while i < crate::SNAPSHOT_SLOTS {
+        if i > 0 {
+            c.put(b",");
+        }
+        c.quoted(crate::hold_word(ex.held[i]).as_bytes());
+        i += 1;
+    }
+    c.put(b"]");
+    c.key("holds");
+    c.u64(ex.holds);
+    c.key("refused_held");
+    c.u64(ex.refused_held);
+    c.put(b"}");
 
     // --- vrp (P6) ---
     //

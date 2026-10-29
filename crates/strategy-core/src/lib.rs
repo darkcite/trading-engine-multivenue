@@ -444,6 +444,13 @@ pub trait StrategyCounters {
         Pm15Counters::default()
     }
 
+    /// PMJ: slot 11's observables (`engine_pmj_*`) — the same H90 tallies
+    /// and levels as slot 9's, its own family (`strategy-pmj`).
+    #[inline]
+    fn pmj_counters(&self) -> Pm15Counters {
+        Pm15Counters::default()
+    }
+
     /// BIN15 O4b: copy the per-family view into `out`, returning how
     /// many families are CONFIGURED (not how many are live — a dormant
     /// slot still has a row, because "no instance" is the observation).
@@ -1575,6 +1582,9 @@ pub struct Pm15Counters {
     pub skip_cap: u64,
     /// Entries skipped: the session loss bound is spent.
     pub skip_halt: u64,
+    /// Entries skipped: the same-side family cap per window is full (PMJ
+    /// J13, `max_side_families`).
+    pub skip_side: u64,
     /// IoCs submitted.
     pub takes_submitted: u64,
     /// IoCs that filled (any quantity).
@@ -1613,7 +1623,7 @@ pub struct Pm15Counters {
 
 /// How many cumulative tallies [`Pm15Counters`] carries (its fields from
 /// `rolls` through `settled_unknown`, in order).
-pub const PM15_TALLIES: usize = 31;
+pub const PM15_TALLIES: usize = 32;
 
 /// The metric suffix of each tally, in [`Pm15Counters::tallies`] order.
 pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
@@ -1638,6 +1648,7 @@ pub const PM15_COUNTER_NAMES: [&str; PM15_TALLIES] = [
     "skip_price",
     "skip_cap",
     "skip_halt",
+    "skip_side",
     "takes_submitted",
     "takes_filled",
     "takes_unfilled",
@@ -1676,6 +1687,7 @@ impl Pm15Counters {
             self.skip_price,
             self.skip_cap,
             self.skip_halt,
+            self.skip_side,
             self.takes_submitted,
             self.takes_filled,
             self.takes_unfilled,
@@ -1771,7 +1783,7 @@ pub struct Bin15Counters {
     /// BIN15 H90: late re-prices whose favoured leg had no usable ask.
     pub late_skipped_book: u64,
     /// BIN15 H90: late re-prices whose test failed (belief under `p_min`,
-    /// or the ask not `e` under it).
+    /// the ask not `e` under it, or — PR-BIN15-P2 — over `late_limit_max_1e6`).
     pub late_skipped_price: u64,
     /// BIN15 H90: late re-prices whose test held but not yet on
     /// `persist_polls` consecutive snapshots.
@@ -1779,6 +1791,12 @@ pub struct Bin15Counters {
     /// BIN15 H90: late entries refused for size — the caps or the resting
     /// size left under one contract.
     pub late_skipped_cap: u64,
+    /// BIN15 fills B-1: late re-prices whose test held but whose next IoC
+    /// waits for another touch on the leg a refused IoC bought on.
+    pub late_skipped_refire: u64,
+    /// BIN15 fills B-2: late re-prices held because the favoured leg's ask
+    /// has stood at its price longer than `late_max_quote_age_ms`.
+    pub late_skipped_age: u64,
 }
 
 /// Families one BIN15 view carries. Mirrors

@@ -47,10 +47,22 @@
 //! table. **BX6's boot must call it before building the real signer and
 //! refuse the boot on `Err`** — never warn; nothing calls it at boot yet.
 //!
+//! ## PMJ J2: Solana (ruling R-PMJ-S3)
+//!
+//! Jupiter Predict hands back an unsigned Solana transaction; the wallet's
+//! signature goes RAW into its slot of the transaction's own buffer
+//! ([`Ed25519Signer::sign_raw`]). A Solana wallet exports its key as 64
+//! bytes, seed ‖ public key: [`Ed25519Signer::from_solana_keypair`] builds
+//! the signer from the seed and refuses a key whose public half is not
+//! the one the seed derives. [`verify`] checks a signature against a public
+//! key (the boot self-test, and a signed transaction before it is sent).
+//!
 //! ## Doctrine
 //!
 //! Boot allocates one page per signer; signing allocates nothing (bench
-//! gate 86). No `dyn`, no iterators, no closures on the signing path.
+//! gate 86 — the renders, and since PMJ J2 the raw signature and its
+//! verification). No `dyn`, no
+//! iterators, no closures on the signing path.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -71,7 +83,7 @@ use core::fmt;
 use core::mem::{align_of, needs_drop, size_of, MaybeUninit};
 
 use ring::error::KeyRejected;
-use ring::signature::{Ed25519KeyPair, KeyPair, Signature};
+use ring::signature::{Ed25519KeyPair, KeyPair, Signature, UnparsedPublicKey, ED25519};
 
 /// Length of a raw Ed25519 signature.
 pub const SIG_LEN: usize = 64;
@@ -127,6 +139,9 @@ pub enum SignerErr {
     /// `mlock` failed; the errno (on macOS and Linux, `RLIMIT_MEMLOCK` is
     /// the usual cause).
     Mlock(i32),
+    /// PMJ J2: a 64-byte Solana keypair whose public half is not the key
+    /// its seed derives — a corrupt export, or two wallets' halves.
+    KeypairMismatch,
 }
 
 impl fmt::Display for SignerErr {
@@ -135,6 +150,9 @@ impl fmt::Display for SignerErr {
             SignerErr::KeyRejected => f.write_str("ed25519: the seed was rejected"),
             SignerErr::PageAlloc => f.write_str("ed25519: the key page could not be allocated"),
             SignerErr::Mlock(e) => write!(f, "ed25519: mlock of the key page failed (errno {e})"),
+            SignerErr::KeypairMismatch => {
+                f.write_str("ed25519: the keypair's public half is not its seed's key")
+            }
         }
     }
 }
@@ -210,6 +228,35 @@ impl Ed25519Signer {
         Ok(Self { page })
     }
 
+    /// PMJ J2: the signer of a Solana wallet's 64-byte secret key (seed ‖
+    /// public key, the `solana-keygen` / wallet export). Boot only. The
+    /// seed half is expanded as by [`Self::from_seed`]; the public half must
+    /// be the key that seed derives, compared in constant time.
+    ///
+    /// # Errors
+    /// [`SignerErr::KeypairMismatch`] for a public half that differs, or
+    /// any [`Self::from_seed`] refusal. The caller wipes `keypair`.
+    pub fn from_solana_keypair(keypair: &[u8; 64]) -> Result<Self, SignerErr> {
+        let mut seed = [0u8; 32];
+        // COPY: the 32-byte seed half into a local the expansion takes by
+        // reference, once per boot — `from_seed` takes `&[u8; 32]` and a
+        // sub-array reference of the caller's 64 bytes needs this copy or
+        // an unsafe cast — the cast rejected (no unsafe for a boot path);
+        // the local is wiped below.
+        seed.copy_from_slice(&keypair[..32]);
+        let built = Self::from_seed(&seed);
+        // SAFETY: `seed` is a live local of exactly 32 bytes, never read
+        // again.
+        unsafe {
+            page::wipe(seed.as_mut_ptr(), seed.len());
+        }
+        let signer = built?;
+        if !core_crypto::ct_eq(signer.public_key(), &keypair[32..]) {
+            return Err(SignerErr::KeypairMismatch);
+        }
+        Ok(signer)
+    }
+
     #[inline(always)]
     fn keypair(&self) -> &Ed25519KeyPair {
         // SAFETY: `from_seed` placed a valid keypair at the page's start
@@ -253,6 +300,18 @@ impl Ed25519Signer {
         core_crypto::base64_encode_pct(sig.as_ref(), dst)
     }
 
+    /// PMJ J2: sign `msg` and write the raw 64-byte signature into `dst` —
+    /// a Solana transaction's signature slot, in the transaction's own
+    /// buffer. Zero-alloc.
+    #[inline]
+    pub fn sign_raw(&self, msg: &[u8], dst: &mut [u8; SIG_LEN]) {
+        // COPY: ring's `Signature`, 120 B by value — as in `sign_b64`.
+        let sig = self.keypair().sign(msg);
+        // COPY: the 64 signature bytes into the caller's slot — ring 0.17
+        // has no sign-into-a-slice call — rejected: a second buffer.
+        dst.copy_from_slice(sig.as_ref());
+    }
+
     /// Write the public key's `SubjectPublicKeyInfo` in base64 into
     /// `dst[..60]` — exactly the body of the PEM block Binance shows for
     /// the registered key, so the boot tell can be compared with it by
@@ -262,6 +321,14 @@ impl Ed25519Signer {
         let n = core_crypto::base64_encode(&SPKI_PREFIX, dst);
         n + core_crypto::base64_encode(self.public_key(), &mut dst[n..])
     }
+}
+
+/// PMJ J2: whether `sig` is `public`'s Ed25519 signature of `msg` (RFC
+/// 8032, `ring`'s strict verification). Zero-alloc.
+#[inline]
+#[must_use]
+pub fn verify(public: &[u8; PUBLIC_KEY_LEN], msg: &[u8], sig: &[u8; SIG_LEN]) -> bool {
+    UnparsedPublicKey::new(&ED25519, public).verify(msg, sig).is_ok()
 }
 
 impl fmt::Debug for Ed25519Signer {
@@ -305,5 +372,59 @@ mod tests {
         assert!(SignerErr::KeyRejected.to_string().contains("rejected"));
         assert!(SignerErr::PageAlloc.to_string().contains("page"));
         assert!(SignerErr::Mlock(12).to_string().contains("errno 12"));
+        assert!(SignerErr::KeypairMismatch.to_string().contains("public half"));
+    }
+
+    /// PMJ J2: the Solana export of RFC 8032 TEST 1 (seed ‖ public key)
+    /// builds TEST 1's signer; a keypair whose halves disagree refuses.
+    #[test]
+    fn a_solana_keypair_builds_its_signer_and_mismatched_halves_refuse() {
+        let v = &crate::RFC8032[0];
+        let mut kp = [0u8; 64];
+        kp[..32].copy_from_slice(&v.seed);
+        kp[32..].copy_from_slice(&v.public);
+        let s = Ed25519Signer::from_solana_keypair(&kp).expect("TEST 1's keypair");
+        assert_eq!(s.public_key(), v.public.as_slice());
+        let mut sig = [0u8; SIG_LEN];
+        s.sign_raw(v.msg, &mut sig);
+        assert_eq!(sig, v.sig);
+        let mut bad = kp;
+        bad[63] ^= 1;
+        assert_eq!(
+            Ed25519Signer::from_solana_keypair(&bad).err(),
+            Some(SignerErr::KeypairMismatch)
+        );
+        let mut other = kp;
+        other[32..].copy_from_slice(&crate::RFC8032[1].public);
+        assert_eq!(
+            Ed25519Signer::from_solana_keypair(&other).err(),
+            Some(SignerErr::KeypairMismatch)
+        );
+    }
+
+    /// PMJ J2: verification accepts exactly the signature, the key and the
+    /// message, and nothing one bit away from any of them.
+    #[test]
+    fn verify_accepts_only_the_signature_of_that_key_and_message() {
+        let mut i = 0usize;
+        while i < crate::RFC8032.len() {
+            let v = &crate::RFC8032[i];
+            assert!(verify(&v.public, v.msg, &v.sig), "vector {i}");
+            let mut b = 0usize;
+            while b < SIG_LEN {
+                let mut s = v.sig;
+                s[b] ^= 0x01;
+                assert!(!verify(&v.public, v.msg, &s), "vector {i} sig bit {b}");
+                b += 1;
+            }
+            let mut p = v.public;
+            p[0] ^= 0x01;
+            assert!(!verify(&p, v.msg, &v.sig), "vector {i} key");
+            let mut m = [0u8; 65];
+            m[..v.msg.len()].copy_from_slice(v.msg);
+            m[v.msg.len()] = 0x01;
+            assert!(!verify(&v.public, &m[..v.msg.len() + 1], &v.sig), "vector {i} msg");
+            i += 1;
+        }
     }
 }

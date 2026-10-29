@@ -2500,6 +2500,9 @@ pub fn log_report(r: &BatteryReport) {
         rest_fallback = a.rest_fallback_posts,
         reconnects = a.reconnects,
         ws_errors = a.gw_ws_errors,
+        signs_pooled = a.gw_signs_pooled,
+        signs_fallback = a.gw_signs_fallback,
+        pool_ready = a.signer_pool_ready,
         "xh4g arm"
     );
     info!(

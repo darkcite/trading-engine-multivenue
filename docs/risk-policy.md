@@ -165,7 +165,86 @@ the full table is the `exec_router::halt` module docs. (Until 2026-10-13 this li
 "NOT YET ENFORCED" and "DARK until BX6"; HK10 brought it current.)
 
 Halt is **sticky**: it requires a manual engine restart. No "auto-resume"
-logic is permitted — a halted engine means a human investigates.
+logic is permitted — a halted engine means a human investigates. **The
+one exception is the two connectivity HOLDS of O-WSG1..4 (2026-10-20,
+below): they are not halts.**
+
+### O-WSG1..4 — a dark venue HOLDS the slot, it does not halt it (operator rulings 2026-10-20)
+
+**The ask (Anton, 2026-10-20):** do not halt the slot when Hyperliquid's
+WebSocket goes silent for several minutes; keep reconnecting and resume
+trading as soon as possible.
+
+**Why.** Main's slot 3 latched `ws-gap` at 10-17 21:22:27Z and at 10-18
+05:15:24Z. Both came during Hyperliquid WebSocket outages of several
+minutes:
+
+- The market-data socket on the same host went silent first, and its
+  reconnects then timed out with 0 of 108 subscription acks.
+- On 10-18 Binance data flowed normally throughout, so the Mac's network
+  was up.
+
+Each latch stopped the slot until a human archived `exec.HALT`. The 10-18
+latch held it from 05:15Z until the O-WSG deploy. The every-boot
+"STARTED HALTED … reason=ws-gap" lines between were the file being read
+back at each restart, not new gaps.
+
+**The rulings:**
+
+| ruling | question | answer |
+|---|---|---|
+| O-WSG1 | When does a held slot trade again? | All four must hold. (a) The user stream is back: its gap under `halt_on_ws_gap_ms` again, which a gap does only once the stream returns. (b) A reconciliation built ONLY from reads issued since the stream came back has agreed with the venue: orders, sheet and spot half, reported by the arm as `resync_pending == 0`. (c) No hold condition stands. (d) The hold edge's cancel is confirmed. |
+| O-WSG2 | When does a hold start? | At `halt_on_ws_gap_ms` = **5 000** on slot 3, main and standalone (30 000 before). That stops trading blind early in a real outage, when market data is stale anyway, and stays well above the gateway's sub-second redials. |
+| O-WSG3 | Is a stale reconciliation a hold too? | Yes. `halt_on_recon_stale_ms` now holds and resumes the same way, because a long outage fails the REST reads too: the 10-17 23:24–23:30Z outage ran about 6 minutes against a 300 s stale bound. |
+| O-WSG4 | Rollout | Main, and the standalone (`bin15-h90-standalone`), committed and deployed. Main's 10-18 `ws-gap` latch is archived at the deploy. |
+
+**A hold, against a halt** (`exec_router::halt`):
+
+| | halt | hold (O-WSG1) |
+|---|---|---|
+| new places and modifies | refused (`refused_halted`) | refused (`refused_held`) |
+| cancels | always pass | always pass |
+| the slot's resting orders | asked back on the edge | asked back on the edge (blind, the arm cannot see them fill) |
+| `exec.HALT` | written; read back at boot | never written |
+| ends | an operator archives the file and restarts | by itself, under O-WSG1 |
+| triggers | every other `HaltReason` | a stream gap ≥ `halt_on_ws_gap_ms`; a reconciliation not agreed for `halt_on_recon_stale_ms` |
+
+**What still halts, sticky and for a human:**
+
+- a reconciliation DRIFT, including one the post-gap re-read finds;
+- the reject and asset-refusal streaks;
+- the budget floor;
+- the gateway's own halt word;
+- a venue lock and margin risk;
+- the ALO rate;
+- the E7 session bounds;
+- the operator.
+
+**Resume latency.** The gateway redials with a 0.5 → 8 s backoff (10 s
+dial budget, re-resolving the host every third failure). Once the stream
+is back after a gap of 2 s or more, the arm reads its sheet and its open
+orders at once instead of at the 10 s cadence (`RESYNC_NOW_NS`), so the
+slot resumes about one read round-trip after the venue answers again.
+
+**Surfaces:**
+
+- `/metrics`: `engine_exec_holds_total`, `engine_exec_refused_held_total`
+  and `engine_exec_held_mask` (bit `1 << slot` per held slot: slot 3 alone
+  reads 8; one gauge, because the fixed registry's every-slot-live worst
+  case has no sixteen to spare).
+- `/state` `exec`: `held` (words), `holds` and `refused_held`.
+- `ExecHealth`: `EXEC_BLOCKED_HELD`.
+- Log: "exec: slot HELD …" and "exec: slot RESUMED …".
+
+**Limits:**
+
+- The router law is venue-agnostic. `resync_pending` comes only from the
+  Hyperliquid GATEWAY arm (`transport = "gateway"`, slot 3's).
+- The other arms report 0. Their holds lift once the stream is up and a
+  reconciliation is fresh.
+- The keys keep their `halt_on_*` names so every artifact still parses.
+- A `ws-gap` or `recon-stale` line already in `exec.HALT` (an older
+  binary's, or an operator's) is still read as a halt.
 
 ### Member-scoped halt: VRP kill criterion 3 (2026-09-10)
 
@@ -473,6 +552,30 @@ HD3, below); the wrapper remains the control.
   (XNU), so the Mac fleet is likely unaffected — not verified. Until the
   question is ruled, BX6 keeps the seed's `SecretKeyBytes` alive for the
   life of the process. Nothing builds a signer from the environment yet.
+- **PMJ J3 adds the Solana wallet** (`PMJ_WALLET_KEY`, slot 11): a
+  wallet's 64-byte export (seed ‖ public key) loads through
+  `Ed25519Signer::from_solana_keypair` (J2) into BX4's locked page, as
+  `from_seed`; the local seed copy is wiped and a public half the seed does
+  not derive is refused, compared in constant time. The variable's decode
+  (base58, not constant-time, boot only) and its read are J5's wiring:
+  nothing reads it in this pass (slot 11 paper builds no arm).
+- **PMJ J16 replaces the variable with a file (R-PMJ-S73):** nothing reads
+  `PMJ_WALLET_KEY`. The wallet is a 0600 Solana CLI keypair file (a JSON
+  array of 64 bytes) whose absolute path is `PMJ_WALLET_KEYFILE`; it is read
+  only by a live slot-11 boot and by `pmj-exec --key-check`, never into the
+  environment. `pmj_live::load_wallet` refuses unless the path is absolute,
+  `lstat` reads a regular file (never a symlink), the file opens
+  `O_NOFOLLOW` with its dev / inode equal to the `lstat`'s, its owner is the
+  running uid, its mode exactly 0600, its size at most 1 KiB, and it lies
+  outside the repo, `~/multivenue` and `MULTIVENUE_DIR`. It reads straight
+  into a stack buffer (no buffered reader); every buffer is wiped, on
+  refusals too; the public half must equal `PMJ_WALLET_PUBKEY` (compared in
+  constant time) and the seed lands in BX4's locked page. Error texts carry
+  paths and counts, never bytes. `JUP_API_KEY`'s `String` copies are wiped
+  once jup-gw holds it (its environment copy is the limit below). **Not
+  checked — operate it:** the directory (non-synced, 0700: never iCloud's
+  Desktop / Documents, a cloud drive or a backup set), ACLs (`ls -le`), the
+  host's core-dump setting (a dump holds the signer's page).
 - The intermediate hex `String` the environment hands us is zeroized
   after parsing. Without that, the key sits in freed heap for the life
   of the process.
@@ -4663,7 +4766,7 @@ once the answer is no, the size of the next order is beside the point.
 | `AssetRefusals` | consecutive asset-id refusals ≥ N | `halt_on_asset_refusal_streak` |
 | `BudgetFloor` | the arm reports its allowance spent | *(none — see below)* |
 | `ReconDrift` | reconciler disagreement ≥ $X | `halt_on_recon_drift_usd_1e6` |
-| `WsGap` | user stream silent ≥ N ms | `halt_on_ws_gap_ms` |
+| `WsGap` | user stream silent ≥ N ms | `halt_on_ws_gap_ms` — **a HOLD since O-WSG1 (2026-10-20), not a halt** |
 
 `trigger_for` evaluates them in that order and returns the FIRST one
 that fires.
@@ -7529,8 +7632,8 @@ are `docs/binance-runbook.md`.
 * **Tested.** `mode.rs` `the_maker_list_is_um_classic_only`; `arm.rs`
   `a_maker_needs_a_working_dead_man`; `bn_live.rs`
   `coinm_binds_ioc_only_and_inverse_at_its_face`; e2e
-  `a_dead_gateway_halts_ws_gap_and_the_venues_countdown_cancels_the_makers`
-  (BX11: the loopback venue's countdown fires),
+  `a_dead_gateway_holds_on_the_gap_and_the_venues_countdown_cancels_the_makers`
+  (BX11: the loopback venue's countdown fires; a hold since O-WSG1),
   `a_renewal_queued_before_the_session_died_is_not_sent`; on Demo the
   battery's `--bn-drill gap` (BX11). BX8: `mode.rs`
   `the_classic_futures_are_built` (no spot maker); `arm.rs`
@@ -8888,11 +8991,11 @@ blind.
 
 | drill | where | proof |
 |---|---|---|
-| The gateway dies under resting makers | loopback | `a_dead_gateway_halts_ws_gap_and_the_venues_countdown_cancels_the_makers`: `WsGap` at the slot's `ws_gap_ms`; the loopback venue's countdown fires and cancels the makers |
+| The gateway dies under resting makers | loopback | `a_dead_gateway_holds_on_the_gap_and_the_venues_countdown_cancels_the_makers` (renamed at O-WSG1): the gap HOLD at the slot's `ws_gap_ms`; the loopback venue's countdown fires and cancels the makers |
 | The same | **Demo** | the battery's `--bn-drill gap`: two makers rest under the dead-man; the gateway thread stops without its sweep; the venue lists neither within the countdown + 10 s, each one's status reads CANCELED (the read retried to the deadline), and no sooner than the countdown less two heartbeats (65 if not — a maker filled, cancelled too soon or not at all; a failure before the kill is 52; after a signal nothing more is read, the makers cancelled by id) |
 | The operator's flatten on a real position | **Demo** | the battery's `--bn-drill flatten` (`--binance um` or `cm`): one IoC opens a position, reconciled; the gateway stops; `bn_ops::flatten` closes it with its own reduce-only IoC and reads flat (if not: its code, 60–63; before the stop, 57, 56 or 52) |
 | Once a drill stopped the gateway | **Demo** | unless a signal came, the end runs the operator's flatten on each lane's symbol (the arm's orders cancelled by id first), then reads the account flat (58 if not) |
-| Reconciliation withheld | loopback | `a_withheld_reconciliation_halts_a_classic_arm_stale`: `ReconStale` |
+| Reconciliation withheld | loopback | `a_withheld_reconciliation_holds_a_classic_arm_stale` (renamed at O-WSG1): the stale HOLD |
 | A 429 | loopback only | `BudgetFloor`, the reason asserted (the departure: a breach on Demo risks an IP ban the running engine's market data shares) |
 | A margin ratio, a scan failure | loopback | `the_margin_and_scan_failure_halts_end_to_end`: `MarginRisk`, `ReconDrift`, the reasons asserted |
 
@@ -14991,7 +15094,7 @@ independent rebuild exact). **Plan:** vault doc 33. **Nothing here arms a slot.*
     `p_yes = Φ(z)` from `late_phi_lut`, an artifact table that reaches 1.0, so
     near-certain instances are priced as such.
   - **The entry.** The favourite side, when `p ≥ late_p_min_1e6` (0.90) and its
-    ask ≤ p − `late_e_1e6` (2 c) on `late_persist_polls` (2) consecutive
+    ask ≤ p − `late_e_1e6` (2 c) on `late_persist_polls` (2; 1 since O-H90-11) consecutive
     snapshots of that leg. One IoC at that ask, sized at the whole resting ask
     up to `late_usd_1e6` ($100) and the caps. One entry per instance; a gateway
     refusal re-arms it.
@@ -15095,12 +15198,12 @@ WebSocket gateway arm, off the engine thread), at a safe minute.
 | exec | `halt_on_recon_drift_usd_1e6` | $1 | on a $5 account, $1 is a large drift |
 | exec | `request_topup_weight` | 1 000 requests ($0.50) | XMM XH5c-2: one purchase must cost at most a quarter of the $4 loss bound (5 000 = $2.50 was refused at boot, 2026-10-16 20:37Z) |
 | exec | `halt_on_reject_streak` / `halt_on_asset_refusal_streak` | 5 / 3 | unchanged |
-| exec | `halt_on_ws_gap_ms` / `halt_on_recon_stale_ms` | 30 s / 300 s | unchanged |
+| exec | `halt_on_ws_gap_ms` / `halt_on_recon_stale_ms` | 5 s / 300 s | both HOLDS since O-WSG1; the gap 5 s since O-WSG2 (2026-10-20; 30 s before) |
 | exec | `halt_on_alo_reject_pct` | 20 | the gateway's window halt (XH-7) |
 
 - **Every other line of the live cut is the paper artifact's**, byte for
   byte (the late law at its ruled values: [2, 30) s, p ≥ 0.90, 2 c,
-  persistence 2, k 1.55). The paper copy stays as `bin15.paper-s7.toml`,
+  persistence 1 since O-H90-11 (2026-10-20; 2 before), k 1.55). The paper copy stays as `bin15.paper-s7.toml`,
   which the nightly accrual replays at paper's $100 / $1 000 / $30 000.
 - **The agent's approval expires 2026-10-19 ~13:54Z.** After it, every live
   order is refused, and the reject streak halts slot 3. Renewing it is the
@@ -15108,6 +15211,51 @@ WebSocket gateway arm, off the engine thread), at a safe minute.
 - **Disarm:** `scripts/bin15-flip.sh paper` (halts slot 3 through
   `exec.HALT`, checks the venue shows nothing of ours resting, restarts at a
   safe minute), or `echo 3 >> ~/multivenue/exec.HALT` for an immediate halt.
+
+### BIN15 H90 O-H90-11 — the late law at persistence 1, live (operator ruling 2026-10-20)
+
+**Ruling (Anton, 2026-10-20 17:30Z):** the late law fires on the first
+qualifying snapshot of the favoured leg: `late_persist_polls = 1` (was 2).
+It applies to main's slot 3 (LIVE at the $2 / $5 dust frame, this file) and to
+the standalone (branch `bin15-h90-standalone`, slot 3 LIVE at $250 / −$500,
+its own entry there). Every other line of the law and of both frames is
+unchanged.
+
+- **What changes:** one line of the paper artifact, so of the live cut too.
+  `bin15-flip.sh paper`, the edit, then `bin15-flip.sh live --gateway` (the
+  flip keeps parity by construction: the live cut is the paper artifact
+  plus its header). The boot tell's late law reads `persist1`. No code
+  changes; `core-config` already bounds the key to `[1, 8]`.
+- **Evidence:** vault `~/multivenue/research/outcome/h90/p1/` and project doc
+  `claude/bin15-p1-results-2026-10-20.md`. An engine-faithful replay of the
+  captured HIP-4 tape (09-13 → 10-20): every touch tick of either leg, the
+  S5 poll, the IoC judged against the favoured leg's raw tick one post
+  round trip (130 ms) after the decision.
+  - Persistence 1: 221 trades, 2 losses, +$1 886. Persistence 2: 144, 1,
+    +$904. Worst day +$1.36 vs +$4.64; maximum drawdown $18.64 vs $11.29.
+  - Day bootstrap: P(P1 ≤ P2) 0.000 over all days, 0.037 since 10-11; the
+    same within $10 at 280 ms, and with the price read at the tick.
+  - About 35 % of persistence 1's IoCs find the quote gone (vs 5 % at
+    persistence 2). A miss is not a refusal: it does not count toward
+    `halt_on_reject_streak` (`exec-hyperliquid` E7-F2).
+- **The forward test** (PR-BIN15-P1, frozen before the first persistence-1
+  boot; vault `p1/PREREG-PR-BIN15-P1-2026-10-20.md`, project
+  `claude/bin15-p1-spec-2026-10-20.md`): 14 UTC days or 60 standalone
+  fills, whichever is later, against the frozen replay's persistence 2 on
+  the same days' tape.
+  - **Kill, any one, reverts the standalone to persistence 2 at the next
+    safe minute:** the window's realised late-entry net reaches −$250; two
+    losses within the first 30 fills on fills persistence 2 would not have
+    taken; the live miss rate above 60 % after 30 attempts; the hit rate
+    below 93 % after 40 fills.
+  - Every halt and bound above binds unchanged (the −$500 session bound
+    first).
+- **Main's slot 3 in the test:** read for its fill and miss rates only; its
+  P&L at $2 is not a criterion. The kill criteria are the standalone's; the
+  operator rules on main when one fires.
+- **Revert:** `bin15-flip.sh paper`, `late_persist_polls = 2` in the paper
+  artifact, `bin15-flip.sh live --gateway`, each at a safe minute; the
+  pre-change artifacts are kept as `bin15.toml.bak-*-o-h90-11`.
 
 ## HK — the housekeeping lane (2026-10-13)
 
@@ -17225,6 +17373,15 @@ skips the journal.
 `strategy_set/on_tick_all` now includes the inert pine member (one branch and one counter); a
 `bench-check` drift there is this, and the re-baseline is the operator's.
 
+**Re-baselined in the r40 merge (2026-10-29, ruling R-P35).** Merging main `df543c33` (pm15 slot 9,
+pmj slot 11) into the branch made pine one of eleven built rows: `strategy_set/on_tick_all` 4.63 →
+5.87 ns and `on_tick_none` 3.06 → 3.32 ns (one cycle). Evidence: an interleaved A/B, six rounds of the
+`strategy_set` benches with bench-check's settings, A = main `df543c33`, B = the merged tree, both
+engines running — on_tick_all A 5.1–5.4 / B 5.86–5.90 ns on the steady rounds, on_tick_none A 3.06 /
+B 3.31 ns; `on_timer_all` and `on_fill_routed` unmoved. The rounds and the values' derivation are in
+`crates/bench/baselines/hot_path.json`. A set-bit fan-in (cost by enabled members, not built rows)
+stays the possible later lane.
+
 **Tests:** `core-config` `tests/pine_manifest.rs` (`slot8_live_section_is_refused_paper_only`,
 `slot8_section_defaults_and_ranges`, `slot8_live_requires_three_keys`,
 `exec_toml_without_slot8_section_is_unchanged`); `cli` `exec_boot`
@@ -17481,6 +17638,21 @@ section).
 | R-PM-8 | $250 per order and per market, a −$500 session loss bound, no day cap; paper runs the same frame. |
 | R-PM-9 | Slot 9 (the S16-R5 ruling a reserved slot needs); the account arrives when the coding is done. |
 | R-PM-10 | A push notification every 45 min. |
+| R-PM-11 | (2026-10-29, the live-ready round) Eligibility, O-PM-0 / R-PM-7: "Eligible; R-PM-7 stands". |
+| R-PM-12 | Git: "Commit on main (Recommended)" — one commit per work item, explicit paths, `PM15:` / `PMJ:` prefixes, on the Mac, never pushed. |
+| R-PM-13 | Paper restarts of main: "Deploy at safe minutes (Recommended)" — release build, a forced gated restart at a safe minute off the grid through the exec gate, verified on `/state`. |
+| R-PM-14 | The Mac's disk: "Read-only du report (Recommended)". |
+| R-PM-15 | P0: "Run once now (Recommended)". **Scored 2026-10-29 10:47:59Z: KILL** (`### PM15-9`). |
+| R-PM-16 | The gate's evidence: "P0 + law-(iii) pack (Recommended)". Moot after R-PM-15's KILL. |
+| R-PM-17 | The live frame: "S33 stage: $500/$500/−$1000 (Recommended)". Built, then parked by the KILL (`### PM15-9`). |
+| R-PM-18 | Live assets: "All seven" (amends R-PM-4). Not applied: the KILL stopped the lane first. |
+| R-PM-19 | The dust step: "Build `live --dust` (Recommended)". Built, then parked by the KILL. |
+| R-PM-20 | PolyBolt as the mark: "Now, behind a key, off (Recommended)". Not built: the KILL. |
+| R-PM-21 | Redemption: "Relayer, sig type 3 (Recommended)" (R-PM-6 stands). |
+| R-PM-22 | The gate host: "Mac, background QoS (Recommended)" — every cargo gate on the Mac under `taskpolicy -b`, one job at a time. |
+| R-PM-23 | The live host: "One eu-west-1 VM, both slots (Recommended)". After the KILL: slot 11 only. |
+| R-PM-24 | The EC2 deliverable: "Kit + provisioning script (Recommended)". |
+| R-PM-25 | The standalone cut's shape: "First everything missed is need to be implemented on main and on the last stage we will create a separate branch". |
 
 ### Slot 9, the member (`strategy-pm15`, PM15-5)
 
@@ -17491,7 +17663,13 @@ section).
   `pm15`.
 - **The law** (doc 39 §4, frozen): τ ∈ [2, 20) s; the favoured side
   p ≥ 0.90 for 2 consecutive report seconds; an IoC at an ask ≤ p − 0.02;
-  at most 4 IoCs per market. The pricer is `core-twaplock::report`
+  at most 4 IoCs per market. *(Amended 2026-10-19 by PMJ J8, ruling
+  R-PMJ-S24 — a documented deviation from doc 39 §4: the ask must also be
+  at least `price_floor` 0.90, slot 11's floor — and its paper fills
+  follow the J8 sweep. P0's count is segmented at the J8 boot (`docs/state.md`
+  dates it): the windows before it ran the frozen law and the touch fill,
+  the ones after it the amended law and the sweep. See "PMJ — slot 11",
+  `### J8`.)* The pricer is `core-twaplock::report`
   (Chainlink reports on their own second, samples [T−60, T−1]).
 - **The strike:** the RTDS mean of [open − 60, open − 1] (within 0.1–15
   ppm of the venue's, measured). Gamma publishes a window's `priceToBeat`
@@ -17500,7 +17678,9 @@ section).
   `strikes_missing`, `hold_strike`) and is never traded.
 - **The caps:** $250 per order, $250 committed per market (fills plus the
   one in flight), the session's realised loss at −$500 halts the member.
-  No day cap.
+  No day cap. *(R-PMJ-S21, 2026-10-19: the session bound is −$3 500 in
+  `pm15.toml` from the next boot — and, by R-PM-8, slot 9's live bound once
+  armed.)*
 - **Paper fills (PM15-5c):** the held-quote law (`core_fill::held`, the
   HC11 law Hypercall's IoCs already use): an IoC fills at the leg's quote
   in force **350 ms after submit** — the activation Δ (200 ms, the
@@ -17508,7 +17688,9 @@ section).
   crypto markets since 2026-09-04) — at the touch, capped by its size, or
   gets nothing. The strict-cross law it replaces waited for the leg's
   first tick after activation: on a delta feed a quiet leg sends none, so
-  an order the venue would fill was cancelled at its TTL. The fee
+  an order the venue would fill was cancelled at its TTL. *(PMJ J8,
+  R-PMJ-S23: no longer the touch alone — the touch, then the depth lane's
+  levels behind it up to the limit, as the venue's FAK; `### J8`.)* The fee
   0.07·p·(1 − p) per share; settlement +1 / 0 per share at
   `market_resolved`. The offline harness has no held law (as for
   Hypercall): slot 9's paper is judged in the engine only.
@@ -17593,7 +17775,10 @@ ingress emits a leg's touch only when it changes — and a favourite at
   before the `PONG` has been read): `touches_reasserted`.
 - **It withdraws every touch when the session drops** — a stale tick,
   both sides zero — so neither the member nor the paper book trusts a dead
-  socket's book: `touches_withdrawn`. The market socket's idle law is 12 s
+  socket's book: `touches_withdrawn`. *(Amended by PMJ J7, R-PMJ-S19: both
+  rules are per market socket — a `PONG` re-asserts, and a lost session
+  withdraws, only the touches of the families that socket carries; see
+  "PMJ — slot 11", `### J7`.)* The market socket's idle law is 12 s
   (it was 30 s): two missed `PONG`s and a margin, well inside a 20 s late
   window.
 - **The member's freshness bound is 8 s** (the `PING` period plus 3 s),
@@ -17812,3 +17997,1640 @@ leg was never redeemed.
 - PolyBolt as the mark, after `polybolt-probe` has run on the account.
 - When the account exists: `pm15-exec.sh key-check`, then `miss-probe`,
   then P0's result or a ruling, then `pm15-flip.sh live`.
+
+### PM15-9 — P0's confirmatory score: KILL; the lane stops (2026-10-29)
+
+- **The score (R-PM-15).** The frozen scorer (vault doc 39 §2/§10; scorer
+  `257172b7…4144`, params `p0-params-2026-10-19-floor.json` `66f71dda…1519`,
+  marks and pull tools as registered) ran ONCE at 2026-10-29 10:47:59Z;
+  receipt `p0-conf-receipt.json`, report sha256 `c832939c…804c`. The bars,
+  per R-PMJ-S49 (post-J8 CONF, floored, BTC + ETH pooled, window [2,20),
+  T2, s = 25 %): 1 515 markets, 24 entered, 2 lost, stake $1 963.55,
+  P&L −$12.36, **EV/$ −0.629 %** (CI90 −9.52 … +5.04 %); B1 ✗, B2 ✓ (6/8),
+  B3 ✗ (2/24), B4 ✗, B5 ✓; B6 [2,15) +4.5 % passes, [15,20) −2.3 %.
+  **VERDICT: KILL.** The research record is the project doc
+  `claude/pm15-p0-results-2026-10-29.md` (side tables, caveats).
+- **The kill rule** (plan v2 §6 P0; R-PM-1): confirmatory EV/$ ≤ 0 under T2
+  stops the lane. Slot 9 stays PAPER on main; nothing was ever armed; no
+  `PM15-LIVE-GATE` line exists.
+- **Scope.** The score judges the FROZEN rule (k 1.80, p_min 0.95, e 0.02,
+  floored), not slot 9's running law (iii). Reopening PM is the operator's
+  ruling alone.
+- **Parked (PROVISIONAL P-4, the operator to confirm).** Two PM-only
+  changes finished before the score are kept OUT of the tree, as vault
+  patches under `docs/research/pmj/liveready/`: `pm15-9a-frames.patch`
+  (`pm15-flip.sh` `frame` / `live --dust`: the stage frame of R-PM-17 and the
+  dust frame of R-PM-19 written into both `pm15.toml` and `[exec.slot.9]`
+  from one line, a `PM15-DUST-GATE: ` line for the dust test, the day cap at
+  $1 000 000 for seven families, and the interlock test over both frames)
+  and `pm15-9c-state.patch` (a `/state` `pm15` section). Each re-applies
+  with `patch -p1`. PolyBolt as the mark (R-PM-20) and the law-(iii) gate
+  pack (R-PM-16) were not built.
+- **Kept:** the CLOB venue law (PMJ `### J14`): it is shared code, and
+  slot 11's 5-minute pipeline needs it.
+
+## PMJ — slot 11 (paper only): H90 on Polymarket's 5-minute up/down markets through Jupiter Predict (2026-10-18)
+
+**Ask (Anton, 2026-10-18):** onboard the PM15 H90 law on Jupiter Predict
+(the same Polymarket books, reached through a Solana keeper) in a spare slot,
+plus research on the 5-minute markets. **Plan:** project docs
+`claude/pmj-plan-2026-10-18.md` (§3 architecture, §4 phases) and
+`claude/pm15-jupiter-review-2026-10-18.md`; the session prompt and the survey
+map are in the vault (`docs/research/pmj/`). This pass builds J1b–J4 on main
+and runs slot 11 in PAPER; nothing is armed.
+
+| id | ruling (operator, 2026-10-18) |
+|---|---|
+| R-PMJ-0 | Jupiter Predict and its API are allowed from the operator's location; the operator runs the J0 probe himself. |
+| R-PMJ-1 | **PMJ takes slot 11** (not 14 as the plan said). Slots 14 and 15 stay reserved; the plan's J1a (moving the unstamped-refusal buckets off 14 / 15) is dropped. |
+| R-PMJ-1b | **The TERM clash is recorded here, not resolved:** TERM's plan v2.1 (R-T1, plan only, `docs/terminal-plan.md`) proposes `term-bn` on slot 11. TERM's own session resolves it; the suggested remap is `term-bn` → 14. No TERM file is edited by this lane. |
+| R-PMJ-3 | **Family split:** slot 9 (`pm15`, direct CLOB) trades the 15-minute families only; slot 11 (`pmj`, Jupiter) the 5-minute families only. A member never binds the other family's windows. |
+| scope | J1b, J2, J3, J4. Slot 11 is built and runs PAPER; J5 onward (dust, live) is out of scope. |
+| R-PMJ-S1 | The 5-minute families get a pool of their own — three token pairs plus the mark per family, roll family bytes 16..40, instance ids flagged with bit 31, an unresolved window retired 540 s after its end; the 15-minute pool, oids and digests stay bit for bit. |
+| R-PMJ-S2 | Jupiter is `VenueId::Jupiter` = 10, an execution-route venue with no market data: slot 11's orders keep the Polymarket leg's sym. |
+| R-PMJ-S3 | Ed25519 stays in `signer-ed25519` (ring, O-BX5), extended with a raw signature and verification; base58 joins `core-crypto`. No new dependency. |
+| R-PMJ-S4 | J1b starts after the survey; each phase stops for the operator before its commit. |
+| R-PMJ-S5 | The operator commits each phase himself on the Mac, from the transfer files the session prepares (explicit paths). |
+| R-PMJ-S6 | A bench-check red is judged by an interleaved A/B against HEAD in a read-only worktree (J1b). |
+| R-PMJ-S7 | J2 commits first, then J1b + J3 as one commit (they share files). |
+| R-PMJ-S8 | J4 starts; no restart or deploy without the operator's word. |
+| R-PMJ-S9 | J4 shares 14 files with J1b + J3, which were not yet committed: **J2, then J1b + J3 + J4 as one commit.** |
+| R-PMJ-S10 | **Re-baseline** `strategy_set/on_tick_none` and `on_timer_all` for slot 11's row (J4-GATES below). |
+| R-PMJ-S11 | Deploy slot 11 PAPER once the commits are made (the restart law unchanged: a safe minute off the 15-minute grid, through the exec gate — slot 3 is LIVE). |
+| R-PMJ-S12 | Slot 11's 5-minute families: **all seven** (btc eth sol xrp hype doge bnb), appended to `universe.toml` `[polymarket] rolling` after the 15-minute ones. |
+| R-PMJ-S13 | Read-only git (log / status / show) is allowed to the session for the deploy; the operator asked the session to make the commits (J2 `9d9d9359`, J1b + J3 + J4 `88f70509`). |
+| R-PMJ-S14 | The restart immediately once the build and the offline checks pass — off the 15-minute grid, through the exec gate (deployed 2026-10-18 13:06Z). |
+| R-PMJ-S15 | The rolling depth capture: at most one record per leg per second — `[polymarket] rolling_depth_ms` (default 1000; 0 = every change) and `rolling_depth` (off = none) (### J6). |
+| R-PMJ-S16 | The session commits J6 (explicit paths) and makes the gated restart itself, as in the 10-18 deploy. |
+| R-PMJ-S17 | Build **J7**: the rolling market socket sharded — N market sockets per period in the same ingress thread and `mio` poll, no new dependency (`claude/pmj-shard-plan-2026-10-19.md`). The `SO_RCVBUF` remedy is dropped: this host drains its sockets (### J7). |
+| R-PMJ-S18 | N = **one socket per family**: `[polymarket] rolling_market_sockets`, default 8 = the family cap, so seven families open seven sockets per period. |
+| R-PMJ-S19 | **Both periods** — pm15 (slot 9's feed) too; `rolling_market_sockets = 1` is one socket per period, the pre-J7 stream bit for bit. |
+| R-PMJ-S20 | The session commits J7 (explicit paths) and makes the gated restart itself, as R-PMJ-S16. |
+| R-PMJ-S21 | Slot 9's frame: $250 per order and per window market kept; the session loss bound scaled to 7 × $500 = **−$3 500** (`pm15.toml`, effective at the next boot; R-PM-8's "paper runs the same frame" makes it slot 9's live bound too once armed). |
+| R-PMJ-S22 | Slot 11's PAPER frame = slot 9's: **$250** deposit per order (max $250.01), $250 per window market, −$3 500 session (`pmj.toml`; the live dust frame stays J5's). |
+| R-PMJ-S23 | Build **J8 F1**: the rolling legs' paper IoC matched as the venue matches a FAK — the touch, then the depth lane's levels behind it up to the limit (slots 9 and 11) (### J8). |
+| R-PMJ-S24 | Slot 9's law gains slot 11's **0.90 floor** on the ask — a documented deviation from doc 39 §4 (P0's frozen law). |
+| R-PMJ-S25 | Slot 11 keeps the 2 s keeper delay (until J0) and is judged in **shadow** at 350 ms and 1 s too (counted, never booked). |
+| R-PMJ-S26 | The session commits J8 (explicit paths) and forces the gated restart, as R-PMJ-S20. |
+| R-PMJ-S27 | **J9**: slots 9 and 11's paper P&L kept since start and recalculated every 15 minutes, counted from the first local run of 2026-10-19 (00:11Z), segmented by fill law (### J9). |
+| R-PMJ-S28 | A window the capture never saw resolve is labelled by **Gamma's resolved market** (by slug), never by our own marks. |
+| R-PMJ-S29 | The book shows in the dashboard's pm15 and pmj blocks, under each slot's session line. |
+| R-PMJ-S30 | The session commits J9 (explicit paths) and installs its agent and reloads the dashboard; the engine is not touched. |
+| R-PMJ-S31 | Slot 9's **P0 scorer** is written now (vault, doc 39 §8), hashed before any CONF outcome is scored, split at the J8 boot (the amended law), and run once after 10-28 00:00Z. |
+| R-PMJ-S32 | Slot 9's paper keeps **all seven families** (`live_assets` stays btc+eth); the J9 ledger's per-family book judges the unstudied ones. |
+| R-PMJ-S33 | Slot 9's **flip to live** sets `pm15.toml` to the stage frame — **$500 per order, $500 per window market, −$1 000 session** — until P0 PASS and ≥ 100 live entries at ≥ 97 %; paper follows (R-PM-8). |
+| R-PMJ-S34 | **F4** (the strike estimate's error in near-tie windows): a research plan now — measure it against Polymarket's resolved strike, propose its uncertainty in the belief (vault). |
+| R-PMJ-S35 | The Polymarket account has **no date**: slot 9's live items (key-check, miss-probe, PolyBolt, the flip) stay parked; paper continues. |
+| R-PMJ-S36 | The `pm15-standalone` cut stays **deferred** until after P0. |
+| R-PMJ-S37 | **J0**: the session prepares a read-only probe kit (scripts that source `.env` themselves; the session never reads it) and a checklist; Anton runs it; the results feed the `guard_*` keys and J5's plan. |
+| R-PMJ-S38 | The TERM slot-11 clash (R-PMJ-1b) stays with TERM's session. |
+| R-PMJ-S39 | The **miss block** stays 2 × ttl in both members. |
+| R-PMJ-S40 | A per-order record of slot 11's shadow verdicts is **parked until J0**. |
+| R-PMJ-S41 | Housekeeping: PM15-8's two E501 lines are wrapped; `bin15/late_fair_in_window` is re-baselined (the median of three `make bench-check` runs; equal at HEAD and J8). |
+| R-PMJ-S42 | **J10**: `audit-pnl` settles Polymarket's rolling windows on the capture's settled roll rows (a window retired unresolved pays 0, as the member books it), and its fee ladder charges Polymarket's p-dependent taker law (rate · p · (1 − p) per share; slot 11 at twice the rate, its paper law; makers 0), closing fees.toml's pm caveat. The session commits and rebuilds the release binary; no forced restart. |
+| R-PMJ-S43 | **J0's wallet**: the dedicated PMJ hot wallet does not exist yet. J0's checklist opens with Anton creating it (its secret never enters a session) and putting its public key in `.env` as `PMJ_WALLET_PUBKEY`, or passing `--owner`. |
+| R-PMJ-S44 | **LAW PMJ-G and Jupiter's co-signer**: every public create-order carries a second, read-only required signer (`AJooF3xRkSx1PUC5Y9dNZHy9LMHcx5xKhPxj4iW4jepf`), which PMJ-G refuses. The session drafts an amendment in the vault (one pinned co-signer, `guard_cosigners`: read-only, not the fee payer, no durable nonce, its signature verified when present); it becomes law only after Anton's own J0 build confirms the second signer and he rules. |
+| R-PMJ-S45 | **The price cap**: `maxBuyPriceUsd` does not bind on public fills. J0 probes for a field that does (a `maxSlippageBps` or other value that reaches the signed `create_order` data). If none binds, the lane **stops at J0**; if one does, J5's guard computes the effective limit from the signed bytes and refuses above the member's limit. |
+| R-PMJ-S46 | **The deposit mint**: J0 builds both USDC and JupUSD; the mint is chosen after Anton's builds. |
+| R-PMJ-S47 | **Slot 11's paper delay** becomes **5 s** (Jupiter's keeper on the public tape) from the 2026-10-19 16:05Z boot; J9 gains a slot-11 segment in the same change (### J11). |
+| R-PMJ-S48 | Slot 11's paper fee stays at **2×** Polymarket's rate until Anton's own J0 fills confirm 1× on buys. |
+| R-PMJ-S49 | **P0**: the bars are scored on the post-J8 CONF segment only, under the floored law; IS is refit under the floor; pre-J8 CONF is a side table, never pooled (doc 39 §10, written before any CONF read). |
+| R-PMJ-S50 | **F4**: the strike law is re-measured on at least 3 days of captures (about 10-22) before law (iii) is ruled. Law (iii) is the venue-aligned trapezoid strike and settlement with a per-asset residual σ, a frozen-law change for slots 9 and 11 (a P0 segment and a J9 segment). |
+| R-PMJ-S51 | J10's carry-head gap is **closed as a known limit**: the J9 ledger is slots 9 and 11's paper truth, and the dashboard reads it. |
+| R-PMJ-S52 | The dashboard's "@tier" labels on audit-pnl's fee ladder become "@2 bps" (the ladder is [@0, @1, @2 bps]); J10's window counters are documented as windows, not positions. |
+| R-PMJ-S53 | F4 (c2): a read-only probe of Polymarket's RTDS for a TWAP or Chainlink stream (the engine's own socket, no credentials). It found none, so (c2) is closed. |
+| R-PMJ-S54 | DOGE's report precision (RTDS v1, ×1e12) folds into law (iii) if (iii) is ruled. |
+| R-PMJ-S55 | With the 5 s delay, slot 11's keeper lead becomes **`min_tau_s` = 6** (`pmj.rs`: the paper delay must be under the lead), so slot 11 decides at τ ∈ [6, 20) s. Slot 9 is unchanged. |
+| R-PMJ-S56 | F4's re-measure data is snapshotted from closed runs until 10-22 by a self-removing vault job, outside git. |
+| R-PMJ-S57 | P0's **B3 stays as frozen** (at most 2 % of fired markets lost). |
+| R-PMJ-S58 | With the Mac's disk near full, the F4 snapshot keeps the pm15 / pm5 events and the manifest only, under a 10 GiB free floor; ticks for the post-J8 check are pulled from the S3 archive at re-measure time if disk allows. |
+| R-PMJ-S59 | The slot 9 / 11 loss analysis (fills land when the price falls during the judge delay; the two 10-19 losers were the weakest entries) changes nothing yet: **collect more days first**, re-run with the F4 re-measure around 10-22. |
+| R-PMJ-S60 | After the 10-22 re-run, out of sample: p_min 0.95 and k 1.80 do not help. **Both slots keep p_min 0.90 and k 1.55.** |
+| R-PMJ-S61 | **Law (iii)** (F4: the trapezoid of the reports over `[open − 62, open − 2]` for the strike and the settlement, plus a volatility-scaled residual) is built as J12 behind a per-slot `strike_law` switch. Slot 11 switches at the next scheduled restart after the build; slot 9 after 10-28 00:00Z, when P0's confirmatory window has closed. |
+| R-PMJ-S62 | The J9 ledger books each segment's fills under the 0.90 entry floor apart from the rest (`below_floor` / `at_or_above`), on the dashboard too. |
+| R-PMJ-S63 | Slot 11 switches to law (iii) at the 10-23 16:05Z restart. The J12 A/B's criterion 2 is read statistically (won ≥ expected − 2 sd): on its letter both laws miss it on slot 11, trap62 by −0.55 sd and mean60, the law running, by −0.64 sd, and wrong-side fills are equal (3 against 3). |
+| R-PMJ-S64 | J12 is one commit, and the release binary is rebuilt once the remaining gates pass. No extra restart: the engine boots it at the 16:05Z restart. |
+| R-PMJ-S65 | `bin15/late_grid_mark_and_perp_1s` is fixed and re-baselined in the J12 commit. Its random-walk mark crossed zero after about 80 M iterations, after which `on_mark` / `on_perp` returned on the rejected input, so the bench timed that return in some runs and the live path in others. The timed loop's walk now reverts to its start; the prefill is unchanged. |
+| R-PMJ-S66 | Overnight 10-23/24, while Anton is away, the PMJ lane does four things: research a per-window cap on same-side families and build the best variant behind a key, default off (J13); research the fills that land under 0.90 (plan only); prepare slot 9's switch to law (iii); and read out slot 11's first night on law (iii). |
+| R-PMJ-S67 | While Anton is away, finished work is committed once every gate is green and a reviewer agent approves: one commit per item, explicit paths. No push, no release rebuild, no restart. |
+| R-PMJ-S68 | Slot 9 switches to law (iii) at the 10-28 0010 restart. `pm15.toml` gets the three keys between 00:00Z and the 0010 drain, so no run boots between 00:00Z and the edit; slot 9's `j12` ledger row starts at 00:00Z. |
+| R-PMJ-S69 | (Ruled 2026-10-24 ~03:55Z, recorded here 10-29.) R5 waits for its pre-registered checkpoint: a scheduled task re-tests it on 10-30 at 00:30Z and asks for a ruling. Slot 11 keeps `tau_max_ns` 20 s. |
+| R-PMJ-S70 | (Ruled 2026-10-24.) J13 stays off for now. |
+| R-PMJ-S71 | (Ruled 2026-10-24.) The 20 S3-pulled run copies in `~/multivenue/research/pmj/loss/runs/` are deleted (each pulled with its files' sha256 verified; scripts, derived tables and the vault kept). |
+| R-PMJ-S72 | (2026-10-29, the live-ready round, verbatim.) PMJ before J0: "Pre-check first (Recommended)" — the binding question tested on public on-chain data before any pre-dust code. |
+| R-PMJ-S73 | The PMJ signing secret: "0600 keypair file (Recommended)" — a 0600 Solana keypair file outside the repo, its path in `.env`. |
+| R-PMJ-S74 | R5 (slot 11 skips τ > 16 s), after the 10-30 checkpoint: "Adopt in paper if it passes (Recommended)". |
+| R-PMJ-S75 | Notifications for slots 9 and 11: "Not now". |
+| R-PMJ-S76 | **PROVISIONAL — Anton to confirm** (the session's choice, J16): the **pilot** frame's day cap is **$1 000** and its open-order bound **4** (`exec_boot` `PMJ_PILOT_CAP_DAY_USD_1E6`, `PMJ_PILOT_MAX_OPEN_ORDERS`); its order, instance and session bounds ($250.01 / $250.01 / −$500) follow slot 9's R-PM-8. Ruled before any `PMJ-LIVE-GATE` line. |
+| R-PMJ-S77 | **PROVISIONAL — Anton to confirm** (the session's choice, J16, risk review M1): **slot 11 arms only alone in its engine** — the engine and the flip refuse a live slot 11 beside any other live slot, because a slot-11 boot refusal aborts the whole engine (the standalone, R-PM-23). |
+| R-PMJ-S78 | **PROVISIONAL — Anton to confirm** (the session's choice, J16, risk review round 2): a **review trigger** found by the daily restart's key check (`pmj-exec` exit 77: the Predict deploy off its pin, the vault table entry or the mint changed, a pinned account closed) **halts the running slot 11** (`slot=11 reason=operator` appended to `exec.HALT`) and pages (`notify-send.sh -l`); every other key-check failure only defers the restart. |
+
+### J1b — the 5-minute pool, its pipeline, the depth capture
+
+- **The pool** (`core_types::pm_roll`): ordinals 4160 + 7·g + offset
+  (`[up0][down0][up1][down1][up2][down2][mark]`), above the whole 15-minute
+  pool; window `w` on pair `w mod 3`, so a pair is needed again 600 s after
+  its window ends and the 540 s retirement frees it 60 s ahead. Instance ids
+  `0x8000_0000 | (window5 · 8 + g)`: a 5-minute id can never equal a
+  15-minute one. `PmPeriod` serves the shared code; its 15-minute answers are
+  the 15-minute free functions (a test pins each).
+- **The universe:** `updown:<asset>:5m`; a family's index is its rank among
+  its period's keys, so adding 5-minute keys moves no 15-minute family (a
+  test compares every 15-minute manifest row of a mixed universe with the
+  15-minute-only one). Each period has its own cap of 8.
+- **The pipeline:** a second instance of the rolling ingress, driven for
+  the 5-minute period: its own discovery (`pm5-discovery`, two windows
+  ahead, the `-updown-5m-` slug and the `5m` settlement law), its own market
+  and RTDS sockets (`ingress-pm5`; at most 42 tokens subscribed), tick and
+  event lane 9 (`engine::PM5_LANE`), the `pm5` capture, raw-tap label and
+  `/metrics` family. It spawns only when `[polymarket] rolling` names a
+  `:5m` key. No gateway tee: slot 9's arm never sees a 5-minute window.
+- **Slot 9 is untouched by the 5-minute records** (R-PMJ-3): `strategy-pm15`
+  returns on any 5-minute sym before its roll, order-law, mark and touch
+  paths — no order, no market, no counter changes (a test). Its boot and the
+  15-minute spawn read the `:15m` keys only.
+- **The router ledger: `LEDGER_ROWS` 32 → 64** (`Ledger` 161 408 B). It
+  binds every roll it sees, keyed (venue, family byte), and refuses a family
+  byte at or above its row count; the 5-minute bytes reach 39, and at the
+  caps the table holds HL's 8 + PM 15 m's 16 + PM 5 m's 24 rows. **This is
+  the live router of slot 3:** the risk checks scan the rows, so the
+  per-order cost grows by the 32 empty rows' bound test.
+- **The depth capture** (month results, caveat 3): the rolling ingress never
+  wrote `pm15-depth.pmlr`; it now writes a top-5 `DepthTopK` per leg,
+  best first from the venue's touch, change-gated through a `DepthPair` (the
+  spare row written in place, flipped on a change), whenever the leg's slot
+  ticks, for both periods. Capture only: no depth lane carries it. A level
+  whose size the ladder does not know is not written.
+- **The Gamma market id** joins `PmWindowSpec` (`market_id`): Jupiter names
+  its markets `POLY-<market id>-<0|1>`. A non-decimal id reads 0; it can
+  never refuse a static market row.
+- **Gates:** see the J1b gate line below.
+
+J1b-GATES (2026-10-18, on the Mac, detached): `make lint` rc 0, 0 warnings ·
+`cargo nextest run --workspace` 4 845 passed, 10 skipped · `make alloc-assert`
+133 passed at 0 B (a fresh `Compiling bench`; gate 133 new) · `make copy-audit`
+hits 27, baselined 27, new 0 · `make license-check` OK (748 files) · fuzz 60 s
+each, clean: `universe_toml` 23.4 M runs, `pm_gamma_markets` (now also the
+window law, both periods) 6.0 M, `pm_rolling_frame` (new: the rolling driver,
+both periods) 221 k · `make bench-check` RED, 8 samples past 15 %: on a re-run
+of the four groups `ledger/locate_*` came back within 15 % (+13 %, +6 %; the
+first run was noise), while `strategy_set/*` (+27…39 %) and `bin15/late_*`
+stayed out — no code of either is in this change (their baselines predate
+PM15-5's ninth member and PM15-4's move of the late grid into
+`core-twaplock`). **A/B against HEAD (ruling R-PMJ-S6;** a read-only
+worktree of `a946a668`, removed after; three interleaved runs, medians,
+bench-check's settings, the engine running): `strategy_set/on_tick_all`
+6.897 HEAD / 6.893 this tree, `on_tick_none` 3.132 / 3.130, `on_fill_routed`
+2.471 / 2.363, `on_timer_all` 3.709 / 3.306, `bin15/late_fair_in_window`
+487 / 397, `bin15/late_grid_mark_and_perp_1s` 14.27 / 12.89,
+`ledger/locate_miss` 3.80 / 3.92, `dispatcher/queued_submit` 0.837 / 0.850,
+`strategy/latency_arb_on_tick_no_fire` 3.128 / 3.140 ns — **HEAD is as red as
+this change; the regressions predate PMJ.** A re-baseline stays the
+operator's ruling.
+
+### J2 — base58, the raw Ed25519 signature, verification, the Solana keypair (R-PMJ-S3)
+
+- **No new dependency.** Ed25519 stays on `ring` in `signer-ed25519`
+  (O-BX5); `core-crypto` stays dependency-free.
+- `core_crypto::base58_decode` / `base58_encode`: the Bitcoin alphabet,
+  zero-alloc (the working number lives in the caller's buffer), boot and
+  cold paths only — **not constant-time**, so it may decode a secret only at
+  boot (the wallet key), never on a path an observer can time.
+- `Ed25519Signer::sign_raw`: the 64-byte signature written into the
+  caller's slot (the transaction's own buffer); `verify`: `ring`'s strict
+  RFC 8032 verification; `Ed25519Signer::from_solana_keypair`: a wallet's
+  64-byte export (seed ‖ public key) — the seed expanded into the locked
+  page as `from_seed`, the local seed copy wiped, and a public half the seed
+  does not derive refused (`KeypairMismatch`, compared in constant time).
+- The boot self-test (LAW BX-3) now also checks every RFC 8032 vector's raw
+  signature and its verification both ways; Binance's arm runs the same
+  self-test, so its boot checks more and accepts nothing new.
+- **Gates:** `make lint` rc 0 · nextest (core-crypto, signer-ed25519,
+  exec-binance, exec-polymarket) 457 passed · gate 86 at 0 B with `sign_raw`
+  + `verify` in its loop (the self-test's allocation count unchanged: one
+  page per vector) · copy-audit new 0 · license OK.
+
+
+### J3 — `exec-jupiter`: the guard, jup-gw, slot 11's arm (built and rig-tested; never armed)
+
+- **The venue (R-PMJ-S2): `VenueId::Jupiter` = 10, `VENUE_COUNT` 11.** An
+  execution route with no market data: no tick, depth, option or fill lane;
+  staleness 0 (never judged); the paper activation and the harness latency
+  0 — dead like `Ai`, and never tradeable in the harness
+  (`tradeable_venue_byte` is unchanged). `exec.toml` spells it `jupiter`.
+- **The router lists gain Jupiter** (`LIVE_ARM_VENUES`,
+  `PNL_JUDGING_VENUES`), **and refusals precede them:** a live slot 11
+  refuses the boot until a `PMJ-DUST-GATE` line here; a live slot naming
+  `jupiter` that is not slot 11 refuses ("whose only arm is slot 11's"); a
+  paper slot naming it arms nothing. The binary-contract risk law
+  (`px·qty/1e6`) is unchanged.
+- **LAW PMJ-G — never sign a server-built transaction blind.** Jupiter's
+  `POST /orders` answers an unsigned Solana transaction; jup-gw decodes it
+  into a fixed 1 232 B buffer and signs it only when every line holds:
+  the fee payer is our wallet and our wallet is a required signer; every
+  invoked program is in `pmj.toml`'s `guard_programs` and is a static key
+  (never loaded from a lookup table); every lookup table is in
+  `guard_alts`; **the transaction requires exactly one signature — ours** (a
+  co-signer could hold it; checked on the transaction, not only on the
+  answer's `requiredSigners`); **no System `AdvanceNonceAccount`, whatever
+  it names** (a durable-nonce transaction never expires, so the server
+  could land it whenever it liked); the SPL Token / Token-2022 `Transfer`
+  / `TransferChecked` our wallet authorises come **from the deposit
+  account** (`guard_deposit_account`, the wallet's USDC account — none configured
+  refuses every debit; one loaded through a lookup table is refused) and,
+  checked, **in the deposit mint**, and sum to at most the `depositAmount`
+  we asked (0 for a claim), with our wallet the authority and nothing
+  else; any other Token
+  instruction our wallet takes part in (`Approve`, `SetAuthority`,
+  `CloseAccount`, `Burn` …) is refused; System transfers and account funding from
+  our keys at most `guard_max_sol_lamports`; the compute-unit price at most
+  `guard_max_cu_price` (so a transaction's fees are bounded by 5 000 lamports
+  for the one signature plus `max_cu_price` × at most 1.4 M units — 0.07
+  mSOL at a 50 000 µlamport cap — plus `guard_max_sol_lamports`).
+  The answer must be the order we asked — `requiredSigners` exactly our
+  wallet, `order.marketId` the window's `POLY-<id>-<o>`, `isYes` and
+  `isBuy` true, `userPubkey` our wallet, `orderCostUsd` within the deposit
+  — and the server's price cap (`maxBuyPriceUsd`, the answer's word) at
+  most the member's limit (`p − 2c`); else the build is refused unsigned. **An empty allowlist
+  refuses everything**, and is the default until J0's decoded programs and
+  tables are reviewed into the `guard_*` keys. **The guard's limit: a CPI's debits
+  are invisible before signing** — an allowlisted program is trusted with
+  whatever the transaction's accounts let it reach; the program allowlist
+  is what bounds that. **Its consequence (risk review, 2026-10-18):**
+  Jupiter's own program most likely moves the deposit itself (a CPI,
+  not a top-level transfer); if so, the "≤ `depositAmount`" line binds
+  nothing, the per-order maximum and the session bound are not enforced
+  before signing, and the real bound is the wallet's USDC. **Before a
+  `PMJ-DUST-GATE` line, this section must require:** (a) the wallet holds
+  at most the slot's day cap in USDC; (b) J0 decodes Jupiter's
+  create-order instruction data so the guard checks its amount (and its
+  price) itself; (c) a halt when the wallet's USDC falls by more than the
+  deposit plus the fee after an order lands.
+- **jup-gw** (`exec_jupiter::gw`, socket-free; `core_net::HttpsReq` in
+  production): build → guard → sign (our signature written into its own
+  slot) → `POST /execute` with the build's `context` verbatim → LANDED /
+  REFUSED / IN DOUBT → `GET /orders/status/{pk}` every 250 ms until
+  terminal or the window's close + 30 s → recon (`GET /orders`, the order's
+  `filledContracts` and `avgFillPriceUsd`) → FILL (cumulative) and DONE.
+  **E-5 for this venue:** the execute's `Success` is the ACK; the order
+  record's fill numbers are the FILL. Fail closed: a build creates nothing
+  on chain, so any failure before the execute is a refusal; **every
+  execute answer but `Success` came after the signed transaction left the
+  host and is not believed** — `Failed`, a 4xx (a region or a key refusal
+  still halts), an unreadable or absent answer are in doubt, polled like
+  an unanswered one, and released (DONE, never landed) only once its
+  blockhash has surely expired (300 s after the execute; ~150 blocks live
+  60–90 s) AND recon read every page without finding it — pages left
+  unread are no evidence; a terminal record without its fill quantity (or
+  a filled one without its price) is not read, never booked unfilled; an
+  order — landed, or in doubt with pages left unread — that recon cannot
+  read for 30 tries is LOST and halts. **Recon reads 4 pages of 50**: if
+  `/orders` lists oldest first, an account past 200 orders would LOSE (and
+  halt on) every in-doubt order — J5 pages deeper or queries by time
+  before arming. **Execute-stage refusals count toward the reject-streak
+  halt** (`halt_on_reject_streak`): a `Failed` or a 4xx at the execute
+  raises the streak while its row stays in doubt; a landing resets it. The
+  build's `lastValidBlockHeight` is not used (no chain height is read in
+  this pass).
+- **Halts** (the duplex's halt word): a region refusal, an authentication
+  refusal, a lost order, a lost event, the arm's own (an event of no
+  order, a full queue or ledger, a fill price off the binary law: it halts
+  jup-gw too, so a queued intent is refused unbuilt), and the operator's —
+  **`exec.HALT`
+  on slot 11 reaches the arm's `cancel_slot`, which halts jup-gw's builds**;
+  a landed keeper order cannot be pulled, so it is still polled and
+  reconciled to its end (`cancel_slot_state` answers Working until then).
+- **The arm** (`exec_jupiter::arm`, an `OrderDispatch`): slot 11 only;
+  `Order.venue` = Jupiter; a 5-minute leg (R-PMJ-3) of a family allowed
+  live, on the window its order law is in force for; an IoC BUY at
+  `0 < px < 1`; a deposit `px·qty/1e6` of at least the venue's $5 and at
+  most the per-order maximum (`pmj.toml`); no cancel, no modify. Its worth
+  for the session bound: the wallet's USDC plus each unclaimed leg at cost,
+  a leg its roll settled as lost at 0; the anchor at the first balance read
+  (or the boot's).
+- **Claims are held, not sent:** jup-gw reads the positions, builds each
+  claimable one's claim, guards it (no token may leave our account) and
+  signs it — and stops: **the claim's submission route is unverified until
+  J0 records one** (and no claim is built while jup-gw is halted). A won
+  leg therefore stays in the worth at cost — until the positions read
+  shows it claimed (or settled by the venue on its own, `settlement:
+  auto`): then it leaves both ledgers, its payout in the USDC. Between a
+  balance read that already holds the payout and the positions read that
+  removes the leg (≤ 60 s), the worth is overstated by the leg's cost.
+  J5 wires the route before any arming.
+- **Wire facts to verify at J0 (before J5):** the market id
+  `POLY-<Gamma id>-<0|1>` with `isYes: true` for a buy of either outcome;
+  `requiredSigners` = our wallet alone on a keeper order; the `/orders`
+  record's `filledContracts` / `avgFillPriceUsd` spelling and units; the
+  `/positions` envelope; the balances read (`GET /ultra/v1/balances/{wallet}`,
+  `amount` in base units, `SOL` for the native coin); the claim route;
+  whether a venue-settled position reads `claimed`, and what the build's
+  `settlement: auto` means.
+- **HTTPS:** one keep-alive connection to `api.jup.ag` through
+  `core_net::HttpsReq` (HttpsConn's raw form) rather than HttpsConn
+  templates — a template's query form always renders `path?`, so the two
+  path-parameter requests fit none; the `x-api-key` header is fixed at boot
+  in the gateway's own buffer (wiped on drop). Two copies are not wiped:
+  the request buffer `HttpsReq` renders each head into, and the caller's
+  environment read (J5's wiring).
+- **Boot checks:** jup-gw refuses a guard for another wallet, a signer
+  that is not the wallet, an API key a header cannot carry, a short body
+  window; the arm refuses any slot but 11; both refuse a per-order maximum
+  under $5, and the boot (J5) builds both from one `pmj.toml` key. The
+  live-slot-11 refusal in `exec_boot` is unreachable until J4 gives slot
+  11 its `BUILT_MASK` bit (S16-R5 refuses it first): J4 pins it with a
+  test in the same commit.
+- **Secrets:** `JUP_API_KEY` and `PMJ_WALLET_KEY` reach the process only
+  through the wrapper sourcing `.env` (J5's wiring: slot 11 paper builds no
+  arm and reads neither). The wallet key loads through
+  `Ed25519Signer::from_solana_keypair` into the locked page.
+- **Gauges:** the arm's and jup-gw's `/metrics` words (`engine_pmj_arm_*`,
+  `engine_pmj_gw_*`: refusals by reason, the USDC and SOL gauges); the
+  latencies in the duplex's fixed series — `push_to_write` decision → build,
+  `post_rtt` the build, `rest_rtt` the land, `cancel_rtt` a status poll,
+  `fill_venue_to_local` execute → fill read.
+- **Risk review** (an Opus subagent at xhigh, read-only, three rounds):
+
+  | round | verdict | findings → resolution |
+  |---|---|---|
+  | 1 | BLOCK | MAJOR: recon running out of pages read as "never landed"; the signer count checked on the answer only (a durable nonce); a token debit's source and mint unchecked; a balance without USDC read as 0; a terminal record without its quantity booked 0; NEEDS-DOCS: the CPI-deposit consequence. MINOR: a 4xx execute freed its row; the 120 s blockhash rule; the build not cross-checked; the arm's halt not stopping jup-gw; claimed legs never leaving; the fee bound unstated. NITs: boot checks, claims while halted, key copies, the signing-key bullet | each fixed in code with a named test (`hostile_a_second_required_signer_is_refused`, `hostile_a_durable_nonce_advance_is_refused_whatever_it_names`, `hostile_a_debit_from_another_account_or_mint_is_refused`, `recon_that_runs_out_of_pages_never_releases_an_in_doubt_order`, `a_terminal_record_without_its_numbers_is_retried_never_booked_unfilled`, `a_balance_answer_without_usdc_is_a_failed_read`, `an_execute_refused_with_a_4xx_is_in_doubt_and_a_region_refusal_still_halts`, `a_build_for_another_order_is_refused_unsigned`, `the_arm_boots_only_for_slot_11_and_its_own_halt_stops_the_gateway`, `a_claimed_position_leaves_the_held_table_and_tells_the_arm`, `no_claim_is_built_while_halted`), or written above (the CPI consequence and its three pre-dust requirements, the fee bound, the key copies) |
+  | 2 | BLOCK | MAJOR (from the 4xx fix): execute-stage refusals never reached the reject streak. MINOR: `EVT_CLAIMED` could overflow the event ring; `on_claimed` left the worth stale; the recon depth. NITs: a missing `orderCostUsd`; the deposit config unchecked at boot; two J0 facts | `execute_stage_refusals_count_toward_the_reject_streak`; claimed events within the ring's room, a leg cleared after its event; the worth recomputed; the depth and its pre-arming requirement written above; `has_cost` (MISMATCH), `GwBootErr::Deposit`; the J0 list |
+  | 3 | APPROVE | residual NIT: a position listed twice would send one empty `EVT_CLAIMED` (matches no leg: 5-minute instances set bit 31) — harmless | — |
+
+J3-GATES (2026-10-18, on the Mac, detached; the release binary untouched,
+mtime 2026-10-17 13:45Z): `make lint` rc 0, 0 warnings · `cargo nextest run
+--workspace` 4 906 run, 10 skipped — 4 905 passed and one test whose boot the
+round-2 `GwBootErr::Deposit` correctly refused, its fixture fixed and
+re-run with `exec-jupiter` + `bench`: 190 passed · `make alloc-assert` 135
+passed at 0 B (a fresh `Compiling bench`; gate 134 the guard / sign /
+scanners, gate 135 jup-gw + the arm's steady state: 15 orders admitted,
+built, guarded, signed, executed, polled, reconciled, filled and retired, 12
+measured) · `make copy-audit` hits 27, baselined 27, new 0 (`exec-jupiter`
+in the set) · `make license-check` OK (it counts tracked files; the new
+crate's SPDX headers checked by hand) · fuzz `jup_wire` 60 s clean, 6.57 M
+runs (the transaction parse + guard and every scanner, the held file) ·
+`make bench-check` RED on `bin15/late_fair_in_window` alone (+16.3 %; red at
+HEAD too, J1b's A/B).
+
+### J4 — `strategy-pmj`, slot 11's member (PAPER)
+- **The member** (`crates/strategy-pmj`) trades slot 9's H90 law on the
+  5-minute pool only (the `pm5_*` syms; instance ids carry bit 31; a
+  15-minute record is ignored, R-PMJ-3). **The law is duplicated, not
+  shared:** the crate is `strategy-pm15` copied and adapted, so slot 9 —
+  armable — stays bit for bit; the cost is two copies to keep in step until
+  the 5-minute research (R5) freezes its own law, and a change to pm15's law
+  is NOT a change to pmj's. PMJ's own keys: the **price floor** (the
+  favourite's ask ≥ 0.90, else `skip_price`); the **keeper's lead** (`τ ≥
+  max(tau_min, min_tau)`, 3 s); the **$5 deposit** (sized up to $5 plus one
+  share step, never past the market's room — under $5 of room, no order);
+  the **paper fee** at twice Polymarket's taker fee (`2 × 0.07·p·(1 − p)`
+  per share: the keeper's and Jupiter's — MEASURED from the venue before
+  any arming, never read from a doc). Orders: an IoC BUY of the favourite,
+  `VenueId::Jupiter`, the Polymarket leg's sym.
+- **The paper law** (the plan's keeper-aware law): the held-quote book
+  (`core_fill::held`) carries the 5-minute legs after the 15-minute ones; a
+  5-minute IoC is judged against the touch held at its submit +
+  `paper_delay_ms` (2 s default, `pmj.toml`;
+  `PaperDispatcher::with_pm5_held_delay_ns`) — the keeper's latency, not the
+  CLOB's *(PMJ J8: the touch and the levels behind it, the FAK sweep,
+  `### J8`)*. The 15-minute legs keep pm15's delay. The delay is bounded by the
+  keeper's lead (`paper_delay_ms` < max(`tau_min`, `min_tau_s`), else the
+  parse refuses): an order decided at the window's floor is still judged
+  before the close, never against a book the venue has closed. The pending
+  IoCs have a share per class (`core_fill::held::HELD_PENDING_SHARES`: 16
+  options, 8 15-minute legs, 8 5-minute legs — one per family, a member
+  holding at most one IoC per family): a burst of slot 11's or slot 7's
+  never refuses slot 9's take (the book's 16 were shared before J4).
+- **A miss frees its market on the member's timer, not at the verdict:**
+  like slot 9's member, slot 11's keeps the trait's no-op for the
+  dispatcher's `CANCELED`/`EXPIRED` order event, so an IoC that does not
+  fill blocks its market until `2 × order_ttl` (10 s) — about 60 % of the
+  late window — and `max_orders_market` is rarely reached. The paper run
+  is that law's, conservatively; changing it for slot 11 alone would part
+  the two copies (above) and is a ruling, not a J4 fix.
+- **The artifact** `~/multivenue/pmj.toml` (`core_config::pmj`: one `[pmj]`
+  section, every bound at parse, the bytes hashed into the boot tell
+  `pmj: artifact configured (PAPER) …`). Read only when `--strategy` names
+  `pmj`; a request without it aborts the boot; `families` must equal the
+  universe's 5-minute `[polymarket] rolling` list in order; `pmj-check`
+  validates it offline. `PMJ_TOML=<path>` in `strategy.conf` names another
+  (`scripts/engine-wrapper.sh`, the `XMM_TOML` shape: a file, and `STRATEGY`
+  must carry `pmj`, else exit 78). A `pm15.toml` copied whole refuses (its section, its
+  `usd_order_1e6`, no deposit). Its H90 values are pm15's, provisional (R5).
+- **The frame (paper; the dust frame R-PMJ-5 names for J5):** the deposit
+  $5 per order; `usd_market` $10 per market; the session loss bound −$50
+  (at or below it the member enters nothing for the session: `skip_halt`,
+  `engine_pmj_halted`); `max_orders_market` 4; `order_ttl` 5 s (a pending
+  order written off at 2 × ttl). Parse bounds: deposit and market
+  $5..$10 000 (the market ≥ the deposit; a deposit within $0.01 of the
+  ceiling leaves `max_order` no room and refuses), session above $0 up to
+  $10 000, orders
+  1..16, ttl 1–30 s, `paper_delay_ms` 0–30 000 and under 2 × ttl and under
+  the keeper's lead, `min_tau_s` 0–59 and under `tau_max`, the price floor
+  0.50–0.999999. **The per-order maximum** (`max_order_usd_1e6`, the J3
+  arm's refusal line) defaults to the deposit + $0.01 and the parse refuses
+  less (`PMJ_SIZING_SLACK_1E6`): the member buys whole hundredths of a
+  share and one more when the rounding left the order under $5, so an order
+  costs at most the deposit + $0.01 — the arm would otherwise refuse the
+  default artifact's every order at J5 (risk review J4, round 1).
+- **Masks and names:** `BUILT_MASK` 0x02FF → 0x0AFF (bit 11); `ALL_MASK`
+  stays 0x00FF (`all` never names slot 11). `/state`'s slot 11 is `pmj`
+  (engine-snapshot's `SLOT_NAMES`, the dashboard's, `exec_boot`'s slot
+  list); slot 12 is now the first reserved slot the unbuilt-slot tests use.
+  **S16 amended:** the debug guard's probe slots (S16 above: "the debug
+  tests at slots 8, 11 and 15") are **8, 12 and 15** since J4 — slot 11 has
+  a member; the strategy-set and `exec_boot` probes moved with it, and a
+  `1u8 <<` at 12 panics in debug as it did at 11.
+- **Paper only, three ways:** the engine refuses a live slot 11 and a live
+  slot naming `jupiter` (J3c, `exec_boot`); `scripts/pmj-flip.sh` has
+  `status` and `paper` — `live` only refuses (`the_pmj_flip_has_no_live_path`);
+  a paper boot never builds the arm (`exec-jupiter` is not linked into the
+  loop). **Arming needs a later `PMJ-DUST-GATE` line here** (J5: R-PMJ-5's
+  dust battery, after J0); nothing in J4 is that line.
+- **Metrics:** `engine_pmj_<tally>_total` (31) and six level gauges,
+  registered at every boot (`the_pmj_member_family_is_31_counters_and_6_gauges_beside_pm15s`;
+  the worst-case boot still fits the fixed registry); `engine_pmj_arm_*` /
+  `engine_pmj_gw_*` stay unregistered until J5's live boot. The dashboard's
+  pmj panel reads `engine_pmj_*` and `engine_ingress_pm5_*`.
+- **Alloc:** gate 136 (`pmj_member_steady_state_is_zero_alloc`) — the
+  member over a real `PaperMatcher`'s 5-minute held branch: four windows
+  taken, held for the keeper's delay, judged, filled and settled at 0 B.
+- **Risk review** (an Opus subagent at xhigh, read-only, two rounds):
+
+  | round | verdict | findings → resolution |
+  |---|---|---|
+  | 1 | NEEDS-DOCS | NEEDS-DOCS: the frame (caps, halt, bounds) unwritten, and a J5 trap — `max_order` defaulted to the deposit while the member sizes up to the deposit + one share step, so the J3 arm would refuse the default artifact's every order. MINOR: `paper_delay` bounded by the ttl only, not by the keeper's lead; `pmj-flip.sh paper` with `ARM_LIVE=11` alone left `EXEC_TOML` set and `ARM_LIVE` empty (the wrapper refuses that boot); the held book's 16 pending shared by slots 7, 9 and 11 (a 5-minute burst could refuse slot 9's take). NITs: `[guard]` wording, the S16 probe slots, the miss's 10 s block, gate coverage of the matcher's 5-minute branch | `PMJ_SIZING_SLACK_1E6` (`max_order` ≥ the deposit + $0.01, the default; pinned) and "The frame" above; the lead bound (pinned); pm15-flip's `kv_off` of both keys, `status` names a half pair (smoke-tested, pinned); `HELD_PENDING_SHARES` 16 / 8 / 8 (`a_full_burst_of_one_class_never_refuses_another`); the wording; "S16 amended" above; the miss recorded above (a ruling, not a fix); gate 136 over the matcher |
+  | 2 | APPROVE | NITs: the session floor is any positive amount, not $1; a deposit within $0.01 of the $10 000 ceiling refuses | both written into "The frame" |
+
+J4-GATES (2026-10-18, on the Mac, detached; the release binary untouched,
+mtime 2026-10-17 13:45Z): `make lint` rc 0, 0 warnings · `cargo nextest run
+--workspace` 4 925 run, 4 925 passed, 10 skipped · `make alloc-assert` 136
+passed at 0 B (a fresh `Compiling bench`; gate 136 new) · `make copy-audit`
+hits 27, baselined 27, new 0 (`strategy-pmj` and `cli/src/pmj_boot.rs` in
+the set) · `make license-check` OK (748 files; it counts tracked files, the
+new files' SPDX headers checked by hand) · `uv run pytest` 1 784 passed, 3
+skipped (serialized behind a running `candles` verb) · `make py-lint` RED on
+two E501 lines in `tests/test_dashboard.py` (864, 867: PM15-8's, untouched by
+J4) · fuzz `jup_wire` 60 s clean, 6.83 M runs (no J4 parser has a target;
+`pmj.toml` is parse-tested) · `make bench-check` RED on
+`bin15/late_fair_in_window` (+16.3 %, red since J1b's A/B) and on
+`strategy_set/on_tick_none` (+21.9 %) / `strategy_set/on_timer_all` (+24.2 %):
+the set's fan-in tests one mask bit per BUILT row per event, and J4 adds a
+row — two J3 runs 2.81 / 2.84 ns and 2.55 / 2.56 ns, two J4 runs 3.06 / 3.06
+ns and 3.03 / 2.81 ns (+0.25 ns a record; HEAD's interleaved A/B, J1b: 3.13 /
+3.71 ns). **Re-baselined (R-PMJ-S10)**, each the median of three `make
+bench-check` runs on the final tree with the engine running (load 5.3–6.4):
+on_tick_none 2.51 → 3.06 ns (3.060 / 3.058 / 3.066), on_timer_all 2.26 →
+2.81 ns (2.808 / 2.810 / 2.808); `crates/bench/baselines/hot_path.json`
+records why. Against it the two pass (+0.2 %, −0.1 %); `bin15/late_fair_in_window`
+stays red as before. A set-bit fan-in (the cost by enabled members, not
+built rows) is a possible later lane.
+
+### J6 — the rolling depth capture, bounded (2026-10-19, ruling R-PMJ-S15)
+- **Why:** J1b's rolling depth capture (`pm15-depth.pmlr` + `pm5-depth.pmlr`)
+  recorded every top-5-per-side change of every leg — ~1.35 GB/h at 7 + 7
+  families, half the run dir's ~2.7 GB/h (the operator's Mac, 2026-10-18) —
+  and the disk fell to 3.6 GiB free (relieved by the S3 push and cleanup at
+  19:35–20:00Z and 2026-10-19 03:15–03:22Z).
+- **The rule:** `[polymarket] rolling_depth` (default on) and
+  `rolling_depth_ms` (default 1000, 0..=60000; 0 = every change, J1b's
+  stream bit for bit): a leg's records are at least the spacing apart, a
+  new window's first book is not held by the spacing (it is written at its
+  first book or change once the slot goes live), and a change
+  the spacing held is written by the first market `PONG` sweep at least the
+  spacing after the leg's last record — so at most spacing + 5 s late (~6 s
+  at the default). That is a departure from the ruling's "the next PONG",
+  made to keep the one-record-per-spacing cap. A sweep record carries the
+  PONG's arrival time. A held change is lost when the leg stops ticking
+  before the sweep (its window resolves or retires, its slot breaks, or the
+  market session drops and the ladders clear) — at most the last spacing +
+  5 s of a window; the first book after a reconnect (not a rebind) waits for
+  the spacing too. Capture only: no lane, member, cap, halt or law reads
+  depth; the ticks and events are identical under every policy, on the
+  replay and on the PONG sweep (pinned by
+  `the_depth_capture_keeps_one_record_per_leg_per_second_and_the_sweep_catches_up`).
+- **The market sockets (diagnosed, not changed):** Polymarket closes the
+  rolling market sockets with **1013 "slow consumer: send buffer full"**
+  (on 2026-10-19 00:11–03:25Z: pm5 111×, pm15 42×). A standalone probe on
+  its own connection (12 tokens; vault `docs/research/pmj/j5probe/`, logs in
+  `~/multivenue/research/pmj/ws-close-*.log`) saw the same code on its
+  dynamically re-subscribing connection (after 65–367 s) while its static
+  one held 868 s — consistent with a venue-side per-connection limit at the
+  5-minute books' message rate, but not conclusive: the probe's own stalls
+  (synchronous discovery calls) and this host's receive side are not
+  excluded, nor is J1b's per-change depth work on the ingress thread. Each
+  close withdraws the touches until the resubscribe. **To do:** re-count
+  the closes per hour after J6 deploys; the remedies (the subscription
+  sharded over several sockets, or a larger kernel receive buffer — a new
+  dependency) are their own ruling.
+- **Risk review** (an Opus subagent at xhigh, read-only, three rounds): 1
+  NEEDS-DOCS (the new test never reached the PONG sweep — its fixture's
+  last frame resolves the window; the 1013 diagnosis overstated; "≤ 5 s"
+  wrong, it is spacing + 5 s; the loss when a leg stops ticking; the
+  readers' note; the ruling row) → the test rewritten to search a cut that
+  holds a change back and to pin ticks and events identical on the replay
+  and the sweep, the docs corrected; 2 BLOCK (the rewritten test did not
+  compile: `ChannelEvent` has no `PartialEq`) → compared by its fields; 3
+  **APPROVE**, on the conditions that bench-check's reds be judged by an
+  A/B against HEAD (R-PMJ-S6) and that the restart keep the restart law.
+
+J6-GATES (2026-10-19, on the Mac, detached; the release binary untouched by
+the gates): `make lint` rc 0, 0 warnings · `cargo nextest run --workspace`
+4 927 passed, 10 skipped · `make alloc-assert` 136 passed at 0 B (gate 133
+under the deployed policy with PONGs) · `make copy-audit` new 0 · `make
+license-check` OK (769 files) · `uv run pytest` 1 784 passed · fuzz
+`universe_toml` 60 s clean (18.1 M runs), `pm_rolling_frame` 60 s clean
+(193 k runs, under the deployed policy) · `make py-lint` RED on PM15-8's two
+E501 lines (untouched) · `make bench-check` RED on untouched groups
+(strategy_set, bin15, ledger, dispatcher, cooldown) with the host's load at
+14–20 — the interleaved A/B against HEAD `86d69f8a` (R-PMJ-S6; a read-only
+worktree and its own target dir, both removed): run 1 A/B on_tick_all
+5.10 / 5.11 ns, on_timer_all 2.87 / 3.00, late_fair 397 / 394, late_grid
+2.41 / 2.39, locate_miss 3.32 / 3.60, queued_submit 0.596 / 0.590,
+cooldown 0.527 / 0.543; run 3 (both under load) 6.89 / 7.05, 3.66 / 3.71,
+397 / 400, 13.4 / 13.7, 3.87 / 3.84, 0.85 / 0.88, 0.70 / 0.70 — J6 equal to
+HEAD; no bench links the rolling driver.
+
+### J7 — the rolling market socket, sharded (2026-10-19, rulings R-PMJ-S17..S20)
+
+- **Why.** After J6 the venue still closes the rolling market sockets with
+  1013 "slow consumer: send buffer full" (pm5 6×, pm15 1× in the first 7 min
+  after the J6 boot). Each socket's load at 05:01Z: pm15 ≈ 925 frames/s and
+  0.55 MB/s (28 tokens), pm5 ≈ 1 000 frames/s and 0.62 MB/s (42 tokens). This
+  host drains them: `Recv-Q` 0 on every Polymarket socket in six samples
+  3 s apart, and macOS autotuned the receive buffers to 340 / 550 KB. That
+  excludes J6's open hypotheses on this side (the receive buffer, the
+  ingress thread's work): the venue's per-connection send queue overflows.
+  Other clients report the same law: one socket per asset × timeframe ran
+  without disconnects ([polymarket-crypto #241](https://github.com/zayansalman/polymarket-crypto/pull/241)),
+  and even two assets per socket close "over time"
+  ([rs-clob-client-v2 #122](https://github.com/Polymarket/rs-clob-client-v2/issues/122)).
+  Sharding cuts each socket to its families' load and bounds a close to
+  them; it may not end the closes.
+- **The rule.** `[polymarket] rolling_market_sockets` = n (1..=8, default 8
+  — the family cap, so every family rides its own socket): family `f`
+  rides shard `f mod n`, and a pipeline opens min(n, its families) sockets —
+  seven per period today (the boot log line `pm15: the families ride n
+  market socket(s)` / `pm5: …` names it). Still one ingress thread and one
+  `mio` poll per period; market shard `k` is token `k`, RTDS token 8
+  (`PM15_MARKET_SOCKETS_MAX`). Each shard has its own `WsConn` (1 MiB receive
+  window, allocated at boot), its own dial schedule (the backoff seed mixed
+  by `k`; shard 0 keeps the pipeline's; no shard `k` dials before
+  `k` × 250 ms — discovery binds the families one by one anyway, so this is
+  a floor), its own 5 s `PING` and its own feed clock, and it dials only
+  while it carries a bound window. After a host network blip every socket
+  fails its 12 s idle law together and redials within the backoff's first
+  250–500 ms: the one burst left. Its open
+  subscribes only its families' bound tokens; a dynamic subscribe and a
+  settlement's unsubscribe go out on the slot's own shard
+  (`PmAction::Unsubscribe` now carries the slot); its `PONG` re-asserts (and
+  sweeps the depth of) **only its own legs** — another shard's socket may be
+  the one behind; its loss withdraws only its legs and restarts only their
+  ladders, their sequencer clocks and its own feed clock. A frame finds its
+  leg by token, whichever socket carried it.
+- **State and metrics.** `engine_ingress_<label>_state` over the shards:
+  Backoff while a shard that carries a bound window waits to dial or redial
+  (its staggered first dial included),
+  Connecting while one dials (or before the first socket opens), else Up
+  (`market_state`, pinned) — with one shard the states as before but one: a
+  lost socket with no window bound reads Connecting (it was left at
+  Backoff). Only the `engine_ingress_<label>_state` gauge reads it: pm15 /
+  pm5 are not `/state` ingress lanes, and no member, halt or dashboard rule
+  reads the state. `market_reconnects_total`,
+  `reconnects` and `last_market_err` are summed / the latest over the shards.
+  New gauge `engine_ingress_<label>_market_sockets_open`.
+  `feed_delay_ema_ms` is the clock of the shard whose leg ticked last.
+- **Hot path.** Frame handling is unchanged but for one read of a boot-time
+  `u8` table (the slot's shard, masked, no bounds check) per tick (its
+  clock) and in the per-shard PONG and withdrawal loops. Zero allocation
+  after boot: gate 133 runs n = 8 with one family (on shard 0), that shard
+  dropping and reopening every 50 s; the run loop itself (`run_pm15`, its
+  per-shard dial / ping / flush passes) is under no alloc gate, as before
+  J7. No new copy, no new dependency.
+- **Equivalence, pinned.** `sharding_changes_only_the_socket_a_frame_rides`:
+  the live window replayed as two families (the same frames on a second
+  family's tokens) with a `PONG` on every socket — one socket and two give
+  the same ticks, events and depth records and the same dynamic frames,
+  each on its family's socket. `each_family_rides_its_own_market_socket_and_a_loss_withdraws_only_its_legs`
+  pins the open, the PONG, the loss (the other shard's sequencer and feed
+  clocks untouched), a window bound while its shard is down, and the
+  socket of a dynamic subscribe and of an unsubscribe; `the_shard_table_spreads_the_families_modulo_the_socket_count`
+  the table and the tokens; every pre-J7 driver test runs unchanged at one
+  socket.
+- **Cost.** 14 rolling market sockets on the venue's host instead of 2 at
+  seven families per period — beside the static `pm` ingress socket and,
+  when slot 9 is armed, its `/ws/user` socket: 15–16 connections from one
+  IP (the venue documents no WebSocket connection limit; its rate limits
+  are HTTP's). 14 × (1 MiB + 64 KiB) of windows. The boot resolves the host
+  once per socket (a later shard's failed lookup is retried three times,
+  200 ms apart, before it fails the boot — and with it the engine, slot 3
+  included, as any rolling boot failure did before J7). Watch
+  `market_reconnects_total` and `last_market_err` for refused upgrades in
+  the first 15 minutes; the rollback is one key.
+- **Rollback.** `rolling_market_sockets = 1` and a restart give one socket
+  per period with this binary. The previous binary refuses the key (unknown
+  key): remove it with the binary.
+- **Risk review** (an Opus subagent, read-only, two rounds): 1 NEEDS-DOCS,
+  no blocker, 17 findings — the slot 9 law still read per-socket; the cost
+  numbers (8 sockets built per period, 7 dialled; the static `pm` and the
+  user socket on the same host); gate 133's reach overstated; no test of a
+  dynamic subscribe's socket nor of the other shard's clocks across a loss;
+  `market_state` untested and its n = 1 claim off by one case; the battery
+  to run; the dial burst at boot; 16 DNS lookups at boot; the per-tick
+  bounds check; debug asserts; the gauge on a poll failure; a test name; the
+  readers' note; the two bounds untied → min(n, families) sockets, the
+  first dials staggered, a later shard's failed lookup retried (warned),
+  the index masked, the tests and the pure `market_state` added, the docs
+  corrected (r1 #11 a cross-shard frame counter and #12 the delay EMA's
+  max over shards: noted, not done); 2 **APPROVE** (nits applied: the
+  stagger is a floor, discovery already paces the binds; Backoff includes
+  a staggered first dial; the spawner's doc; a warn per DNS retry), on the
+  condition that the battery and the bench A/B on the final tree be green.
+
+J7-GATES (2026-10-19 05:55–06:05Z, on the Mac, detached, the final tree;
+the release binary untouched by the gates): `make lint` rc 0 · `cargo
+nextest run --workspace` 4 934 passed, 10 skipped · `make alloc-assert` 136
+passed at 0 B (a fresh `Compiling bench`) · `make copy-audit` new 0 · `make
+license-check` OK (769 files) · `uv run pytest` 1 784 passed · fuzz
+`universe_toml` 60 s clean (19.1 M runs), `pm_rolling_frame` 60 s clean
+(176 k runs, two families on two sockets) · `make py-lint` RED on PM15-8's
+two E501 lines (untouched) · `make bench-check` RED on 8 untouched samples
+(dispatcher, strategy, vol, bin15, strategy_set, ledger) with the host's
+load at 15 — `hot_path` links none of the crates J7 changes (core-config,
+ingress-polymarket, cli; no crate it uses depends on them). The interleaved
+A/B against `56284590` (R-PMJ-S6; a read-only worktree and its own target
+dir, both removed), medians of three A / B: on_tick_all 6.99 / 7.94 ns (run
+3: 6.70 / 6.55), on_tick_none 3.34 / 3.55, on_fill_routed 2.34 / 2.77 (run
+3: 2.30 / 2.26), on_timer_all 3.72 / 3.73, late_fair 400 / 398,
+late_grid 13.0 / 13.0, locate_miss 3.83 / 3.73, cooldown 698 / 693 ps,
+long_day_close 38.4 / 38.4 µs, latency_arb 3.45 / 2.96 — the swings run
+both ways under the load (B's run 2 and A's run 2 the outliers); J7 equal to
+HEAD.
+
+### J8 — the paper fill matches the venue (2026-10-19, rulings R-PMJ-S21..S26)
+
+- **Why.** The touch alone is not how the venue matches a FAK, and slot 9
+  entered far under its belief in near-tie windows; the measurement and the
+  takes are the plan's (`claude/pmj-fill-plan-2026-10-19.md`, the vault's
+  `docs/research/pmj/fill/`), not this document's.
+- **F1 — the FAK sweep (R-PMJ-S23).** `core_fill::held`: a rolling leg's IoC
+  takes the touch in force at submit + Δ (unchanged: 350 ms for pm15,
+  `paper_delay_ms` for pmj), then the levels held behind it up to the limit,
+  best first, up to its size; ONE fill at the size-weighted price, rounded
+  against the taker; each level's size consumed. The touch is the gate (none,
+  stale or past the limit fills nothing); a level at the touch's price or
+  better is never taken from the levels; five levels and no more (the rest
+  cancels — fewer shares booked, on a losing take as on a winning one). The
+  levels must be as new as the touch: when the touch changed after the levels
+  last arrived (the frame's depth record still in its lane — the depth lanes
+  drain after the tick lanes), the order sweeps the touch alone, counted
+  (`engine_paper_matcher_held_levels_lagged_total`). How to read that
+  counter: any stale tick clears the leg's last touch, so the next touch —
+  a PONG's re-assert of the same price included — counts as a change, and
+  the leg sweeps the touch alone until its levels next arrive; the counter
+  over-reads and the paper fill under-fills there, never the reverse. The
+  opposite lag — levels newer than the touch — is not caught: it needs a
+  dropped tick (counted) or more rolling ticks backed up in one engine pass
+  than the drain takes, and the touch in force still gates the fill. The
+  Hypercall options keep the touch law.
+  - **The depth lanes.** `engine::NUM_DEPTH_LANES` 2 → 4:
+    `PM15_DEPTH_LANE` 2 and `PM5_DEPTH_LANE` 3, one per rolling ingress
+    thread (single writer each). The ingress pushes a ticking leg's top five
+    on every change — its own change gate (`lane` pairs), independent of the
+    capture's 1-per-second policy, so no disk; reset at each rebind and each
+    shard's loss and open, so the first book after a loss reaches the lane
+    even unchanged. The engine hands every depth record to the dispatcher
+    first (`OrderDispatch::observe_depth`, default no-op; the paper matcher
+    judges due held IoCs against the book before the record, as for a tick,
+    then holds it); members still see only OKX's and Deribit's
+    (`NUM_VENUE_DEPTH_LANES`). The routed dispatcher hands depth to its paper
+    arm only; a withdrawn (stale) touch clears its leg's levels.
+  - **Cost.** One more `top_k` and compare per book event of a ticking leg
+    on the ingress thread (the lane's gate; J6's capture ran it at most once
+    a second per leg) — a scan of the leg's grid on a sparse 0.001 book —
+    and one 160 B copy per lane record into the paper book (documented);
+    about 1 000 lane records a second per period. `/state` `counters.depths`
+    (`depths_dispatched`) counts the rolling lanes too. A full lane is
+    counted (`depth_ring_drops`) and the record re-offered at the leg's next
+    pass. New counter `engine_paper_matcher_held_swept_deeper_total`.
+- **F2 — slot 9's floor (R-PMJ-S24).** `strategy-pm15`: an ask under
+  `price_floor` (`pm15.toml price_floor_1e6`, absent = 0.90; 0.50..1, or 0 =
+  none) at the decision is no entry (`skip_price`, shared with an ask over
+  the limit), as slot 11's. The fill 350 ms later can still land under the
+  floor (the limit is p − e). P0's law amended, documented above.
+- **F3 — slot 11's shadow delays (R-PMJ-S25).** Each slot-11 IoC is judged
+  in shadow at 350 ms and 1 s after submit against the book then — on
+  copies: nothing consumed, nothing booked — beside its real verdict at
+  `paper_delay_ms`: `engine_paper_matcher_pmj_{shadow350ms,shadow1s,real}_
+  {judged,filled,qty_1e6,usd_1e6}_total` (refusals of a full shadow table:
+  `…_pmj_shadow_refused_total`, 0 while `paper_delay_ms` ≥ 1 s). J0's
+  measured keeper latency can then be priced on the paper history.
+- **What it changes in the books.** More of each rolling take fills, at a
+  worse size-weighted price; slot 9 stops deciding entries under 0.90. Slot
+  9 and 11 paper P&L before and after the J8 boot are different laws (the
+  shadows price slot 11's delay, they do not reconstruct the touch law).
+- **Rollback.** The previous binary, `4690bcac` (the deploy's kit). With
+  this binary, `price_floor_1e6 = 0` in `pm15.toml` restores slot 9's law
+  as frozen; the sweep has no switch.
+
+### J9 — slots 9 and 11's paper P&L, since start (2026-10-19, rulings R-PMJ-S27..S30)
+
+- **Why.** The members' P&L counters (`engine_pm15_pnl_usd_1e6`,
+  `engine_pmj_pnl_usd_1e6`) are per engine session: they restart at every
+  boot. A window that ends before a boot and resolves after it is settled
+  by neither session (the old one stops, the new one holds no such
+  instance). A window the ingress retires unresolved (`v0` 0) the member
+  books as a full loss (`settled_unknown`); J9 waits for Gamma there
+  instead (R-PMJ-S28). A late fill whose instance no market holds is not
+  booked by the member (`unknown_fills`, must stay 0); J9 books it.
+- **What.** `claude_worker.pm_paper_pnl`, a worker-side pass — Python only,
+  no engine change — run by launchd `com.multivenue.pm-pnl` at :06, :21,
+  :36 and :51 (`scripts/pm-pnl.sh`):
+  - every slot 9 / 11 PAPER trade fill since the start
+    (`engine-fills.pmlr`); a venue-origin fill of either slot (an armed
+    arm) is counted, never booked here; an unreadable capture is reported
+    and skipped;
+  - its window named from the member's client order id and the run's
+    instrument manifest — the sym's family, pair and leg, the order id's
+    and the instance's must agree, and the pair must be the window's, or
+    the fill is reported `unmapped`;
+  - labelled on the venue's result: the settled roll row of the fill's own
+    run's capture (`market_resolved`), else Gamma's resolved market by slug
+    (R-PMJ-S28) — a later run's capture is not consulted, so with Gamma
+    down such a window stays open; Gamma re-checks each capture label once
+    (after the windows that need it, within 64 reads a pass, none after 3
+    failures in a row), and a disagreement is counted, never absorbed; an
+    unlabelled window stays open at cost, never guessed;
+  - priced with the member's own arithmetic (cost, the paper fee 0.07 /
+    0.14 · p(1 − p) per share, payout 1 or 0 per share);
+  - the ledger `~/multivenue/worker/pm/paper-pnl.tsv` (rewritten atomically
+    in window order: a row is never modified or removed), the open fills
+    `open.tsv` (they outlive their run directory), and the summary
+    `paper-pnl.json` the dashboard serves as `pm_pnl`.
+  - An unreadable capture stays flagged at every pass while its run
+    directory is there (every run since the start is re-read): inspect it,
+    and remove the run once retention allows.
+- **Segments.** Each fill carries its run's fill law, by run epoch
+  (`pm_paper_pnl.SEGMENTS`): `touch` (before the J8 boot) and `j8` (the
+  sweep; slot 9's floor). The page shows one line per segment and never
+  sums across them. **Any change to slot 9's or 11's fill or entry law — a
+  rollback (the `4690bcac` kit, `price_floor_1e6 = 0`) included — adds a
+  `SEGMENTS` row in the same change.**
+- **Laws.** Read-only on the captures; writes only `worker/pm/`; never
+  `state.db`, the engine or a secret (`.env` is not sourced); the CMDLINE
+  LAW (venv alias + `scripts/pm-pnl.py`); a lock serializes passes. Its
+  only socket is Gamma's public read, at most 64 a pass.
+- **Not covered.** Slot 11's shadow verdicts (350 ms / 1 s) are aggregate
+  counters with no per-order record, so they cannot be settled per window.
+- **Rollback.** `launchctl bootout gui/$UID/com.multivenue.pm-pnl`; the
+  page's ledger lines then read the last summary written, and say its time.
+
+### J10 — `audit-pnl` settles Polymarket's rolling windows (2026-10-19, ruling R-PMJ-S42)
+
+- **Why.** The nightly day report (`pnl_report` → `audit-pnl`) never opened
+  the rolling captures: slot 9 / 11 intents could not fill in its replay,
+  its HIP-4-only settlement pass never saw a Polymarket window, and its
+  paper view booked every rolling paper fill as a total loss (no mark, no
+  settlement). Its `pm` fee was a flat 350 bps of notional.
+- **What.**
+  - A run that placed an order on a rolling leg also loads that leg's
+    `pm15` / `pm5` ticks, inside the run's tick span (the anchor, the
+    window's end and every other run are unchanged).
+  - A separate pass reads the settled roll rows (kind byte strict) for legs
+    the root already interned: winner +1 / −1 pays 1 / 0 on Up / Down; a
+    window retired unresolved pays 0 on both (the member's book); a window
+    with no row whose pair the run re-created is flattened at 0 there. A
+    window a run ended without a result for settles at a later run's
+    settled row when one saw it resolve, else — when a later run follows — is
+    flattened at 0 at its own run's last instant (its slot sym is reused, so
+    leaving it open would let the next window's settlement close it at the
+    wrong winner); only in the root's last run does it stay open and mark out
+    (counted; the counters name windows on traded slots, with or without a
+    position). Each rides
+    the per-sym settlement queue HIP-4 slots use. Keys are (Up descriptor,
+    instance). A Polymarket descriptor is never issued the dense id of the
+    legacy anchor (7), which the model judges as Binance.
+  - A rolling leg's taker fill pays `rate · p · (1 − p)` per share, ceiled
+    (0.07; slot 11 at 0.14, its paper law until J0), its maker fill and its
+    settlement nothing.
+  - The paper view settles rolling paper fills on the same schedule (still
+    fee-free, as for every venue in that view).
+  - Reported only when a run traded a rolling leg: `audit-pnl: run-<e>: pm
+    rolling orders=… ticks=…`, `audit-pnl: pm settlement table: …`, JSON
+    `pm_settlement`.
+- **Not the paper law.** The replay fills these IoCs by the harness's law
+  (the first fresh touch after Δ_pm, displayed size), not J8's held-book
+  sweep, so its slot 9 / 11 rows are the model's; the J9 ledger is the
+  paper book.
+- **Known limit (R-PMJ-S51).** The nightly's carry head knows HIP-4 only: a
+  window whose fill and settled row fall in two ≤ 2 h units is not settled
+  in the first. Closed as a known limit: the J9 ledger is slots 9 and 11's
+  paper truth, and the dashboard reads it.
+- **Counters (R-PMJ-S52).** `flattened_run_end` and `open_at_end` (and every
+  `pm_settlement` count) count windows on traded slots, never positions or
+  shares.
+- **Rollback.** The previous binary.
+- **Housekeeping in the same change (R-PMJ-S41).** PM15-8's two E501 lines in
+  `claude-worker/tests/test_dashboard.py` wrapped (py-lint green);
+  `bin15/late_fair_in_window` re-baselined 340 → 396 ns
+  (`crates/bench/baselines/hot_path.json`, the median of three
+  `make bench-check` runs, 395.2 / 414.4 / 396.0 ns) — no PMJ change moved
+  it (the A/B read it equal at J7 and J8).
+
+### J11 — slot 11's paper delay follows Jupiter's keeper; J9 segments per slot (2026-10-19, rulings R-PMJ-S47, S51, S52, S55)
+
+- **Why.** J0's public tape (vault `docs/research/pmj/j0/`) puts Jupiter's
+  keeper at a median of about 5 s from the create-order transaction to its
+  Polymarket print, against slot 11's assumed 2 s. A paper fill judged at
+  2 s books takes the venue could not give.
+- **Config** (`~/multivenue/pmj.toml`, outside git): `paper_delay_ms`
+  2000 → 5000 and `min_tau_s` 3 → 6. `pmj.rs` requires the delay to be
+  under the keeper's lead, so an order decided at τ = 6 s is judged at
+  τ ≥ 1 s, before the close. Slot 11's law becomes τ ∈ [6, 20) s; slot 9 is
+  unchanged. The J8 shadows (350 ms / 1 s) stay; they now price a faster
+  keeper. It takes effect at the 2026-10-19 16:05Z daily restart; the
+  previous file is `~/multivenue/rollback-pmj-20261019/pmj.toml.pre-j11`.
+- **J9.** Each `SEGMENTS` row names the slots it applies to, and
+  `segment_of(epoch, sid)` picks the last row of the fill's slot. The new
+  row `j11` (slot 11 only) starts at the first boot at or after 2026-10-19
+  16:00Z (`J11_FROM_NS`); slot 9's book stays on `j8`.
+- **Dashboard (R-PMJ-S52).** audit-pnl's fee ladder is `FEE_LADDER_BPS`
+  [0, 1, 2]; its third column was labelled "@tier" in four places and now
+  reads "@2 bps". The members table's "Σ net @tier" is another figure (each
+  member's evidence at its tier) and stays.
+- **Rollback.** Restore `pmj.toml.pre-j11` and restart; per J9's rule the
+  rollback adds a `SEGMENTS` row.
+
+### J12 — law (iii), the measured strike and settlement law, behind `strike_law` (2026-10-23, rulings R-PMJ-S59..S65)
+
+- **Why.** F4 (vault `docs/research/pmj/f4/`) measured the venue's law on
+  9 000+ windows. The strike `priceToBeat` and the settlement `finalPrice`
+  are the TRAPEZOID of the Chainlink reports over the labels `[T − 62,
+  T − 2]` (weights ½, 1, …, 1, ½), about 2 s behind the first law's mean of
+  `[T − 60, T − 1]`. On days it was not fitted on, the trapezoid matches the
+  published strike 3.3× more closely, and our own numbers call the wrong
+  outcome far less often. What it still misses scales with the asset's 1-s
+  volatility, so the residual is σ_res = max(ρ · σ, floor), with ρ fitted
+  against the raw σ (F4 §11: 0.13).
+- **The law, `core_twaplock::report`.**
+  - `ReportGrid::trap(open)` is the strike; `report_fair_trap` prices on the
+    trapezoid's own samples with its closed-form tail variance (pinned
+    against the double sum) and `sd′ = √(sd² + (σ_res · K)²)`.
+  - The report ring grows to 128 s, so `o − 62` is still held once
+    `o − 1` has arrived. The first law reads only its old 61-s horizon, so its
+    results are unchanged value for value.
+  - `late::price_twap` and BIN15's law are untouched.
+- **The members** (`strategy-pm15`, `strategy-pmj`). `strike_law` is `mean60`
+  (the default: the first law, byte-identical) or `trap62`. Under `trap62`:
+  - the strike is fixed once the report of `open − 2` is in;
+  - the grid holds the reports ×1e9 from v1 (DOGE's ×1e6 steps were
+    12.6 ppm), with the perp's BBO scaled to match;
+  - a market's strike is held in that scale;
+  - σ is measured on the fine reports too, so the quantization the ×1e6
+    steps added to a coarse asset's σ (DOGE) leaves both the main sd and the
+    residual. The F4 fit and the A/B ran on the same fine reports.
+- **Not counted (by choice).** Whether the residual's floor or ρ · σ set it.
+  `report_fair_trap` returns it, but the members' counters are pinned, so
+  it is not exported.
+- **The keys** (`pm15.toml`, `pmj.toml`; `core_config::strike_law`):
+  - `strike_law = "mean60" | "trap62"`;
+  - `sigma_res_ratio_1e3`, `1..=1000`;
+  - `sigma_res_min_ppm`, one per family, `1..=100`.
+
+  The residual keys are required under `trap62` and refused under `mean60`.
+  The boot tell adds `:strike=trap62:res=<ratio>/<floors>` under law (iii);
+  under `mean60` it is unchanged.
+- **Proof.**
+  - Unit tests in `report.rs`, both members and both configs.
+  - Alloc gates 136b and 114b: slot 11's and slot 9's members under law
+    (iii), 0 B.
+  - A real-member A/B (`crates/cli/examples/pm_law_ab.rs`, vault
+    `docs/research/pmj/j12/ab-2026-10-23.md`) over 27 runs from 10-19 08:49Z
+    to 10-23. It reproduces the engine's own mean60 orders 98–100 %. The two
+    laws are indistinguishable on that sample: wrong-side fills are 3 against
+    3 on slot 11 and 0 against 0 on slot 9.
+  - Calibration at p ≥ 0.90 sits within 1 sd of the belief under both laws.
+    Read statistically (R-PMJ-S63), both slots pass the plan's criterion 2.
+- **Deploy.** Config only, per slot, at a scheduled restart, with a J9
+  `SEGMENTS` row in the same change. Slot 9 only after 10-28 00:00Z.
+  - Slot 9 (R-PMJ-S68): `~/multivenue/pm15.toml` gets the same three keys
+    between 00:00Z and the 0010 drain on 10-28 (vault runbook
+    `docs/research/pmj/j12/slot9-flip-runbook.md`, run by a scheduled task),
+    so the 0010 restart is its first boot. Its `j12` row (`J12_SLOT9_FROM_NS`,
+    10-28 00:00Z, slot 9 only) is in the worker from 10-23; until then the
+    dashboard shows it as slot 9's current segment, empty.
+  - Slot 11 (R-PMJ-S63): `~/multivenue/pmj.toml` gets `strike_law =
+    "trap62"`, `sigma_res_ratio_1e3 = 130` and `sigma_res_min_ppm = [3, 5,
+    6, 5, 6, 6, 3]` (btc, eth, sol, xrp, hype, doge, bnb) before 16:00Z on
+    10-23; the 16:05Z restart is its first boot. The `j12` row
+    (`J12_FROM_NS`, 16:00Z, slot 11 only) is in this commit.
+- **Rollback.** `strike_law = "mean60"` and a restart, plus a `SEGMENTS` row.
+- **The bench gate (R-PMJ-S65).** `bin15/late_grid_mark_and_perp_1s` failed
+  bench-check at 12.2 ns against HK16's 1.6 ns. `late.rs` has not changed
+  since 10-17; the bench was at fault. Its random-walk mark crosses zero after
+  about 80 M iterations (simulated exactly), and from then on `on_mark` /
+  `on_perp` return on the rejected input. HK16's 1.6 ns timed that return; a
+  run that iterates less times the live path.
+  - The timed walk now reverts to its start (1/1024 of the gap per second,
+    stationary sd about 1.3e8 against 7.9e10), so every iteration takes the
+    live path. The prefill, and with it `late_fair_in_window`, is unchanged.
+  - Re-baselined 1.6 → 12.25 ns (`crates/bench/baselines/hot_path.json`): the
+    median of three `make bench-check` runs, 12.249 / 12.255 / 12.233 ns.
+  - `strategy_set/on_tick_all` read 5.09–5.10 ns on the same runs (+10 %,
+    inside the 15 % gate). It read the same at J8 and J10 on 10-19 (5.10–5.11
+    ns), so J12 did not move it, and it is left as it is.
+
+### J13 — the same-side family cap per window, default off (2026-10-24, rulings R-PMJ-S66, S67)
+
+- **Why.** Slots 9 and 11 each trade 7 families on one window clock, so several families can buy the same side of one window. Their outcomes are not independent.
+  - F4's 11 682 windows put the median correlation of the late price surprise across families at about 0.71.
+  - With three same-side fills, all three losing is about 10× likelier than under independence.
+  - In 4½ days of our own takes a cap of 3 never bound, and tighter caps removed only winners: every loss was the only take on its side in its window.
+  - The cap is tail protection, not an edge. The research is in the vault, `docs/research/pmj/corr/corr-2026-10-24.md`; it recommends 3.
+- **The key.** `max_side_families` in `pm15.toml` / `pmj.toml`. Absent or 0 means off, the default; otherwise 1 up to the family count.
+- **The law** (`strategy-pm15`, `strategy-pmj`, a gate in `take` after the per-market IoC gate):
+  - a family counts on a side of a window while its market holds that leg, or has an IoC in flight on it;
+  - first come, first served;
+  - a family already on the side is never stopped by the cap;
+  - other windows do not count;
+  - each member counts its own slot only (no cross-slot exposure).
+- **Known limits.**
+  - An unfilled IoC holds its place until the member writes it off at its deadline (2 × `order_ttl_ns`: 2 s on slot 9, 10 s on slot 11). The research freed it at the judge delay, so the live cap binds slightly more than modelled.
+  - A late fill booked after the write-off can put a family back on a side whose place another family has since taken. Under late fills the cap is soft by one.
+- **Observability.** The new tally `skip_side` (`engine_pm15_skip_side_total`, `engine_pmj_skip_side_total`; `Pm15Counters` 31 → 32 tallies) is on the dashboard's skip row. The boot tell gains `:side<=N` only when on; off, the tell, the artifact hash and every decision are unchanged.
+- **Hot path.** The gate runs on the take path only. It reads at most 8 markets in a while loop, with no allocation and no float. Alloc gates 136b and 114b run with the cap on, at 1 over one family, so they prove the loop allocation-free but never count another family.
+- **Deploy.** Config only, at a scheduled restart, on Anton's word. Turning it on changes the entry law, so a J9 `SEGMENTS` row goes in the same change. It is not on anywhere.
+
+### J14 — the venue law read from the CLOB, both rolling pipelines (2026-10-29; the code's PM15-9b)
+
+- **Scope.** Every rolling window — pm15 (slot 9's 15-minute families) and
+  pm5 (slot 11's 5-minute families) — is admitted only when Gamma's law
+  (PM15-2, `gamma15`) AND the venue's own market record pass: `GET
+  clob.polymarket.com/clob-markets/{conditionId}`, read by the discovery
+  thread for every window, the boot's first windows included
+  (`ingress_polymarket::clob_law`). Both slots are PAPER; the PM lane is
+  stopped (`### PM15-9`); nothing is armed. This is plan v2's P1/P3 "venue
+  law at every boot". **Cross-reference PM15-6c:** "the per-market half of
+  D-8 is discovery's own law" now includes the CLOB law — a refused window
+  never reaches slot 9's arm (no token; an order for it is refused unsent,
+  `LOCAL_NO_TOKEN`).
+- **The law** (causes appended after Gamma's 0–7, so `last_law_refusal`'s
+  old codes are unchanged):
+
+  | field | wanted | cause (code) |
+  |---|---|---|
+  | `c` | the condition id asked for (hex, any case) | `ClobShape` (8) |
+  | `itode` | present and true (the crypto taker hold, 150 ms since 2026-09-04) | `ClobHold` (9) |
+  | `fd` | `r` 0.07, `e` 1, `to` true | `ClobFee` (10) |
+  | `mts` | 0.01 or 0.001 | `ClobTick` (11) |
+  | `mos` | > 0 | `ClobTick` (11) |
+  | `ao` | true | `ClobShape` (8) |
+
+  An unparsable 200 (a CDN error page) is `ClobShape`. A non-200 or a
+  transport failure is a fetch failure: retried after 10 s, counted
+  `discovery_fetch_errors`, no operator line.
+- **What gets bound.** The window's spec takes the CLOB's tick (`mts`) and
+  minimum size (`mos`) over Gamma's (Gamma's lag behind the venue — the G2
+  lesson). Both reach `OutcomeMeta` at the roll's creation and slot 9's
+  gateway's local floor; `tick_size_change` still governs after creation;
+  both ticks fit the 0.001 ladder and pm-gw's `amount_grain` (`fak_buy`). **This
+  changes inputs of slots 9 and 11's paper law** (limit rounding, the
+  min-size skip): readers of J9's ledger split at the deploying boot,
+  which `docs/state.md` names when it is deployed.
+- **Dormancy, not a halt — PROVISIONAL (P-5, the operator to confirm;
+  plan v2 P1 said "halt the member and alert").** A refusal is per family,
+  per window: no `exec.HALT`, not sticky, nothing cancelled; other families
+  keep trading; the family resumes by itself (re-read every 60 s,
+  `RETRY_LAW_NS`; a refused window waits out its retry even after the law
+  holds again). Windows handed over before a change stay bound and can
+  still trade under the changed law: the current window plus 1 for pm15
+  (≈ 30 min), plus 2 for pm5 (≈ 15 min). The alternative, a sticky member
+  halt, is the operator's ruling.
+- **Where it shows.** `/metrics`: `engine_ingress_{pm15,pm5}_venue_law_changed_total`
+  (new; a family that passed the CLOB law this session and now fails it),
+  `…_discovery_law_refused_total`, `…_slots_bound`. `engine.out.log`: one
+  `WARN … VENUE LAW CHANGED on the CLOB` per rise (the 5 s report block;
+  family index and cause). `engine.err.log`: an unstamped line per family's
+  first CLOB outcome per session and per change, naming the asset, window
+  and record (written so a stderr error can never panic: `say()`). The
+  cause is not on `/metrics` or `/state`; the notifier is not wired
+  (R-PMJ-S75) — the `venue_law_changed` gauge is the surface to alert on. A
+  family that never passes shows only on stderr, `discovery_law_refused`
+  and `slots_bound`.
+- **Boot.** Both pipelines resolve a fourth host, `clob.polymarket.com`,
+  with DNS retried 3 × 200 ms; a persistent failure fails the rolling
+  boot and with it the engine (as J7 recorded for any rolling boot
+  failure); launchd relaunches it.
+- **Run-time bounds.** One fetch can block up to 5 s on Gamma plus 5 s on
+  the CLOB before `stop` is seen (≈ 10 s of the 20 s join grace).
+  Allocation: rustls per TLS record only. One new copy (the request target,
+  ≤ 80 B, `// COPY:`-marked); no new dependency. `with_client` /
+  `with_client_for` are the Gamma-only constructors for tests; production
+  (`new_for`), the miss-probe and `pm15-probe` always read the CLOB.
+- **Rollback.** The previous binary.
+- **Risk review** (an Opus subagent at xhigh, read-only): round 1 **BLOCK**
+  — `eprintln!` on the discovery thread can panic (abort) on a stderr
+  error; no risk-policy entry, and "halt" misnamed a refusal; minors (boot
+  DNS retry, a never-passing family silent, `mos` unused, the Gamma-only
+  constructors fail open, stale strings) → every operator line through a
+  non-panicking `say()`, the engine-log WARN in the 5 s report, DNS retry,
+  `mos` bound, first-outcome lines, docs; round 2 **NEEDS-DOCS** (code
+  approved; nits: the change record and the tally are Relaxed — documented
+  best-effort; one load in the WARN) → this subsection; round 3 **APPROVE**
+  (nits: pm-gw's `amount_grain`, the code's tag, the deploy record — applied).
+
+J14-GATES (2026-10-29 11:18–11:37Z, on the Mac, detached, every cargo under
+`taskpolicy -b` — R-PM-22; the release binary untouched): `make lint` rc 0,
+0 warnings · `cargo nextest run --workspace` 5 122 passed, 1 failed, 10
+skipped — the red is gate 103 (`hl_gateway_outcome_arm_is_zero_alloc`, the HL
+gateway's hot-window wall-clock script, a crate J14 does not touch; "path 1
+fell short of its script in the window" on the background-QoS E-cores), which
+passes alone at normal QoS (0.27 s) and under `make alloc-assert` · `make
+alloc-assert` 139 passed at 0 B (a fresh `Compiling bench`) · `make
+copy-audit` hits 27, baselined 27, new 0 · `make license-check` OK (795
+files) · fuzz `pm_gamma_markets` 60 s clean (2.15 M runs, the CLOB scanner and
+law included) · `make bench-check` not a valid reading under background QoS
+(every group +50 … +330 %, the clock and ring benches included); `hot_path`
+links no crate J14 changes. No worker change: pytest not run.
+
+### J15 — the pre-dust guard: the signed order bound, the debit halt, recon by order (2026-10-29)
+
+**Why.** `### J3` required, before any `PMJ-DUST-GATE` line, (a) the wallet
+at most the slot's day cap, (b) the guard reading `create_order`'s data and
+checking its amount and price itself, (c) a halt when the wallet's balance
+falls by more than the deposit. The binding pre-check (R-PMJ-S72; project
+`research/pmj/binding-precheck-2026-10-29.md`) found the field that binds
+the price on chain: **`order_type = Limit` with `max_fill_price_usd`** —
+on 1 038 public create-orders, Market fills cleared above their signed cap
+in 210 of 647 cases (up to +197 %), Limit fills in 0 of 58 (IDL error 6053
+`FillPriceExceedsLimit`). This section builds (b), (c), recon by order
+and the co-signer amendment in code; (a) and the live wiring are J16.
+`exec-jupiter` is still linked by `bench` and `fuzz` only; a paper boot
+builds no arm and the engine refuses a live slot 11.
+
+- **LAW PMJ-G for ORDER builds** (replaces J3's "the transfers our wallet
+  authorises … sum to at most the `depositAmount`" line for orders): a
+  build is signed only through `guard_order`, which keeps every J3 line and
+  adds:
+  - **no top-level token debit at all** (the program moves the deposit by
+    CPI; a top-level debit would add to it — a USDC→JupUSD swap build is
+    therefore refused); nothing but Compute Budget instructions and
+    **exactly one** Predict instruction, `create_order` (`8d3625cfedd2fad7`)
+    or `create_order2` (`96ed113d3bc07c34`, deployed, not in the published
+    IDL; same parameter bytes);
+  - `CreateOrderParams` (IDL v0.10.0) read whole: strings ≤ 64 B, Option
+    tags 0 / 1, no trailing byte; `is_buy` and `is_yes`; **order type Limit**
+    (`NotLimit` otherwise); `max_fill_price_usd ≤` the arm's limit `p − e`
+    (`PriceAboveLimit`); `deposit_amount` = the ask (`DepositMismatch`);
+    contracts > 0, = the answer's `contractsMicro`, and contracts × cap ≤
+    deposit × 1e6 (a 6-decimal deposit mint); no integrator, no integrator
+    fee;
+  - by account role (12 accounts for v1, 13 for v2): payer and owner our
+    wallet; the deposit source = `guard_deposit_account` (role 6 / 7); the
+    settlement mint = the deposit mint (7 / 8); the order and position
+    accounts = the answer's `orderPubkey` / `positionPubkey` (roles 5 / 4),
+    static keys; the vault pinned — `guard_vault` (static) or
+    `guard_vault_alt` (`<table>:<entry>`, the table one of `guard_alts`;
+    publicly `2y9Ad2…` at `6awx…:1`; boot refuses with no vault pinned;
+    table `6awx…`'s authority `2SoQ…` is not frozen, its written entries are
+    immutable; J16 re-reads entry 1 before arming);
+  - the signed `market_id` (a 32-hex hash) = the answer's `marketIdHash`
+    (`MarketMismatch`).
+  New `TxErr` codes are appended (existing codes unchanged): 20
+  `CosignerSignature` … 33 `ExtraInstruction`.
+- **Claims** only through `guard_claim`: one `claim_payout`
+  (`7ff0843ee3c69285`) or `claim_payout2` (`8dcd63cb8ee757e2`), no data, 7
+  accounts, the authority our wallet, the payout into our deposit
+  account, the vault pinned; besides it only Compute Budget and at most one
+  ATA `CreateIdempotent` of our own deposit account (payer and owner our
+  wallet). A claim has one signer: LAW PMJ-G holds unchanged there.
+- **The CPI consequence still holds.** The deposit, the price and the order
+  type are bound in the signed bytes; what the CPI moves is still trust in
+  the program, which is upgradeable (authority `5myNNmEm…`): **a new
+  deploy slot is a review trigger** (J16 re-reads it before arming).
+- **Residual — requirement (d), before the dust gate:** the instrument and
+  outcome are bound only to the answer's own `marketIdHash` (the server's
+  word). Its derivation from `POLY-<id>-<o>` is unknown (not md5 / sha of
+  the obvious strings); J0 / J5 must bind the signed hash to the window
+  independently (a derivation, or Jupiter's market record read at
+  discovery). Until then a hostile server could swap the market or the
+  outcome within the deposit and the limit.
+- **The request (`build_extra`, `pmj.toml`).** The documented `POST
+  /orders` has no order-type or limit field; Jupiter's UI places limit buys.
+  `build_extra` adds ≤ 4 `"name":"value"` members to the build body: names
+  `[A-Za-z][A-Za-z0-9_]{0,31}`, never (case-insensitively) one of the body's
+  own members; values `[A-Za-z0-9_.]{1,32}` or exactly `{limit_micro}` /
+  `{limit_usd}` (the member's limit). Rendered in place (zero alloc).
+  **Absent → every build is refused `NotLimit`** (fail-closed). The guard is
+  the law whatever the request said.
+- **The co-signer amendment (R-PMJ-S44) is in code, DORMANT:** G-S1..G-S5
+  and G-A1 exactly as the vault draft (`pmj-g-amendment-draft.md`);
+  `guard_cosigners` (≤ 1; refused if it equals a program, a lookup table,
+  the deposit account, the vault, a system program, the wallet or the zero
+  key). **LAW PMJ-G as written stands** and `guard_cosigners` stays empty in
+  every committed config until Anton's J0 and his S44 ruling.
+- **(c) The debit halt** (jup-gw). Reference: the last balance read with no
+  row open and ≥ 30 s after the last execute; floor: the reference minus
+  the deposits of every execute that may have left the host; checked at
+  every successful read (every 30 s); a breach halts with `HALT_DEBIT`
+  (venue base + 7) on the shared halt word → the arm halted → the router's
+  `GatewayHalt` → `exec.HALT`, sticky; a breaching read never re-anchors.
+  Build refusals, each counting toward the reject streak by design (the
+  slot stops rather than trading without a working check): `NO_REFERENCE`
+  (17, before the first reference), `STALE_REFERENCE` (18, the last good
+  read older than 60 s), `ALLOWANCE` (19, outstanding deposits plus this one
+  over 4 × the per-order maximum — `DEBIT_ALLOW_ORDERS` 4 suits the BTC-only
+  dust and pilot frames and must be re-sized to families × the per-market
+  cap before more than one family arms live). **Limits:** refunds, payouts
+  and unlanded in-doubt deposits can mask a drain within their amount until
+  the next quiet read; a restart re-anchors (a drain while down is unseen);
+  a stale answer can only cause a false halt; the fee is inside the deposit.
+  Requirement (a) bounds all of this and is J16's.
+- **Unknown positions halt** (the venue analogue of kill-switch trigger 3):
+  a `/positions` record with contracts > 0, not claimed, on a position key
+  no held leg or in-flight order carries → `unknown_positions` counted,
+  `HALT_UNKNOWN_POSITION` (base + 8); never claimed. A held-leg file
+  restored with a zero position key fails closed (it halts).
+- **A fill above its own limit halts the arm** (`over_limit`): it falsifies
+  the Limit evidence. The fill is still booked (the contracts are held).
+- **Recon by order** (supersedes J3's "Recon reads 4 pages of 50" text and
+  its pre-arming depth requirement): `GET /orders/status/{orderPubkey}`
+  (the key now tied to the signed account) is primary; `/orders` pages are
+  secondary and never evidence of absence (J0: they list OPEN orders only).
+  A terminal status books at once only with consistent numbers — the top
+  level and every `order_filled` event must agree (a Limit order can fill
+  in increments); missing or conflicting numbers are not read and end LOST
+  (30 tries) → `HALT_RECON`. **Release** (DONE, never landed) only on
+  Jupiter's own `invalid_request_error` 404, twice, ≥ 30 s apart, both ≥
+  300 s after the execute, and only if no 200 of any kind was ever read for
+  that order; any other 404 (a CDN page, another error kind) stays in doubt.
+- **A Limit order rests** (public data: one filled in three increments over
+  11 min; 3 of 12 closed unfilled). The paper IoC does not model a resting
+  order; its lifetime and who cancels it (the IDL has `cancel_order`) are
+  J5 facts — J3's "a landed keeper order cannot be pulled" is to be
+  re-checked there.
+- **Wire facts added to J0 / J5:** the request field for a Limit build;
+  create_order vs create_order2 in our builds; the 404 body for an unknown
+  order; the closed status's fill fields (cumulative or per increment; the
+  event name); `marketIdHash` and `contractsMicro` in our build answer; the
+  `market_id` derivation; the deposit mint's decimals; the co-signer slot.
+- **New `pmj.toml` keys** (all optional): `guard_vault` / `guard_vault_alt`
+  (absent = the boot refuses), `guard_cosigners` (absent = LAW PMJ-G as
+  written), `build_extra` (absent = today's body, so every build is refused
+  `NotLimit`).
+- **Known limits, until J0 / J5 settle them:** (1) **every split fill halts
+  for now** — until J0 settles what an `order_filled` event's quantity means,
+  an order of ours that fills in two or more increments, or still rests ≈ 60 s
+  past its deadline (the window's close + 30 s), ends with `HALT_RECON`; the
+  dust battery expects it; (2) **held-table capacity** — 32 legs; a leg
+  leaves only when `/positions` reads it claimed (lost legs never leave;
+  won legs only when the venue settles them, our claims being built but
+  held), so once full the next booked leg is not held (`held_full`) and the
+  next positions read halts `HALT_UNKNOWN_POSITION` — 40 dust orders can
+  reach it; whether a venue-settled position reads claimed is a J0 / J5
+  fact; (3) the unknown-position check matches **keys, not amounts** (up to
+  4 orders share one position per market) — an amount check at J5 once J0
+  confirms `contractsMicro`'s units; (4) the positions read covers the
+  **first page** only (the envelope's paging is a J0 item).
+- **Proof.** Public mainnet transactions as test vectors
+  (`crates/exec-jupiter/tests/fixtures/`: create_order v1 Market and Limit,
+  create_order2 Market and Limit, claim_payout2; every key pinned); hostile
+  loopback tests refused unsigned (an extra signer, a durable nonce, an
+  unlisted or table-loaded program, a token debit, Market, a cap above the
+  limit, an integrator fee, a deposit or contracts mismatch, a foreign
+  source / order / position / market hash, an unknown Predict instruction,
+  an extra instruction); the debit halt, recon, release and positions
+  cases; alloc gates 134 / 135 over the guard (both versions, the claim,
+  the co-signature verified), the extras, the status numbers, the debit
+  check and re-anchor, recon by status at 0 B; fuzz `jup_wire` extended.
+  proptest as a dev-dependency (already in the workspace; `about.toml`
+  ignores dev-dependencies: no `license-deps`).
+- **Risk review** (an Opus subagent at xhigh, read-only): round 1 **BLOCK**
+  — the answer's order / position keys untied to the signed accounts;
+  conflicting fill numbers could book a filled order unfilled; minors (any
+  404 released; the floor could sink to 0; stale reads blind the halt; a
+  fill above the limit unchecked; other allowlisted instructions in an order
+  build) → fixed with tests; round 2 **NEEDS-DOCS** (code approved; minors:
+  only `invalid_request_error` 404s count; positions vs held legs; the
+  reject-streak note) → fixed; this subsection; round 3 **APPROVE** (the
+  additions on split fills, held-table capacity, key-not-amount positions,
+  the first page and the vault table — folded in above).
+
+J15-GATES (2026-10-29 12:57–13:07Z, on the Mac, detached, every cargo under
+`taskpolicy -b`; the release binary untouched): `make lint` rc 0, 0 warnings
+· `cargo nextest run --workspace` 5 179 passed, 6 failed, 10 skipped — the
+reds are wall-clock and loopback tests in crates J15 does not touch (four
+`exec-binance::bn_equity_e2e`, `core-net` `an_idle_close_is_noticed_and_the_next_request_dials_fresh`,
+gate 103) on the background-QoS E-cores beside another lane's cargo; all six
+pass at normal QoS (30 / 30 of their binaries' tests, 13:0xZ) · `make
+alloc-assert` 139 passed at 0 B (a fresh `Compiling bench`; gates 134 / 135
+over the new paths) · `make copy-audit` new 0 · `make license-check` OK (797
+files) · fuzz `jup_wire` 60 s clean (1.97 M runs). `make bench-check` not run
+(`hot_path` links no crate J15 changes; and under background QoS it is no
+reading — J14).
+
+### J16 — slot 11's live wiring: the gated interlock, the secret-free boot, requirement (a), the flip, the restart gate (2026-10-29)
+
+**Why.** `### J3` named, before any dust gate, (a) the wallet at most the
+slot's day cap, (b) the guard checking `create_order`'s data itself and (c)
+a debit halt; J15 built (b), (c) and recon by order. J16 is the rest: slot
+11's `JupArm` in the engine behind a build-time gate, LAW E-1's two
+switches and a frame; requirement (a); the keypair file (R-PMJ-S73); the
+operator verbs (`pmj-exec`, the flip's `live`); a pmj gate in the daily
+restart. **Nothing in J16 arms anything:** this file carries no gate line;
+the guard's `guard_*` keys default absent — an empty allowlist refuses
+everything (LAW PMJ-G) — and no committed file sets them before Anton has
+reviewed J0's decode; main's `ARM_LIVE` does not name 11. A paper boot is
+unchanged.
+
+- **The gates (build time).** `crates/cli/build.rs` compiles
+  `PMJ_GATES_BUILT` from this file through `src/gate_line.rs`: `dust` when
+  the line `PMJ-DUST-GATE: ruled YYYY-MM-DD`, `pilot` when the line
+  `PMJ-LIVE-GATE: ruled YYYY-MM-DD`, stands at a line's start outside ```
+  and `~~~` fences **in the working tree AND in `git show HEAD:`** (any git
+  failure gives 0; an unclosed fence hides the rest of the file — fail
+  closed; the file is fence-balanced at J16). The flip reads the same
+  grammar at `HEAD`. **A built binary keeps its flags:** revoking a gate is
+  `pmj-flip.sh paper`, then a rebuild. **Never begin a line in this file
+  with either gate word** — no example, no placeholder date: the dated line
+  is Anton's alone.
+- **Arming** (`exec_boot::resolve_gated`, `check_pmj_frame`). Slot 11 arms
+  only with: the two switches (`[exec.slot.11] mode = "live"` and
+  `--arm-live` naming 11); the `dust` flag built in; `venues` exactly
+  `["jupiter"]` (`jupiter` on any other slot refuses, J3); **no other live
+  slot in its engine** (R-PMJ-S77, PROVISIONAL — a slot-11 boot refusal
+  aborts its engine, so the engine must be its own: the standalone,
+  R-PM-23); all four bounds set (> 0) and inside the frame — beyond the
+  pilot frame always refused, beyond dust only with the `pilot` flag;
+  `max_open_orders` inside it; `pmj.toml` `live_assets` = `["btc"]`;
+  `pmj.toml`'s max order at most the exec max order, its `usd_market` at
+  most `cap_instance`.
+- **The frames.**
+
+  | frame | needs | `[exec.slot.11]` | `pmj.toml` |
+  |---|---|---|---|
+  | dust (plan-J5) | the dust line | $5.01 an order and an instance, 1 open order, $50 a day, −$50 a session, reject streak 5, recon-stale 180 s | deposit $5, max order $5.01, $5 a market, −$50 a session, `live_assets` `["btc"]` |
+  | pilot | both lines | $250.01 an order and an instance, at most 4 open orders, **$1 000 a day**, −$500 a session | the operator's, inside the exec frame |
+
+  The pilot's day cap and open-order bound are the session's (R-PMJ-S76,
+  PROVISIONAL — ruled before any pilot line). The flip writes the dust
+  frame only.
+- **What halts slot 11.** No market data rides this venue, so the drift,
+  ws-gap and asset-refusal thresholds never fire for it. It is halted by:
+  the debit halt and the unknown-position halt (J15); recon lost; a fill
+  above its limit; the reject streak (5); the E7 session bound; recon stale
+  (180 s); the operator (`exec.HALT`); the restart gate's review halt
+  (below, R-PMJ-S78).
+- **The boot** (`pmj_live.rs`), each step a refusal that aborts the
+  engine's boot. **Secret-free half** (`pmj_preboot`: no environment,
+  secret or network): slot 11 armed; `exec.HALT` — naming 11, unreadable,
+  not a regular file or over 640 B refuses ("flip to paper first"); its
+  section; the member; the families; the member caps inside the slot's
+  clamps; the frame (with `pmj.toml`'s `live_assets`, and
+  `max_open_orders`); the offline self-test (RFC 8032, the guard's known
+  answers on J15's public fixtures, the keypair parser); the `guard_*` keys
+  reviewed — an empty allowlist or an unset pin refuses, `build_extra`
+  required, the Predict program listed, co-signers only when named; the SOL
+  floor set. **Then** the public key and the guard for it; the keypair
+  file; the Jupiter client; `JUP_API_KEY`. **Networked half:** requirement
+  (a); the held legs (`pmj-held.state`) and the session anchor
+  (`pmj-pnl-anchor.state`, a temporary and a rename), both beside
+  `exec.toml`; jup-gw's and the arm's own boot checks; the thread.
+  `boot_with` is generic over the Jupiter client, so scripted-client tests
+  run (a), the anchor and the tell.
+- **Requirement (a).** One balance read before the arm exists: the deposit
+  mint's balance at most `[exec.slot.11] cap_day_usd_1e6`, and SOL at least
+  `pmj.toml` `min_sol_lamports`. `guard_deposit_mint` has no default and
+  must be USDC or JupUSD (six decimals: base units are micro dollars). A
+  failed read, a missing mint entry, an unset cap or an unset floor
+  refuses. **Judged at the boot and the flip only:** move no funds in
+  during a session; wins can lift the wallet over the cap and make the next
+  boot refuse — sweep profits out only with a new session (`pmj-flip.sh
+  live` sets the anchor aside). SOL has a floor, no ceiling.
+- **The secret (R-PMJ-S73):** "Signing-key handling", amended by J16.
+- **`pmj-exec`** (`multivenue-engine pmj-exec`, `scripts/pmj-exec.sh`):
+  `--self-test` is offline. `--key-check` is read-only and reads **the chain
+  first** — public RPC `getAccountInfo` (host `PMJ_SOLANA_RPC`, else
+  `api.mainnet-beta.solana.com`; no secret) of the Predict program, its
+  ProgramData (the deploy slot against `pmj.toml` `guard_program_slot`),
+  the vault's lookup table (`guard_vault_alt`'s entry) and the deposit mint
+  — then the keypair file, one authenticated Jupiter `GET`, the balances,
+  the SOL floor and the day cap. No signature leaves the host; nothing
+  secret is printed. Exit 0 passes; **77 is a review trigger**: the program
+  not owned by the upgradeable loader or not a Program; the account not
+  ProgramData or the deploy slot off its pin; the vault's table not a
+  lookup table, deactivated, missing the entry or naming another key; the
+  mint not a token program's, not initialised or not six-decimal; any of
+  these accounts closed (`value: null`). **78 is everything else**
+  (transport, budget, HTTP, parse, the balances, the key, the region, the
+  SOL floor, the self-test). The chain runs first, so a 78 never masks a 77.
+- **The flip** (`scripts/pmj-flip.sh`; J4's "`live` only refuses" is
+  superseded). `live` refuses unless: `ARM_LIVE` (read as the wrapper reads
+  it) names no slot but 11 and the exec.toml the boot reads marks no other
+  slot live (R-PMJ-S77); the committed (`HEAD`) dust line; `pmj.toml`
+  exists, `STRATEGY` names pmj, `exec.HALT` does not name 11; `pmj.toml`
+  pins `guard_program_slot`; `pmj-check` passes on the dust-frame
+  `pmj.toml`; `pmj-exec --key-check` passes at the $50 cap. Only then does
+  it write, each file after a stamped `.bak`: `strategy.conf`
+  (`ARM_LIVE=11`, `EXEC_TOML`), the `[exec.slot.11]` dust section and
+  `pmj.toml`'s frame lines; it sets the session anchor aside (every `live`
+  starts a new session). `paper` takes 11 out of `ARM_LIVE`, sets the
+  section's `mode` to paper and restores R-PMJ-S22's paper frame in
+  `pmj.toml` ($250 / $250.01 / $250 / −$3 500; `live_assets` as is) when
+  `pmj-check` passes on it, warning otherwise. Neither restarts anything.
+- **The daily-restart pmj gate** (`scripts/daily-restart.sh`; on main's
+  launchd since 2026-10-29 ~14:46Z, where nothing of it runs: slot 11 is not
+  armed). **Armed** when `ARM_LIVE` (`strategy.conf` sourced in a subshell;
+  parts trimmed, a leading `+` dropped, compared as numbers) names 11, or
+  the in-force `EXEC_TOML` or any `~/multivenue/exec*.toml` marks
+  `[exec.slot.11]` live (an unreadable file arms it; `enabled = 0` does
+  not). It decides only the restarts E3 did not defer:
+  - `exec.HALT` beside the in-force `EXEC_TOML` naming 11 (parsed as the
+    router parses it) or not readable whole → the restart is **deferred**,
+    no check run and no failure counted, paged silently once per halt-file
+    mtime: archive the line or `pmj-flip.sh paper`;
+  - else the offline self-test, then `pmj-exec.sh key-check` at the slot's
+    `cap_day_usd_1e6` (the in-force file's, else the arming file's) before
+    the drain. A failure defers the restart (owed in
+    `state/pmj-gate-pending`; retention and the xsd rotation still run)
+    with a 1 / 5 / 15 / 60-minute backoff, and writes `state/pmj-gate-RED`
+    after three;
+  - **77** also appends `slot=11 reason=operator` once to that `exec.HALT`
+    (the router's own word; it reads unknown words as `operator`), so the
+    running router halts slot 11 within about a second, and pages once
+    (`notify-send.sh -l -s PMJ`) (R-PMJ-S78). Clearing it: review, re-pin,
+    archive the halt line; the next restart checks again.
+  - A harness in the vault (51 cases; stub `exec-smoke.sh`, `pmj-exec.sh`
+    and `notify-send.sh`) runs the arming spellings, the E3 interplay, the
+    backoff, 77 / 78 and the halt deferral.
+  - **Limits:** a launchd crash relaunch skips E3 and this gate, and a
+    slot-11 boot refusal there keeps that engine in a relaunch loop until
+    slot 11 is flipped to paper or the wallet swept (hence alone, on the
+    standalone); payouts between the check and the boot can still make the
+    boot refuse; the halt goes beside the `EXEC_TOML` now in
+    `strategy.conf` — if that changed since the engine booted, the engine
+    does not poll it; `strategy.conf` is sourced at each decision.
+- **Paper and routing.** Paper is unchanged: with slot 11 not live there is
+  no arm, no socket, no secret read and no arm metric
+  (`a_paper_slot_11_builds_no_arm_and_reads_no_secret`); one stats struct
+  is allocated at boot. The composition is `SlotSplit(11, SlotSplit(9,
+  SlotSplit(3, inner, bin15), pm15), pmj)`; cancels route per slot, so
+  another slot's halt never reaches `JupArm`, and every other slot routes
+  as before. Live only: `engine_pmj_arm_*` (21) and `engine_pmj_gw_*` (36)
+  (the worst case ≈ 715 of 768 gauges) and one keep-alive connection to
+  `api.jup.ag` on jup-gw's thread. The order path is J15's (alloc gate
+  135); the split layer allocates nothing; the held-file writes allocate on
+  jup-gw's thread (documented). `exec-jupiter` and `signer-ed25519` are
+  workspace crates: no `license-deps`. `.env.example` names the four keys
+  (no values).
+- **Open before the dust line** (the go-live runbook's order): J0 — the
+  `guard_*` keys from its decode, the 404 and closed-status shapes,
+  `market_id`'s derivation (requirement (d): the market hash bound to the
+  window), the `orderType: limit` request fields; R-PMJ-S44 (the
+  co-signer), S45 (the price cap — J15's Limit answers it on public data;
+  Anton's own builds confirm), S46 (the deposit mint), S48 (the fee); the
+  claim route (claims are built and held, never sent); J15's limits (split
+  fills halt; 32 held legs; positions by key, first page); R-PMJ-S76..S78.
+- **Risk review** (an Opus subagent at xhigh, read-only): round 1
+  **BLOCK** — M1 any slot-11 boot refusal took the whole engine down; M2
+  the review trigger not re-read at arming; minors (the gate grammar loose;
+  the build gate on the working tree only; refusal tests stopped at pure
+  functions; (a) judged at boot only) and NITs → fixed (slot 11 alone; the
+  secret-free pre-boot, `exec.HALT` first; the dated, fence-aware grammar
+  in the tree AND at `HEAD`; an injected client; temporary + rename;
+  `max_open_orders` in the frame check; `paper` restoring the paper frame);
+  round 2 **APPROVE** with four minors (`ARM_LIVE` read fail-open; the
+  harness outside E3; a review trigger not halting the running slot; crash
+  relaunch) → fixed; round 3 **APPROVE** with two minors (the chain checks
+  masked by 78s; a halted slot 11 looping a scheduled restart) and a NIT (a
+  closed pinned account) → fixed; round 4 **APPROVE**. After it the
+  session carried M1 to the flip (it added 11 to any `ARM_LIVE`): `live`
+  refuses beside another live slot, tested on the real script.
+
+J16-GATES (2026-10-29, on the Mac, detached, every cargo under `taskpolicy
+-b` unless noted; the release binary untouched). The battery, 15:05–15:19Z:
+`make lint` rc 0, 0 warnings · `cargo nextest run --workspace` 5 216
+passed, 1 failed, 10 skipped — the red is gate 103
+(`hl_gateway_outcome_arm_is_zero_alloc`, a crate J16 does not touch) under
+nextest on the background-QoS E-cores, as at J15; it passes in `make
+alloc-assert` and alone at normal QoS (15:34Z, 1 / 1) · `make alloc-assert`
+139 passed at 0 B (a fresh `Compiling bench`) · `make copy-audit` new 0 ·
+fuzz `jup_wire` 60 s clean (1.50 M runs). After the round-4 and flip fixes,
+15:24–15:31Z: `cargo nextest run -p cli -p exec-jupiter -p core-config`
+1 011 passed, 6 skipped · `make copy-audit` new 0 · `make lint` rc 0, 0
+warnings · `make license-check` OK (802 files, the five new ones staged) ·
+the restart-gate harness 51 / 51 and `zsh -n` on `daily-restart.sh`,
+`pmj-flip.sh`, `pmj-exec.sh`. `make bench-check` not run (`hot_path` links
+no crate J16 changes; under background QoS it is no reading — J14).
+
+## NOTIFY — N-DOCTRINE: the one-way Telegram notifier (2026-10-24)
+
+**Rulings (Anton, 2026-10-24; the plan is the project doc
+`claude/notify-plan-2026-10-24.md`).** R-NT-1 a Rust sidecar out of process;
+R-NT-1a a separate binary `multivenue-notify` (crate `crates/notify`,
+identical on `main` and `bin15-h90-standalone`); R-NT-2 fills + settlements,
+order attempts, safety and digests; R-NT-3 notify-only; R-NT-4 a
+per-instance `notify.toml`, absent = off — the standalone's slot 3 live
+first, main installed with no slot; R-NT-5 gross P&L per instance from the
+captured fills, the session net (fees included) from the engine's own
+accounting — `/state`, or for the Hyperliquid gateway transport its anchor
+and worth in `/metrics`, which `/state` does not carry; R-NT-6 one
+chat tagged `[SA]` / `[MAIN]`, settlements and safety ring, the rest silent;
+R-NT-7 a daily digest at 00:00Z and an hourly line while a slot is live;
+R-NT-8 UTC; R-NT-9 the code on both branches. O-NT-A: the CLAUDE.md
+"Deployment" amendment. **No alert threshold has a built-in default:** a
+threshold left out of `notify.toml` turns its alert off. A forward-test
+watch (the PR-BIN15-P2 tallies) is configuration in the instance's
+`notify.toml` only, never git. The AI-session inbox: both a state-dir inbox
+for Mac-side processes and a git-ignored `<repo>/.notify-inbox/` for Cowork
+sessions, owned by main's notifier.
+
+**The doctrine.**
+
+1. **Out of process.** `multivenue-notify` is never linked into the engine
+   and never reached by the engine loop; the engine never waits for it. Its
+   failure — a crash, a dark Telegram, a sleeping Mac — cannot affect
+   trading.
+2. **Reads only:** `/state` on loopback (the config refuses another host)
+   and, on the same port, `/metrics` for the gateway's session anchor and
+   worth;
+   the run's `engine-fills.pmlr`, `engine-orders.pmlr` and
+   `engine-events.pmlr` (tailed by record index); the `[hyperliquid]
+   rolling` line of the instance's `universe.toml`; its `notify.toml`; the
+   `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` lines of the instance's
+   `.env`; its inbox directories.
+3. **Writes only** its state directory (cursor, open positions, the settled
+   ledger, keyed values, the outbox) and its log; it removes only inbox
+   files it has relayed.
+4. **One host off the machine:** `api.telegram.org:443`, through
+   `core_net::boot_http` (rustls, the compiled-in webpki roots). It never
+   calls `getUpdates`: nothing reaches the engine through Telegram and it
+   has no write path into live safety (an emergency halt from the phone
+   would be its own ruling).
+5. **Secrets.** `.env` stays the only secrets file. The plists launch it
+   under `env -i`, so no venue key enters its environment; the token is
+   never logged (`Debug` is redacted) and its buffers are overwritten.
+6. **It reports, never acts.** A watch criterion met is a message;
+   disarming stays the operator's (`scripts/bin15-flip.sh paper`,
+   `exec.HALT`).
+7. **No engine restart.** Deploying, reloading or rolling it back relinks
+   no engine binary and needs no exec-smoke or safe minute.
+
+**What it sends** (all times UTC):
+
+| message | tier | from |
+|---|---|---|
+| `FILL` — leg, instance, τ, qty × px, the order's limit | silent | `engine-fills.pmlr` (`origin`, `strategy_id`), the order from `engine-orders.pmlr` |
+| `SETTLED WON/LOST` — the instance's qty, average price, payout, gross; the session net; the watch tallies | ring | the SETTLEMENT fill joined to the instance's own fills (persisted across restarts) |
+| `attempts` — sent / filled / missed (`REASON_IOC_MISS`) / rejected by reason, limits, first τ, per instance | silent | orders + order events, flushed 15 s after the last or 5 s after expiry |
+| `HALT` / `HALT CLEARED`, `exec.HALT file present`, `BOOT`, `REFUSED` bursts, `RECON` | ring | `/state` transitions and counter deltas (none across a boot) |
+| `HOLD` / `RESUMED` (`hold_loud_s`), `ENGINE DARK` / `BACK` (`dark_after_s`), `NOT SEEDED` (`seed_warn_s`), `BUDGET` (`budget_warn`), `SESSION` (`session_warn_usd`), `AGENT` (`agent_warn_days`) | ring, only when the threshold is set | `/state`, the clock |
+| `WATCH … criterion met` | ring, once per criterion | the settled ledger since the watch's start |
+| hourly line (while live), `DAY` digest | silent | the period counters, `/state` |
+| `[AI:SOURCE] …` | as the file asks (`level=loud`) | the inbox, ≤ `inbox_max_per_hour` |
+
+**Delivery.** `TELEGRAM_CHAT_ID` is one chat or a comma-separated list
+(at most 10, 2026-10-24 on Anton's ask): every message goes to each chat,
+and a chat that refuses the bot (403: blocked it, or never started it) or
+a message Telegram refuses (400) is skipped for that chat only, never the
+others. Every message is a file in the outbox before a send is
+tried; a sender thread posts at most one a second (burst three), joins a
+silent backlog into fewer messages, backs off on 429 / network errors,
+pauses five minutes on 401/403/404 and drops only a message Telegram
+refuses as malformed (400). At-least-once: a crash between a send and its
+removal repeats one message.
+
+**Cadence and the bench gate.** One poll every five seconds by default
+(`poll_ms`): a fill is reported up to ~6 s after the venue's. A resident
+notifier still shifts the ns-scale hot-path benches on the engine host by
+about one cycle — measured 2026-10-24, `strategy_set/on_timer_all` +9.5 to
++12.6 % over the baseline with the notifiers stopped (3 runs), +15.6 to
++19.7 % with them polling every second (6 runs), +11.7 to +16.5 % every
+five seconds (3 runs) against `make bench-check`'s 15 % — although `notify`
+is in no bench's dependency tree. **So `make bench-check` runs with the
+notifier labels booted out** (`launchctl bootout gui/$UID/<label>` for each
+label below; re-bootstrap after): it restarts no engine.
+
+**Operation.** Main: `com.multivenue.notify`, `~/multivenue/notify.toml`,
+log `~/multivenue/logs/launchd/notify.log`. The standalone:
+`com.multivenue.bin15-notify`, `~/bin15/multivenue/notify.toml`, log
+`~/bin15/multivenue/logs/launchd/bin15-notify.log`. `multivenue-notify
+check` validates a config (the keys by presence only), `test-send` posts one
+line, `replay --run-dir` renders a capture's fills and settlements. Off:
+remove `notify.toml` (the job exits 0 and stays down) or `launchctl bootout`
+the label.
+
+## T2T T1 — the order path's quick wins (2026-10-25): main only; the standalone unchanged
+
+Anton, 2026-10-25: "Go do T1", on plan `claude/t2t-plan-2026-10-25.md`. The signer ruling was given earlier: "Precomputed nonces, guarded". **The standalone (live money, slot 3) changes only on Anton's explicit confirmation**, under the HARD RULE. Nothing below changes what an order says, when the law fires, or any cap.
+
+**Main runs T1 on paper, but main has no Hyperliquid gateway**: every slot is paper. So main exercises T1-b only (the ingress, the engine, QoS). T1-a, c and f first run on the standalone. Before that they are covered by the harness, the alloc gate (96b) and testnet `exec-smoke`, whose phase C has the venue verify a pooled signature.
+
+### T1-a — the gateway never parks in the late window; commands before reads
+
+- **The hot window:** `core_time::HotWindow` is a recurring wall-clock window. `exec_gateway::Idle::with_hot` never parks inside it. The window comes from slot 3's artifact (`cli::bin15_boot::late_hot_window`): from `tau_max + 2 s` to `tau_min − 1 s` before each quarter hour.
+  - With P2's τ ∈ [2, 30) s, that is 32 s → 1 s before each quarter hour: 34 444 ppm of one core.
+  - With the late law off there is no window, and the gateway behaves as before.
+  - The boot tell says so: `the gateway never parks from … ms to … ms before each quarter hour`.
+- **Commands first:** `HlGateway::turn` drains the command ring at the start of the turn, before its poll and its reads. It still drains it after them, as before.
+- **Unchanged:** admission, coalescing, the rates, every refusal.
+- **The idle policy's fields narrowed** (spin to `u16`, park to `u32` ns, both clamped), so `Idle` stays 16 B inside the gateway's bounded inline state.
+
+### T1-b — the ingress and the engine stay awake in the same window; QoS
+
+- **The ingress:** the Hyperliquid ingress polls without blocking inside the window. It reads it from a `core_time::HotCell` that the boot fills once slot 3's artifact is read.
+  - **Inside the window each drive step reads once** (`core_net::fill_rx_once`), parses what landed and drives again. Outside it the step still reads until the transport would block.
+  - **Why, from main's first live windows** (`11a3458a`, 10-25): with read-until-block, a thread that never blocks reaches a burst while it is still arriving. Inside the 06:59Z window the first tick of each read turn was stamped 50–90 µs after the turn began, against ~1 µs outside, with the same ticks per turn. One read per step parses each wave as it lands.
+- **The engine:** the engine loop skips its per-iteration `yield_now` inside the window, re-reading it every 100 µs.
+- **QoS:** on macOS the ingress, the engine and the Hyperliquid gateway threads take QoS `USER_INTERACTIVE`, the performance-core hint (`cli::pinning::prefer_performance_cores`). Linux pins instead, so this is a no-op there.
+
+### T1-c — the precomputed-nonce signer (`signer_eip712::prenonce`)
+
+The gateway signs every order from a pool of 64 precomputed ECDSA nonces. Each entry holds `k⁻¹`, `r`, `r·d` and the recovery id. A signature is then one mod-n add, one mod-n multiply and the low-s rule: 0.67 µs warm, where RFC 6979 takes 18.9 µs.
+
+**The laws:**
+
+1. **A k is never reused.**
+   - The gateway thread is the pool's one owner.
+   - An entry is popped once and wiped as it is popped, whether or not it signed.
+2. **k is random and hedged.**
+   - `k = keccak256(tag ‖ d ‖ counter ‖ try ‖ rand)`, with `rand` 32 bytes from the OS CSPRNG (`getrandom`).
+   - With a fixed key, a weak RNG cannot repeat a k, and while the RNG works a broken counter cannot either.
+   - Keccak is a sponge, so a secret prefix makes it a PRF (no length extension).
+3. **No field code of our own.**
+   - Every operation on a secret scalar is libsecp256k1's constant-time scalar arithmetic, the library that already signs every order: `seckey_tweak_add`, `seckey_tweak_mul`, `seckey_negate`, `ec_pubkey_create`.
+   - The inverse is Fermat's `k^(n−2)`, by square-and-multiply over the public exponent.
+   - The plan named `k256`. This uses no new crypto dependency instead: one library, already audited and already on the path.
+4. **The secrets sit in a page of their own.**
+   - The key, every `k⁻¹` and every `r·d` are in one page-aligned, page-sized (16 KiB) `mlock`'d allocation. With `r` public, `r·d` is as secret as `d`.
+   - The page is wiped with volatile writes and `munlock`'d on drop.
+   - No neighbour shares the page, so no `munlock` reaches across it (the BX4 rule).
+   - **This is a third locked-memory implementation**, beside `SecretKeyBytes` and BX4's page. The open BX4 question, whether a page type moves into `core-config`, now covers three.
+5. **Every boot self-tests.** One pooled signature must verify and recover to the key, or the gateway does not build (`GatewayErr::Signer`).
+6. **Every pooled signature is checked after the fact.**
+   - The gateway's quiet turns outside the hot window verify each signature and recover its key, from a ring of the last 16.
+   - A mismatch turns the pool off for the process and halts the gateway: `HALT_SIGNER` = `HALT_VENUE_BASE + 1`.
+7. **Fallback:** an empty pool, or an edge the pool cannot sign (a digest ≥ n, a zero `s`; each about 2⁻¹²⁸), signs by RFC 6979, today's path unchanged.
+
+The plan's first step, dropping `secp256k1`'s `lowmemory` tables, is not taken: the pool takes the signature off the path, and the fallback is rare.
+
+**Refills and checks** run in quiet turns outside the hot window: about 60 µs per entry and 40 µs per check. A command that arrives meanwhile waits that long, as it would for a park.
+
+**Inside the window the pool is not refilled.** It opens each window full: 64 entries against a window's few takes. Past 64 signed actions in one window, the rest sign by RFC 6979 (law 7).
+
+**Observability:** `/metrics` (hlgw family) `engine_exec_hlgw_gateway_signs_pooled_total`, `engine_exec_hlgw_gateway_signs_fallback_total` and `engine_exec_hlgw_signer_pool_ready`. A live take that signed from the pool moves the first.
+
+**Tests:**
+- 2 000 signatures verify, recover and are low-s, and both values of `v` occur.
+- No `r` repeats in 3 000 signatures.
+- The fallback is byte-identical to today's signature.
+- A corrupted check turns the pool off.
+- A proptest runs random keys and digests.
+- **`exec-smoke` gains phase C:** the cancel probe, signed from a pool built from the testnet key, must recover to our address at the venue, as phase A's does. A failure exits 20.
+
+### T1-f — keep-hot
+
+Inside the hot window, every 1 ms, a quiet gateway turn runs the order path dry: a dummy IoC is encoded, hashed, signed with the pool's arithmetic on a throwaway key's fixed entry, then rendered and enveloped into the gateway's own buffers.
+
+Nothing is admitted or sent. No nonce is drawn, and no rate moves; the gateway's own `keep_hot` counter counts the runs. The alloc gate (96b) pins 20 dry runs at 0 B.
+
+**Measured (below):** −4 µs at the median when warm, no p99 cost. Against a cache eviction it measured nothing: the cold part of the path is what a dry run cannot touch (rustls' seal, `write(2)`, the command ring). Kept: it is cheap and does no harm.
+
+**Not done from the plan's T1-f** (to T2): the member and router run dry, the TLS seal into a scratch record (rustls has no dry seal), `mlock` of the other order-path buffers, and the dry runs' timings into the T0 histograms.
+
+### T1-d, T1-e — deferred
+
+- **T1-e, the O(1) router:** the router's clamps measured 0.17 µs p50 and 0.21 µs p99 warm (0.83 / 1.5 µs cold) on a full ledger. O(1) would save under 1 µs, for a change to the ledger's accounting.
+- **T1-d, the one-compare trigger:** the member's stage measured 3.3 µs p50 live (XMM). T2's pre-sealed order needs the precomputed trigger anyway, and T2 carries its own parity test.
+
+### T1-g — one write per post: verified, no change
+
+A post is one `write(2)`:
+1. `GwConn::send` hands the frame to rustls in one `write`.
+2. rustls seals it into one record (frames are under 16 KiB).
+3. The flush is one `write_tls`, which is one `writev`.
+
+`TCP_NODELAY` is set and asserted (`core-net/transport.rs`).
+
+### The measurements
+
+The harness (`cargo bench -p bench --bench t2t`) on the M4 Pro, with both engines running, gives the medians over 2 to 8 runs. The gateway rows run from the command's push to the moment the socket took the frame. The vault holds the JSON: `research/t2t/t2t-bench-20261025-t1-*.json`.
+
+| stage | T0 p50 / p99 | T1 p50 / p99 |
+|---|---|---|
+| signature (RFC 6979) | 18.9 / 21.2 µs | the fallback |
+| signature from the pool, warm / cold | — | 0.67 / 0.80 µs; 1.4 / 2.2 µs |
+| gateway, parked (outside the window) | 159 / 193 µs | 139 / 172 µs |
+| **gateway, hot window: one take every 25 ms** | — | **24 / 58 µs** (p99.9 ≤ 108 µs) |
+| gateway, hot window, caches evicted before each take | — | 38 / 60 µs |
+| gateway, spinning (one take every 2 ms) | 42 / 58 µs | 20 / 38 µs |
+| HL ingress wake-up, blocked `poll` → spinning (loopback) | 133 / 388 µs | 75 / 104 µs |
+
+- **The hot window takes the gateway from 159 µs to 24 µs at the median.** Adding the live in-engine 8.5 / 43 µs (T0) gives a live take ≈ 33 µs p50 and ≤ 101 µs p99 (a sum of p99s), against T0's 170 / 230 µs.
+- **The plan's T1 bar is p50 ≤ 20 µs, p99 ≤ 40 µs.** The gateway meets it spinning (20 / 38 µs). In the hot window it misses: 24 / 58 µs. Keep-hot off reads the same p99 (57 µs), so the dry run is not the cause. What remains against spinning is the 25 ms gap, not isolated further.
+- **QoS** (`USER_INTERACTIVE`) changes neither row: 24 / 55 µs with it.
+- **The ingress wake-up** is new information: a blocked `poll` costs about 58 µs at the median over spinning, before T0's read stamp. The loopback rows include macOS' own loopback delivery, about 75 µs, which a real NIC replaces.
+- **0 B/op:** alloc-assert, including gate 96b's keep-hot phase.
+- **The decisions do not change:** T1-d is deferred, so the member is untouched.
+- **The signer** passes its tests and proptest, and testnet `exec-smoke` phases A, B and C.
+- **The real gateway on testnet:** `exec-smoke --lifecycle --hl-perp` (XH4g: BTC, ETH, SOL; 20 cycles, 3 IoC pairs) exit 0, the bar met. 209 actions signed from the pool, 0 by RFC 6979, and the venue took every one. The pool was full (64) at the end.
