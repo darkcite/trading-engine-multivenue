@@ -38,6 +38,15 @@
 //!   value a literal `[A-Za-z0-9_.]{1,32}` or exactly `{limit_micro}` /
 //!   `{limit_usd}` (the member's limit). Absent = today's body; the guard
 //!   is the law whatever the request says.
+//! - **the live wallet's keys** (PMJ J16, read only by the live arm's boot
+//!   and `pmj-exec --key-check`; a paper boot reads none of them) —
+//!   `guard_deposit_mint`, the deposit mint (USDC or JupUSD, the two
+//!   6-decimal USD mints the cap check reads in micro dollars; R-PMJ-S46 is
+//!   undecided, so there is NO default: absent = the live boot refuses);
+//!   `min_sol_lamports`, the wallet's SOL floor at boot (absent = 0 = unset:
+//!   the live boot refuses); `guard_program_slot`, the Predict program's
+//!   reviewed deploy slot (absent = 0 = unpinned; the key check compares
+//!   it with the chain — a new deploy is a review trigger).
 
 use crate::bin15::{int, opt_int, pos_u64, strs, table};
 use crate::icdp::{parse_single_section, Value};
@@ -79,6 +88,22 @@ pub const PMJ_GUARD_COSIGNERS_MAX: usize = 1;
 /// `build_extra` members (`exec_jupiter::render::BUILD_EXTRA_MAX`).
 pub const PMJ_BUILD_EXTRA_MAX: usize = 4;
 
+/// PMJ J16: the deposit mints `guard_deposit_mint` may name (R-PMJ-S46):
+/// `(name, base58)`. Both are 6-decimal USD stablecoins, so a balance in
+/// base units is micro dollars — the unit of `[exec.slot.11]
+/// cap_day_usd_1e6` the live boot judges the wallet against.
+pub const PMJ_DEPOSIT_MINTS: [(&str, &str); 2] = [
+    ("USDC", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+    ("JupUSD", "JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD"),
+];
+
+/// PMJ J16: the widest `min_sol_lamports` the grammar admits (10 SOL) — a
+/// guard on a slipped scale.
+pub const PMJ_MIN_SOL_LAMPORTS_LIMIT: i64 = 10_000_000_000;
+
+/// PMJ J16: the widest `guard_program_slot` the grammar admits.
+pub const PMJ_PROGRAM_SLOT_LIMIT: i64 = 1_000_000_000_000;
+
 /// Program ids a co-signer may never be: a co-signer is a signing key, not
 /// a program or an account the guard reasons about.
 const NOT_A_COSIGNER: [&str; 5] = [
@@ -110,7 +135,7 @@ fn err(msg: impl Into<String>) -> PmjError {
 }
 
 /// Every key the grammar accepts; an unknown key is a refusal.
-const PMJ_KEYS: [&str; 33] = [
+const PMJ_KEYS: [&str; 36] = [
     "families",
     "perp",
     "tau_min_ns",
@@ -148,6 +173,10 @@ const PMJ_KEYS: [&str; 33] = [
     "guard_vault_alt",
     "guard_cosigners",
     "build_extra",
+    // PMJ J16: the live wallet's keys (the live boot and the key check).
+    "guard_deposit_mint",
+    "min_sol_lamports",
+    "guard_program_slot",
 ];
 
 /// `pmj.toml` as parsed. Descriptors and keys stay strings: `pmj_boot`
@@ -227,6 +256,15 @@ pub struct PmjFile {
     /// PMJ J13: at most this many families hold, or are buying, one side of
     /// one window (absent = 0, off; at most the family count).
     pub max_side_families: u8,
+    /// PMJ J16: the deposit mint, base58 — one of [`PMJ_DEPOSIT_MINTS`]
+    /// (absent = none: the live boot refuses; no default, R-PMJ-S46).
+    pub guard_deposit_mint: String,
+    /// PMJ J16: the wallet's SOL floor at the live boot, lamports (absent =
+    /// 0 = unset: the live boot refuses).
+    pub min_sol_lamports: u64,
+    /// PMJ J16: the Predict program's reviewed deploy slot (absent = 0 =
+    /// unpinned; `pmj-exec --key-check` compares it with the chain).
+    pub guard_program_slot: u64,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES.
@@ -458,6 +496,14 @@ pub fn parse(src: &str) -> Result<PmjFile, PmjError> {
     if !guard_vault.is_empty() {
         b58_key("guard_vault", 0, &guard_vault)?;
     }
+    let guard_deposit_mint = opt_str(&kv, "guard_deposit_mint")?;
+    if !guard_deposit_mint.is_empty() && !PMJ_DEPOSIT_MINTS.iter().any(|(_, m)| *m == guard_deposit_mint) {
+        return Err(err(format!(
+            "`guard_deposit_mint` = `{guard_deposit_mint}` is neither USDC ({}) nor JupUSD ({}) — the \
+             two 6-decimal USD mints the live boot's cap check reads in micro dollars (R-PMJ-S46)",
+            PMJ_DEPOSIT_MINTS[0].1, PMJ_DEPOSIT_MINTS[1].1
+        )));
+    }
     let guard_vault_alt = opt_str(&kv, "guard_vault_alt")?;
     if !guard_vault_alt.is_empty() {
         let Some((table, entry)) = guard_vault_alt.split_once(':') else {
@@ -488,6 +534,7 @@ pub fn parse(src: &str) -> Result<PmjFile, PmjError> {
             || guard_alts.contains(c)
             || *c == guard_deposit_account
             || *c == guard_vault
+            || *c == guard_deposit_mint
             || NOT_A_COSIGNER.contains(&c.as_str())
         {
             return Err(err(format!(
@@ -532,6 +579,18 @@ pub fn parse(src: &str) -> Result<PmjFile, PmjError> {
         0,
         10_000_000,
     )? as u64;
+    let min_sol_lamports = in_range(
+        "min_sol_lamports",
+        opt_int(&kv, "min_sol_lamports", 0).map_err(m)?,
+        0,
+        PMJ_MIN_SOL_LAMPORTS_LIMIT,
+    )? as u64;
+    let guard_program_slot = in_range(
+        "guard_program_slot",
+        opt_int(&kv, "guard_program_slot", 0).map_err(m)?,
+        0,
+        PMJ_PROGRAM_SLOT_LIMIT,
+    )? as u64;
     Ok(PmjFile {
         families,
         perp,
@@ -564,6 +623,9 @@ pub fn parse(src: &str) -> Result<PmjFile, PmjError> {
         build_extra,
         strike_law,
         max_side_families,
+        guard_deposit_mint,
+        min_sol_lamports,
+        guard_program_slot,
     })
 }
 
@@ -602,6 +664,11 @@ mod tests {
         assert!(f.live_assets.is_empty());
         assert!(f.guard_programs.is_empty() && f.guard_alts.is_empty(), "refuse all by default");
         assert_eq!((f.guard_deposit_account.as_str(), f.guard_max_sol_lamports, f.guard_max_cu_price), ("", 0, 0));
+        assert_eq!(
+            (f.guard_deposit_mint.as_str(), f.min_sol_lamports, f.guard_program_slot),
+            ("", 0, 0),
+            "PMJ J16: no deposit mint (no default, R-PMJ-S46), no SOL floor, no deploy pin"
+        );
         let g = parse(&src(
             "guard_programs = [\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\"]\n\
              guard_deposit_account = \"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\"\n\
@@ -702,6 +769,35 @@ mod tests {
         ] {
             assert!(parse(&src(bad)).is_err(), "{why}: {bad}");
         }
+    }
+
+    // --- PMJ J16: the live wallet's keys
+
+    #[test]
+    fn the_live_wallet_keys_parse_within_their_bounds() {
+        for (name, mint) in PMJ_DEPOSIT_MINTS {
+            let f = parse(&src(&format!(
+                "guard_deposit_mint = \"{mint}\"\nmin_sol_lamports = 50000000\nguard_program_slot = 462839696\n"
+            )))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!((f.guard_deposit_mint.as_str(), f.min_sol_lamports, f.guard_program_slot), (mint, 50_000_000, 462_839_696));
+        }
+        for bad in [
+            // A base58 key that is not one of the two USD mints (SOL's wrapped mint).
+            "guard_deposit_mint = \"So11111111111111111111111111111111111111112\"\n",
+            "guard_deposit_mint = \"0OIl\"\n",
+            "guard_deposit_mint = [\"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\"]\n",
+            "min_sol_lamports = -1\n",
+            "min_sol_lamports = 10000000001\n",
+            "guard_program_slot = -1\n",
+            "guard_program_slot = 1000000000001\n",
+        ] {
+            assert!(parse(&src(bad)).is_err(), "{bad}");
+        }
+        // A co-signer may not be the deposit mint.
+        let mint = PMJ_DEPOSIT_MINTS[0].1;
+        let both = format!("guard_deposit_mint = \"{mint}\"\nguard_cosigners = [\"{mint}\"]\n");
+        assert!(parse(&src(&both)).is_err());
     }
 
     // --- PMJ W5: the co-signer (dormant), the vault pins, the build extras

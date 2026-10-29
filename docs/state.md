@@ -398,6 +398,27 @@ affected paragraph at each lane close; the superseded text goes to
     (and `universe-refresh` writes in `engine.err.log`); the Mac had 22 GiB free
     at 00:21Z.
 
+## Corrections found 2026-10-29 (PMJ / PM15 live-ready round; verify on `/state`)
+
+- **2026-10-29 14:12Z: main booted `3ab7a855` (J14 + J15), PAPER** — a
+  forced `0010`-slot restart through daily-restart (the exec gate first; R-PM-13).
+  Run `run-1793283147479631000` (epoch 14:12:27Z), pid 26516, `paper` 1,
+  masks 2815 / 2815, nothing halted, `exec` configured 0. Checked 14:37Z: pm15
+  and pm5 `discovery_law_refused` 0 and `venue_law_changed` 0, sockets 7 / 7;
+  every family's first CLOB record admitted.
+  - **J9's ledger splits at this boot** (J14: the window's tick and minimum
+    size now come from the CLOB, so slots 9 and 11's paper law reads the
+    venue's values from here on).
+  - J15 changes nothing in paper (`exec-jupiter` is still not in the loop).
+- **PM15 (slot 9): P0's confirmatory score is KILL** (risk-policy `### PM15-9`):
+  slot 9's live-ready work stops (slot 9 keeps running in PAPER); the
+  PM-only patches are parked in the vault.
+- **PMJ (slot 11) J16 is committed, not deployed to a live frame:** the
+  gated live wiring (risk-policy `### J16`). No gate line exists, so no
+  binary can arm slot 11. `scripts/daily-restart.sh` (the pmj gate) has run
+  from the working tree on main's launchd since ~14:46Z and does nothing
+  while slot 11 is not armed. Provisional rulings R-PMJ-S76..S78 await Anton.
+
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that

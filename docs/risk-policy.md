@@ -559,6 +559,23 @@ HD3, below); the wrapper remains the control.
   not derive is refused, compared in constant time. The variable's decode
   (base58, not constant-time, boot only) and its read are J5's wiring:
   nothing reads it in this pass (slot 11 paper builds no arm).
+- **PMJ J16 replaces the variable with a file (R-PMJ-S73):** nothing reads
+  `PMJ_WALLET_KEY`. The wallet is a 0600 Solana CLI keypair file (a JSON
+  array of 64 bytes) whose absolute path is `PMJ_WALLET_KEYFILE`; it is read
+  only by a live slot-11 boot and by `pmj-exec --key-check`, never into the
+  environment. `pmj_live::load_wallet` refuses unless the path is absolute,
+  `lstat` reads a regular file (never a symlink), the file opens
+  `O_NOFOLLOW` with its dev / inode equal to the `lstat`'s, its owner is the
+  running uid, its mode exactly 0600, its size at most 1 KiB, and it lies
+  outside the repo, `~/multivenue` and `MULTIVENUE_DIR`. It reads straight
+  into a stack buffer (no buffered reader); every buffer is wiped, on
+  refusals too; the public half must equal `PMJ_WALLET_PUBKEY` (compared in
+  constant time) and the seed lands in BX4's locked page. Error texts carry
+  paths and counts, never bytes. `JUP_API_KEY`'s `String` copies are wiped
+  once jup-gw holds it (its environment copy is the limit below). **Not
+  checked — operate it:** the directory (non-synced, 0700: never iCloud's
+  Desktop / Documents, a cloud drive or a backup set), ACLs (`ls -le`), the
+  host's core-dump setting (a dump holds the signer's page).
 - The intermediate hex `String` the environment hands us is zeroized
   after parsing. Without that, the key sits in freed heap for the life
   of the process.
@@ -17586,6 +17603,9 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S73 | The PMJ signing secret: "0600 keypair file (Recommended)" — a 0600 Solana keypair file outside the repo, its path in `.env`. |
 | R-PMJ-S74 | R5 (slot 11 skips τ > 16 s), after the 10-30 checkpoint: "Adopt in paper if it passes (Recommended)". |
 | R-PMJ-S75 | Notifications for slots 9 and 11: "Not now". |
+| R-PMJ-S76 | **PROVISIONAL — Anton to confirm** (the session's choice, J16): the **pilot** frame's day cap is **$1 000** and its open-order bound **4** (`exec_boot` `PMJ_PILOT_CAP_DAY_USD_1E6`, `PMJ_PILOT_MAX_OPEN_ORDERS`); its order, instance and session bounds ($250.01 / $250.01 / −$500) follow slot 9's R-PM-8. Ruled before any `PMJ-LIVE-GATE` line. |
+| R-PMJ-S77 | **PROVISIONAL — Anton to confirm** (the session's choice, J16, risk review M1): **slot 11 arms only alone in its engine** — the engine and the flip refuse a live slot 11 beside any other live slot, because a slot-11 boot refusal aborts the whole engine (the standalone, R-PM-23). |
+| R-PMJ-S78 | **PROVISIONAL — Anton to confirm** (the session's choice, J16, risk review round 2): a **review trigger** found by the daily restart's key check (`pmj-exec` exit 77: the Predict deploy off its pin, the vault table entry or the mint changed, a pinned account closed) **halts the running slot 11** (`slot=11 reason=operator` appended to `exec.HALT`) and pages (`notify-send.sh -l`); every other key-check failure only defers the restart. |
 
 ### J1b — the 5-minute pool, its pipeline, the depth capture
 
@@ -18690,6 +18710,200 @@ over the new paths) · `make copy-audit` new 0 · `make license-check` OK (797
 files) · fuzz `jup_wire` 60 s clean (1.97 M runs). `make bench-check` not run
 (`hot_path` links no crate J15 changes; and under background QoS it is no
 reading — J14).
+
+### J16 — slot 11's live wiring: the gated interlock, the secret-free boot, requirement (a), the flip, the restart gate (2026-10-29)
+
+**Why.** `### J3` named, before any dust gate, (a) the wallet at most the
+slot's day cap, (b) the guard checking `create_order`'s data itself and (c)
+a debit halt; J15 built (b), (c) and recon by order. J16 is the rest: slot
+11's `JupArm` in the engine behind a build-time gate, LAW E-1's two
+switches and a frame; requirement (a); the keypair file (R-PMJ-S73); the
+operator verbs (`pmj-exec`, the flip's `live`); a pmj gate in the daily
+restart. **Nothing in J16 arms anything:** this file carries no gate line;
+the guard's `guard_*` keys default absent — an empty allowlist refuses
+everything (LAW PMJ-G) — and no committed file sets them before Anton has
+reviewed J0's decode; main's `ARM_LIVE` does not name 11. A paper boot is
+unchanged.
+
+- **The gates (build time).** `crates/cli/build.rs` compiles
+  `PMJ_GATES_BUILT` from this file through `src/gate_line.rs`: `dust` when
+  the line `PMJ-DUST-GATE: ruled YYYY-MM-DD`, `pilot` when the line
+  `PMJ-LIVE-GATE: ruled YYYY-MM-DD`, stands at a line's start outside ```
+  and `~~~` fences **in the working tree AND in `git show HEAD:`** (any git
+  failure gives 0; an unclosed fence hides the rest of the file — fail
+  closed; the file is fence-balanced at J16). The flip reads the same
+  grammar at `HEAD`. **A built binary keeps its flags:** revoking a gate is
+  `pmj-flip.sh paper`, then a rebuild. **Never begin a line in this file
+  with either gate word** — no example, no placeholder date: the dated line
+  is Anton's alone.
+- **Arming** (`exec_boot::resolve_gated`, `check_pmj_frame`). Slot 11 arms
+  only with: the two switches (`[exec.slot.11] mode = "live"` and
+  `--arm-live` naming 11); the `dust` flag built in; `venues` exactly
+  `["jupiter"]` (`jupiter` on any other slot refuses, J3); **no other live
+  slot in its engine** (R-PMJ-S77, PROVISIONAL — a slot-11 boot refusal
+  aborts its engine, so the engine must be its own: the standalone,
+  R-PM-23); all four bounds set (> 0) and inside the frame — beyond the
+  pilot frame always refused, beyond dust only with the `pilot` flag;
+  `max_open_orders` inside it; `pmj.toml` `live_assets` = `["btc"]`;
+  `pmj.toml`'s max order at most the exec max order, its `usd_market` at
+  most `cap_instance`.
+- **The frames.**
+
+  | frame | needs | `[exec.slot.11]` | `pmj.toml` |
+  |---|---|---|---|
+  | dust (plan-J5) | the dust line | $5.01 an order and an instance, 1 open order, $50 a day, −$50 a session, reject streak 5, recon-stale 180 s | deposit $5, max order $5.01, $5 a market, −$50 a session, `live_assets` `["btc"]` |
+  | pilot | both lines | $250.01 an order and an instance, at most 4 open orders, **$1 000 a day**, −$500 a session | the operator's, inside the exec frame |
+
+  The pilot's day cap and open-order bound are the session's (R-PMJ-S76,
+  PROVISIONAL — ruled before any pilot line). The flip writes the dust
+  frame only.
+- **What halts slot 11.** No market data rides this venue, so the drift,
+  ws-gap and asset-refusal thresholds never fire for it. It is halted by:
+  the debit halt and the unknown-position halt (J15); recon lost; a fill
+  above its limit; the reject streak (5); the E7 session bound; recon stale
+  (180 s); the operator (`exec.HALT`); the restart gate's review halt
+  (below, R-PMJ-S78).
+- **The boot** (`pmj_live.rs`), each step a refusal that aborts the
+  engine's boot. **Secret-free half** (`pmj_preboot`: no environment,
+  secret or network): slot 11 armed; `exec.HALT` — naming 11, unreadable,
+  not a regular file or over 640 B refuses ("flip to paper first"); its
+  section; the member; the families; the member caps inside the slot's
+  clamps; the frame (with `pmj.toml`'s `live_assets`, and
+  `max_open_orders`); the offline self-test (RFC 8032, the guard's known
+  answers on J15's public fixtures, the keypair parser); the `guard_*` keys
+  reviewed — an empty allowlist or an unset pin refuses, `build_extra`
+  required, the Predict program listed, co-signers only when named; the SOL
+  floor set. **Then** the public key and the guard for it; the keypair
+  file; the Jupiter client; `JUP_API_KEY`. **Networked half:** requirement
+  (a); the held legs (`pmj-held.state`) and the session anchor
+  (`pmj-pnl-anchor.state`, a temporary and a rename), both beside
+  `exec.toml`; jup-gw's and the arm's own boot checks; the thread.
+  `boot_with` is generic over the Jupiter client, so scripted-client tests
+  run (a), the anchor and the tell.
+- **Requirement (a).** One balance read before the arm exists: the deposit
+  mint's balance at most `[exec.slot.11] cap_day_usd_1e6`, and SOL at least
+  `pmj.toml` `min_sol_lamports`. `guard_deposit_mint` has no default and
+  must be USDC or JupUSD (six decimals: base units are micro dollars). A
+  failed read, a missing mint entry, an unset cap or an unset floor
+  refuses. **Judged at the boot and the flip only:** move no funds in
+  during a session; wins can lift the wallet over the cap and make the next
+  boot refuse — sweep profits out only with a new session (`pmj-flip.sh
+  live` sets the anchor aside). SOL has a floor, no ceiling.
+- **The secret (R-PMJ-S73):** "Signing-key handling", amended by J16.
+- **`pmj-exec`** (`multivenue-engine pmj-exec`, `scripts/pmj-exec.sh`):
+  `--self-test` is offline. `--key-check` is read-only and reads **the chain
+  first** — public RPC `getAccountInfo` (host `PMJ_SOLANA_RPC`, else
+  `api.mainnet-beta.solana.com`; no secret) of the Predict program, its
+  ProgramData (the deploy slot against `pmj.toml` `guard_program_slot`),
+  the vault's lookup table (`guard_vault_alt`'s entry) and the deposit mint
+  — then the keypair file, one authenticated Jupiter `GET`, the balances,
+  the SOL floor and the day cap. No signature leaves the host; nothing
+  secret is printed. Exit 0 passes; **77 is a review trigger**: the program
+  not owned by the upgradeable loader or not a Program; the account not
+  ProgramData or the deploy slot off its pin; the vault's table not a
+  lookup table, deactivated, missing the entry or naming another key; the
+  mint not a token program's, not initialised or not six-decimal; any of
+  these accounts closed (`value: null`). **78 is everything else**
+  (transport, budget, HTTP, parse, the balances, the key, the region, the
+  SOL floor, the self-test). The chain runs first, so a 78 never masks a 77.
+- **The flip** (`scripts/pmj-flip.sh`; J4's "`live` only refuses" is
+  superseded). `live` refuses unless: `ARM_LIVE` (read as the wrapper reads
+  it) names no slot but 11 and the exec.toml the boot reads marks no other
+  slot live (R-PMJ-S77); the committed (`HEAD`) dust line; `pmj.toml`
+  exists, `STRATEGY` names pmj, `exec.HALT` does not name 11; `pmj.toml`
+  pins `guard_program_slot`; `pmj-check` passes on the dust-frame
+  `pmj.toml`; `pmj-exec --key-check` passes at the $50 cap. Only then does
+  it write, each file after a stamped `.bak`: `strategy.conf`
+  (`ARM_LIVE=11`, `EXEC_TOML`), the `[exec.slot.11]` dust section and
+  `pmj.toml`'s frame lines; it sets the session anchor aside (every `live`
+  starts a new session). `paper` takes 11 out of `ARM_LIVE`, sets the
+  section's `mode` to paper and restores R-PMJ-S22's paper frame in
+  `pmj.toml` ($250 / $250.01 / $250 / −$3 500; `live_assets` as is) when
+  `pmj-check` passes on it, warning otherwise. Neither restarts anything.
+- **The daily-restart pmj gate** (`scripts/daily-restart.sh`; on main's
+  launchd since 2026-10-29 ~14:46Z, where nothing of it runs: slot 11 is not
+  armed). **Armed** when `ARM_LIVE` (`strategy.conf` sourced in a subshell;
+  parts trimmed, a leading `+` dropped, compared as numbers) names 11, or
+  the in-force `EXEC_TOML` or any `~/multivenue/exec*.toml` marks
+  `[exec.slot.11]` live (an unreadable file arms it; `enabled = 0` does
+  not). It decides only the restarts E3 did not defer:
+  - `exec.HALT` beside the in-force `EXEC_TOML` naming 11 (parsed as the
+    router parses it) or not readable whole → the restart is **deferred**,
+    no check run and no failure counted, paged silently once per halt-file
+    mtime: archive the line or `pmj-flip.sh paper`;
+  - else the offline self-test, then `pmj-exec.sh key-check` at the slot's
+    `cap_day_usd_1e6` (the in-force file's, else the arming file's) before
+    the drain. A failure defers the restart (owed in
+    `state/pmj-gate-pending`; retention and the xsd rotation still run)
+    with a 1 / 5 / 15 / 60-minute backoff, and writes `state/pmj-gate-RED`
+    after three;
+  - **77** also appends `slot=11 reason=operator` once to that `exec.HALT`
+    (the router's own word; it reads unknown words as `operator`), so the
+    running router halts slot 11 within about a second, and pages once
+    (`notify-send.sh -l -s PMJ`) (R-PMJ-S78). Clearing it: review, re-pin,
+    archive the halt line; the next restart checks again.
+  - A harness in the vault (51 cases; stub `exec-smoke.sh`, `pmj-exec.sh`
+    and `notify-send.sh`) runs the arming spellings, the E3 interplay, the
+    backoff, 77 / 78 and the halt deferral.
+  - **Limits:** a launchd crash relaunch skips E3 and this gate, and a
+    slot-11 boot refusal there keeps that engine in a relaunch loop until
+    slot 11 is flipped to paper or the wallet swept (hence alone, on the
+    standalone); payouts between the check and the boot can still make the
+    boot refuse; the halt goes beside the `EXEC_TOML` now in
+    `strategy.conf` — if that changed since the engine booted, the engine
+    does not poll it; `strategy.conf` is sourced at each decision.
+- **Paper and routing.** Paper is unchanged: with slot 11 not live there is
+  no arm, no socket, no secret read and no arm metric
+  (`a_paper_slot_11_builds_no_arm_and_reads_no_secret`); one stats struct
+  is allocated at boot. The composition is `SlotSplit(11, SlotSplit(9,
+  SlotSplit(3, inner, bin15), pm15), pmj)`; cancels route per slot, so
+  another slot's halt never reaches `JupArm`, and every other slot routes
+  as before. Live only: `engine_pmj_arm_*` (21) and `engine_pmj_gw_*` (36)
+  (the worst case ≈ 715 of 768 gauges) and one keep-alive connection to
+  `api.jup.ag` on jup-gw's thread. The order path is J15's (alloc gate
+  135); the split layer allocates nothing; the held-file writes allocate on
+  jup-gw's thread (documented). `exec-jupiter` and `signer-ed25519` are
+  workspace crates: no `license-deps`. `.env.example` names the four keys
+  (no values).
+- **Open before the dust line** (the go-live runbook's order): J0 — the
+  `guard_*` keys from its decode, the 404 and closed-status shapes,
+  `market_id`'s derivation (requirement (d): the market hash bound to the
+  window), the `orderType: limit` request fields; R-PMJ-S44 (the
+  co-signer), S45 (the price cap — J15's Limit answers it on public data;
+  Anton's own builds confirm), S46 (the deposit mint), S48 (the fee); the
+  claim route (claims are built and held, never sent); J15's limits (split
+  fills halt; 32 held legs; positions by key, first page); R-PMJ-S76..S78.
+- **Risk review** (an Opus subagent at xhigh, read-only): round 1
+  **BLOCK** — M1 any slot-11 boot refusal took the whole engine down; M2
+  the review trigger not re-read at arming; minors (the gate grammar loose;
+  the build gate on the working tree only; refusal tests stopped at pure
+  functions; (a) judged at boot only) and NITs → fixed (slot 11 alone; the
+  secret-free pre-boot, `exec.HALT` first; the dated, fence-aware grammar
+  in the tree AND at `HEAD`; an injected client; temporary + rename;
+  `max_open_orders` in the frame check; `paper` restoring the paper frame);
+  round 2 **APPROVE** with four minors (`ARM_LIVE` read fail-open; the
+  harness outside E3; a review trigger not halting the running slot; crash
+  relaunch) → fixed; round 3 **APPROVE** with two minors (the chain checks
+  masked by 78s; a halted slot 11 looping a scheduled restart) and a NIT (a
+  closed pinned account) → fixed; round 4 **APPROVE**. After it the
+  session carried M1 to the flip (it added 11 to any `ARM_LIVE`): `live`
+  refuses beside another live slot, tested on the real script.
+
+J16-GATES (2026-10-29, on the Mac, detached, every cargo under `taskpolicy
+-b` unless noted; the release binary untouched). The battery, 15:05–15:19Z:
+`make lint` rc 0, 0 warnings · `cargo nextest run --workspace` 5 216
+passed, 1 failed, 10 skipped — the red is gate 103
+(`hl_gateway_outcome_arm_is_zero_alloc`, a crate J16 does not touch) under
+nextest on the background-QoS E-cores, as at J15; it passes in `make
+alloc-assert` and alone at normal QoS (15:34Z, 1 / 1) · `make alloc-assert`
+139 passed at 0 B (a fresh `Compiling bench`) · `make copy-audit` new 0 ·
+fuzz `jup_wire` 60 s clean (1.50 M runs). After the round-4 and flip fixes,
+15:24–15:31Z: `cargo nextest run -p cli -p exec-jupiter -p core-config`
+1 011 passed, 6 skipped · `make copy-audit` new 0 · `make lint` rc 0, 0
+warnings · `make license-check` OK (802 files, the five new ones staged) ·
+the restart-gate harness 51 / 51 and `zsh -n` on `daily-restart.sh`,
+`pmj-flip.sh`, `pmj-exec.sh`. `make bench-check` not run (`hot_path` links
+no crate J16 changes; under background QoS it is no reading — J14).
 
 ## NOTIFY — N-DOCTRINE: the one-way Telegram notifier (2026-10-24)
 

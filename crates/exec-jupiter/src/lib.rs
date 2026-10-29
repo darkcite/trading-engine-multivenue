@@ -10,8 +10,10 @@
 //! account (project doc `claude/pmj-plan-2026-10-18.md` §3.3; the API's
 //! wire facts in the vault, `docs/research/pmj/jup-api-spec-2026-10-18.md`).
 //!
-//! **Paper only in this pass** (scope ruling): the cores are socket-free and
-//! rig-tested; a live slot 11 refuses the boot until a `PMJ-DUST-GATE` line.
+//! **Never armed by this crate** (scope ruling): the cores are socket-free and
+//! rig-tested; the live boot is `cli::pmj_live` (PMJ J16), and the engine
+//! refuses a live slot 11 unless its binary was BUILT from a tree whose risk
+//! policy carries a line beginning `PMJ-DUST-GATE: `.
 //!
 //! | module | responsibility |
 //! |---|---|
@@ -24,6 +26,7 @@
 //! | [`arm`] | the engine thread's `OrderDispatch`: admission, fills, the ledger and the worth |
 //! | [`held`] | `pmj-held.state`: the legs held, across a restart |
 //! | [`stats`] | the arm's and jup-gw's `/metrics` words |
+//! | [`selftest`] | the guard's known answers on the public fixtures, in the binary that signs (J16) |
 //!
 //! ## The laws
 //!
@@ -54,6 +57,7 @@ pub mod gw;
 pub mod held;
 pub mod json;
 pub mod render;
+pub mod selftest;
 pub mod stats;
 pub mod tx;
 

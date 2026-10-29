@@ -255,6 +255,19 @@ enum Cmd {
     /// `--miss-probe` (PM15-6e, ONE order) sends a $1 FAK priced to miss.
     /// Exit 0, or 78 with the refusal on stderr. Never prints a secret.
     PmExec(PmExecArgs),
+    /// PMJ J16: slot 11's arm, checked. `--self-test` (offline) runs RFC
+    /// 8032, the guard's known answers on the public Jupiter Predict
+    /// fixtures and the keypair parser's vector; `--key-check` (online,
+    /// READ-ONLY; the wrapper sources slot 11's wallet) adds `pmj.toml`'s
+    /// guard keys, the 0600 keypair file, the wallet's balances (amounts
+    /// only), one authenticated read (the API key, the region) and, from
+    /// public Solana RPC, the Predict program's deploy slot, the vault's
+    /// lookup-table entry and the deposit mint's decimals against their
+    /// pins. No order, no transaction. Exit 0; 77 a REVIEW TRIGGER (the
+    /// deploy, the vault entry or the mint is not what was reviewed —
+    /// `daily-restart.sh` halts a running slot 11 on it); 78 any other
+    /// refusal. The refusal on stderr; never prints a secret.
+    PmjExec(PmjExecArgs),
     /// PM15-7: PolyBolt's `price.crypto` and `price.crypto.twap` for the
     /// assets, on the account's CLOB API credentials (the wrapper sources
     /// them; never printed), for `--seconds`: the first frames raw, a JSON
@@ -279,6 +292,28 @@ struct PmExecArgs {
     /// fill — the venue's "no match" proves the order path.
     #[arg(long)]
     miss_probe: bool,
+}
+
+#[derive(Debug, Parser)]
+#[command(group(
+    clap::ArgGroup::new("check")
+        .required(true)
+        .args(["self_test", "key_check"])
+))]
+struct PmjExecArgs {
+    /// Offline: the self-test's vectors.
+    #[arg(long)]
+    self_test: bool,
+    /// Online, read-only: the self-test, the wallet, the reads.
+    #[arg(long)]
+    key_check: bool,
+    /// slot 11's artifact (default ~/multivenue/pmj.toml).
+    #[arg(long)]
+    pmj: Option<PathBuf>,
+    /// Refuse when the wallet's deposit balance is over this day cap,
+    /// ×1e6 USD (the flip passes the dust frame's).
+    #[arg(long)]
+    cap_day_usd_1e6: Option<i64>,
 }
 
 #[derive(Debug, Parser)]
@@ -1864,6 +1899,28 @@ fn main() -> ExitCode {
                 Err(reason) => {
                     eprintln!("pm-exec: {reason}");
                     ExitCode::from(78)
+                }
+            }
+        }
+        Cmd::PmjExec(args) => {
+            let r = if args.key_check {
+                cli::pmj_exec::key_check(
+                    TlsTransport::default_client_config(),
+                    args.pmj.as_deref(),
+                    args.cap_day_usd_1e6,
+                )
+                .map_err(|e| (e.exit_code(), e.to_string()))
+            } else {
+                cli::pmj_exec::self_test().map_err(|e| (cli::pmj_exec::EXIT_REFUSED, e))
+            };
+            match r {
+                Ok(tell) => {
+                    println!("{tell}");
+                    ExitCode::SUCCESS
+                }
+                Err((code, reason)) => {
+                    eprintln!("pmj-exec: {reason}");
+                    ExitCode::from(code)
                 }
             }
         }
@@ -4272,6 +4329,17 @@ fn run(args: RunArgs) -> ExitCode {
     } else {
         (None, None)
     };
+    // PMJ J16: slot 11's jup-gw reads every window the 5-minute discovery
+    // finds — the tee's two ends, when slot 11 is live (none on paper).
+    let (mut pmj_tee_tx, mut pmj_tee_rx) = if exec_boot
+        .as_ref()
+        .is_some_and(cli::exec_boot::ExecBoot::pmj_live)
+    {
+        let (t, r) = cli::pmj_live::spec_tee();
+        (Some(t), Some(r))
+    } else {
+        (None, None)
+    };
     // (BX9: before the discovery too — a live Binance arm's options held
     // outside the chain join it right after the discovery, before any
     // table is built from the chain: the R3 ruling.)
@@ -5596,6 +5664,9 @@ fn run(args: RunArgs) -> ExitCode {
         drop(pm5_prod);
         drop(pm5_event_prod);
         drop(pm5_depth_prod);
+        // PMJ J16: no 5-minute discovery, no windows for jup-gw — a live
+        // slot 11 refuses its boot (fail closed) rather than arm blind.
+        pmj_tee_rx = None;
     } else {
         let mut assets = Vec::with_capacity(pm5_keys.len());
         for key in &pm5_keys {
@@ -5626,6 +5697,7 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.pm5,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_pm5)),
+            pmj_tee_tx.take(),
         ) {
             Ok(hs) => handles.extend(hs),
             Err(e) => {
@@ -5955,6 +6027,8 @@ fn run(args: RunArgs) -> ExitCode {
     let mut bin15_stop: Option<cli::xmm_live::GatewayStop> = None;
     // PM15-6c: slot 9's two threads' owner, alike.
     let mut pm15_stop: Option<cli::xmm_live::GatewayStop> = None;
+    // PMJ J16: slot 11's jup-gw thread's owner, alike.
+    let mut pmj_stop: Option<cli::xmm_live::GatewayStop> = None;
     let result = match (strategy_choice, args.live, set_mask) {
         // HYPARB H0 (O-H1): `latency-arb` has no arm any more — slot 0
         // is the hyparb set member and the old name falls through to
@@ -6827,6 +6901,53 @@ fn run(args: RunArgs) -> ExitCode {
                     } else {
                         exec_router::NO_SLOT
                     };
+                    // PMJ J16: **slot 11 on its own Jupiter arm**, when the
+                    // artifact marks it live (and the binary carries the
+                    // PMJ-DUST-GATE line — `exec_boot` refused it otherwise):
+                    // `SlotSplit(11, …)` just outside slot 9's — none
+                    // (`NO_SLOT`) without. jup-gw is released after the
+                    // loop, as slot 9's threads.
+                    let pmj_arm = if eb.pmj_live() {
+                        let booted = match pmj_tee_rx.take() {
+                            Some(rx) => cli::pmj_live::boot_pmj_arm(
+                                &eb,
+                                pmj_boot.as_ref(),
+                                TlsTransport::default_client_config(),
+                                rx,
+                                statuses.pmjx.clone(),
+                            ),
+                            None => Err(String::from(
+                                "slot 11 is live, but the 5-minute ingress did not start (no \
+                                 `[polymarket] rolling` :5m family): its arm would have no windows",
+                            )),
+                        };
+                        match booted {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                pmj_stop = Some(b.stop);
+                                handles.push(b.handle);
+                                Some(b.arm)
+                            }
+                            Err(reason) => {
+                                error!(%reason, "pmj: slot 11's arm refused — boot aborted");
+                                if let Some(s) = &bin15_stop {
+                                    s.release();
+                                }
+                                if let Some(s) = &pm15_stop {
+                                    s.release();
+                                }
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let pmj_slot = if pmj_arm.is_some() {
+                        cli::exec_boot::PMJ_SLOT as u8
+                    } else {
+                        exec_router::NO_SLOT
+                    };
                     let xmm_arm = if eb.gateway_live().is_some() {
                         let spec = cli::xmm_live::XmmSpec {
                             eb: &eb,
@@ -6850,6 +6971,9 @@ fn run(args: RunArgs) -> ExitCode {
                                     s.release();
                                 }
                                 if let Some(s) = &pm15_stop {
+                                    s.release();
+                                }
+                                if let Some(s) = &pmj_stop {
                                     s.release();
                                 }
                                 join_reverse(handles);
@@ -6917,6 +7041,9 @@ fn run(args: RunArgs) -> ExitCode {
                             if let Some(s) = &pm15_stop {
                                 s.release();
                             }
+                            if let Some(s) = &pmj_stop {
+                                s.release();
+                            }
                             join_reverse(handles);
                             return ExitCode::from(1);
                         }};
@@ -6963,16 +7090,20 @@ fn run(args: RunArgs) -> ExitCode {
                             match xmm_arm {
                                 None => {
                                     let inner = exec_router::SlotSplit::new(
-                                        pm15_slot,
-                                        exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
-                                        pm15_arm,
+                                        pmj_slot,
+                                        exec_router::SlotSplit::new(
+                                            pm15_slot,
+                                            exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
+                                            pm15_arm,
+                                        ),
+                                        pmj_arm,
                                     );
                                     let mut d = exec_router::RoutedDispatcher::new(
                                         eb.route, paper, inner, anchor,
                                     );
                                     wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                                     $(
-                                        let split_aliases = *d.live().a().a()$(.$hop())*.aliases();
+                                        let split_aliases = *d.live().a().a().a()$(.$hop())*.aliases();
                                         finish_bn!(d, split_aliases, $specs);
                                     )?
                                     enter_loop!(d, $what)
@@ -6981,9 +7112,13 @@ fn run(args: RunArgs) -> ExitCode {
                                     let split = exec_router::SlotSplit::new(
                                         cli::exec_boot::XMM_SLOT as u8,
                                         exec_router::SlotSplit::new(
-                                            pm15_slot,
-                                            exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
-                                            pm15_arm,
+                                            pmj_slot,
+                                            exec_router::SlotSplit::new(
+                                                pm15_slot,
+                                                exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
+                                                pm15_arm,
+                                            ),
+                                            pmj_arm,
                                         ),
                                         xmm,
                                     );
@@ -6992,7 +7127,7 @@ fn run(args: RunArgs) -> ExitCode {
                                     );
                                     wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                                     $(
-                                        let split_aliases = *d.live().a().a().a()$(.$hop())*.aliases();
+                                        let split_aliases = *d.live().a().a().a().a()$(.$hop())*.aliases();
                                         finish_bn!(d, split_aliases, $specs);
                                     )?
                                     finish_xmm!(d, xspecs);
@@ -7117,6 +7252,9 @@ fn run(args: RunArgs) -> ExitCode {
         s.release();
     }
     if let Some(s) = &pm15_stop {
+        s.release();
+    }
+    if let Some(s) = &pmj_stop {
         s.release();
     }
     join_reverse(handles);

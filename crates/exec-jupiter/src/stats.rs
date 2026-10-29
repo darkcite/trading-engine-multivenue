@@ -29,6 +29,9 @@ pub const PUBLISH_EVERY_NS: u64 = 1_000_000_000;
 
 /// The arm's words.
 pub const ARM_WORDS: usize = 21;
+/// PMJ J16: the arm's trailing words that are levels, not tallies (the
+/// metrics mirror names a tally `…_total`, a level bare).
+pub const ARM_LEVELS: usize = 5;
 /// The arm's names, in word order (the last five are levels).
 pub const ARM_NAMES: [&str; ARM_WORDS] = [
     "submitted",
@@ -56,6 +59,8 @@ pub const ARM_NAMES: [&str; ARM_WORDS] = [
 
 /// jup-gw's words.
 pub const GW_WORDS: usize = 36;
+/// PMJ J16: jup-gw's trailing words that are levels.
+pub const GW_LEVELS: usize = 5;
 /// jup-gw's names, in word order (the last five are levels: the halt
 /// reason, the USDC and SOL gauges, -1 = not read; the debit halt's
 /// reference, -1 = none yet, and the deposits sent since it).
@@ -178,3 +183,4 @@ pub(crate) fn word(v: u64) -> i64 {
 }
 
 const _: () = assert!(core::mem::align_of::<JupExecStats>() == 64);
+const _: () = assert!(ARM_LEVELS < ARM_WORDS && GW_LEVELS < GW_WORDS);

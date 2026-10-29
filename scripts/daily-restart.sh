@@ -70,6 +70,13 @@
 # keep running, and the owed restart is taken the minute the gate goes
 # green. See the block below for the backoff and why it is mandatory.
 #
+# PMJ GATE (J16): when slot 11 is armed (strategy.conf's ARM_LIVE names
+# it, or an exec*.toml marks it live), the drain that would re-arm it
+# waits on scripts/pmj-exec.sh key-check too, the same deferral and
+# backoff shape; a review trigger (exit 77) also halts the running slot
+# through exec.HALT. A launchd crash relaunch skips E3 and this gate
+# alike (their blocks below).
+#
 # StartInterval (not StartCalendarInterval) because launchd calendar
 # fires in LOCAL time — a UTC-day law must not bend to DST.
 set -u
@@ -351,7 +358,331 @@ exec_gate_pass() {
   return 1
 }
 
-if [ "$drain" = 1 ] || [ -f "$EXEC_GATE_PENDING" ]; then
+# >>> pmj-gate (definitions)
+# ---------------------------------------------------------------------
+# PMJ J16 PRE-RESTART GATE (slot 11; risk review J16 M2, round 2).
+#
+#   Every arming of slot 11 re-proves its wallet and its venue's code.
+#
+# A restart is an ARMING: the engine that comes back boots slot 11 live
+# when strategy.conf's ARM_LIVE names 11. So the review trigger the flip
+# runs — scripts/pmj-exec.sh key-check: the keypair file; the wallet at
+# most the day cap (requirement (a)) and its SOL floor; the API key and
+# the region; the Predict program's deploy slot against its pin (a new
+# deploy is a review trigger); the vault's lookup-table entry; the deposit
+# mint's decimals — runs again before every drain that would re-arm it,
+# at the [exec.slot.11] cap_day_usd_1e6 of the EXEC_TOML in force.
+#
+# WHEN IT ARMS (E3's asymmetry: a false positive costs a key check, a
+# false negative an unproven arming): strategy.conf's ARM_LIVE names 11,
+# read as the wrapper and the engine read it — the file SOURCED in a
+# subshell (quotes, `export `, $HOME and ~, the last assignment wins),
+# each comma-separated part trimmed and compared as a number (`011`,
+# `3, 11` count) — OR the EXEC_TOML in force or any ~/multivenue/exec*.toml
+# marks [exec.slot.11] live (an existing but unreadable one arms too; an
+# `enabled = 0` file is inert, as E3 reads it).
+#
+# THE SAME SHAPE AS E3: the offline half (pmj-exec.sh self-test) on every
+# attempt; the online half backs off 1, 5, 15, then 60 minutes (Jupiter's
+# API key and public Solana RPC have request budgets too); a failure
+# DEFERS the drain and only the drain — the restart is owed in
+# pmj-gate-pending and taken the minute the key check passes, retention
+# and the xsd rotation still run; after PMJ_GATE_ALERT_AFTER consecutive
+# failures it writes state/pmj-gate-RED. It decides only a restart E3 did
+# not defer (a restart E3 owes stays E3's). FAIL-CLOSED: an unreadable
+# cap, a missing key check, an unreachable venue all defer.
+#
+# A REVIEW TRIGGER STOPS THE RUNNING SLOT: key-check exit 77 (the Predict
+# program's deploy slot is not the pinned one, the vault's lookup-table
+# entry is not the pinned vault, or the deposit mint is not the reviewed
+# 6-decimal one) also appends `slot=11 reason=operator` to the exec.HALT
+# beside the EXEC_TOML in force — the running router reads that file every
+# second and halts slot 11 (`operator` is the router's own word; any word
+# it does not know reads as `operator` too) — once per halt, and pages the
+# operator (scripts/notify-send.sh -l -s PMJ). Every other failure (78:
+# transport, budget, balance, the key) only defers. The key check reads the
+# chain FIRST (public RPC, no secret), so no 78 can mask a 77.
+#
+# A HALTED SLOT 11 DEFERS, NOT LOOPS: the live boot refuses while the
+# exec.HALT beside the EXEC_TOML in force names slot 11 (pmj_live::
+# check_halt_file), so a drain then would leave launchd relaunching into
+# that refusal — every lane of the engine down. So when the gate is armed
+# and that exec.HALT names slot 11 as the router reads it (a line whose
+# `slot=` — or, with none, first bare number — is 11), or exists but cannot
+# be read whole (not a regular file, over 640 B, unreadable, not UTF-8, as
+# check_halt_file refuses it), the restart is deferred and kept owed in
+# pmj-gate-pending, no key check runs, it counts as no failure (no backoff,
+# no RED), and the operator is paged once per exec.HALT mtime (silently:
+# notify-send.sh -s PMJ). Archive the halt line after review, or
+# pmj-flip.sh paper.
+#
+# WHAT THIS GATE DOES NOT COVER: a launchd CRASH RELAUNCH (KeepAlive) boots
+# the engine without this script — it skips E3 and this gate alike; and a
+# slot-11 boot refusal (a wallet over the cap, Jupiter down, the keypair
+# file) then keeps that engine down in a relaunch loop until the operator
+# flips slot 11 to paper (scripts/pmj-flip.sh paper) or sweeps the wallet.
+# Slot 11 is meant to run alone, on the standalone (R-PM-23), where that
+# loop takes no other slot down.
+#
+# With slot 11 armed nowhere, nothing here runs a check and nothing changes.
+# ---------------------------------------------------------------------
+STRATEGY_CONF="$HOME/multivenue/strategy.conf"
+PMJ_GATE_PENDING="$STATE/pmj-gate-pending"
+PMJ_GATE_FAILS="$STATE/pmj-gate-fails"
+PMJ_GATE_NEXT="$STATE/pmj-gate-next"
+PMJ_GATE_RED="$STATE/pmj-gate-RED"
+PMJ_GATE_HALT_PAGED="$STATE/pmj-gate-halt-paged"
+PMJ_GATE_ALERT_AFTER=3
+PMJ_GATE_TRIGGER=""
+PMJ_GATE_FILE=""
+exec_gate_deferred=0
+
+# The value strategy.conf gives KEY as the wrapper sees it: the file
+# SOURCED in a subshell (the wrapper sources it), nothing it prints kept.
+pmj_conf_get() {
+  [ -f "$STRATEGY_CONF" ] || return 0
+  (
+    unset "$1"
+    set +u
+    . "$STRATEGY_CONF" >/dev/null 2>&1
+    print -r -- "${(P)1:-}"
+  )
+}
+
+# 0 = the ARM_LIVE spec $1 names slot 11 as the engine's parse_arm_live
+# reads it: comma-separated parts, each trimmed, a decimal slot number.
+pmj_spec_names_11() {
+  local part
+  for part in "${(@s:,:)1}"; do
+    part="${part//[[:space:]]/}"
+    part="${part#+}"
+    [[ "$part" == <-> ]] || continue
+    (( 10#$part == 11 )) && return 0
+  done
+  return 1
+}
+
+# The EXEC_TOML in force: strategy.conf's, else the default.
+pmj_exec_toml() {
+  local f
+  f="$(pmj_conf_get EXEC_TOML)"
+  print -r -- "${f:-$HOME/multivenue/exec.toml}"
+}
+
+# 0 = file $1 has an [exec.slot.11] section whose mode is live.
+pmj_file_arms_11() {
+  awk '/^[ \t]*\[/ { s = ($0 ~ /^[ \t]*\[exec\.slot\.11\][ \t]*(#.*)?$/) } s && /^[ \t]*mode[ \t]*=[ \t]*"live"/ { found = 1 } END { exit !found }' "$1"
+}
+
+# 0 = slot 11 is (or may be) armed (the header's WHEN IT ARMS);
+# PMJ_GATE_TRIGGER says why, PMJ_GATE_FILE the exec file that armed it.
+pmj_gate_armed() {
+  local f
+  PMJ_GATE_FILE=""
+  if pmj_spec_names_11 "$(pmj_conf_get ARM_LIVE)"; then
+    PMJ_GATE_TRIGGER="strategy.conf's ARM_LIVE names slot 11"
+    return 0
+  fi
+  for f in "$(pmj_exec_toml)" "$HOME"/multivenue/exec*.toml(N); do
+    [ -f "$f" ] || continue
+    if [ ! -r "$f" ]; then
+      PMJ_GATE_TRIGGER="$f (UNREADABLE — arming the pmj gate rather than assuming slot 11 is not live)"
+      return 0
+    fi
+    if grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*0' "$f"; then
+      continue
+    fi
+    if pmj_file_arms_11 "$f"; then
+      PMJ_GATE_TRIGGER="$f marks [exec.slot.11] live"
+      PMJ_GATE_FILE="$f"
+      return 0
+    fi
+  done
+  PMJ_GATE_TRIGGER=""
+  return 1
+}
+
+# The [exec.slot.11] cap_day_usd_1e6 of file $1, digits only (TOML's
+# underscores dropped); empty when there is none.
+pmj_cap_of() {
+  local v
+  [ -r "$1" ] || return 0
+  v="$(awk '/^[ \t]*\[/ { s = ($0 ~ /^[ \t]*\[exec\.slot\.11\][ \t]*(#.*)?$/) } s && /^[ \t]*cap_day_usd_1e6[ \t]*=/ { v = $0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t]*(#.*)?$/, "", v); print v; exit }' "$1")"
+  print -r -- "${v//_/}"
+}
+
+# The cap the key check judges the wallet at: the EXEC_TOML in force's,
+# else that of the file that armed the gate; empty when there is none.
+pmj_gate_cap_day() {
+  local v
+  v="$(pmj_cap_of "$(pmj_exec_toml)")"
+  if [ -z "$v" ] && [ -n "$PMJ_GATE_FILE" ]; then
+    v="$(pmj_cap_of "$PMJ_GATE_FILE")"
+  fi
+  print -r -- "$v"
+}
+
+pmj_gate_note_failure() {
+  local rc="$1" where="$2" n delay
+  n=1
+  [ -f "$PMJ_GATE_FAILS" ] && n=$(( $(cat "$PMJ_GATE_FAILS") + 1 ))
+  echo "$n" > "$PMJ_GATE_FAILS"
+  case "$n" in
+    1) delay=60 ;;
+    2) delay=300 ;;
+    3) delay=900 ;;
+    *) delay=3600 ;;
+  esac
+  echo "$(( $(date -u +%s) + delay ))" > "$PMJ_GATE_NEXT"
+  echo "daily-restart: pmj gate FAILED at the $where (exit $rc), attempt $n; next pmj key-check in $((delay / 60)) min" >&2
+  if [ "$n" -ge "$PMJ_GATE_ALERT_AFTER" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) pmj gate RED: $where exit $rc, $n consecutive failures" \
+      > "$PMJ_GATE_RED"
+    echo "daily-restart: *** $PMJ_GATE_RED written — restarts are deferred until the pmj key-check passes ***" >&2
+  fi
+}
+
+pmj_gate_clear() {
+  rm -f "$PMJ_GATE_FAILS" "$PMJ_GATE_NEXT" "$PMJ_GATE_RED" "$PMJ_GATE_HALT_PAGED"
+}
+
+# The exec.HALT beside the EXEC_TOML in force (the router's and the live
+# boot's halt file).
+pmj_halt_path() {
+  local h
+  h="$(pmj_exec_toml)"
+  print -r -- "${h:h}/exec.HALT"
+}
+
+# The mtime of $1 (zsh's own stat: no platform flags), or `unknown`.
+pmj_halt_mtime() {
+  zmodload -F zsh/stat b:zstat 2>/dev/null
+  zstat +mtime -- "$1" 2>/dev/null || print -r -- unknown
+}
+
+# 0 = the halt file $1 would refuse slot 11's live boot (the header's A
+# HALTED SLOT 11): it names slot 11 as the router's parse_halt_file reads
+# it, or it exists but cannot be read whole. Absent = 1.
+pmj_halt_blocks() {
+  local h="$1"
+  [ -e "$h" ] || return 1
+  [ -f "$h" ] && [ -r "$h" ] || return 0
+  [ "$(( $(wc -c < "$h") ))" -le 640 ] || return 0
+  if command -v iconv >/dev/null 2>&1 && ! iconv -f UTF-8 -t UTF-8 "$h" >/dev/null 2>&1; then
+    return 0
+  fi
+  awk '
+    {
+      line = $0
+      sub(/\r$/, "", line); sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") next
+      n = split(line, w, /[ \t]+/)
+      slot = ""
+      for (i = 1; i <= n; i++) {
+        f = w[i]
+        if (f ~ /^slot=/) {
+          v = substr(f, 6)
+          slot = (v ~ /^[+]?[0-9]+$/) ? v : ""
+        } else if (f ~ /^reason=/) {
+          continue
+        } else if (slot == "" && f ~ /^[+]?[0-9]+$/) {
+          slot = f
+        }
+      }
+      if (slot != "") { sub(/^[+]/, "", slot); if (slot + 0 == 11) found = 1 }
+    }
+    END { exit !found }' "$h"
+}
+
+# Page once per halt-file mtime (silently: the halt is the operator's own,
+# or the review trigger already rang).
+pmj_halt_page() {
+  local m
+  m="$(pmj_halt_mtime "$1")"
+  if [ -f "$PMJ_GATE_HALT_PAGED" ] && [ "$(cat "$PMJ_GATE_HALT_PAGED")" = "$m" ]; then
+    return 0
+  fi
+  echo "$m" > "$PMJ_GATE_HALT_PAGED"
+  "$SCRIPTS_DIR/notify-send.sh" -s PMJ "slot 11: exec.HALT names slot 11 — restarts deferred until the halt line is archived (after review) or slot 11 is flipped to paper (pmj-flip.sh paper)." >/dev/null 2>&1 \
+    || echo "daily-restart: pmj: notify-send.sh failed" >&2
+}
+
+# The review trigger fired (key-check exit 77): halt the RUNNING slot 11
+# through the exec.HALT beside the EXEC_TOML in force (once per halt: a
+# file that already halts slot 11 is left alone) and page the operator.
+pmj_gate_review_halt() {
+  local h when
+  h="$(pmj_halt_path)"
+  when="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [ -f "$h" ] && grep -Eq '^[[:space:]]*(slot=)?0*11([[:space:]]|$)' "$h"; then
+    echo "daily-restart: pmj REVIEW TRIGGER — $h already halts slot 11" >&2
+    return 0
+  fi
+  if [ -s "$h" ] && [ -n "$(tail -c 1 "$h")" ]; then
+    printf '\n' >> "$h"
+  fi
+  if printf 'slot=11 reason=operator\n' >> "$h"; then
+    echo "daily-restart: *** pmj REVIEW TRIGGER — slot 11 HALTED: slot=11 appended to $h ***" >&2
+    if [ "$(( $(wc -c < "$h") ))" -gt 640 ]; then
+      echo "daily-restart: *** $h is over the router's 640 B — it will NOT be read: HALT SLOT 11 BY HAND ***" >&2
+    fi
+  else
+    echo "daily-restart: *** pmj REVIEW TRIGGER — could NOT append to $h: HALT SLOT 11 BY HAND ***" >&2
+  fi
+  "$SCRIPTS_DIR/notify-send.sh" -l -s PMJ "slot 11 REVIEW TRIGGER at $when: pmj key-check exit 77 (the Predict deploy, the vault entry or the deposit mint is not what was reviewed, or a pinned account closed). slot=11 written to exec.HALT; restarts deferred. Review before clearing." >/dev/null 2>&1 \
+    || echo "daily-restart: pmj review trigger — notify-send.sh failed (page by hand)" >&2
+  # This page rang for this halt: the halt deferral below does not re-page
+  # until the file changes.
+  pmj_halt_mtime "$h" > "$PMJ_GATE_HALT_PAGED"
+}
+
+# 0 = slot 11's wallet and venue code are proven for this arming.
+pmj_gate_pass() {
+  local rc now next cap pmj
+  # Free half, every time (the explicit rc=$?, as E3's).
+  "$SCRIPTS_DIR/pmj-exec.sh" self-test >/dev/null
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    pmj_gate_note_failure "$rc" "pmj self-test"
+    return 1
+  fi
+  now="$(date -u +%s)"
+  if [ -f "$PMJ_GATE_NEXT" ]; then
+    next="$(cat "$PMJ_GATE_NEXT")"
+    if [ "$now" -lt "$next" ]; then
+      echo "daily-restart: pmj key-check backing off — $(( (next - now + 59) / 60 )) min until the next attempt" >&2
+      return 1
+    fi
+  fi
+  cap="$(pmj_gate_cap_day)"
+  case "$cap" in
+    ''|*[!0-9]*)
+      pmj_gate_note_failure 78 "[exec.slot.11] cap_day_usd_1e6 read (none in the EXEC_TOML in force)"
+      return 1
+      ;;
+  esac
+  pmj="$(pmj_conf_get PMJ_TOML)"
+  if [ -n "$pmj" ]; then
+    "$SCRIPTS_DIR/pmj-exec.sh" key-check --pmj "$pmj" --cap-day-usd-1e6 "$cap" >/dev/null
+  else
+    "$SCRIPTS_DIR/pmj-exec.sh" key-check --cap-day-usd-1e6 "$cap" >/dev/null
+  fi
+  rc=$?
+  if [ "$rc" = 0 ]; then
+    pmj_gate_clear
+    return 0
+  fi
+  if [ "$rc" = 77 ]; then
+    pmj_gate_review_halt
+    pmj_gate_note_failure "$rc" "pmj key-check REVIEW TRIGGER"
+    return 1
+  fi
+  pmj_gate_note_failure "$rc" "pmj key-check"
+  return 1
+}
+# <<< pmj-gate
+
+if [ "$drain" = 1 ] || [ -f "$EXEC_GATE_PENDING" ] || [ -f "$PMJ_GATE_PENDING" ]; then
   if exec_gate_armed; then
     echo "daily-restart: $EXEC_GATE_TRIGGER marks a slot LIVE — the execution gate decides this restart" >&2
     if exec_gate_pass; then
@@ -370,6 +701,7 @@ if [ "$drain" = 1 ] || [ -f "$EXEC_GATE_PENDING" ]; then
         echo "daily-restart: restart DEFERRED (slots$fired owed); retention and rotation still run" >&2
       fi
       drain=0
+      exec_gate_deferred=1
     fi
   else
     # Not armed. Any pending restart is moot — the binary it was
@@ -381,6 +713,47 @@ if [ "$drain" = 1 ] || [ -f "$EXEC_GATE_PENDING" ]; then
     exec_gate_clear
   fi
 fi
+
+# >>> pmj-gate (decision)
+# The PMJ gate (its definitions above): a restart E3 did not defer that
+# would re-arm slot 11 waits on its key check; a failure defers it as E3's
+# does, owed in pmj-gate-pending (exit 77 also halts the running slot); an
+# exec.HALT naming slot 11 defers it without a check (no boot loop).
+if [ "$exec_gate_deferred" = 0 ] && { [ "$drain" = 1 ] || [ -f "$PMJ_GATE_PENDING" ]; }; then
+  if pmj_gate_armed && pmj_halt_blocks "$(pmj_halt_path)"; then
+    echo "daily-restart: pmj: exec.HALT names slot 11 — restart deferred; archive the halt line or pmj-flip.sh paper" >&2
+    if [ "$drain" = 1 ]; then
+      echo "$fired" >> "$PMJ_GATE_PENDING"
+    fi
+    drain=0
+    pmj_halt_page "$(pmj_halt_path)"
+  elif pmj_gate_armed; then
+    echo "daily-restart: $PMJ_GATE_TRIGGER — the pmj key-check decides this restart" >&2
+    if pmj_gate_pass; then
+      echo "daily-restart: pmj key-check PASSED — restart may proceed" >&2
+      if [ -f "$PMJ_GATE_PENDING" ]; then
+        echo "daily-restart: taking the restart the pmj key-check owed, from$(cat "$PMJ_GATE_PENDING")" >&2
+        fired="$fired$(cat "$PMJ_GATE_PENDING")"
+        rm -f "$PMJ_GATE_PENDING"
+        drain=1
+      fi
+    else
+      if [ "$drain" = 1 ]; then
+        echo "$fired" >> "$PMJ_GATE_PENDING"
+        echo "daily-restart: restart DEFERRED by the pmj key-check (slots$fired owed); retention and rotation still run" >&2
+      fi
+      drain=0
+    fi
+  else
+    # Slot 11 armed nowhere any more: a restart its key check deferred is moot.
+    if [ -f "$PMJ_GATE_PENDING" ]; then
+      echo "daily-restart: slot 11 is armed nowhere any more — dropping the restart the pmj key-check deferred" >&2
+    fi
+    rm -f "$PMJ_GATE_PENDING"
+    pmj_gate_clear
+  fi
+fi
+# <<< pmj-gate
 
 # XSD-4 (statarb doc 08 §3.7; operator ruling 2026-09-12 "automatic
 # monthly at the 00:10Z restart"): the xsd member's TABLE ROTATION.

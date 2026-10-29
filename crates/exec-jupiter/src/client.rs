@@ -21,6 +21,10 @@ use core::ops::Range;
 
 use core_net::{Header, HttpsReq, Method, PostErr};
 
+/// The Prediction API's host (PMJ J16: the live boot's one keep-alive
+/// connection, `x-api-key` from `JUP_API_KEY`).
+pub const JUP_HOST: &str = "api.jup.ag";
+
 /// The Prediction API as jup-gw sees it.
 pub trait JupClient {
     /// The body window: render the request body here.

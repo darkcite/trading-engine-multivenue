@@ -113,11 +113,14 @@ use tracing::info;
 /// `--live` dispatcher is not this arm and never arms through it.
 ///
 /// **PMJ J3 (R-PMJ-S2): `VenueId::Jupiter`**, for slot 11 only
-/// ([`PMJ_SLOT`]) and only alone: its arm (`exec_jupiter`) builds keeper
-/// orders on Jupiter Prediction, guards and signs their Solana
-/// transactions. Listed so the venue has its place in the law; a live
-/// slot 11 — or a live slot naming `jupiter` — still refuses the boot
-/// until the `PMJ-DUST-GATE` ruling (risk-policy "PMJ — slot 11").
+/// ([`PMJ_SLOT`]) and only alone: its arm (`exec_jupiter`, booted by
+/// `cli::pmj_live`, PMJ J16) builds keeper orders on Jupiter Prediction,
+/// guards and signs their Solana transactions. A live slot naming
+/// `jupiter` that is not slot 11 refuses the boot; a live slot 11 refuses
+/// unless this binary was BUILT from a tree whose `docs/risk-policy.md` has
+/// the line `PMJ-DUST-GATE: ruled YYYY-MM-DD` outside code fences, in the
+/// tree AND at `HEAD` ([`PMJ_GATES_BUILT`], `gate_line.rs`), and then only
+/// at or inside the frame that line opens ([`check_pmj_frame`]).
 pub const LIVE_ARM_VENUES: &[u8] = &[
     core_types::VenueId::Hyperliquid as u8,
     core_types::VenueId::HyperEvm as u8,
@@ -179,11 +182,176 @@ pub const BIN15_SLOT: usize = strategy_set::SLOT_BIN15 as usize;
 /// their own reconciled account.
 pub const HCV_SLOT: usize = strategy_set::SLOT_HCV as usize;
 
-/// PMJ J3 (R-PMJ-1, R-PMJ-S2): slot 11 (`pmj`) is paper only. A live slot
-/// 11 refuses the boot until the `PMJ-DUST-GATE` ruling, whatever venues
-/// it names, and `jupiter` is slot 11's venue alone: the arm is built
-/// and rig-tested (J3), never armed in this pass.
+/// PMJ J3 (R-PMJ-1, R-PMJ-S2) and J16: slot 11 (`pmj`). A live slot 11
+/// refuses the boot — whatever venues it names — unless this binary was
+/// built with the `PMJ-DUST-GATE` line ([`PMJ_GATES_BUILT`]); with it, it is
+/// live on exactly `["jupiter"]`, at or inside the frame
+/// ([`check_pmj_frame`]), and alone: beside any other live slot it refuses
+/// (risk review J16 M1 — its own engine, the EC2 standalone, R-PM-23, so
+/// its boot refusals take no other slot down). `jupiter` is slot 11's
+/// venue alone.
 pub const PMJ_SLOT: usize = core_types::STRATEGY_SLOT_PMJ as usize;
+
+/// **PMJ J16 — the gate lines a binary was built with.** `build.rs` reads
+/// `docs/risk-policy.md` at build time (the grammar is [`crate::gate_line`]):
+/// `dust` = a line BEGINS with `PMJ-DUST-GATE: ruled YYYY-MM-DD`, `pilot` =
+/// one begins with `PMJ-LIVE-GATE: ruled YYYY-MM-DD` (plan-J8's) — each
+/// only when it is in the working-tree file AND in the committed one
+/// (`git show HEAD:`), outside fenced code blocks; a section that only
+/// QUOTES a gate word opens nothing. The engine's own refusal, beside the
+/// flip script's check of the committed policy: a binary built before the
+/// gate line was written and committed can never arm slot 11, whatever the
+/// files say. **Revoking** a gate is `scripts/pmj-flip.sh paper` plus a
+/// rebuild from a tree without the line (a binary keeps its flags).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PmjGates {
+    /// `PMJ-DUST-GATE: ` — slot 11 may arm at or inside the dust frame.
+    pub dust: bool,
+    /// `PMJ-LIVE-GATE: ` — and, with the dust gate, inside the pilot frame.
+    pub pilot: bool,
+}
+
+/// `"1"` from `build.rs`; anything else is no gate.
+const fn gate_flag(v: &str) -> bool {
+    let b = v.as_bytes();
+    b.len() == 1 && b[0] == b'1'
+}
+
+/// The gate lines THIS binary was built with (`build.rs`).
+pub const PMJ_GATES_BUILT: PmjGates = PmjGates {
+    dust: gate_flag(env!("PMJ_DUST_GATE_LINE")),
+    pilot: gate_flag(env!("PMJ_LIVE_GATE_LINE")),
+};
+
+/// PMJ J16, the DUST frame (plan-J5): the per-order clamp — the venue's $5
+/// deposit plus the member's sizing slack (`core_config::pmj::
+/// PMJ_SIZING_SLACK_1E6`).
+pub const PMJ_DUST_MAX_ORDER_USD_1E6: i64 = 5_010_000;
+/// The dust frame's per-instance (per window market) clamp: one order.
+pub const PMJ_DUST_CAP_INSTANCE_USD_1E6: i64 = 5_010_000;
+/// The dust frame's day cap ($50 a UTC day) — also the most the wallet
+/// may hold at boot (risk-policy J3 requirement (a)).
+pub const PMJ_DUST_CAP_DAY_USD_1E6: i64 = 50_000_000;
+/// The dust frame's session loss bound (−$50).
+pub const PMJ_DUST_LOSS_USD_1E6: i64 = 50_000_000;
+/// The PILOT frame (plan-J8: $250 an order, $250 a market, −$500): the
+/// per-order clamp with the sizing slack.
+pub const PMJ_PILOT_MAX_ORDER_USD_1E6: i64 = 250_010_000;
+/// The pilot frame's per-instance clamp.
+pub const PMJ_PILOT_CAP_INSTANCE_USD_1E6: i64 = 250_010_000;
+/// The pilot frame's day cap: plan-J8 states none, so it is bounded here
+/// at 2 × the session bound ($1 000) — the day cap is also the most the
+/// wallet may hold at boot. A ruling widens it.
+pub const PMJ_PILOT_CAP_DAY_USD_1E6: i64 = 1_000_000_000;
+/// The pilot frame's session loss bound (−$500).
+pub const PMJ_PILOT_LOSS_USD_1E6: i64 = 500_000_000;
+/// The dust frame's open orders: one at a time.
+pub const PMJ_DUST_MAX_OPEN_ORDERS: i64 = 1;
+/// The pilot frame's open orders (the member's per-market cap,
+/// `pmj.toml` `max_orders_market` default 4).
+pub const PMJ_PILOT_MAX_OPEN_ORDERS: i64 = 4;
+/// The families both frames arm: BTC alone (plan-J5 and plan-J8).
+pub const PMJ_FRAME_ASSETS: [&str; 1] = ["btc"];
+
+/// The frame a live slot 11 runs at.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PmjFrame {
+    /// At or inside the dust frame (`PMJ-DUST-GATE: `).
+    Dust,
+    /// Beyond dust, inside the pilot frame (`PMJ-LIVE-GATE: ` too).
+    Pilot,
+}
+
+impl PmjFrame {
+    /// The tell's word.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            PmjFrame::Dust => "dust",
+            PmjFrame::Pilot => "pilot",
+        }
+    }
+}
+
+/// **PMJ J16 — may slot 11 arm at this section's numbers?** `gates` are the
+/// binary's ([`PMJ_GATES_BUILT`]; tests inject theirs). Refused: no dust
+/// gate line; any of the five bounds (the per-order, per-instance and day
+/// clamps, the session loss bound, `max_open_orders`) unset (`0`); a bound
+/// beyond the pilot frame (always — a later ruling widens it); a bound
+/// beyond the dust frame without the pilot's gate line; and, when given
+/// (`live_assets`, `pmj.toml`'s — the live boot passes them), any family
+/// set but BTC alone.
+///
+/// # Errors
+/// The refusal, naming the bound and the frame.
+pub fn check_pmj_frame(
+    s: &core_config::exec::ExecSlot,
+    live_assets: Option<&[String]>,
+    gates: PmjGates,
+) -> Result<PmjFrame, String> {
+    if !gates.dust {
+        return Err(String::from(
+            "slot 11 is marked live, but this binary was built from a tree whose \
+             docs/risk-policy.md has no line beginning `PMJ-DUST-GATE: ruled YYYY-MM-DD` (in the \
+             working tree AND committed) — the dust gate is the operator's ruling, written there \
+             and built in (PMJ J16). Refusing the boot.",
+        ));
+    }
+    let bounds = [
+        ("max_order_usd_1e6", s.max_order_usd_1e6, PMJ_DUST_MAX_ORDER_USD_1E6, PMJ_PILOT_MAX_ORDER_USD_1E6),
+        ("cap_instance_usd_1e6", s.cap_instance_usd_1e6, PMJ_DUST_CAP_INSTANCE_USD_1E6, PMJ_PILOT_CAP_INSTANCE_USD_1E6),
+        ("cap_day_usd_1e6", s.cap_day_usd_1e6, PMJ_DUST_CAP_DAY_USD_1E6, PMJ_PILOT_CAP_DAY_USD_1E6),
+        ("halt_on_loss_usd_1e6", s.halt_on_loss_usd_1e6, PMJ_DUST_LOSS_USD_1E6, PMJ_PILOT_LOSS_USD_1E6),
+        (
+            "max_open_orders",
+            i64::from(s.max_open_orders),
+            PMJ_DUST_MAX_OPEN_ORDERS,
+            PMJ_PILOT_MAX_OPEN_ORDERS,
+        ),
+    ];
+    let mut frame = PmjFrame::Dust;
+    for (name, v, dust, pilot) in bounds {
+        if v <= 0 {
+            return Err(format!(
+                "slot 11: `{name}` = {v} — the frame needs every bound set (0 is UNSET, never \
+                 unlimited; the session loss bound included)"
+            ));
+        }
+        if v > pilot {
+            return Err(format!(
+                "slot 11: `{name}` = {v} is beyond the PILOT frame ({pilot}) — refused always \
+                 until a ruling widens the frame (PMJ J16)"
+            ));
+        }
+        if v > dust {
+            frame = PmjFrame::Pilot;
+        }
+    }
+    if frame == PmjFrame::Pilot && !gates.pilot {
+        return Err(format!(
+            "slot 11 is beyond the DUST frame (order ${:.2}, instance ${:.2}, day ${:.0}, session \
+             −${:.0}, {PMJ_DUST_MAX_OPEN_ORDERS} open order), which needs a line beginning \
+             `PMJ-LIVE-GATE: ruled YYYY-MM-DD` in the docs/risk-policy.md this binary was built \
+             from (plan-J8's pilot) — refusing",
+            PMJ_DUST_MAX_ORDER_USD_1E6 as f64 / 1e6,
+            PMJ_DUST_CAP_INSTANCE_USD_1E6 as f64 / 1e6,
+            PMJ_DUST_CAP_DAY_USD_1E6 as f64 / 1e6,
+            PMJ_DUST_LOSS_USD_1E6 as f64 / 1e6,
+        ));
+    }
+    if let Some(assets) = live_assets {
+        let btc_only = assets.len() == PMJ_FRAME_ASSETS.len()
+            && assets.iter().zip(PMJ_FRAME_ASSETS.iter()).all(|(a, b)| a == b);
+        if !btc_only {
+            return Err(format!(
+                "slot 11: pmj.toml `live_assets` = {assets:?} — the {} frame arms {:?} alone",
+                frame.name(),
+                PMJ_FRAME_ASSETS
+            ));
+        }
+    }
+    Ok(frame)
+}
 
 /// Three crates name their own slot count and the dependency graph
 /// forbids them importing each other's. Assert all three agree at
@@ -286,6 +454,13 @@ impl ExecBoot {
     #[must_use]
     pub fn pm15_live(&self) -> bool {
         slot_in(self.live_mask, PM15_SLOT)
+    }
+
+    /// PMJ J16: is slot 11 (its own Jupiter arm) armed? Only `resolve`
+    /// with the gate built in can make this true.
+    #[must_use]
+    pub fn pmj_live(&self) -> bool {
+        slot_in(self.live_mask, PMJ_SLOT)
     }
 
     /// XMM XH4f: does slot `slot` name the gateway transport?
@@ -578,6 +753,16 @@ pub fn render_slot_mask(mask: SlotMask) -> String {
 ///   (an absent flag arms nothing, so it must pair with an artifact
 ///   that arms nothing).
 pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option<ExecBoot>, String> {
+    resolve_gated(artifact, arm_live, PMJ_GATES_BUILT)
+}
+
+/// [`resolve`] with slot 11's gate lines given (PMJ J16: the binary's own,
+/// [`PMJ_GATES_BUILT`]; the tests inject theirs).
+pub(crate) fn resolve_gated(
+    artifact: Option<&Path>,
+    arm_live: Option<&str>,
+    gates: PmjGates,
+) -> Result<Option<ExecBoot>, String> {
     let Some(path) = artifact else {
         // No `--exec`. If `--arm-live` was passed anyway, that is a
         // half-armed command line and must not boot silently.
@@ -708,18 +893,42 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
             ));
         }
 
-        // PMJ J3: slot 11 is paper only until the PMJ-DUST-GATE ruling
-        // ([`PMJ_SLOT`]), and Jupiter is slot 11's alone.
+        // PMJ J16: slot 11 arms only from a binary BUILT with the dust
+        // gate line, at or inside the frame it opens, on exactly
+        // `["jupiter"]` ([`check_pmj_frame`]; the live boot checks
+        // `pmj.toml`'s `live_assets` too); Jupiter is slot 11's alone.
         if mode == ExecMode::Live && slot == PMJ_SLOT {
-            return Err(format!(
-                "exec: slot {slot} ({slot_name}) is marked live, but slot {slot} is paper only \
-                 until the PMJ-DUST-GATE ruling (risk-policy \"PMJ — slot 11\"): the Jupiter \
-                 arm is built and rig-tested, never armed — its transaction guard refuses \
-                 everything until J0's decoded programs and lookup tables are reviewed into \
-                 the pmj.toml `guard_*` keys, and a dust run must land first. Refusing the boot."
-            ));
+            let frame = check_pmj_frame(&s, None, gates)
+                .map_err(|e| format!("exec: slot {slot} ({slot_name}): {e}"))?;
+            // Risk review J16 M1: a slot-11 boot refusal (a wallet over
+            // the cap, Jupiter or the keypair file) aborts its engine's
+            // boot — so slot 11 arms only in an engine of its own, where
+            // that takes no other slot down.
+            let others = artifact_mask & !((1 as SlotMask) << PMJ_SLOT);
+            if others != 0 {
+                return Err(format!(
+                    "exec: slot 11 (pmj) arms only alone — its own engine (the EC2 standalone, \
+                     R-PM-23); other live slots: {} — refusing until an operator ruling",
+                    describe_slots(others)
+                ));
+            }
+            let jup = s.venues.contains(&(core_types::VenueId::Jupiter as u8));
+            if !(jup && s.venues.len() == 1) {
+                return Err(format!(
+                    "exec: slot {slot} ({slot_name}) is marked live with venues {:?}; it is live \
+                     on exactly [\"jupiter\"] or not at all (PMJ J16)",
+                    s.venues
+                ));
+            }
+            info!(
+                frame = frame.name(),
+                "exec: slot 11 (pmj) is marked live — the binary carries the PMJ-DUST-GATE line"
+            );
         }
-        if mode == ExecMode::Live && s.venues.contains(&(core_types::VenueId::Jupiter as u8)) {
+        if mode == ExecMode::Live
+            && slot != PMJ_SLOT
+            && s.venues.contains(&(core_types::VenueId::Jupiter as u8))
+        {
             return Err(format!(
                 "exec: slot {slot} ({slot_name}) is marked live for `jupiter`, whose only arm \
                  is slot 11's (pmj) — refusing"
@@ -790,8 +999,8 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                     return Err(format!(
                         "exec: slot {slot} ({slot_name}) is marked live for venue `{vname}`, \
                          but this binary has NO live execution arm for it (the arms compiled \
-                         in are hyperliquid, binance (USDⓈ-M, classic), hyperevm for slot 0 \
-                         and polymarket for slot 9). Slot {slot} can only be \"paper\" or \
+                         in are hyperliquid, binance (USDⓈ-M, classic), hyperevm for slot 0, \
+                         polymarket for slot 9 and jupiter for slot 11). Slot {slot} can only be \"paper\" or \
                          \"off\" on that venue. \
                          Refusing the boot rather than trading it on paper under a live label."
                     ));
@@ -2322,24 +2531,34 @@ mod tests {
         assert!(e.contains("NoneSym"), "{e}");
     }
 
-    /// PMJ J4 (R-PMJ-1): slot 11 is built and PAPER only — a live slot 11
-    /// refuses the boot whatever venues it names, agreed by `--arm-live`;
-    /// a paper slot 11 on `jupiter` is an ordinary artifact.
+    /// PMJ J4 (R-PMJ-1) and J16: without the dust gate line built in, a
+    /// live slot 11 refuses the boot whatever venues and frame it names,
+    /// agreed by `--arm-live`; a paper slot 11 on `jupiter` is an ordinary
+    /// artifact. The binary's own `resolve` refuses exactly when this
+    /// tree's build carries no gate line.
     #[test]
-    fn a_live_slot_eleven_refuses_it_is_paper_only() {
+    fn a_live_slot_eleven_refuses_without_the_gate_line() {
         let d = tmp();
         let live = MINIMAL_LIVE
             .replace("[exec.slot.3]", "[exec.slot.11]")
             .replace("name = \"bin15\"", "name = \"pmj\"")
             .replace("[\"hyperliquid\"]", "[\"jupiter\"]");
+        let none = PmjGates { dust: false, pilot: false };
         let p = write(&d, "exec.toml", &live);
-        let e = resolve(Some(&p), Some("11")).unwrap_err();
+        let e = resolve_gated(Some(&p), Some("11"), none).unwrap_err();
         assert!(e.contains("slot 11 (pmj)") && e.contains("PMJ-DUST-GATE"), "{e}");
         assert!(e.contains("Refusing the boot"), "{e}");
+        // The pilot's line alone opens nothing.
+        let e = resolve_gated(Some(&p), Some("11"), PmjGates { dust: false, pilot: true }).unwrap_err();
+        assert!(e.contains("PMJ-DUST-GATE"), "{e}");
         let on_hl = live.replace("[\"jupiter\"]", "[\"hyperliquid\"]");
         let p = write(&d, "exec-hl.toml", &on_hl);
-        let e = resolve(Some(&p), Some("11")).unwrap_err();
+        let e = resolve_gated(Some(&p), Some("11"), none).unwrap_err();
         assert!(e.contains("PMJ-DUST-GATE"), "whatever venues it names: {e}");
+        // This binary: refused unless its build carried the line — and
+        // MINIMAL_LIVE's $100 orders are beyond the pilot frame anyway.
+        let e = resolve(Some(&p), Some("11")).unwrap_err();
+        assert!(e.contains("PMJ-DUST-GATE") || e.contains("PILOT"), "{e}");
         let paper = live.replacen("mode = \"live\"", "mode = \"paper\"", 1);
         let p = write(&d, "exec-paper.toml", &paper);
         let b = resolve(Some(&p), None).expect("a paper slot 11 is fine").expect("present");
@@ -2676,27 +2895,323 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// **PMJ J4** — `scripts/pmj-flip.sh` has no path to a live slot 11:
-    /// its `live` verb only refuses, it never writes a live `mode`, and the
-    /// one `ARM_LIVE` it writes is the list without 11.
+    /// **PMJ J16** — `scripts/pmj-flip.sh live` is gated before it writes:
+    /// the COMMITTED policy's `PMJ-DUST-GATE: ` line, `pmj.toml`, STRATEGY,
+    /// `exec.HALT`, the deploy pin, `pmj-check` on the result and the key
+    /// check (at the dust day cap) — in that order, all before the first
+    /// install; its one live `mode` is the dust section's; `paper` still
+    /// writes `ARM_LIVE` without 11 and drops both keys together.
     #[test]
-    fn the_pmj_flip_has_no_live_path() {
+    fn the_pmj_flip_live_path_is_gated_before_it_writes() {
         const FLIP: &str = include_str!("../../../scripts/pmj-flip.sh");
         let live = FLIP.find("\n  live)\n").expect("the live verb");
-        let body = &FLIP[live..live + FLIP[live..].find(";;").expect("its end")];
-        assert!(body.contains("die \"live is out of scope"), "live refuses");
-        assert!(body.lines().count() <= 4, "and does nothing else");
-        assert!(!FLIP.contains("mode = \\\"live\\\"") && !FLIP.contains("mode = \"live\""), "no live mode written");
+        let body = &FLIP[live..live + FLIP[live..].find("\n    ;;").expect("its end")];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("live: {needle}"));
+        let gate = at("show HEAD:docs/risk-policy.md");
+        assert!(
+            body.contains("/^PMJ-DUST-GATE: ruled [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/"),
+            "the gate line's grammar, at the line's start"
+        );
+        assert!(
+            body.contains("c == \"```\" || c == \"~~~\" { if (f == \"\") f = c; else if (f == c) f = \"\"; next }"),
+            "outside fenced code blocks, ``` or ~~~"
+        );
+        let checks = [
+            gate,
+            at("[ -f \"$PMJ\" ]"),
+            at("*pmj*"),
+            at("halt_names_11 && die"),
+            at("guard_program_slot"),
+            at("pmj-check --pmj \"$work_pmj\""),
+            at("pmj-exec.sh\" key-check --pmj \"$work_pmj\" --cap-day-usd-1e6 50000000"),
+        ];
+        let install = at("cat \"$work_exec\" > \"$EXEC\"");
+        let mut prev = 0usize;
+        for c in checks {
+            assert!(c >= prev && c < install, "every refusal precedes the install");
+            prev = c;
+        }
+        // The one live mode is the section's.
+        assert_eq!(FLIP.matches("mode = \"live\"").count(), 1, "one live mode, the section's");
+        assert!(FLIP.contains("[exec.slot.11]\n# pmj live (the DUST frame"));
         assert_eq!(
             FLIP.matches("kv_set ARM_LIVE").count(),
-            FLIP.matches("kv_set ARM_LIVE \"$(arm_without_11)\"").count(),
-            "ARM_LIVE is only ever written without 11"
+            FLIP.matches("kv_set ARM_LIVE \"$(arm_without_11)\"").count()
+                + FLIP.matches("kv_set ARM_LIVE \"$(arm_with_11)\"").count(),
+            "ARM_LIVE is written with 11 (live) or without it (paper), nothing else"
         );
         assert!(FLIP.contains("$1 != \"11\""), "the list drops 11");
         assert!(
             FLIP.contains("kv_off ARM_LIVE \"$work_conf\"\n          kv_off EXEC_TOML \"$work_conf\""),
             "slot 11 alone: both keys go together (the wrapper refuses one without the other)"
         );
+    }
+
+    /// **PMJ J16 round 5** — `scripts/pmj-flip.sh live` refuses FIRST
+    /// (before git, the binary or any write) when ARM_LIVE, sourced as the
+    /// wrapper sources it, names a slot other than 11, or when the
+    /// exec.toml the boot reads marks another slot live: slot 11 arms only
+    /// alone, and the engine's own refusal would leave launchd relaunching
+    /// into it. Drives the script itself (`zsh -f`, a scratch
+    /// MULTIVENUE_DIR and HOME); a host without zsh skips it.
+    #[test]
+    fn the_pmj_flip_live_refuses_beside_another_live_slot() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/pmj-flip.sh");
+        let run = |conf: &str, exec: &str| -> Option<(i32, String, Vec<String>)> {
+            let d = tmp();
+            std::fs::write(d.join("strategy.conf"), conf).unwrap();
+            std::fs::write(d.join("exec.toml"), exec).unwrap();
+            let out = match std::process::Command::new("zsh")
+                .arg("-f")
+                .arg(&script)
+                .arg("live")
+                .env("MULTIVENUE_DIR", &d)
+                .env("HOME", &d)
+                .env_remove("ARM_LIVE")
+                .env_remove("EXEC_TOML")
+                .env_remove("PMJ_TOML")
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => panic!("zsh: {e}"),
+            };
+            let mut files: Vec<String> = std::fs::read_dir(&d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            files.sort();
+            std::fs::remove_dir_all(&d).ok();
+            Some((out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).into_owned(), files))
+        };
+        let exec11 = "[exec]\n[exec.slot.11]\nmode = \"paper\"\n";
+        for (conf, list) in [
+            ("ARM_LIVE=3\n", "3"),
+            ("ARM_LIVE=\" +3 , 11\"\n", "3"),
+            ("export ARM_LIVE=011,5\n", "5"),
+            ("ARM_LIVE=11\nARM_LIVE=9,11\n", "9"),
+            ("ARM_LIVE=\"3,x\"\n", "3,x"),
+        ] {
+            let Some((code, err, files)) = run(conf, exec11) else {
+                return;
+            };
+            assert_eq!(code, 1, "{conf}: {err}");
+            let want = format!(
+                "ARM_LIVE names slot(s) {list} — slot 11 arms only alone in its engine (risk-policy J16, \
+                 R-PMJ-S77); run it on its own engine (the standalone)"
+            );
+            assert!(err.contains(&want), "{conf}: {err}");
+            assert_eq!(files, ["exec.toml", "strategy.conf"], "{conf}: nothing written");
+        }
+        let exec_others = "[exec]\n[exec.slot.3]\nmode = \"live\"\n[exec.slot.6]\nmode = \"paper\"\n\
+                           [exec.slot.9]\nmode = \"live\"\n[exec.slot.11]\nmode = \"paper\"\n";
+        let Some((code, err, files)) = run("STRATEGY=pmj\nARM_LIVE=11\n", exec_others) else {
+            return;
+        };
+        assert_eq!(code, 1, "{err}");
+        assert!(
+            err.contains("marks slot(s) 3,9 live — slot 11 arms only alone in its engine (risk-policy J16, R-PMJ-S77)"),
+            "{err}"
+        );
+        assert_eq!(files, ["exec.toml", "strategy.conf"]);
+        // The live verb writes slot 11 alone.
+        const FLIP: &str = include_str!("../../../scripts/pmj-flip.sh");
+        assert!(FLIP.contains("arm_with_11() {\n  print -r -- 11\n}"), "ARM_LIVE=11, alone");
+    }
+
+    /// **PMJ J16** — the section `scripts/pmj-flip.sh live` writes resolves
+    /// through the interlock at the DUST frame with the gate line built in,
+    /// refuses without it, and the live boot's `live_assets` check takes
+    /// BTC alone.
+    #[test]
+    fn the_pmj_flip_writes_a_dust_slot_11_section_the_gated_interlock_resolves() {
+        const FLIP: &str = include_str!("../../../scripts/pmj-flip.sh");
+        let start = FLIP.find("[exec.slot.11]\n# pmj live").expect("the section");
+        let end = start + FLIP[start..].find("\nEOF").expect("its end");
+        let section = FLIP[start..end].replace("$TS", "test");
+        let d = tmp();
+        let p = write(&d, "exec.toml", &format!("[exec]\n{section}\n"));
+        let dust = PmjGates { dust: true, pilot: false };
+        let b = resolve_gated(Some(&p), Some("11"), dust).unwrap().unwrap();
+        assert!(b.pmj_live() && !b.pm15_live() && !b.hl_arm_needed() && !b.hyparb_live());
+        assert!(b.route.venue_live(core_types::VenueId::Jupiter as u8));
+        let s = b.slots.iter().find(|s| s.slot == PMJ_SLOT).unwrap();
+        assert_eq!(
+            (s.max_order_usd_1e6, s.cap_instance_usd_1e6, s.cap_day_usd_1e6, s.halt_on_loss_usd_1e6),
+            (5_010_000, 5_010_000, 50_000_000, 50_000_000)
+        );
+        assert_eq!((s.max_open_orders, s.halt_on_gain_usd_1e6), (1, 0));
+        assert_eq!(check_pmj_frame(s, Some(&[String::from("btc")][..]), dust), Ok(PmjFrame::Dust));
+        assert!(check_pmj_frame(s, Some(&[String::from("btc"), String::from("eth")][..]), dust).is_err());
+        let e = resolve_gated(Some(&p), Some("11"), PmjGates { dust: false, pilot: false }).unwrap_err();
+        assert!(e.contains("PMJ-DUST-GATE"), "{e}");
+        // The two switches still have to agree.
+        assert!(resolve_gated(Some(&p), None, dust).is_err(), "live without --arm-live 11");
+        // Beside another live venue: refused (slot 11 on jupiter alone).
+        let two = section.replace("[\"jupiter\"]", "[\"jupiter\", \"hyperliquid\"]");
+        let p2 = write(&d, "exec-two.toml", &format!("[exec]\n{two}\nrequest_budget_floor = 2000\n"));
+        let e = resolve_gated(Some(&p2), Some("11"), dust).unwrap_err();
+        assert!(e.contains("exactly [\"jupiter\"]"), "{e}");
+        // Paper arms nothing and reads nothing.
+        let paper = section.replace("mode = \"live\"", "mode = \"paper\"");
+        let p3 = write(&d, "exec-paper.toml", &format!("[exec]\n{paper}\n"));
+        let b = resolve_gated(Some(&p3), None, dust).unwrap().unwrap();
+        assert!(!b.any_live() && !b.pmj_live());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **PMJ J16** — the frame check: no dust gate refuses everything; the
+    /// dust frame needs only it; beyond dust needs the pilot's line; beyond
+    /// the pilot frame is refused always; an unset bound is refused; the
+    /// families are BTC alone.
+    #[test]
+    fn the_pmj_frame_opens_only_what_its_gate_lines_open() {
+        let mut s = core_config::exec::ExecSlot::paper_default(PMJ_SLOT);
+        s.mode = String::from("live");
+        s.name = String::from("pmj");
+        s.max_order_usd_1e6 = PMJ_DUST_MAX_ORDER_USD_1E6;
+        s.cap_instance_usd_1e6 = PMJ_DUST_CAP_INSTANCE_USD_1E6;
+        s.cap_day_usd_1e6 = PMJ_DUST_CAP_DAY_USD_1E6;
+        s.halt_on_loss_usd_1e6 = PMJ_DUST_LOSS_USD_1E6;
+        s.max_open_orders = 1;
+        let none = PmjGates { dust: false, pilot: false };
+        let dust = PmjGates { dust: true, pilot: false };
+        let both = PmjGates { dust: true, pilot: true };
+        let btc = [String::from("btc")];
+        assert!(check_pmj_frame(&s, Some(&btc[..]), none).unwrap_err().contains("PMJ-DUST-GATE: "));
+        assert_eq!(check_pmj_frame(&s, Some(&btc[..]), dust), Ok(PmjFrame::Dust));
+        assert_eq!(check_pmj_frame(&s, None, both), Ok(PmjFrame::Dust), "inside dust: dust, whatever else is built");
+        // One unit past each dust bound: the pilot's line needed.
+        for k in 0..5 {
+            let mut t = s.clone();
+            match k {
+                0 => t.max_order_usd_1e6 += 1,
+                1 => t.cap_instance_usd_1e6 += 1,
+                2 => t.cap_day_usd_1e6 += 1,
+                3 => t.halt_on_loss_usd_1e6 += 1,
+                _ => t.max_open_orders += 1,
+            }
+            assert!(check_pmj_frame(&t, Some(&btc[..]), dust).unwrap_err().contains("PMJ-LIVE-GATE: "), "bound {k}");
+            assert_eq!(check_pmj_frame(&t, Some(&btc[..]), both), Ok(PmjFrame::Pilot), "bound {k}");
+        }
+        // The pilot frame exactly; one past it is refused even with both lines.
+        let mut pilot = s.clone();
+        pilot.max_order_usd_1e6 = PMJ_PILOT_MAX_ORDER_USD_1E6;
+        pilot.cap_instance_usd_1e6 = PMJ_PILOT_CAP_INSTANCE_USD_1E6;
+        pilot.cap_day_usd_1e6 = PMJ_PILOT_CAP_DAY_USD_1E6;
+        pilot.halt_on_loss_usd_1e6 = PMJ_PILOT_LOSS_USD_1E6;
+        pilot.max_open_orders = 4;
+        assert_eq!(check_pmj_frame(&pilot, Some(&btc[..]), both), Ok(PmjFrame::Pilot));
+        for k in 0..5 {
+            let mut t = pilot.clone();
+            match k {
+                0 => t.max_order_usd_1e6 += 1,
+                1 => t.cap_instance_usd_1e6 += 1,
+                2 => t.cap_day_usd_1e6 += 1,
+                3 => t.halt_on_loss_usd_1e6 += 1,
+                _ => t.max_open_orders += 1,
+            }
+            assert!(check_pmj_frame(&t, Some(&btc[..]), both).unwrap_err().contains("beyond the PILOT frame"), "bound {k}");
+        }
+        // An unset bound (the session loss bound off, no open-order clamp)
+        // is refused.
+        let mut off = s.clone();
+        off.halt_on_loss_usd_1e6 = 0;
+        assert!(check_pmj_frame(&off, Some(&btc[..]), both).unwrap_err().contains("every bound set"));
+        let mut off = s.clone();
+        off.max_open_orders = 0;
+        assert!(check_pmj_frame(&off, Some(&btc[..]), both).unwrap_err().contains("max_open_orders"));
+        // BTC alone.
+        for bad in [vec![], vec![String::from("eth")], vec![String::from("btc"), String::from("eth")]] {
+            assert!(check_pmj_frame(&s, Some(bad.as_slice()), dust).is_err(), "{bad:?}");
+        }
+    }
+
+    /// **PMJ J16** — a gate flag compiled in implies the gate line in this
+    /// tree's `docs/risk-policy.md` (build.rs also requires it committed,
+    /// which a test cannot read without git; it re-runs when the file or
+    /// HEAD moves).
+    #[test]
+    fn the_built_gate_flags_imply_this_trees_policy() {
+        let policy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/risk-policy.md");
+        let (dust, pilot) = match std::fs::read_to_string(&policy) {
+            Ok(text) => crate::gate_line::gate_lines_in(&text),
+            Err(_) => (false, false),
+        };
+        let built = PMJ_GATES_BUILT;
+        if built.dust {
+            assert!(dust, "a dust flag with no line in the tree");
+        }
+        if built.pilot {
+            assert!(pilot, "a pilot flag with no line in the tree");
+        }
+        assert!(!gate_flag("0") && !gate_flag("") && !gate_flag("11") && gate_flag("1"));
+    }
+
+    /// **PMJ J16 MINOR A** — the gate grammar (`crate::gate_line`, the one
+    /// `build.rs` includes): `PMJ-DUST-GATE: ruled YYYY-MM-DD` at the line's
+    /// start, outside fenced code blocks; anything else opens nothing.
+    #[test]
+    fn the_gate_grammar_takes_only_a_dated_ruling_outside_code_fences() {
+        use crate::gate_line::{gate_lines_in, is_gate_line, DUST_GATE, LIVE_GATE};
+        assert!(is_gate_line("PMJ-DUST-GATE: ruled 2026-11-02", DUST_GATE));
+        assert!(is_gate_line("PMJ-DUST-GATE: ruled 2026-11-02 (Anton, after J0)", DUST_GATE));
+        assert!(is_gate_line("PMJ-LIVE-GATE: ruled 2026-12-01", LIVE_GATE));
+        for bad in [
+            "PMJ-DUST-GATE: yes",
+            "PMJ-DUST-GATE: ruled",
+            "PMJ-DUST-GATE: ruled 2026-1-02",
+            "PMJ-DUST-GATE: ruled 2026/11/02",
+            "PMJ-DUST-GATE: ruled 20261102xx",
+            "PMJ-DUST-GATE:ruled 2026-11-02",
+            " PMJ-DUST-GATE: ruled 2026-11-02",
+            "> PMJ-DUST-GATE: ruled 2026-11-02",
+            "the `PMJ-DUST-GATE: ruled 2026-11-02` line",
+            "PMJ-LIVE-GATE: ruled 2026-11-02",
+        ] {
+            assert!(!is_gate_line(bad, DUST_GATE), "{bad}");
+        }
+        assert_eq!(gate_lines_in("x\nPMJ-DUST-GATE: ruled 2026-11-02\n"), (true, false));
+        assert_eq!(
+            gate_lines_in("PMJ-DUST-GATE: ruled 2026-11-02\nPMJ-LIVE-GATE: ruled 2026-12-01\n"),
+            (true, true)
+        );
+        // Inside a fence: nothing; after it closes: read again.
+        let fenced = "```text\nPMJ-DUST-GATE: ruled 2026-11-02\n```\n";
+        assert_eq!(gate_lines_in(fenced), (false, false));
+        let indented = "  ```\nPMJ-LIVE-GATE: ruled 2026-12-01\n  ```\nPMJ-DUST-GATE: ruled 2026-11-02\n";
+        assert_eq!(gate_lines_in(indented), (true, false));
+        assert_eq!(gate_lines_in("```\nPMJ-DUST-GATE: ruled 2026-11-02\n"), (false, false), "an unclosed fence");
+        // Tilde fences too; a fence closes only with its own marker.
+        assert_eq!(gate_lines_in("~~~\nPMJ-DUST-GATE: ruled 2026-11-02\n~~~\n"), (false, false));
+        let mixed = "```\n~~~\nPMJ-DUST-GATE: ruled 2026-11-02\n```\nPMJ-LIVE-GATE: ruled 2026-12-01\n";
+        assert_eq!(gate_lines_in(mixed), (false, true), "a ~~~ inside a ``` block closes nothing");
+        assert_eq!(gate_lines_in(""), (false, false));
+    }
+
+    /// **PMJ J16 M1** — slot 11 arms only alone: beside any other live slot
+    /// the interlock refuses, naming them, whatever the gates.
+    #[test]
+    fn a_live_slot_eleven_beside_another_live_slot_is_refused() {
+        const FLIP: &str = include_str!("../../../scripts/pmj-flip.sh");
+        let start = FLIP.find("[exec.slot.11]\n# pmj live").expect("the section");
+        let end = start + FLIP[start..].find("\nEOF").expect("its end");
+        let section = FLIP[start..end].replace("$TS", "test");
+        let d = tmp();
+        let both = format!("{MINIMAL_LIVE}{section}\n");
+        let p = write(&d, "exec.toml", &both);
+        let dust = PmjGates { dust: true, pilot: true };
+        let e = resolve_gated(Some(&p), Some("3,11"), dust).unwrap_err();
+        assert!(
+            e.contains("slot 11 (pmj) arms only alone") && e.contains("R-PM-23") && e.contains("3 (bin15)"),
+            "{e}"
+        );
+        // Slot 11 paper beside a live slot 3: an ordinary artifact.
+        let paper = format!("{MINIMAL_LIVE}{}\n", section.replace("mode = \"live\"", "mode = \"paper\""));
+        let p = write(&d, "exec-paper.toml", &paper);
+        let b = resolve_gated(Some(&p), Some("3"), dust).unwrap().unwrap();
+        assert!(b.slot_live(3) && !b.pmj_live());
+        std::fs::remove_dir_all(&d).ok();
     }
 
     /// The caps line is the last thing an operator reads before real

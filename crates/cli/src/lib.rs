@@ -66,6 +66,13 @@ pub mod har_writer;
 pub mod hl_outcome_probe;
 /// PMJ J4: `pmj.toml` → slot 11's member (paper).
 pub mod pmj_boot;
+/// PMJ J16: slot 11's gate-line grammar (`PMJ-DUST-GATE: ruled YYYY-MM-DD`),
+/// shared with `build.rs` through `include!` — one parser, unit-tested here.
+pub mod gate_line;
+/// PMJ J16: slot 11's operator checks (`pmj-exec --self-test | --key-check`).
+pub mod pmj_exec;
+/// PMJ J16: slot 11's live boot — the Jupiter arm, jup-gw, the wallet.
+pub mod pmj_live;
 pub mod pm15_boot;
 pub mod pm15_live;
 pub mod pm15_polybolt;

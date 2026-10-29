@@ -790,6 +790,9 @@ pub struct IngressStatusSet {
     pub pm5: Arc<IngressStatus>,
     /// PMJ J1b: the 5-minute families' own counters (ingress + discovery).
     pub pm5c: Arc<ingress_polymarket::pm15_loop::Pm15Counters>,
+    /// PMJ J16: slot 11's arm and jup-gw — zero unless slot 11 boots live
+    /// (and only then mirrored: [`register_pmjx_metrics`]).
+    pub pmjx: Arc<exec_jupiter::stats::JupExecStats>,
 }
 
 impl IngressStatusSet {
@@ -815,6 +818,7 @@ impl IngressStatusSet {
             pm15x: Arc::new(exec_polymarket::stats::PmExecStats::new()),
             pm5: Arc::new(IngressStatus::new()),
             pm5c: Arc::new(ingress_polymarket::pm15_loop::Pm15Counters::new()),
+            pmjx: Arc::new(exec_jupiter::stats::JupExecStats::new()),
         }
     }
 }
@@ -917,7 +921,9 @@ pub fn spawn_pm15(
 /// pipeline's code driven for `PmPeriod::M5` (`pm5-discovery`,
 /// `ingress-pm5`), feeding `engine::PM5_LANE`, with the `pm5` capture.
 /// `assets` are the `:5m` keys' assets in `[polymarket] rolling` order.
-/// No gateway tee: slot 9's arm never reads a 5-minute window (R-PMJ-3).
+/// Slot 9's arm never reads a 5-minute window (R-PMJ-3); PMJ J16: `tee`
+/// feeds slot 11's jup-gw every window the discovery finds, when slot 11
+/// is live (`None` otherwise: paper unchanged).
 ///
 /// # Errors
 /// The capture could not be opened, or a host did not resolve.
@@ -939,6 +945,12 @@ pub fn spawn_pm5(
     epoch_ns: u64,
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
+    tee: Option<
+        Producer<
+            ingress_polymarket::gamma15::PmWindowSpec,
+            { ingress_polymarket::pm15_loop::PM15_SPEC_RING },
+        >,
+    >,
 ) -> io::Result<Vec<JoinHandle<()>>> {
     spawn_rolling(
         core_types::pm_roll::PmPeriod::M5,
@@ -959,7 +971,7 @@ pub fn spawn_pm5(
         epoch_ns,
         tap_cfg,
         capture_metrics,
-        None,
+        tee,
     )
 }
 
@@ -4862,6 +4874,15 @@ impl Observability {
             // PM15-8c: slot 9's arm and pm-gw (gauges mirrored from
             // `PmExecStats`).
             let pm15x = register_pm15x_metrics(&mut reg)?;
+            // PMJ J16: slot 11's arm and jup-gw — registered only when the
+            // artifact marks slot 11 live (a paper boot builds no arm and
+            // names none of them).
+            let pmjx = match exec_modes.as_ref() {
+                Some(spec) if spec.modes.get(crate::exec_boot::PMJ_SLOT) == Some(&1) => {
+                    Some(register_pmjx_metrics(&mut reg)?)
+                }
+                _ => None,
+            };
 
             // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
             // (mirrored centrally from the shared status slot), the
@@ -5012,6 +5033,7 @@ impl Observability {
                 pm15,
                 pm5,
                 pm15x,
+                pmjx,
                 ingress_ai,
                 capture_ai,
                 fills_capture,
@@ -5491,6 +5513,9 @@ pub struct EngineCounters {
     pub pm5: Pm15MetricIds,
     /// PM15-8c: slot 9's arm and pm-gw ([`register_pm15x_metrics`]).
     pub pm15x: Pm15xMetricIds,
+    /// PMJ J16: slot 11's arm and jup-gw ([`register_pmjx_metrics`]) —
+    /// `None` unless slot 11 is live.
+    pub pmjx: Option<PmjxMetricIds>,
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
@@ -10126,6 +10151,58 @@ pub fn pm15x_metric_values(s: &exec_polymarket::stats::PmExecStats) -> [i64; PM1
     v
 }
 
+/// PMJ J16: slot 11's arm (`engine_pmj_arm_*`) and jup-gw
+/// (`engine_pmj_gw_*`) — one gauge per word of
+/// `exec_jupiter::stats::JupExecStats`, a tally `…_total`, a level bare.
+/// Registered only when slot 11 is live.
+#[derive(Copy, Clone, Debug)]
+pub struct PmjxMetricIds {
+    /// The arm's words, then jup-gw's.
+    pub gauges: [GaugeId; PMJX_METRICS],
+}
+
+/// Size of the slot-11 arm family.
+pub const PMJX_METRICS: usize = exec_jupiter::stats::ARM_WORDS + exec_jupiter::stats::GW_WORDS;
+
+/// Register the slot-11 arm family (boot-only; the names are rendered once).
+fn register_pmjx_metrics(reg: &mut MetricsRegistry) -> Result<PmjxMetricIds, &'static str> {
+    use exec_jupiter::stats::{ARM_LEVELS, ARM_NAMES, ARM_WORDS, GW_LEVELS, GW_NAMES, GW_WORDS};
+    let mut gauges = [GaugeId::default(); PMJX_METRICS];
+    let mut i = 0usize;
+    while i < PMJX_METRICS {
+        let (who, name, level) = if i < ARM_WORDS {
+            ("arm", ARM_NAMES[i], i >= ARM_WORDS - ARM_LEVELS)
+        } else {
+            let k = i - ARM_WORDS;
+            ("gw", GW_NAMES[k], k >= GW_WORDS - GW_LEVELS)
+        };
+        let full = if level {
+            format!("engine_pmj_{who}_{name}")
+        } else {
+            format!("engine_pmj_{who}_{name}_total")
+        };
+        gauges[i] = reg
+            .register_gauge(&full)
+            .map_err(|_| "register pmj arm gauge")?;
+        i += 1;
+    }
+    Ok(PmjxMetricIds { gauges })
+}
+
+/// The slot-11 arm family's current values, in [`register_pmjx_metrics`]
+/// order.
+#[must_use]
+pub fn pmjx_metric_values(s: &exec_jupiter::stats::JupExecStats) -> [i64; PMJX_METRICS] {
+    let arm = exec_jupiter::stats::ARM_WORDS;
+    let mut v = [0i64; PMJX_METRICS];
+    let mut i = 0usize;
+    while i < PMJX_METRICS {
+        v[i] = if i < arm { s.arm(i) } else { s.gw(i - arm) };
+        i += 1;
+    }
+    v
+}
+
 /// The Hypercall family's current values, in [`HC_METRIC_NAMES`] order.
 /// Relaxed loads — statistics, never a synchronization point.
 #[must_use]
@@ -10849,6 +10926,15 @@ where
                     while k < PM15X_METRICS {
                         reg.gauge(ids.pm15x.gauges[k]).set(px[k]);
                         k += 1;
+                    }
+                    // PMJ J16: slot 11's arm and jup-gw (live only).
+                    if let Some(jx) = ids.pmjx.as_ref() {
+                        let v = pmjx_metric_values(&ing.pmjx);
+                        let mut k = 0usize;
+                        while k < PMJX_METRICS {
+                            reg.gauge(jx.gauges[k]).set(v[k]);
+                            k += 1;
+                        }
                     }
                     // HC5: the venue family — plain stores (see
                     // `HcMetricIds`).
@@ -13885,6 +13971,48 @@ mod tests {
         }
     }
 
+    /// **PMJ J16** — slot 11's arm family (`engine_pmj_arm_*`,
+    /// `engine_pmj_gw_*`: 21 + 36 gauges, a tally `…_total`, a level bare)
+    /// registers only when the artifact marks slot 11 live: a boot with no
+    /// `--exec`, or with slot 11 paper, names none of it.
+    #[test]
+    fn the_pmj_arm_family_registers_only_with_slot_11_live() {
+        let names = |obs: &Observability| {
+            let reg = obs.metrics.as_ref().expect("metrics on");
+            let mut buf = vec![0u8; 256 * 1024];
+            let n = reg.encode_prometheus(&mut buf).expect("fits");
+            String::from_utf8(buf[..n].to_vec()).unwrap()
+        };
+        let paper = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
+        for exec in [None, Some(ExecObs { modes: paper, binance: false, gateway: false })] {
+            let obs = Observability::build(true, exec).expect("builds");
+            let text = names(&obs);
+            assert!(!text.contains("engine_pmj_arm_") && !text.contains("engine_pmj_gw_"));
+            assert!(obs.counter_ids.as_ref().unwrap().pmjx.is_none());
+        }
+        let mut live = paper;
+        live[crate::exec_boot::PMJ_SLOT] = 1;
+        let obs = Observability::build(true, Some(ExecObs { modes: live, binance: false, gateway: false }))
+            .expect("builds");
+        let text = names(&obs);
+        for n in [
+            "engine_pmj_arm_submitted_total",
+            "engine_pmj_arm_over_limit_total",
+            "engine_pmj_arm_halted",
+            "engine_pmj_arm_usdc_usd_1e6",
+            "engine_pmj_gw_debit_halts_total",
+            "engine_pmj_gw_unknown_positions_total",
+            "engine_pmj_gw_halt_reason",
+            "engine_pmj_gw_debit_allow_micro",
+        ] {
+            assert!(text.contains(&format!("{n} ")) || text.contains(&format!("{n}\n")), "{n}");
+        }
+        assert!(!text.contains("engine_pmj_arm_halted_total") && !text.contains("engine_pmj_gw_submitted"));
+        assert!(obs.counter_ids.as_ref().unwrap().pmjx.is_some());
+        let s = exec_jupiter::stats::JupExecStats::new();
+        assert_eq!(pmjx_metric_values(&s), [0i64; PMJX_METRICS], "a stats block never written reads 0");
+    }
+
     /// O4b: the family's SIZE, and the headroom it leaves.
     ///
     /// The registry is a fixed array (`MAX_COUNTERS` 256, `MAX_GAUGES`
@@ -14026,7 +14154,9 @@ mod tests {
         // (`engine_ingress_binance_options_*`). O-WSG1 two counters and ONE
         // gauge (`engine_exec_held_mask`): a gauge a slot did not fit.
         // T2T T0 twenty gauges, the engine's stage family: measured 706 /
-        // 658 of 768 / 768 (638 before, MAX_GAUGES 640 → 768).
+        // 658 of 768 / 768 (638 before, MAX_GAUGES 640 → 768). PMJ J16
+        // fifty-seven gauges, slot 11's arm family (live slot 11 only, so
+        // in this worst case): ≈ 715 of 768.
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");

@@ -11,9 +11,10 @@
 //!   validator uses.
 //! - Requested-but-absent REFUSES the boot (the caller's F19 check); a
 //!   present-and-wrong artifact refuses too.
-//! - Slot 11 is PAPER: nothing here builds or arms the Jupiter arm; the
-//!   paper law's keeper delay (`paper_delay_ms`) goes to the paper
-//!   dispatcher, and the guard's keys wait for J5's arm boot.
+//! - Nothing here builds or arms the Jupiter arm; the paper law's keeper
+//!   delay (`paper_delay_ms`) goes to the paper dispatcher, and the guard's
+//!   and the wallet's keys ride in [`PmjLiveKeys`], read only by the live
+//!   arm's boot (`cli::pmj_live`, PMJ J16) when slot 11 is armed.
 
 use std::path::{Path, PathBuf};
 
@@ -38,10 +39,73 @@ pub struct PmjBoot {
     /// Programs and lookup tables the guard lists, and whether the
     /// deposit account is set (the boot tell; the arm's boot decodes them).
     pub guard: (usize, usize, bool),
+    /// PMJ J16: the keys only the live arm's boot reads (the guard's, the
+    /// wallet's, the frame's) — a paper boot never decodes them.
+    pub live_keys: PmjLiveKeys,
     /// sha256 of the artifact BYTES — the boot tell's identity.
     pub hash: [u8; 32],
     /// The artifact path actually read.
     pub path: PathBuf,
+}
+
+/// **PMJ J16** — the `pmj.toml` keys the live arm's boot and `pmj-exec
+/// --key-check` read, kept as the artifact wrote them (base58 text; the
+/// live boot decodes and refuses). Cold; a paper boot carries them unread.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PmjLiveKeys {
+    /// `guard_programs`.
+    pub guard_programs: Vec<String>,
+    /// `guard_alts`.
+    pub guard_alts: Vec<String>,
+    /// `guard_deposit_account`.
+    pub guard_deposit_account: String,
+    /// `guard_deposit_mint` (USDC or JupUSD; empty: unset).
+    pub guard_deposit_mint: String,
+    /// `guard_max_sol_lamports`.
+    pub guard_max_sol_lamports: u64,
+    /// `guard_max_cu_price`.
+    pub guard_max_cu_price: u64,
+    /// `guard_vault`.
+    pub guard_vault: String,
+    /// `guard_vault_alt` (`<table>:<entry>`; empty: a static vault).
+    pub guard_vault_alt: String,
+    /// `guard_cosigners` (≤ 1; empty: LAW PMJ-G as written).
+    pub guard_cosigners: Vec<String>,
+    /// `build_extra`.
+    pub build_extra: Vec<String>,
+    /// `min_sol_lamports` (0: unset — the live boot refuses).
+    pub min_sol_lamports: u64,
+    /// `guard_program_slot` (0: unpinned).
+    pub guard_program_slot: u64,
+    /// `deposit_usd_1e6` (the frame check).
+    pub deposit_usd_1e6: i64,
+    /// `usd_market_1e6` (the frame check).
+    pub usd_market_1e6: i64,
+    /// `session_loss_usd_1e6` (the frame check).
+    pub session_loss_usd_1e6: i64,
+}
+
+/// The live keys of a parsed artifact (`resolve_file`, and the key check,
+/// which reads `pmj.toml` without the universe).
+#[must_use]
+pub fn live_keys_of(file: &core_config::pmj::PmjFile) -> PmjLiveKeys {
+    PmjLiveKeys {
+        guard_programs: file.guard_programs.clone(),
+        guard_alts: file.guard_alts.clone(),
+        guard_deposit_account: file.guard_deposit_account.clone(),
+        guard_deposit_mint: file.guard_deposit_mint.clone(),
+        guard_max_sol_lamports: file.guard_max_sol_lamports,
+        guard_max_cu_price: file.guard_max_cu_price,
+        guard_vault: file.guard_vault.clone(),
+        guard_vault_alt: file.guard_vault_alt.clone(),
+        guard_cosigners: file.guard_cosigners.clone(),
+        build_extra: file.build_extra.clone(),
+        min_sol_lamports: file.min_sol_lamports,
+        guard_program_slot: file.guard_program_slot,
+        deposit_usd_1e6: file.deposit_usd_1e6,
+        usd_market_1e6: file.usd_market_1e6,
+        session_loss_usd_1e6: file.session_loss_usd_1e6,
+    }
 }
 
 /// Whether the operator asked for the member.
@@ -139,6 +203,7 @@ fn resolve_file(
         params.res_min_ppm[f] = file.strike_law.sigma_res_min_ppm[f];
         f += 1;
     }
+    let live_keys = live_keys_of(&file);
     let mut lut = Box::new(core_twaplock::late::LateLut::flat());
     let mut i = 0usize;
     while i < core_config::pmj::PMJ_PHI_POINTS {
@@ -153,6 +218,7 @@ fn resolve_file(
         paper_delay_ns: file.paper_delay_ms.saturating_mul(1_000_000),
         max_order_usd_1e6: file.max_order_usd_1e6,
         guard: (file.guard_programs.len(), file.guard_alts.len(), !file.guard_deposit_account.is_empty()),
+        live_keys,
         hash,
         path,
     })
@@ -309,6 +375,9 @@ mod tests {
             guard_vault_alt: String::new(),
             guard_cosigners: Vec::new(),
             build_extra: Vec::new(),
+            guard_deposit_mint: String::new(),
+            min_sol_lamports: 0,
+            guard_program_slot: 0,
         }
     }
 
@@ -332,6 +401,9 @@ mod tests {
         assert!(tell.contains("law=3-20s:p>=0.900:ask<=p-0.020:floor0.900"), "{tell}");
         assert!(tell.contains("frame=$5/order:$10/market:-$50/session max=$5.01/order paper=+2000ms"), "{tell}");
         assert!(tell.contains("guard=0p/0alt/acct-unset live=none"), "{tell}");
+        // PMJ J16: the live keys ride along, unread on paper.
+        assert_eq!(b.live_keys, live_keys_of(&file()));
+        assert_eq!((b.live_keys.min_sol_lamports, b.live_keys.deposit_usd_1e6), (0, 5_000_000));
         // A 15-minute key, a permutation, a short list, an unresolvable perp.
         let fifteen = vec!["updown:btc:15m".to_string(), "updown:eth:15m".to_string()];
         assert!(resolve_file(file(), [0; 32], PathBuf::from("x"), &resolve, &fifteen).is_err());
