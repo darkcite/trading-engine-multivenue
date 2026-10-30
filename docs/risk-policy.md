@@ -17601,7 +17601,7 @@ and runs slot 11 in PAPER; nothing is armed.
 | R-PMJ-S71 | (Ruled 2026-10-24.) The 20 S3-pulled run copies in `~/multivenue/research/pmj/loss/runs/` are deleted (each pulled with its files' sha256 verified; scripts, derived tables and the vault kept). |
 | R-PMJ-S72 | (2026-10-29, the live-ready round, verbatim.) PMJ before J0: "Pre-check first (Recommended)" — the binding question tested on public on-chain data before any pre-dust code. |
 | R-PMJ-S73 | The PMJ signing secret: "0600 keypair file (Recommended)" — a 0600 Solana keypair file outside the repo, its path in `.env`. |
-| R-PMJ-S74 | R5 (slot 11 skips τ > 16 s), after the 10-30 checkpoint: "Adopt in paper if it passes (Recommended)". |
+| R-PMJ-S74 | R5 (slot 11 skips τ > 16 s), after the 10-30 checkpoint: "Adopt in paper if it passes (Recommended)". *(Outcome 2026-10-30: the pre-registered checkpoint FAILs for R5, and for R1 and R1 ∪ R5 too — vault `docs/research/pmj/loss/below-floor/checkpoint-2026-10-30.md`. Nothing is adopted; slot 11 keeps `tau_max_ns` 20 s.)* |
 | R-PMJ-S75 | Notifications for slots 9 and 11: "Not now". |
 | R-PMJ-S76 | **PROVISIONAL — Anton to confirm** (the session's choice, J16): the **pilot** frame's day cap is **$1 000** and its open-order bound **4** (`exec_boot` `PMJ_PILOT_CAP_DAY_USD_1E6`, `PMJ_PILOT_MAX_OPEN_ORDERS`); its order, instance and session bounds ($250.01 / $250.01 / −$500) follow slot 9's R-PM-8. Ruled before any `PMJ-LIVE-GATE` line. |
 | R-PMJ-S77 | **PROVISIONAL — Anton to confirm** (the session's choice, J16, risk review M1): **slot 11 arms only alone in its engine** — the engine and the flip refuse a live slot 11 beside any other live slot, because a slot-11 boot refusal aborts the whole engine (the standalone, R-PM-23). |

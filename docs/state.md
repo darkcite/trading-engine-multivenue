@@ -431,6 +431,12 @@ affected paragraph at each lane close; the superseded text goes to
 - **PMJ J18 (the slot-11 EC2 standalone kit, `deploy/ec2-pmj/`) is committed**
   (risk-policy `### J18`): nothing provisioned, nothing deployed — Anton runs it.
   Provisional R-PMJ-S81.
+- **2026-10-30 00:11Z: the scheduled `0010` restart booted `e9659ee7` (J17 + J18),
+  PAPER** — run `run-1793319106878759000` (00:11:46Z), masks 2815, nothing halted,
+  `exec` configured 0, `vm` 2; the CLOB law tallies 0; no `engine_pmj_arm_*` /
+  `engine_pmj_gw_*` metric.
+- **The R5 checkpoint (R-PMJ-S69 / S74) FAILs:** nothing adopted; slot 11 keeps
+  `tau_max_ns` 20 s (risk-policy, the S74 row; the numbers stay in the vault).
 
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
