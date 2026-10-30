@@ -438,6 +438,43 @@ affected paragraph at each lane close; the superseded text goes to
 - **The R5 checkpoint (R-PMJ-S69 / S74) FAILs:** nothing adopted; slot 11 keeps
   `tau_max_ns` 20 s (risk-policy, the S74 row; the numbers stay in the vault).
 
+## Corrections found 2026-10-30 (PVM — the Pine engine merged into main; verify on `/state`)
+
+- **The Pine branch is merged into main as `e915613e`** (`pvm-pine-engine`
+  `37806cb4` into `82445bc5`; R-P31 step 2, Anton: "go merge to main now").
+  It brings:
+  - the Pine VM crates (`pine-lang`, `pine-sema`, `pine-ir`, `pine-vm`,
+    `pine-std`, `pine-spec`, `pine-broker`, `pine-conformance`, `pine-screen`,
+    `pine-corpus`);
+  - `strategy-pine` as **slot 8** (PVM impl-08);
+  - the cli's pine arms (the `--pine <manifest>` boot, the pine backtest,
+    replay and tapes);
+  - the Binance arm's Pine path (PB0–PB10, proven on the loopback only);
+  - the pine benches and alloc gates, and `make license-check`'s research
+    guard (`.pine` / C1–C5).
+  - **`BUILT_MASK` = 0x0BFF** (pine 8 joins); `ALL_MASK` stays 0x00FF.
+  - **Slot 8 is PAPER only.** A live slot 8 is refused at parse
+    (`[exec.slot.8]`), by `--arm-live 8` and for the AI's enable. It is not in
+    `all`, and it boots only when `STRATEGY` names `pine` with
+    `--pine <manifest>`. `strategy.conf` does not name it, so the running set
+    is unchanged (masks 2815; `/state` lists `8:pine` disabled).
+  - **Bench re-baseline** for slot 8's built row (R-P35): `strategy_set/on_tick_all`
+    4.63 → 5.87 ns, `on_tick_none` 3.06 → 3.32 ns. Recorded in `hot_path.json`
+    and risk-policy's PVM bench note.
+  - **Gates on main with the merge staged:** lint clean; nextest 7 503 / 7 503
+    (12 skipped); alloc-assert 156 / 0; copy-audit new 0; license-check OK;
+    LOCK-OK; bench-check 22 / 22; `pine-conf` 564 / 569 TradingView fixtures.
+  - **Open PVM items:** `claude/pvm-r40-results-2026-10-29.md` §3.
+- **2026-10-30 04:07Z: main restarted (forced `0010` slot at 04:06:08Z) on
+  `e915613e`, PAPER** (Anton: "a restart is needed to run the merged code").
+  - The release cli was rebuilt first (G0, 03:54Z); `strategy-mask` on the new
+    binary resolves `STRATEGY` to 2815, as before.
+  - Run `run-1793333249048513000` (epoch 04:07:29Z), pid 73166.
+  - `paper` 1, masks 2815 / 2815 / 2815, nothing halted, `exec` configured 0,
+    `vm` rows_active 2.
+  - The pm15 / pm5 CLOB law tallies are 0. There is no `engine_pmj_arm_*` or
+    `engine_pmj_gw_*` metric (paper).
+
 ## Slots and boot (moved verbatim from CLAUDE.md "What this is", 2026-10-16)
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
