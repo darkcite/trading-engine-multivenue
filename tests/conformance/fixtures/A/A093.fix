@@ -1,0 +1,22 @@
+fix	2
+id	A093
+group	A
+title	na as a switch subject · bool
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A093.pine
+script_sha256	6ccded9f2a714702bc897fc99ccbad44d62cfe18482836dbba7e397eab05712a
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	6
+twin	A077
+mode	bar_close
+bars	pending
+window	head	64
+oracle	authored
+tier	1
+plot	f_A093_val	exact
+refuse	3007

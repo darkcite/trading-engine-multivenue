@@ -1,0 +1,8 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+indicator("Function", precision = 2, format = format.price)
+f(x, y) =>
+    x + y
+plot(f(close, open))

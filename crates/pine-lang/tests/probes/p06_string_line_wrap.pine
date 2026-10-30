@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// PIN: pin:01-string-line-wrap
+// OURS: reject 1001
+// TV: pending
+//@version=6
+indicator("p06")
+s = "ab
+  cd"
+plot(str.length(s))

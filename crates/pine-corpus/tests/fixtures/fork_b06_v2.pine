@@ -1,0 +1,10 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+indicator("Array Mean")
+buf = array.new<float>()
+array.push(buf, close)
+if array.size(buf) > 50
+    array.shift(buf)
+plot(array.avg(buf))

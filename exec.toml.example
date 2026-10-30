@@ -53,6 +53,8 @@
 #   1  vrp              5  vm
 #   2  xsd              6  xmm (LIVE only on its gateway arm, XMM XH4f)
 #   3  bin15            7  hcv (DARK: a LIVE slot 7 refuses, O-HC18)
+#   8  pine (PAPER ONLY: a LIVE slot 8 refuses at parse and at boot,
+#      ruling 2026-10-16)    9-15  reserved (S16-R5)
 #
 #
 # THE THREE GRAMMAR LAWS
@@ -441,6 +443,44 @@ mode = "paper"
 # halt_on_loss_usd_1e6 = 50000000
 # request_topup_weight = 10000
 # request_topup_day_max = 100000
+
+
+# ---- [exec.slot.8.pine] — the Pine member's slot-level knobs (PVM impl-08 §4.8) ----
+#
+# Slot 8 holds `strategy-pine` (third-party Pine scripts, one manifest).
+# It is PAPER ONLY by ruling (2026-10-16): `[exec.slot.8] mode = "live"`
+# refuses at parse and `--arm-live 8` refuses at boot, whatever this
+# section says. The section is optional; without it every key takes its
+# default and the file parses exactly as before the section existed.
+# Recognised only as `[exec.slot.8.pine]`, after `[exec]`, at most once.
+# An unknown key is 6004, an out-of-range value 6006 (each refusal starts
+# with its code and names the key and the line).
+#
+# min_coalesce_ms:   1..=60000. Live-required (moot while paper only): every
+#                    realtime script's coalesce_ms >= this (6010).
+# event_insn_budget: 1000..=1000000000 (default 4000000). Live-required: VM
+#                    budget units per engine callback, all scripts (6011).
+# boot_exit_policy:  "accept" | "standing" | "protective" | "flatten"
+#                    (default accept). Live-required: what a boot does with
+#                    an adopted position.
+# max_frame_bytes:   65536..=268435456 (default 16777216), per-script arena.
+# quote_stale_ms:    1..=60000 (default: the venue's own stale window).
+# live_settle_ms:    100..=60000 (default 2000), event time.
+# refusal_streak_max: 1..=1024 (default 16), per-script entry suppression.
+# fee_taker_ppm / fee_maker_ppm: 0..=100000 (default 0) — the venue's
+#                    MEASURED rates, never a doc's.
+# max_warm_lag_bars: 0..=1000 (default 1).
+# [exec.slot.8.pine]
+# min_coalesce_ms    = 250
+# event_insn_budget  = 4000000
+# boot_exit_policy   = "protective"
+# max_frame_bytes    = 16777216
+# quote_stale_ms     = 700
+# live_settle_ms     = 2000
+# refusal_streak_max = 16
+# fee_taker_ppm      = 0
+# fee_maker_ppm      = 0
+# max_warm_lag_bars  = 1
 
 
 # ---- [exec.binance] — the Binance arm (BX6) -----------------------------

@@ -1,0 +1,577 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
+//! Time builtins (impl-04 §4.12, T22): `time` / `time_close` (all three overloads), the civil
+//! fields `year month dayofmonth dayofweek hour minute second` (function and variable forms),
+//! `timenow`, `time_tradingday`, `timeframe.in_seconds`, `timeframe.change`. Every time is UTC
+//! milliseconds; bar boundaries come from `core_time::barclock` only; no clock (`timenow` is the
+//! host's event time). `weekofyear` (function and variable): the reference does not define its
+//! numbering; operator ruling 2026-10-16 — the ISO 8601 week (`pin:04-weekofyear-provisional`).
+
+use crate::load::{session_parse, tf_seconds, tz_lookup, tz_offset_s, SessionSpec, TzId, TZ_UTC};
+use crate::state::Prev;
+use core_time::barclock;
+use pine_ir::{Dialect, FaultKind, SiteId};
+use pine_vm::Frame;
+
+const DAY_MS: i64 = 86_400_000;
+
+/// `(year, month 1..=12, day 1..=31)` of day `z` since 1970-01-01 (Hinnant's `civil_from_days`,
+/// integer, the full range of a day count derived from i64 ms).
+#[must_use]
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Days since 1970-01-01 of the civil date `(y, m, d)` (Hinnant's `days_from_civil`); `m` in
+/// 1..=12, `d` in 1..=31.
+#[must_use]
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400); // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Which civil field a body reports.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum Civil {
+    /// `year`.
+    Year = 0,
+    /// `month`, 1..=12.
+    Month = 1,
+    /// `dayofmonth`, 1..=31.
+    DayOfMonth = 2,
+    /// `dayofweek`, 1 = Sunday … 7 = Saturday (verified, time page).
+    DayOfWeek = 3,
+    /// `hour`, 0..=23.
+    Hour = 4,
+    /// `minute`, 0..=59.
+    Minute = 5,
+    /// `second`, 0..=59.
+    Second = 6,
+    /// `weekofyear`, 1..=53: the ISO 8601 week — weeks start on Monday and week 1 holds the
+    /// year's first Thursday, so 1–3 January may be week 52/53 and 29–31 December week 1
+    /// (`pin:04-weekofyear-provisional`, operator ruling 2026-10-16; to be verified against
+    /// TradingView in the capture month).
+    WeekOfYear = 7,
+}
+
+/// Field `k` of UTC ms `t` shifted by `off_s` seconds (the zone's offset at `t`).
+#[inline]
+fn civil_field(t: i64, off_s: i32, k: u8) -> i64 {
+    let local = t.saturating_add(off_s as i64 * 1000);
+    let days = local.div_euclid(DAY_MS);
+    let ms = local.rem_euclid(DAY_MS);
+    const Y: u8 = Civil::Year as u8;
+    const MO: u8 = Civil::Month as u8;
+    const D: u8 = Civil::DayOfMonth as u8;
+    const W: u8 = Civil::DayOfWeek as u8;
+    const H: u8 = Civil::Hour as u8;
+    const MI: u8 = Civil::Minute as u8;
+    const WK: u8 = Civil::WeekOfYear as u8;
+    match k {
+        Y => civil_from_days(days).0,
+        MO => civil_from_days(days).1 as i64,
+        D => civil_from_days(days).2 as i64,
+        // 1970-01-01 was a Thursday (5 in 1 = Sunday numbering).
+        W => (days + 4).rem_euclid(7) + 1,
+        WK => iso_week(days),
+        H => ms / 3_600_000,
+        MI => ms / 60_000 % 60,
+        _ => ms / 1000 % 60,
+    }
+}
+
+/// The ISO 8601 week number of day `days` since 1970-01-01: the week's Thursday (ISO weekday
+/// 1 = Monday … 7 = Sunday; 1970-01-01 was a Thursday) names the ISO year, and the week is
+/// `(thursday − 1 January of that year) / 7 + 1`.
+#[inline]
+fn iso_week(days: i64) -> i64 {
+    let wd = (days + 3).rem_euclid(7) + 1;
+    let thu = days - (wd - 4);
+    let (y, _, _) = civil_from_days(thu);
+    (thu - days_from_civil(y, 1, 1)) / 7 + 1
+}
+
+/// A `series` timezone string at run time: na → `None`; unknown → `Err(ScriptRefused)`
+/// (`pin:04-time-edges`).
+#[inline]
+fn tz_of(f: &Frame<'_>, e: u16) -> Result<Option<TzId>, FaultKind> {
+    match f.str_arg(e) {
+        None => Ok(None),
+        Some(s) => match tz_lookup(s) {
+            Some(z) => Ok(Some(z)),
+            None => Err(FaultKind::ScriptRefused),
+        },
+    }
+}
+
+/// `year(time, timezone)` … `second(time, timezone)` — window `[time, timezone, out]`;
+/// `propagate` na.
+pub fn bi_civil<const K: u8>(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 3 {
+        return Err(FaultKind::Internal);
+    }
+    let t = f.i64_arg(args[0]);
+    let z = tz_of(f, args[1])?;
+    let v = match (t, z) {
+        (Some(t), Some(z)) => Some(civil_field(t, tz_offset_s(z, t), K)),
+        _ => None,
+    };
+    f.set_i64_arg(args[2], v);
+    Ok(())
+}
+
+/// The variables `year` … `second` — window `[out]`: the field of the bar's `time` in
+/// `syminfo.timezone`, `"Etc/UTC"` for every venue (`pin:04-exchange-tz`).
+pub fn bi_civil_var<const K: u8>(
+    f: &mut Frame<'_>,
+    _: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    if args.len() != 1 {
+        return Err(FaultKind::Internal);
+    }
+    let t = f.bar().open_ms;
+    let v = civil_field(t, tz_offset_s(TZ_UTC, t), K);
+    f.set_i64_arg(args[0], Some(v));
+    Ok(())
+}
+
+/// `timenow` — `ctx().now_ms()`, the host's event time (never a clock).
+pub fn bi_timenow(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 1 {
+        return Err(FaultKind::Internal);
+    }
+    let t = f.ctx().now_ms();
+    f.set_i64_arg(args[0], Some(t));
+    Ok(())
+}
+
+/// `time_tradingday` — `barclock::open_ms(bar.open_ms, 86_400)`: a 24/7 UTC venue's trading day
+/// (`pin:04-exchange-tz`).
+pub fn bi_time_tradingday(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 1 {
+        return Err(FaultKind::Internal);
+    }
+    let t = barclock::open_ms(f.bar().open_ms, 86_400);
+    f.set_i64_arg(args[0], Some(t));
+    Ok(())
+}
+
+/// The second timeframes `timeframe.from_seconds` rounds up to (`pin:04-from-seconds`).
+const FROM_S_SECONDS: [i64; 6] = [1, 5, 10, 15, 30, 45];
+
+/// `timeframe.from_seconds(seconds)` as `(multiplier, unit)` (`0` = minutes): an exact
+/// representation in the largest unit first — month (`IN_SECONDS_MONTH`, ≤ 12), week (≤ 52),
+/// day (≤ 365), minute (≤ 1440), second (`FROM_S_SECONDS`) — else the next higher valid
+/// timeframe in the smallest unit that holds `s`: `s ≤ 1` → `1S`, then the second set, then
+/// whole minutes up to 1440, then whole days up to 365, and above 365 days `12M` (the
+/// reference's remarks: 2–5 s → `5S`, 604 799 → `7D`, 604 800 → `1W`, above 366 days → `12M`;
+/// `pin:04-from-seconds`, CI-013, fixtures F075 F076 F092).
+fn from_seconds_parts(s: i64) -> (i64, u8) {
+    const MIN: i64 = 60;
+    const DAY: i64 = 86_400;
+    const WEEK: i64 = 604_800;
+    if s <= 1 {
+        return (1, b'S');
+    }
+    if s % IN_SECONDS_MONTH == 0 && s / IN_SECONDS_MONTH <= 12 {
+        return (s / IN_SECONDS_MONTH, b'M');
+    }
+    if s % WEEK == 0 && s / WEEK <= 52 {
+        return (s / WEEK, b'W');
+    }
+    if s % DAY == 0 && s / DAY <= 365 {
+        return (s / DAY, b'D');
+    }
+    if s % MIN == 0 && s / MIN <= 1440 {
+        return (s / MIN, 0);
+    }
+    let mut i = 0usize;
+    while i < FROM_S_SECONDS.len() {
+        if s <= FROM_S_SECONDS[i] {
+            return (FROM_S_SECONDS[i], b'S');
+        }
+        i += 1;
+    }
+    if s <= 1440 * MIN {
+        let m = (s + MIN - 1) / MIN;
+        return if m == 1440 { (1, b'D') } else { (m, 0) };
+    }
+    if s <= 365 * DAY {
+        return ((s + DAY - 1) / DAY, b'D');
+    }
+    (12, b'M')
+}
+
+/// `timeframe.from_seconds(seconds) -> string` — window `[seconds, out]`: `from_seconds_parts`
+/// written with its multiplier always (`"1D"`, also in v5: F075 printed length 2 in both
+/// dialects, so the `tf_multiplier` switch does not apply here — `pin:04-from-seconds`); a na
+/// `seconds` → na. At most 5 bytes of scratch.
+pub fn bi_tf_from_seconds(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 2 {
+        return Err(FaultKind::Internal);
+    }
+    let Some(s) = f.i64_arg(args[0]) else {
+        f.set_i64_arg(args[1], None);
+        return Ok(());
+    };
+    let (mut m, unit) = from_seconds_parts(s);
+    let mut digits = [0u8; 5];
+    let mut k = 0usize;
+    loop {
+        digits[k] = b'0' + (m % 10) as u8;
+        k += 1;
+        m /= 10;
+        if m == 0 || k == 4 {
+            break;
+        }
+    }
+    let n = k + usize::from(unit != 0);
+    let (r, dst) = f.str_alloc(n as u32)?;
+    let mut j = 0usize;
+    while k > 0 {
+        k -= 1;
+        dst[j] = digits[k];
+        j += 1;
+    }
+    if unit != 0 {
+        dst[j] = unit;
+    }
+    f.set_i64_arg(args[1], Some(r.0 as i64));
+    Ok(())
+}
+
+/// `session.isfirstbar` (`LAST == false`) / `session.islastbar` — stateless over the bar's own
+/// span: the day's session of a 24/7 UTC venue opens at `time_tradingday`
+/// (`pin:04-exchange-tz`), so the bar is the session's first when its span `[open, close)`
+/// starts in that day and its open lies less than one bar length past the day's open (it covers
+/// the session open), and the last when its close reaches the next day's open. A bar of a day
+/// or more is both (`pin:04-session-first-last`, CI-041, fixture D058).
+pub fn bi_session_edge<const LAST: bool>(
+    f: &mut Frame<'_>,
+    _: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    if args.len() != 1 {
+        return Err(FaultKind::Internal);
+    }
+    let (open, close) = (f.bar().open_ms, f.bar().close_ms);
+    let day = barclock::open_ms(open, 86_400);
+    let r = if LAST {
+        close >= day + 86_400_000
+    } else {
+        open - day < close - open
+    };
+    f.set_bool_arg(args[0], r);
+    Ok(())
+}
+
+/// A `series` timeframe string at run time, in seconds: `""` → the chart's; na, a string
+/// outside the grammar, or one off the bar clock → `None` (na, §4.12).
+#[inline]
+fn tf_of(f: &Frame<'_>, e: u16) -> Option<u32> {
+    let s = f.str_arg(e)?;
+    let secs = match tf_seconds(s) {
+        Ok(None) => f.meta().chart.timeframe_s,
+        Ok(Some(x)) => x,
+        Err(_) => return None,
+    };
+    if barclock::is_allowed(secs) {
+        Some(secs)
+    } else {
+        None
+    }
+}
+
+/// Seconds of one month as `timeframe.in_seconds` reports them: the reference's remark —
+/// "calculations use 2628003 as the number of seconds in one month" (`pin:04-tf-month-seconds`,
+/// lead ruling 2026-10-16). Only this body uses it; `tf_seconds` (the load-time sort key) keeps
+/// `MONTH_SORT_S`.
+pub(crate) const IN_SECONDS_MONTH: i64 = 2_628_003;
+
+/// `timeframe.in_seconds(timeframe)` — window `[timeframe, out]`: `tf_seconds`, `""` → the
+/// chart's `timeframe_s`; na or unparsable → na. A month timeframe (`N` months, the sort key
+/// `N × MONTH_SORT_S`) reports `N × 2 628 003` (`pin:04-tf-month-seconds`); every other unit is
+/// `tf_seconds`' value. Not checked against the bar clock.
+pub fn bi_tf_in_seconds(f: &mut Frame<'_>, _: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 2 {
+        return Err(FaultKind::Internal);
+    }
+    let secs = match f.str_arg(args[0]) {
+        None => None,
+        Some(s) => match tf_seconds(s) {
+            Ok(None) => Some(f.meta().chart.timeframe_s),
+            Ok(Some(x)) => Some(x),
+            Err(_) => None,
+        },
+    };
+    let v = secs.map(|x| match crate::load::tf_parts(x) {
+        Some(p) if p.unit == crate::load::TfUnit::Month => p.mult as i64 * IN_SECONDS_MONTH,
+        _ => x as i64,
+    });
+    f.set_i64_arg(args[1], v);
+    Ok(())
+}
+
+/// `timeframe.change(timeframe)` — window `[timeframe, out]`, block `Prev` (`v` = the last
+/// period open as f64 bits): true when `open_ms(bar.open_ms, tf)` differs from the last
+/// execution's. A na timeframe (the parameter's default) is the chart's; one off the bar clock
+/// or unparsable → false (a `bool` result has no na in v6; `pin:04-time-edges`).
+///
+/// `pin:04-tf-change-first-false` (r33c verdict, TV right, fixture F091 — impl-06's
+/// `first_false` reading; supersedes `first_true` of `pin:04-time-edges`): the first execution
+/// has no previous period to differ from and is **false**, whatever the calendar.
+pub fn bi_tf_change(f: &mut Frame<'_>, site: SiteId, args: &[u16]) -> Result<(), FaultKind> {
+    if args.len() != 2 {
+        return Err(FaultKind::Internal);
+    }
+    let tf = if f.str_arg(args[0]).is_none() {
+        Some(f.meta().chart.timeframe_s)
+    } else {
+        tf_of(f, args[0])
+    };
+    let open = f.bar().open_ms;
+    let r = match tf {
+        None => false,
+        Some(tf) => {
+            let p = barclock::open_ms(open, tf);
+            let s = f.state::<Prev>(site);
+            let changed = s.primed != 0 && s.v.to_bits() as i64 != p;
+            s.v = f64::from_bits(p as u64);
+            s.primed = 1;
+            changed
+        }
+    };
+    f.set_bool_arg(args[1], r);
+    Ok(())
+}
+
+/// Window positions of a `time` / `time_close` overload: `(session, timezone, bars_back,
+/// timeframe_bars_back)` (`u16::MAX` = absent) and the window length.
+/// `K`: 0 = `TIME_I` / `TIME_CLOSE_I` (v5), 1 = `*_SSII_5_1`, 2 = `*_SSII_5_2`.
+#[inline]
+const fn time_layout(k: u8, d: Dialect) -> ([u16; 4], usize) {
+    const NO: u16 = u16::MAX;
+    let v6 = matches!(d, Dialect::V6);
+    match k {
+        0 => ([NO, NO, 1, NO], 3),
+        1 => {
+            if v6 {
+                ([1, NO, 2, 3], 5)
+            } else {
+                ([1, NO, 2, NO], 4)
+            }
+        }
+        _ => {
+            if v6 {
+                ([1, 2, 3, 4], 6)
+            } else {
+                ([1, 2, 3, NO], 5)
+            }
+        }
+    }
+}
+
+/// Is local minute-of-day `m` on day-of-week `dow` (1 = Sunday) inside `sp`?
+///
+/// `pin:04-session-overnight-day` (r33c verdict, TV right, fixture D056; supersedes "the day it
+/// starts on" of `pin:04-time-edges`): an overnight range (`start > end`) belongs to the day it
+/// **ends** on — `"2200-0200:2"` (Monday) is Sunday 22:00 → Monday 02:00 on all 256 captured
+/// rows (8 in session, Sunday 22:00/23:00 and Monday 00:00/01:00, twice).
+#[inline]
+fn in_session(sp: &SessionSpec, m: u16, dow: u8) -> bool {
+    let today = sp.days & (1 << (dow - 1)) != 0;
+    // Tomorrow's bit: `dow % 7` is tomorrow's `dow − 1` (Saturday 7 → Sunday's bit 0).
+    let tmrw = sp.days & (1 << (dow % 7)) != 0;
+    let mut i = 0usize;
+    while i < sp.n as usize && i < sp.ranges.len() {
+        let r = sp.ranges[i];
+        // `start == end` is the empty half-open range, the literal reading
+        // (`pin:04-session-equal-ends`).
+        let hit = if r.start_min <= r.end_min {
+            today && m >= r.start_min && m < r.end_min
+        } else {
+            (tmrw && m >= r.start_min) || (today && m < r.end_min)
+        };
+        if hit {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `time(timeframe[, session[, timezone]][, bars_back[, timeframe_bars_back]])` (`CLOSE` false)
+/// and `time_close(…)` (`CLOSE` true): `t = barclock::open_ms(bar.open_ms, tf)`; with a session,
+/// `t`'s local minute-of-day and day-of-week (in `timezone`, default `syminfo.timezone` =
+/// UTC) inside the session → `t` (or `close_ms(t, tf)`), else **na** (§4.12). `""` timeframe →
+/// the chart's; `""` session → the symbol's, `"24x7"` (`pin:04-exchange-tz`). A nonzero
+/// `bars_back` / `timeframe_bars_back` needs the chart's own history, which a stateless body
+/// does not have: `Err(ScriptRefused)` (`pin:04-time-bars-back-open`).
+pub fn bi_time<const CLOSE: bool, const K: u8>(
+    f: &mut Frame<'_>,
+    _: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    let ([sess, tz, bb, tfbb], n) = time_layout(K, f.dialect());
+    if args.len() != n {
+        return Err(FaultKind::Internal);
+    }
+    let out = args[n - 1];
+    let mut k = 0usize;
+    while k < 2 {
+        let p = if k == 0 { bb } else { tfbb };
+        if p != u16::MAX {
+            if let Some(x) = f.i64_arg(args[p as usize]) {
+                if x != 0 {
+                    return Err(FaultKind::ScriptRefused);
+                }
+            }
+        }
+        k += 1;
+    }
+    let Some(tf) = tf_of(f, args[0]) else {
+        f.set_i64_arg(out, None);
+        return Ok(());
+    };
+    let t = barclock::open_ms(f.bar().open_ms, tf);
+    if sess != u16::MAX {
+        let zone = if tz == u16::MAX {
+            TZ_UTC
+        } else {
+            match tz_of(f, args[tz as usize])? {
+                Some(z) => z,
+                None => {
+                    f.set_i64_arg(out, None);
+                    return Ok(());
+                }
+            }
+        };
+        let Some(s) = f.str_arg(args[sess as usize]) else {
+            f.set_i64_arg(out, None);
+            return Ok(());
+        };
+        if !s.is_empty() {
+            let sp = session_parse(s).map_err(|_| FaultKind::ScriptRefused)?;
+            let local = t.saturating_add(tz_offset_s(zone, t) as i64 * 1000);
+            let m = (local.rem_euclid(DAY_MS) / 60_000) as u16;
+            let dow = ((local.div_euclid(DAY_MS) + 4).rem_euclid(7) + 1) as u8;
+            if !in_session(&sp, m, dow) {
+                f.set_i64_arg(out, None);
+                return Ok(());
+            }
+        }
+    }
+    let v = if CLOSE { barclock::close_ms(t, tf) } else { t };
+    f.set_i64_arg(out, Some(v));
+    Ok(())
+}
+
+/// Local civil fields → local ms since the epoch, every field carried (`month` 13 is January of
+/// the next year, `day` 0 the previous month's last, `hour` 25 the next day's first, …;
+/// `pin:04-time-edges`); an i64 overflow → `None`.
+#[inline]
+fn local_ms(fl: [i64; 6]) -> Option<i64> {
+    let [y, mo, d, h, mi, s] = fl;
+    let m0 = mo.checked_sub(1)?;
+    let y = y.checked_add(m0.div_euclid(12))?;
+    let m = (m0.rem_euclid(12) + 1) as u32;
+    // `days_from_civil` is exact for |y| far beyond any i64-ms date; bound it first.
+    if !(-300_000_000..=300_000_000).contains(&y) {
+        return None;
+    }
+    let days = days_from_civil(y, m, 1).checked_add(d.checked_sub(1)?)?;
+    let secs = h
+        .checked_mul(3600)?
+        .checked_add(mi.checked_mul(60)?)?
+        .checked_add(s)?;
+    days.checked_mul(DAY_MS)?
+        .checked_add(secs.checked_mul(1000)?)
+}
+
+/// `timestamp(year, month, day[, hour, minute, second])` (`TZ` false, window `[y, mo, d, h, mi,
+/// s, out]`, `syminfo.timezone` = UTC) and `timestamp(timezone, year, …)` (`TZ` true, window
+/// `[tz, y, mo, d, h, mi, s, out]`): the local civil time → UTC ms. The zone's offset is taken
+/// at `local − offset(local)` and re-read once there (a DST gap or overlap resolves to that
+/// second reading, `pin:04-time-edges`). `propagate` na; overflow → na.
+pub fn bi_timestamp<const TZ: bool>(
+    f: &mut Frame<'_>,
+    _: SiteId,
+    args: &[u16],
+) -> Result<(), FaultKind> {
+    let base = TZ as usize;
+    if args.len() != base + 7 {
+        return Err(FaultKind::Internal);
+    }
+    let out = args[base + 6];
+    let zone = if TZ {
+        match tz_of(f, args[0])? {
+            Some(z) => z,
+            None => {
+                f.set_i64_arg(out, None);
+                return Ok(());
+            }
+        }
+    } else {
+        TZ_UTC
+    };
+    let mut fl = [0i64; 6];
+    let mut k = 0usize;
+    while k < 6 {
+        let Some(v) = f.i64_arg(args[base + k]) else {
+            f.set_i64_arg(out, None);
+            return Ok(());
+        };
+        fl[k] = v;
+        k += 1;
+    }
+    let v = local_ms(fl).and_then(|local| {
+        let o1 = tz_offset_s(zone, local) as i64 * 1000;
+        let t1 = local.checked_sub(o1)?;
+        let o2 = tz_offset_s(zone, t1) as i64 * 1000;
+        local.checked_sub(o2)
+    });
+    f.set_i64_arg(out, v);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `days_from_civil ∘ civil_from_days` is the identity over ±10⁶ days, and consecutive days
+    /// are consecutive civil dates.
+    #[test]
+    fn civil_roundtrips_over_the_full_range() {
+        let mut prev = civil_from_days(-1_000_001);
+        let mut z = -1_000_000i64;
+        while z <= 1_000_000 {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z);
+            let next_ok = (y, m, d) == (prev.0, prev.1, prev.2 + 1)
+                || (d == 1 && (m == prev.1 + 1 && y == prev.0 || m == 1 && y == prev.0 + 1));
+            assert!(next_ok, "{z}: {prev:?} → {:?}", (y, m, d));
+            prev = (y, m, d);
+            z += 1;
+        }
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_729), (2024, 1, 7));
+        assert_eq!(days_from_civil(2000, 2, 29), 11_016);
+    }
+}

@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+indicator("probe01", overlay = false)
+// probe-01-barhash · impl-06 §4.7.4 · REPLAY_FROM_MS / TO_MS / TF_MS from pine_spec::chart (chart.json 06a9d4c0)
+var float h = 0.0
+var int   n = 0
+q(float x) => math.round(x * 1000000.0)
+mix(float a, float v) => (a * 1000003.0 + v) - math.floor((a * 1000003.0 + v) / 2147483647.0) * 2147483647.0
+if time >= 1773705600000 and time < 1791849600000
+    h := mix(mix(mix(mix(mix(mix(h, (time - 1773705600000) / 3600000), q(open)), q(high)), q(low)), q(close)), q(volume))
+    n := n + 1
+plot(h, "p_barhash", display = display.data_window)
+plot(n, "p_n", display = display.data_window)

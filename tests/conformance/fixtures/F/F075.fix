@@ -1,0 +1,35 @@
+fix	2
+id	F075
+group	F
+title	str.length(timeframe.from_seconds(s)), s in 86400, 604800, 3600
+pin	pin:00-tf-multiplier
+script	tests/conformance/fixtures/F/F075.pine
+script_sha256	99339aca8149ee6958bbf2f9cde3c2ecad4b691cac9365b4c02bd0bbfad3079c
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T04:32Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	5
+driver	syn
+align	step
+dialects	5
+twin	F076
+mode	bar_close
+bars	24484
+window	head	1
+oracle	tv
+tier	1
+plot	f_F075_isna1	exact
+plot	f_F075_val1	exact
+plot	f_F075_isna2	exact
+plot	f_F075_val2	exact
+plot	f_F075_isna3	exact
+plot	f_F075_val3	exact
+series
+0	0	2	0	2	0	2
+end
+reading	omit_one
+0	0.0	1.0	0.0	1.0	0.0	2.0
+end
+reading	always
+0	0.0	2.0	0.0	2.0	0.0	2.0
+end

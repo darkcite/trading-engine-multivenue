@@ -1,0 +1,21 @@
+fix	2
+id	Z010
+group	Z
+title	probe p10_var_field · pin:01-var-field
+pin	pin:01-var-field
+script	crates/pine-lang/tests/probes/p10_var_field.pine
+script_sha256	9a56168993e7d96718b28b0b87e58bf9445daab7a3facb57ad7fdb27ef67b111
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T03:53Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
+driver	syn
+align	step
+dialects	6
+mode	bar_close
+bars	pending
+window	head	1
+oracle	tv
+tier	1
+plot	f_Z010_ok	exact
+parse	reject

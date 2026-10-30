@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "captured_utc": "2026-10-15",
+  "sources": {"v5": "v5", "v6": "v6", "migration": "mg"},
+  "namespaces": [],
+  "switches": [{"id": "int_div", "row": "W1", "mech": "switch", "owner": "pine-sema", "readings": ["const_trunc", "fraction"], "v5": "const_trunc", "v6": "bogus", "normative": false, "source": "", "pin": "pin:W1-int-div", "doc": ""}],
+  "deltas": [],
+  "entries": []
+}

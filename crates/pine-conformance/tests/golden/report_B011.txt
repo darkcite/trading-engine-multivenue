@@ -1,0 +1,33 @@
+FAIL  B011  ta.ema inside a conditional                   pin:06-cond-call-state
+  fixture : tests/conformance/fixtures/B/B011.fix
+  script  : tests/conformance/fixtures/B/B011.pine    sha 000000…  OK
+  oracle  : tv   captured 2026-11-06T09:14Z   tv_build desktop:1.0.0;pine:2026-10   captured_in 56
+  chart   : 06a9…  OK        align step, bars 20        dialect: v5 ≡ v6
+  plot 1  "f_B011_val"  -  tolerance ulp 10
+  first divergent row : 17
+      expected   1284.5327181818182
+      actual     1284.5327181818184       1 ulp          WITHIN BOUND
+  first OUT-OF-BOUND row : 18
+      expected   1285.25
+      actual     1287.0                   7.70e+12 ulp   OUT OF BOUND
+  plot 0  "f_B011_isna" exact : 0 divergences
+  signature : none
+  bucket    : SemanticBug      owner: PVM-6 (the pin's switch)
+  note      : decide pin:06-cond-call-state first (pine-conf pins --decide), then flip its switch.
+---
+FAIL  B011  ta.ema inside a conditional                   pin:06-cond-call-state
+  fixture : tests/conformance/fixtures/B/B011.fix
+  script  : tests/conformance/fixtures/B/B011.pine    sha 000000…  OK
+  oracle  : tv   captured 2026-11-06T09:14Z   tv_build desktop:1.0.0;pine:2026-10   captured_in 56
+  chart   : 06a9…  OK        align step, bars 20        dialect: v5 ≡ v6
+  plot 1  "f_B011_val"  -  tolerance ulp 10
+  first divergent row : 17
+      expected   1284.5327181818182
+      actual     (not retained)
+  first OUT-OF-BOUND row : 18
+      expected   1285.25
+      actual     (not retained)  OUT OF BOUND
+  plot 0  "f_B011_isna" exact : (not retained) divergences
+  signature : none
+  bucket    : SemanticBug      owner: PVM-6 (the pin's switch)
+  note      : decide pin:06-cond-call-state first (pine-conf pins --decide), then flip its switch.

@@ -28,6 +28,9 @@ exec-hyperliquid = { path = "../crates/exec-hyperliquid" }
 exec-binance     = { path = "../crates/exec-binance" }
 # cargo-fuzz runtime.
 libfuzzer-sys = "0.4"
+# pine_lex_parse: the PVM lane's Pine v5/v6 front end (impl-01 section 7.12).
+pine-lang = { path = "../crates/pine-lang" }
+pine-ir   = { path = "../crates/pine-ir" }
 
 # Workspace crates under test.
 ingress-ai         = { path = "../crates/ingress-ai" }
@@ -550,6 +553,13 @@ bench  = false
 [[bin]]
 name   = "hypercall_userws"
 path   = "fuzz_targets/hypercall_userws.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "pine_lex_parse"
+path   = "fuzz_targets/pine_lex_parse.rs"
 test   = false
 doc    = false
 bench  = false

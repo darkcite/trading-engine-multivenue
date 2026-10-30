@@ -13,7 +13,15 @@
 //!    floors, a SELL price ceils, the quantity floors — then the minimum
 //!    quantity and notional, the maximum quantity, and the percent-price
 //!    band while a fresh mark exists (each judged by cross-multiplying in
-//!    `i128`: no division on the submit path);
+//!    `i128`: no division on the submit path). **PB2 — a strict owner**
+//!    ([`BnArm::set_strict_grid`], the Pine slot): an order the grid would
+//!    move is refused ([`Refusal::OffGrid`]), never rounded; an on-grid
+//!    order leaves exactly as before. **PB3** — a USDⓈ-M reduce-only PLACE
+//!    of a strict owner is exempt from the minimum notional (`-4164`:
+//!    "unless you choose reduce only") once the boot sets
+//!    [`BnArm::set_ro_min_exempt`] (off by default: PB0.2 records the
+//!    venue's answer first, OD-6); `minQty` still binds, and a modify is
+//!    not exempt (`-5029` carries no such clause);
 //! 4. **the governors** ([`crate::gov`]): the ORDERS windows (futures',
 //!    spot's, options' or Binance Stocks' pool, by the row's product), the UM quantitative
 //!    rules, the open orders per symbol and the breadth (futures' alone);
@@ -165,10 +173,13 @@ pub enum Refusal {
     /// BX9 (BX-18): a SELL on an option row this account may not write,
     /// with no long of the owner's to reduce — it could only open a short.
     NotWritable = 20,
+    /// PB2 (I-PB2): a strict owner's price or quantity off the row's grid
+    /// — refused, never rounded (the Pine slot read the same row).
+    OffGrid = 21,
 }
 
 /// Refusal reasons.
-pub const REFUSALS: usize = 21;
+pub const REFUSALS: usize = 22;
 /// The `/state` words, by [`Refusal`].
 pub const REFUSAL_WORDS: [&str; REFUSALS] = [
     "unbound",
@@ -192,6 +203,7 @@ pub const REFUSAL_WORDS: [&str; REFUSALS] = [
     "deadman_down",
     "flags",
     "not_writable",
+    "off_grid",
 ];
 
 /// The arm's counters (`/state` `exec.arms.binance`).
@@ -437,6 +449,11 @@ pub struct BnArm {
     eq: EquityOrders,
     qtr: Qtr,
     knobs: ArmKnobs,
+    /// PB2: refuse, never round (the Pine slot's law); false keeps BX-5.
+    strict_grid: bool,
+    /// PB3: a strict owner's USDⓈ-M reduce-only place skips the minimum
+    /// notional; false (the default) keeps the refusal for every owner.
+    ro_min_exempt: bool,
     margin: MarginBook,
     /// Rows the owner slot holds a position or open orders in.
     active_rows: u32,
@@ -554,6 +571,8 @@ impl BnArm {
             },
             margin,
             knobs,
+            strict_grid: false,
+            ro_min_exempt: false,
             active_rows: 0,
             rows_open: 0,
             in_flight: 0,
@@ -567,6 +586,41 @@ impl BnArm {
             lat: [const { core::cell::Cell::new(0) }; LAT_QUANTILES],
             lat_next: core::cell::Cell::new(0),
         }
+    }
+
+    /// **PB2 — the strict grid** (boot-only, before the first order): on,
+    /// an order whose price or quantity the row's grid would move is
+    /// refused ([`Refusal::OffGrid`]) instead of quantized (BX-5); off (the
+    /// default: the batteries, every non-Pine owner), BX-5 unchanged.
+    // pin:cli-pb2-strict-setter — the plan names `ArmKnobs::strict_grid`;
+    // a new `ArmKnobs` field breaks the batteries' and the bench's struct
+    // literals (files outside this task), so the knob is a boot-time setter
+    // with the same default (false = BX-5).
+    pub fn set_strict_grid(&mut self, on: bool) {
+        self.strict_grid = on;
+    }
+
+    /// PB2: whether the grid is strict.
+    #[must_use]
+    pub const fn strict_grid(&self) -> bool {
+        self.strict_grid
+    }
+
+    /// **PB3 — the reduce-only minimum exemption** (boot-only, before the
+    /// first order; OD-6 "once confirmed"): on, a USDⓈ-M reduce-only PLACE
+    /// of a STRICT owner ([`Self::set_strict_grid`]) is sent below the
+    /// minimum notional (`-4164`: "unless you choose reduce only"); off (the
+    /// default, every owner until PB0.2 is recorded), the minimum binds as
+    /// BX-5 states it. r28 risk review B1: the exemption never reaches a
+    /// non-Pine owner, and never before the venue's answer is on record.
+    pub fn set_ro_min_exempt(&mut self, on: bool) {
+        self.ro_min_exempt = on;
+    }
+
+    /// PB3: whether the reduce-only minimum exemption is on.
+    #[must_use]
+    pub const fn ro_min_exempt(&self) -> bool {
+        self.ro_min_exempt
     }
 
     /// The counters.
@@ -650,8 +704,10 @@ impl BnArm {
     /// Quantize and check the venue law for an order on `row` (BX-5).
     /// Returns (price, quantity, dust: the notional under the QTR's dust
     /// line). Every notional and band test cross-multiplies in `i128`.
+    /// PB2: a strict arm refuses what the grid would move. PB3: `min_exempt`
+    /// (a USDⓈ-M reduce-only place) skips the minimum notional alone.
     #[inline(always)]
-    fn quantize(&mut self, row: u16, buy: bool, px: i64, qty: i64, now_ns: u64) -> Result<(i64, i64, bool), Refusal> {
+    fn quantize(&mut self, row: u16, buy: bool, px: i64, qty: i64, min_exempt: bool, now_ns: u64) -> Result<(i64, i64, bool), Refusal> {
         let h = self.inst.hot(row);
         let tick = h.tick_1e6 as i64;
         let step = h.step_1e6 as i64;
@@ -664,6 +720,11 @@ impl BnArm {
             ceil_to(px, tick, h.tick_magic())
         };
         let qty_q = floor_to(qty, step, h.step_magic());
+        // PB2 (I-PB2): refuse, never round — judged on the order as sent,
+        // before any minimum (an off-grid order is a defect, not a size).
+        if self.strict_grid && (px_q != px || qty_q != qty) {
+            return Err(Refusal::OffGrid);
+        }
         if px_q <= 0 {
             return Err(Refusal::Price);
         }
@@ -672,7 +733,7 @@ impl BnArm {
         }
         // The notional is qty × unit (COIN-M) or px × qty, ×1e6 each.
         let (na, nb) = if h.has(INST_INVERSE) { (qty_q, h.unit_1e6) } else { (px_q, qty_q) };
-        if scaled_lt(na, nb, h.min_notional_1e6) {
+        if !min_exempt && scaled_lt(na, nb, h.min_notional_1e6) {
             return Err(Refusal::MinNotional);
         }
         let dust = scaled_lt(na, nb, QTR_DUST_USD_1E6);
@@ -743,7 +804,7 @@ impl BnArm {
             Refusal::NotOwner => DispatchError::NoLiveRoute,
             Refusal::Kind | Refusal::NoDeadman | Refusal::Verb | Refusal::Flags | Refusal::NotWritable => DispatchError::Unsupported,
             Refusal::NotReady | Refusal::DeadmanDown => DispatchError::Disconnected,
-            Refusal::Price | Refusal::MinQty | Refusal::MinNotional | Refusal::MaxQty | Refusal::Band | Refusal::Ttl => {
+            Refusal::Price | Refusal::MinQty | Refusal::MinNotional | Refusal::MaxQty | Refusal::Band | Refusal::Ttl | Refusal::OffGrid => {
                 DispatchError::Unsupported
             }
             Refusal::Orders | Refusal::Qtr | Refusal::MaxOrders | Refusal::Breadth => DispatchError::SlotDisabled,
@@ -772,7 +833,16 @@ impl BnArm {
         if equity {
             equity_law(self.inst.cold(row).eq_sides, buy, self.rt[rx(row)].pos_1e6, self.knobs.equity_ttl_ns)?;
         }
-        let (px, qty, dust) = self.quantize(row, buy, o.px.raw(), o.qty.raw(), now)?;
+        // PB3 (OD-6; Binance USDⓈ-M `-4164` MIN_NOTIONAL: "Order's notional
+        // must be no smaller than %s (unless you choose reduce only)"): a
+        // strict owner's USDⓈ-M place carrying reduce-only (validated above)
+        // is exempt from the minimum notional while the boot set the knob
+        // (B1: off until PB0.2 is recorded); its `minQty` still binds.
+        let min_exempt = self.ro_min_exempt
+            && self.strict_grid
+            && product == PRODUCT_USDM
+            && flags & ORDER_FLAG_REDUCE_ONLY != 0;
+        let (px, qty, dust) = self.quantize(row, buy, o.px.raw(), o.qty.raw(), min_exempt, now)?;
         // ---- governors ----------------------------------------------------
         let r = rx(row);
         let wall_ms = self.knobs.anchor.wall_of(now) / 1_000_000;
@@ -1142,7 +1212,10 @@ impl OrderDispatch for BnArm {
             return Err(self.refused(r));
         }
         let buy = o.side == Side::Bid;
-        let (px, qty, _) = match self.quantize(row, buy, o.px.raw(), o.qty.raw(), now) {
+        // PB3: a modify is never exempt from the minimum — the venue's
+        // `-5029` MODIFICATION_MIN_NOTIONAL carries no reduce-only clause.
+        // pin:cli-pb3-modify-not-exempt
+        let (px, qty, _) = match self.quantize(row, buy, o.px.raw(), o.qty.raw(), false, now) {
             Ok(v) => v,
             Err(r) => return Err(self.refused(r)),
         };
@@ -1983,6 +2056,218 @@ pub(crate) mod tests {
         // 0.002 × 49 999.9 = 99.9998: under it.
         assert_eq!(r.arm.submit(&order(ORDER_KIND_IOC, Side::Bid, 49_999_900_000, 2_000, 2)), Err(DispatchError::Unsupported));
         assert_eq!(r.arm.counters().refused[Refusal::MinNotional as usize], 1);
+    }
+
+    /// The rig with the strict grid on (PB2, the Pine slot's law), healthy.
+    fn strict_rig() -> Rig {
+        let mut r = rig_with(true);
+        r.arm.set_strict_grid(true);
+        r.healthy();
+        r
+    }
+
+    /// **PB2 (I-PB2)** — a strict owner's order off the row's grid
+    /// (BTCUSDT: tick 0.10, step 0.001) is refused `OffGrid`, counted,
+    /// mapped `Unsupported` as a price refusal is, and nothing reaches the
+    /// ring: an off-tick price (either side), an off-step quantity, and a
+    /// modify off the tick. Break-and-watch: without the check the BUY
+    /// floors to 65 000.1 and is pushed (`a_healthy_arm_quantizes_and_pushes`).
+    #[test]
+    fn off_grid_price_or_size_is_refused_never_rounded_for_a_strict_owner() {
+        let mut r = strict_rig();
+        assert!(r.arm.strict_grid());
+        let off_px = order(ORDER_KIND_IOC, Side::Bid, 65_000_150_000, 12_000, 1);
+        assert_eq!(r.arm.submit(&off_px), Err(DispatchError::Unsupported));
+        let off_px_sell = order(ORDER_KIND_IOC, Side::Ask, 65_000_150_000, 12_000, 2);
+        assert_eq!(r.arm.submit(&off_px_sell), Err(DispatchError::Unsupported));
+        let off_qty = order(ORDER_KIND_IOC, Side::Bid, 65_000_100_000, 12_300, 3);
+        assert_eq!(r.arm.submit(&off_qty), Err(DispatchError::Unsupported));
+        // Off the step and under minQty at once: the grid is judged first.
+        assert_eq!(
+            r.arm
+                .submit(&order(ORDER_KIND_IOC, Side::Bid, 65_000_100_000, 900, 4)),
+            Err(DispatchError::Unsupported)
+        );
+        let mut m = order(ORDER_KIND_MAKER, Side::Bid, 65_000_050_000, 12_000, 5);
+        m.ttl_ns = 10_000_000_000;
+        assert_eq!(
+            r.arm.modify(&ModifyReq::new(9, m)),
+            Err(DispatchError::Unsupported)
+        );
+        let c = r.arm.counters();
+        assert_eq!(c.refused[Refusal::OffGrid as usize], 5);
+        assert_eq!(
+            (
+                c.refused[Refusal::MinQty as usize],
+                c.refused[Refusal::Price as usize]
+            ),
+            (0, 0)
+        );
+        assert_eq!((c.submitted, c.modifies_sent), (0, 0));
+        assert!(
+            r.pop_cmd().is_none(),
+            "nothing off the grid reached the ring"
+        );
+    }
+
+    /// **PB2 (I-PB2)** — an on-grid order leaves a strict arm exactly as it
+    /// leaves a BX-5 arm: every byte of the command but the push stamp.
+    #[test]
+    fn on_grid_orders_pass_byte_identical() {
+        let mut strict = strict_rig();
+        let mut bx5 = rig_with(true);
+        bx5.healthy();
+        let mut m = order(ORDER_KIND_MAKER, Side::Ask, 65_000_100_000, 12_000, 8);
+        m.ttl_ns = 10_000_000_000;
+        let mut ro = order(ORDER_KIND_IOC, Side::Ask, 64_000_000_000, 2_000, 9);
+        ro.flags = ORDER_FLAG_REDUCE_ONLY;
+        for o in [
+            order(ORDER_KIND_IOC, Side::Bid, 65_000_100_000, 12_000, 7),
+            m,
+            ro,
+        ] {
+            strict.arm.submit(&o).unwrap();
+            bx5.arm.submit(&o).unwrap();
+            let (mut a, mut b) = (strict.pop_cmd().unwrap(), bx5.pop_cmd().unwrap());
+            (a.pushed_ns, b.pushed_ns) = (0, 0);
+            a.ttl_deadline_ns = a.ttl_deadline_ns.min(1);
+            b.ttl_deadline_ns = b.ttl_deadline_ns.min(1);
+            assert_eq!(a, b, "oid {}", o.client_oid);
+        }
+        assert_eq!(strict.arm.counters().refused, bx5.arm.counters().refused);
+        assert_eq!(strict.arm.counters().submitted, 3);
+    }
+
+    /// **PB2 (I-PB6)** — a non-strict owner (the default: the batteries,
+    /// every other slot) still quantizes by BX-5: a BUY floors, a SELL
+    /// ceils, the quantity floors; `OffGrid` is never counted.
+    #[test]
+    fn a_non_strict_owner_still_quantizes_bx5() {
+        let mut r = rig_with(true);
+        r.healthy();
+        assert!(!r.arm.strict_grid());
+        r.arm
+            .submit(&order(ORDER_KIND_IOC, Side::Bid, 65_000_150_000, 12_300, 1))
+            .unwrap();
+        let c = r.pop_cmd().unwrap();
+        assert_eq!((c.px_1e6, c.qty_1e6), (65_000_100_000, 12_000));
+        r.arm
+            .submit(&order(ORDER_KIND_IOC, Side::Ask, 65_000_150_000, 12_300, 2))
+            .unwrap();
+        assert_eq!(r.pop_cmd().unwrap().px_1e6, 65_000_200_000);
+        assert_eq!(r.arm.counters().refused[Refusal::OffGrid as usize], 0);
+        // Switched off again, a strict arm is BX-5's.
+        let mut s = strict_rig();
+        s.arm.set_strict_grid(false);
+        s.arm
+            .submit(&order(ORDER_KIND_IOC, Side::Bid, 65_000_150_000, 12_300, 3))
+            .unwrap();
+        assert_eq!(s.pop_cmd().unwrap().px_1e6, 65_000_100_000);
+    }
+
+    /// **PB2** — the refusal words, the count and the dispatcher's length
+    /// agree: one word per reason, `off_grid` last, every word unique.
+    #[test]
+    fn the_refusal_words_and_count_agree() {
+        assert_eq!(REFUSALS, 22);
+        assert_eq!(REFUSAL_WORDS.len(), REFUSALS);
+        assert_eq!(BINANCE_REFUSALS, REFUSALS);
+        assert_eq!(Refusal::OffGrid as usize, REFUSALS - 1);
+        assert_eq!(REFUSAL_WORDS[Refusal::OffGrid as usize], "off_grid");
+        assert_eq!(REFUSAL_WORDS[Refusal::NotWritable as usize], "not_writable");
+        let mut i = 0;
+        while i < REFUSALS {
+            let mut j = i + 1;
+            while j < REFUSALS {
+                assert_ne!(REFUSAL_WORDS[i], REFUSAL_WORDS[j]);
+                j += 1;
+            }
+            i += 1;
+        }
+        let k = BnArmCounters::default();
+        assert_eq!(k.refused.len(), REFUSALS);
+    }
+
+    /// **PB3 (I-PB3, OD-6)** — with the exemption on, a strict owner's
+    /// USDⓈ-M reduce-only order below the minimum notional is sent (`-4164`
+    /// exempts it: "unless you choose reduce only"), reduce-only on the
+    /// wire; its `minQty` still binds; the strict grid still binds.
+    /// 0.001 × 65 000 = 65 < 100 USDT.
+    #[test]
+    fn a_reduce_only_order_below_min_notional_passes_on_usdm() {
+        let mut r = rig_with(true);
+        r.arm.set_strict_grid(true);
+        r.arm.set_ro_min_exempt(true);
+        r.healthy();
+        let mut o = order(ORDER_KIND_IOC, Side::Ask, 65_000_000_000, 1_000, 1);
+        o.flags = ORDER_FLAG_REDUCE_ONLY;
+        r.arm.submit(&o).unwrap();
+        let c = r.pop_cmd().unwrap();
+        assert_eq!(
+            (c.verb, c.px_1e6, c.qty_1e6, c.flags),
+            (VERB_PLACE, 65_000_000_000, 1_000, ORDER_FLAG_REDUCE_ONLY)
+        );
+        // A reduce-only maker too (the exit that rests).
+        let mut m = order(ORDER_KIND_MAKER, Side::Bid, 64_000_000_000, 1_000, 2);
+        m.flags = ORDER_FLAG_REDUCE_ONLY;
+        m.ttl_ns = 10_000_000_000;
+        r.arm.submit(&m).unwrap();
+        assert_eq!(r.pop_cmd().unwrap().flags, ORDER_FLAG_REDUCE_ONLY);
+        // minQty binds: 0.0009 is under the step, so the strict arm refuses
+        // it off the grid before any minimum.
+        let mut dust = order(ORDER_KIND_IOC, Side::Ask, 65_000_000_000, 900, 3);
+        dust.flags = ORDER_FLAG_REDUCE_ONLY;
+        assert_eq!(r.arm.submit(&dust), Err(DispatchError::Unsupported));
+        let k = r.arm.counters();
+        assert_eq!(k.refused[Refusal::OffGrid as usize], 1);
+        assert_eq!(k.refused[Refusal::MinNotional as usize], 0);
+        assert_eq!(k.submitted, 2);
+    }
+
+    /// **PB3 (r28 risk review B1)** — the exemption needs BOTH the knob and
+    /// a strict owner: off by default (PB0.2 unrecorded), and never for a
+    /// non-strict owner (the batteries, every non-Pine slot) even with the
+    /// knob on. Each refusal is `MinNotional`, nothing reaches the wire.
+    #[test]
+    fn the_minimum_exemption_needs_the_knob_and_a_strict_owner() {
+        for (strict, knob) in [(true, false), (false, true), (false, false)] {
+            let mut r = rig_with(true);
+            r.arm.set_strict_grid(strict);
+            r.arm.set_ro_min_exempt(knob);
+            assert_eq!(r.arm.ro_min_exempt(), knob);
+            r.healthy();
+            let mut o = order(ORDER_KIND_IOC, Side::Ask, 65_000_000_000, 1_000, 1);
+            o.flags = ORDER_FLAG_REDUCE_ONLY;
+            assert_eq!(r.arm.submit(&o), Err(DispatchError::Unsupported), "strict {strict} knob {knob}");
+            assert_eq!(r.arm.counters().refused[Refusal::MinNotional as usize], 1);
+            assert!(r.pop_cmd().is_none());
+        }
+        let r = rig_with(true);
+        assert!(!r.arm.ro_min_exempt(), "off by default");
+    }
+
+    /// **PB3 (I-PB3)** — an opening order below the minimum is still
+    /// refused, and so is a modify below it even when it names reduce-only
+    /// (`-5029` MODIFICATION_MIN_NOTIONAL has no reduce-only clause;
+    /// pin:cli-pb3-modify-not-exempt).
+    #[test]
+    fn an_opening_order_below_min_notional_is_still_refused() {
+        let mut r = rig_with(true);
+        r.healthy();
+        assert_eq!(
+            r.arm
+                .submit(&order(ORDER_KIND_IOC, Side::Bid, 65_000_000_000, 1_000, 1)),
+            Err(DispatchError::Unsupported)
+        );
+        let mut m = order(ORDER_KIND_MAKER, Side::Bid, 65_000_000_000, 1_000, 2);
+        m.flags = ORDER_FLAG_REDUCE_ONLY;
+        m.ttl_ns = 10_000_000_000;
+        assert_eq!(
+            r.arm.modify(&ModifyReq::new(9, m)),
+            Err(DispatchError::Unsupported)
+        );
+        assert_eq!(r.arm.counters().refused[Refusal::MinNotional as usize], 2);
+        assert!(r.pop_cmd().is_none());
     }
 
     #[test]

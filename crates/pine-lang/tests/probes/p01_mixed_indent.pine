@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// PIN: pin:01-mixed-indent
+// OURS: reject 1006
+// TV: pending
+//@version=6
+indicator("p01")
+x = 0
+if close > open
+    if high > low
+	    x := 1
+plot(x)

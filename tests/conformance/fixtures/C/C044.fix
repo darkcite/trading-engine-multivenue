@@ -1,0 +1,52 @@
+fix	2
+id	C044
+group	C
+title	barstate flags per realtime update, tick-independent
+pin	pin:U17-barstate-table
+script	tests/conformance/fixtures/C/C044.pine
+script_sha256	7ae1bfb9aca077b3560092775683cbd066188d7fd5d9efdf1a0a5d5113e3741e
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T14:19Z
+tv_build	web:Claude-2.42304.0/Chrome-152.0.7977.149;pine:2026-09
+captured_in	6
+driver	rt
+align	step
+dialects	56
+mode	realtime
+bars	80
+window	tail	16
+oracle	tv
+tier	1
+rt	64	16	3	0
+plot	f_C044_rt	exact
+plot	f_C044_done	exact
+plot	f_C044_isnew	exact
+plot	f_C044_confirmed	exact
+plot	f_C044_confmono	exact
+plot	f_C044_ishistory	exact
+plot	f_C044_notlast	exact
+plot	f_C044_notrt	exact
+relation
+f_C044_isnew	1
+f_C044_confirmed	1
+f_C044_confmono	1
+f_C044_ishistory	0
+f_C044_notlast	0
+f_C044_notrt	0
+end
+reading	contract
+f_C044_isnew	1
+f_C044_confirmed	1
+f_C044_confmono	1
+f_C044_ishistory	0
+f_C044_notlast	0
+f_C044_notrt	0
+end
+reading	isnew_on_confirm
+f_C044_isnew	0
+f_C044_confirmed	1
+f_C044_confmono	1
+f_C044_ishistory	0
+f_C044_notlast	0
+f_C044_notrt	0
+end

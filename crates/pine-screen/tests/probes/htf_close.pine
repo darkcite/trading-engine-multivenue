@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+// impl-07 §7.6 probe (ours): one request.security("240") sub-program, lookahead off.
+strategy("htf close", overlay=true)
+h = request.security(syminfo.tickerid, "240", close)
+plot(h)
+if close > h
+    strategy.entry("L", strategy.long)
+if close < h
+    strategy.close("L")

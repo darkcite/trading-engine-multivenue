@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//@description Round-trip fixture: declarations, expressions, structures.
+indicator("basics", overlay = true)
+len = input.int(14, "Length", minval = 1)
+var float acc = 0.0
+varip int ticks = 0
+series float src = close
+//@variable the smoothed value
+sm = ta.ema(src, len) * 2 - ta.sma(src, len) / 3 % 2
+up = close > open and not (high < low) or volume >= 1e6
+c = up ? #FF0000 : #00ff0080
+s = 'it\'s' + "a\tb\\c" + "line\n"
+h = close[1] + -close[2] + (close - open)[3]
+[m, sg, hi] = ta.macd(close, 12, 26, 9)
+[m, sg, hi] := ta.macd(open, 12, 26, 9)
+acc := acc + 1
+acc += 2, ticks -= 1
+plot(sm, title = "sm", color = color.new(color.blue, 50))

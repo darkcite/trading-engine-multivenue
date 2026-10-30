@@ -708,8 +708,10 @@ scripts/exec-smoke.sh --binance um --lifecycle --bn-mainnet --bn-drill gap
   never sold by the run; the plan line prints `adopt_usd` and the
   instance cap it makes.
 - **Sizes:** every order is `--bn-usd` raised to its row's minimum
-  notional — so the futures trade their minimum (USDⓈ-M's 100 USDT,
-  COIN-M's one contract). Spot's BUY must leave a SELL above the minimum
+  notional — so the futures trade their minimum (USDⓈ-M's row minimum:
+  BTCUSDT's is 50 USDT, read 2026-10-17 (PB0), no longer 100; ETHUSDT's
+  20, SOLUSDT's 5 — the plan line prints each row's; COIN-M's one
+  contract). Spot's BUY must leave a SELL above the minimum
   after the base-asset fee: 12 USD is about twice spot's minimum. Options'
   `--bn-usd` is the most premium an IoC through the touch may cost (a
   dearer touch ends unfilled at the band's edge — short of R0): read the
@@ -802,3 +804,78 @@ dropped), three clean reconciliations in a row, every fill booked from
 its trade report, exactly one `J_FEE` a trade — order by order — with
 its asset judged, no scan failure, no fill lost. It changes nothing by itself: arming a
 member is a ruling of its own (§8).
+
+## 14. Pine on Binance — the fee source (PB12, OD-12; DARK)
+
+Slot 8 (Pine) is paper only; this section is what the arming change will rely on.
+`core_types::Fill` carries no fee, so a live Pine fill books the MODEL fee from
+`[exec.slot.8.pine] fee_taker_ppm / fee_maker_ppm` and counts it on
+`engine_pine_fee_modelled_live_total` (`/state` `pine.fee_modelled_live`).
+
+1. Before `bn-fees` has N = 30 measured trades per class (BX-14), set both ppm keys to the
+   account's read rate: `/fapi/v1/commissionRate` for the dedicated account, BNB burn OFF
+   (PB0.5, a signed read the operator runs). The values are MODELLED until step 2.
+2. Once `bn-fees` prints a measured row at N = 30 for USDⓈ-M taker / maker, replace the ppm
+   keys with those rows (rounded UP to whole ppm).
+3. `fee_modelled_live` counts every live fill booked with the model; it never stops counting
+   (the venue's `J_FEE` journal stays the truth). A fee carrier on `Fill` is a later CAR.
+
+## 15. Pine on Binance — the arming checklist (PB14; DARK)
+
+Nothing here arms anything. Slot 8 is PAPER ONLY: the parse, boot and AI-plane refusals stand
+(risk-policy "PVM — slot 8, paper only"), and the cli never sets the live permit (PL2). The law
+is risk-policy "PVM — slot 8 on Binance USDⓈ-M"; this is the operator's list, in order. Every box
+is yours; arming is your act alone, at R2.
+
+**The rulings (yours):**
+
+- [ ] OD-2, the symbol: one symbol, one script for R2. BTCUSDT keeps parity with the captured
+  conformance chart (`BINANCE:BTCUSDT.P`); its minimum is **50 USDT** (PB0, 2026-10-17), so a
+  unit is ~75–100 USDT. A 5-USDT-minimum perp (SOL, BNB, XRP, DOGE) allows ~8–10 USDT units.
+- [ ] OD-4, the caps (O-E4: live equals paper): per script `unit ≥ 1.5 × minimum`,
+  `cap_instance = unit`, `cap_day ≈ 8 × unit`, `max_open ≤ 2`; the slot's `max_order ≥ 2 ×
+  cap_instance`; `halt_on_margin_ratio_1e6` well under 800 000; an E7 loss bound.
+- [ ] OD-9 (R-P4 lifted for slot 8 paper on the running engine) and OD-10 (O-BX6 lifted for slot
+  8, at R2 only, after the BX13 R0 record exists).
+
+**The account (a dedicated sub-account, used only by slot 8 — OD-3, R-P11):**
+
+- [ ] USDⓈ-M only (`[exec.binance] products = ["usdm"]`, OD-1); `account_scope = "dedicated"`,
+  `account_mode = "classic"` (makers need the dead-man).
+- [ ] §3.1 setup applied with `--confirm`: CROSSED margin, one-way, single-asset; leverage set
+  by the tool, **≤ 3**, and the boot asserts it ≤ `max_leverage`. Funded ≥ the slot's
+  `cap_instance_usd_1e6`, so account leverage stays ≤ 1×.
+- [ ] BNB burn OFF; the commission rate read (`/fapi/v1/commissionRate`, PB0.5) into
+  `[exec.slot.8.pine] fee_taker_ppm / fee_maker_ppm`, flagged modelled until N = 30 (§14).
+- [ ] The key: Ed25519, futures trading on, withdrawals off, IP-restricted (§1, §8).
+- [ ] PB0.3 / 0.4 / 0.6 read on this account (margin and position mode, the boot's trades page).
+- [x] PB0.2: the venue's `-4164` rule for reduce-only below the minimum — RECORDED 2026-10-29
+  from Binance's docs (R-P32; vault `pvm/live/pb0-2-2026-10-29.md`): a reduce-only PLACE is
+  exempt, a MODIFY is not (`-5029`). `bn_live::PB0_2_RECORDED = true` turns the arm's
+  `ro_min_exempt` on for the Pine owner only; risk-policy item 4 and BX-5 amended. Optional
+  before R2: a Demo drill of a sub-minimum reduce-only IoC and GTX on a 50-USDT symbol (the docs
+  predate per-symbol minimums). Until R2 a dust remainder can still be flattened by tool (§3.2).
+
+**The evidence (on the tree and binary you arm):**
+
+- [ ] The BX13 mainnet R0 record on this account (§13), every bar met.
+- [ ] impl-08 R0 and R1 artifacts; `pin:U17-barstate-table` pinned; Q1 ruled (`protective`).
+- [ ] PB15 green: `crate-gates.sh`; `cargo nextest run -p exec-binance -p strategy-pine -p
+  exec-router -p cli`; `make alloc-assert` (your OK) at 0 B/op on the submit and settle paths;
+  `make copy-audit` new = 0; the touched fuzz targets 300 s; the loopback readiness proof (PB10).
+- [ ] `pine-verify --check --exec` passes the live artifact offline (PB9 / PB11): slot 8
+  `venues = ["binance"]`, every Pine symbol `binance_usdm:*`, `max_order_usd_1e6 ≥` each
+  symbol's minimum (`6009`), `max_symbols ≥` the Pine symbol count.
+- [ ] `risk-reviewer` closed the risk-policy entry.
+
+**What the boot refuses (fail-closed, each on its own):** `6006` an inexact tick or step or a
+non-USDⓈ-M perpetual; `6009` `minQty ≠ stepSize` or a cap below a minimum; `6013` facts unlike
+the arm's bound row, an unread day (a full trades page), resting orders not swept, a position on
+a bound symbol no enabled script trades; `6005` a Live boot without `boot_exit_policy`. Read
+the boot tell; a refusal arms nothing.
+
+**At R2 (the arming change, yours):** lift the paper-only refusals for slot 8 on Binance only,
+call PB9 from `exec_boot`, set the PL2 permit, edit `exec.toml` (`mode = "live"`, the caps
+above), restart through `scripts/exec-smoke.sh` and `--arm-live 8`. One script, one symbol, the
+smallest size. A liquidation / ADL fill disables its script without a flatten (OD-8): read the
+`VENUE_FILL` incident and the account before anything else.

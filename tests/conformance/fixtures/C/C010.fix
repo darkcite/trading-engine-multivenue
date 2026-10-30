@@ -1,0 +1,86 @@
+fix	2
+id	C010
+group	C
+title	var inside for_block
+script	tests/conformance/fixtures/C/C010.pine
+script_sha256	ef20934f88cb403be9e13930c993a08a82e47cb0bccd4973761599baa1d28db4
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T04:40Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	24484
+window	head	64
+oracle	tv
+tier	1
+plot	f_C010_isna	exact
+plot	f_C010_val	exact
+series
+0	0	2
+1	0	4
+2	0	6
+3	0	8
+4	0	10
+5	0	12
+6	0	14
+7	0	16
+8	0	18
+9	0	20
+10	0	22
+11	0	24
+12	0	26
+13	0	28
+14	0	30
+15	0	32
+16	0	34
+17	0	36
+18	0	38
+19	0	40
+20	0	42
+21	0	44
+22	0	46
+23	0	48
+24	0	50
+25	0	52
+26	0	54
+27	0	56
+28	0	58
+29	0	60
+30	0	62
+31	0	64
+32	0	66
+33	0	68
+34	0	70
+35	0	72
+36	0	74
+37	0	76
+38	0	78
+39	0	80
+40	0	82
+41	0	84
+42	0	86
+43	0	88
+44	0	90
+45	0	92
+46	0	94
+47	0	96
+48	0	98
+49	0	100
+50	0	102
+51	0	104
+52	0	106
+53	0	108
+54	0	110
+55	0	112
+56	0	114
+57	0	116
+58	0	118
+59	0	120
+60	0	122
+61	0	124
+62	0	126
+63	0	128
+end

@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=5
+strategy("sma cross")
+f = ta.sma(close, 10)
+s = ta.sma(close, 30)
+if ta.crossover(f, s)
+    strategy.entry("L", strategy.long)
+if ta.crossunder(f, s)
+    strategy.close("L")
+plot(f)
+plot(s)

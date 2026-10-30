@@ -1,0 +1,89 @@
+fix	2
+id	F062
+group	F
+title	0.1 + 0.2 == 0.3, 1.0000000001 == 1.0, 1e-10 == 2e-10
+pin	pin:U06-float-eq-v6
+script	tests/conformance/fixtures/F/F062.pine
+script_sha256	929bf4b483fc4fdfc37619c4f9b80683015b6dd65cc83bb0644791b499645849
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T04:11Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
+driver	syn
+align	step
+dialects	6
+twin	F061
+mode	bar_close
+bars	24484
+window	head	64
+oracle	tv
+tier	1
+plot	f_F062_val1	exact
+plot	f_F062_val2	exact
+plot	f_F062_val3	exact
+series
+0	1	0	1
+1	1	0	1
+2	1	0	1
+3	1	0	1
+4	1	0	1
+5	1	0	1
+6	1	0	1
+7	1	0	1
+8	1	0	1
+9	1	0	1
+10	1	0	1
+11	1	0	1
+12	1	0	1
+13	1	0	1
+14	1	0	1
+15	1	0	1
+16	1	0	1
+17	1	0	1
+18	1	0	1
+19	1	0	1
+20	1	0	1
+21	1	0	1
+22	1	0	1
+23	1	0	1
+24	1	0	1
+25	1	0	1
+26	1	0	1
+27	1	0	1
+28	1	0	1
+29	1	0	1
+30	1	0	1
+31	1	0	1
+32	1	0	1
+33	1	0	1
+34	1	0	1
+35	1	0	1
+36	1	0	1
+37	1	0	1
+38	1	0	1
+39	1	0	1
+40	1	0	1
+41	1	0	1
+42	1	0	1
+43	1	0	1
+44	1	0	1
+45	1	0	1
+46	1	0	1
+47	1	0	1
+48	1	0	1
+49	1	0	1
+50	1	0	1
+51	1	0	1
+52	1	0	1
+53	1	0	1
+54	1	0	1
+55	1	0	1
+56	1	0	1
+57	1	0	1
+58	1	0	1
+59	1	0	1
+60	1	0	1
+61	1	0	1
+62	1	0	1
+63	1	0	1
+end

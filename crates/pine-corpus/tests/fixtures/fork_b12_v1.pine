@@ -1,0 +1,9 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+indicator("Loop")
+acc = 0.0
+for j = 0 to 9
+    acc := acc + close[j]
+plot(acc / 10)

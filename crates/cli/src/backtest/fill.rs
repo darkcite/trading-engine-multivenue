@@ -341,6 +341,77 @@ pub struct SynthFill {
     pub oos: bool,
     /// The filled order's `client_oid`.
     pub client_oid: u64,
+    /// PVM B'3 (impl-Bp §4.10 item 3): the fee row the fill was
+    /// charged from. Carried on every fill; read by the pine arm only.
+    #[cfg_attr(not(test), allow(dead_code))] // pin:Bp-fee-row-unread-t15
+    pub(crate) fee_row: FeeRowId,
+}
+
+/// PVM B'3 (impl-Bp §3.8, §4.10 item 3): which fee row a fill was
+/// charged from.
+///
+/// pin:Bp-fee-row-layout — the spec's 3-bit venue field (0..=6) predates
+/// `VENUE_COUNT = 10`; the literal widening: bits 0..4 model venue,
+/// 4..7 instrument class index (7 = unknown, the dearest-class
+/// fallback), 7..9 leg (0 ordinary, 1 open, 2 settle), bit 9 column
+/// (0 maker, 1 taker), bit 10 the option-fee formula.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub(crate) struct FeeRowId(pub u16);
+
+#[cfg_attr(not(test), allow(dead_code))] // pin:Bp-fee-row-unread-t15
+impl FeeRowId {
+    /// The class field of a sym whose class the descriptor law could not read.
+    pub(crate) const CLASS_UNKNOWN: u8 = 7;
+    pub(crate) const LEG_ORDINARY: u8 = 0;
+    pub(crate) const LEG_OPEN: u8 = 1;
+    pub(crate) const LEG_SETTLE: u8 = 2;
+    /// pin:Bp-fee-row-none — an AMM swap is charged by no row (bps 0 by
+    /// law, HYPARB H2): every bit set.
+    pub(crate) const NONE: Self = Self(u16::MAX);
+
+    pub(crate) const fn new(venue: u8, class: u8, leg: u8, taker: bool, opt_formula: bool) -> Self {
+        debug_assert!(venue < 16 && class < 8 && leg < 3);
+        Self(
+            (venue as u16 & 0xF)
+                | ((class as u16 & 0x7) << 4)
+                | ((leg as u16 & 0x3) << 7)
+                | ((taker as u16) << 9)
+                | ((opt_formula as u16) << 10),
+        )
+    }
+    pub(crate) const fn venue(self) -> u8 {
+        (self.0 & 0xF) as u8
+    }
+    pub(crate) const fn class(self) -> u8 {
+        ((self.0 >> 4) & 0x7) as u8
+    }
+    pub(crate) const fn leg(self) -> u8 {
+        ((self.0 >> 7) & 0x3) as u8
+    }
+    pub(crate) const fn taker(self) -> bool {
+        self.0 & (1 << 9) != 0
+    }
+    pub(crate) const fn opt_formula(self) -> bool {
+        self.0 & (1 << 10) != 0
+    }
+    const fn with_opt_formula(self, on: bool) -> Self {
+        Self(self.0 | ((on as u16) << 10))
+    }
+}
+
+/// PVM B'3 (impl-Bp §4.10 item 3): one charged fill (or settlement) of
+/// the FULL book, recorded when the pine bookkeeping is on — the
+/// material of one `fees.tsv` row. pin:Bp-fee-row-virt — `virt_ns` is
+/// the record's at which the model charged it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FeeCharge {
+    pub(crate) virt_ns: u64,
+    pub(crate) sym: u32,
+    pub(crate) row: FeeRowId,
+    pub(crate) bps: u32,
+    pub(crate) notional_1e12: i128,
+    pub(crate) fee_1e12: i128,
 }
 
 // ---------------------------------------------------------------
@@ -780,6 +851,64 @@ pub struct PerSymDetail {
 // The fill engine (§4)
 // ---------------------------------------------------------------
 
+/// PVM B'3 (impl-Bp §3.8): an order left the model's open table — the
+/// per-order disposition the pine arm hands to the member (impl-08 R3).
+/// `filled_1e6` is the order's total filled quantity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrderDone {
+    pub(crate) client_oid: u64,
+    pub(crate) filled_1e6: i64,
+    pub(crate) reason: DoneReason,
+}
+
+/// Why an order left the model. pin:Bp-done-filled — the spec's four
+/// reasons name no fully-filled order; I24 ("every order that leaves a
+/// model yields exactly one `OrderDone`") needs one, so `Filled` is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum DoneReason {
+    IocJudged = 0,
+    TtlExpired = 1,
+    Cancelled = 2,
+    EndOfRun = 3,
+    Filled = 4,
+}
+
+/// What `intake_checked` reports, one per counter `intake` advances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntakeRefusal {
+    Unroutable,
+    PredictionGrid,
+    SymCap,
+    TotalCap,
+    Refused,
+    NoSuchOrder,
+    UnknownVerb,
+}
+
+impl IntakeRefusal {
+    const ALL: [Self; 7] = [
+        Self::Unroutable,
+        Self::PredictionGrid,
+        Self::SymCap,
+        Self::TotalCap,
+        Self::Refused,
+        Self::NoSuchOrder,
+        Self::UnknownVerb,
+    ];
+}
+
+/// PVM B'3: the pine arm's bookkeeping inside the model.
+#[derive(Debug)]
+struct PineBook {
+    done: Vec<OrderDone>,
+    filled: BTreeMap<(u8, u64), i64>,
+    /// The current record's `virt_ns` (set at `on_record`).
+    virt_ns: u64,
+    /// Every full-book charge since the last `take_fee_charges`.
+    charges: Vec<FeeCharge>,
+}
+
 /// The §4 model: open-order table + strict-cross matcher + fee/latency
 /// tables + the two accounting books + trackers. Deterministic by
 /// construction — zero RNG, fixed scan orders, BTree iteration only.
@@ -881,6 +1010,18 @@ pub struct FillEngine {
     ttl_expired: u64,
     /// E5 lifecycle replay — see [`FillEngine::lifecycle`].
     lifecycle: LifecycleReplay,
+    /// PVM B'3: the pine arm's bookkeeping (`OrderDone` queue, per-order
+    /// filled totals). `None` — every legacy caller — is inert.
+    pine: Option<Box<PineBook>>,
+    /// PVM B'3 T19b (impl-Bp §4.12 F5): `true` takes a strict-table
+    /// order's activation Δ by the wire `symbol_venue_byte` — the paper
+    /// dispatcher's law, which gives the legacy anchor sym 7 Polymarket's
+    /// Δ — instead of `model_venue_byte`. Off by default (every legacy
+    /// caller byte-identical); set by the 8g judged replay only.
+    /// pin:Bp-f5-switch-strict-delta — the switch moves the place's and a
+    /// modify's re-armed Δ; the fee column and the queue law stay on
+    /// `model_venue_byte` (F5 names the Δ only).
+    delta_by_symbol_venue: bool,
     /// HYPARB H2: pool state for AMM swaps, rebuilt from the tape's
     /// pool-event signals — the SAME `core_fill::AmmBook` the engine's
     /// paper matcher keeps. Boxed: 16 KiB of fixed arrays.
@@ -1003,6 +1144,8 @@ impl FillEngine {
             binary_halted: BTreeSet::new(),
             pm_fee_syms: BTreeSet::new(),
             lifecycle: LifecycleReplay::default(),
+            pine: None,
+            delta_by_symbol_venue: false,
             prediction_grid_refused: 0,
             prediction_short_refused_1e6: 0,
             prediction_short_refused_fills: 0,
@@ -1092,7 +1235,7 @@ impl FillEngine {
                 while i < self.open_len {
                     if self.open[i].kind == core_fill::ORDER_KIND_AMM_SWAP {
                         self.amm_replay.canceled += 1;
-                        self.remove_open(i);
+                        self.retire(i, DoneReason::Cancelled);
                         continue;
                     }
                     i += 1;
@@ -1114,7 +1257,7 @@ impl FillEngine {
             }
             if core_fill::expired_at(virt_ns, o.expiry_ns) {
                 self.ttl_expired += 1;
-                self.remove_open(i);
+                self.retire(i, DoneReason::TtlExpired);
                 continue;
             }
             if virt_ns < o.t_active_ns {
@@ -1130,7 +1273,8 @@ impl FillEngine {
                     // Marked at the pool BEFORE our own impact (the
                     // mark the last pool event set).
                     let mark = self.marks_1e6.get(&o.sym).copied().unwrap_or(px_1e6);
-                    self.book_fill(&o, px_1e6, qty_1e6, 0, false, mark, wall_ns, out);
+                    let row = FeeRowId::NONE;
+                    self.book_fill(&o, px_1e6, qty_1e6, 0, false, row, mark, wall_ns, out);
                     self.amm_replay.fills += 1;
                     if qty_1e6 < o.remaining_1e6 {
                         self.amm_replay.partial += 1;
@@ -1143,7 +1287,7 @@ impl FillEngine {
                     }
                 }
             }
-            self.remove_open(i);
+            self.retire(i, DoneReason::IocJudged);
         }
     }
 
@@ -1196,7 +1340,7 @@ impl FillEngine {
     fn intake_cancel(&mut self, order: &Order, emit_virt: u64) {
         match self.find_resting(order.prev_client_oid, order.strategy_id) {
             Some(i) => {
-                self.remove_open(i);
+                self.retire(i, DoneReason::Cancelled);
                 self.lifecycle.cancels += 1;
             }
             None => self.intake_queue_cancel(order, emit_virt),
@@ -1250,8 +1394,8 @@ impl FillEngine {
         self.open[i].px_1e6 = px;
         self.open[i].remaining_1e6 = qty;
         self.open[i].client_oid = order.client_oid;
-        self.open[i].t_active_ns =
-            emit_virt.saturating_add(self.params.latency_ns[o.venue as usize]);
+        self.open[i].t_active_ns = emit_virt
+            .saturating_add(self.params.latency_ns[self.delta_venue(o.sym, o.venue as usize)]);
         self.lifecycle.modifies += 1;
     }
 
@@ -1370,6 +1514,9 @@ impl FillEngine {
         out: &mut Vec<SynthFill>,
     ) {
         out.clear();
+        if let Some(p) = self.pine.as_mut() {
+            p.virt_ns = virt_ns;
+        }
         if !core_fill::queue_venue(model_venue_byte(print.sym)) {
             return;
         }
@@ -1436,7 +1583,8 @@ impl FillEngine {
                 };
                 let opening = self.is_opening_fill(e.sym, e.side);
                 let maker_bps = self.fee_rate_for(venue, e.sym, opening).0;
-                self.book_fill(&o, e.px_1e6, e.qty_1e6, maker_bps, false, mark, wall_ns, out);
+                let row = self.fee_row(venue, e.sym, opening, false);
+                self.book_fill(&o, e.px_1e6, e.qty_1e6, maker_bps, false, row, mark, wall_ns, out);
                 self.queue_replay.fills += 1;
                 continue;
             }
@@ -1586,7 +1734,8 @@ impl FillEngine {
         }
         self.open[self.open_len] = OpenOrder {
             seq: self.seq_next,
-            t_active_ns: emit_virt.saturating_add(self.params.latency_ns[venue]),
+            t_active_ns: emit_virt
+                .saturating_add(self.params.latency_ns[self.delta_venue(order.sym, venue)]),
             expiry_ns: core_fill::expiry_at(emit_virt, order.ttl_ns),
             sym: order.sym,
             side: order.side,
@@ -1667,6 +1816,9 @@ impl FillEngine {
     /// an absent ask must not read as "ask below our bid".
     pub fn on_record(&mut self, tick: &Tick, virt_ns: u64, wall_ns: u64, out: &mut Vec<SynthFill>) {
         out.clear();
+        if let Some(p) = self.pine.as_mut() {
+            p.virt_ns = virt_ns;
+        }
         let sym = tick.sym;
         if sym == SYMBOL_ID_NONE {
             return;
@@ -1689,7 +1841,7 @@ impl FillEngine {
             let o = self.open[i];
             if o.sym == sym && core_fill::expired_at(virt_ns, o.expiry_ns) {
                 self.ttl_expired += 1;
-                self.remove_open(i);
+                self.retire(i, DoneReason::TtlExpired);
                 continue;
             }
             i += 1;
@@ -1791,10 +1943,12 @@ impl FillEngine {
                 };
                 let opening = self.is_opening_fill(o.sym, o.side);
                 let taker_bps = self.fee_rate_for(o.venue, o.sym, opening).1;
-                self.book_fill(&o, fill_px, o.remaining_1e6, taker_bps, true, mark, wall_ns, out);
+                let row = self.fee_row(o.venue, o.sym, opening, true);
+                let q = o.remaining_1e6;
+                self.book_fill(&o, fill_px, q, taker_bps, true, row, mark, wall_ns, out);
                 self.mark_fills += 1;
                 // Full fill: compact (FIFO preserved).
-                self.remove_open(i);
+                self.retire(i, DoneReason::Filled);
             }
             return;
         }
@@ -1861,12 +2015,13 @@ impl FillEngine {
                     core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
                         let opening = self.is_opening_fill(o.sym, o.side);
                         let taker_bps = self.fee_rate_for(o.venue, o.sym, opening).1;
-                        self.book_fill(&o, px_1e6, qty_1e6, taker_bps, true, mark, wall_ns, out);
+                        let row = self.fee_row(o.venue, o.sym, opening, true);
+                        self.book_fill(&o, px_1e6, qty_1e6, taker_bps, true, row, mark, wall_ns, out);
                         self.ioc_fills += 1;
                     }
                     _ => self.ioc_canceled += 1,
                 }
-                self.remove_open(i);
+                self.retire(i, DoneReason::IocJudged);
                 continue;
             }
             // Strict cross only — never the touch (§4.2) — and the fill
@@ -1882,14 +2037,15 @@ impl FillEngine {
                 core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
                     let opening = self.is_opening_fill(o.sym, o.side);
                     let maker_bps = self.fee_rate_for(o.venue, o.sym, opening).0;
-                    self.book_fill(&o, px_1e6, qty_1e6, maker_bps, false, mark, wall_ns, out);
+                    let row = self.fee_row(o.venue, o.sym, opening, false);
+                    self.book_fill(&o, px_1e6, qty_1e6, maker_bps, false, row, mark, wall_ns, out);
                     let remaining = o.remaining_1e6 - qty_1e6;
                     if remaining > 0 {
                         self.open[i].remaining_1e6 = remaining;
                         i += 1;
                     } else {
                         // Compact: the next order slides into slot i.
-                        self.remove_open(i);
+                        self.retire(i, DoneReason::Filled);
                     }
                 }
                 _ => i += 1,
@@ -1903,7 +2059,9 @@ impl FillEngine {
         let mut i = 0usize;
         while i < self.open_len {
             if self.open[i].sym == sym {
-                self.remove_open(i);
+                // pin:Bp-done-sym-cancel — a settlement / roll takes the sym's
+                // orders back: the pine arm reads it as a cancel.
+                self.retire(i, DoneReason::Cancelled);
                 self.settled_sym_orders_canceled += 1;
             } else {
                 i += 1;
@@ -1914,6 +2072,188 @@ impl FillEngine {
     /// Remove open-order slot `i`, shifting the tail left (emit order —
     /// the FIFO priority — is preserved).
     #[inline]
+    /// PVM B'3: an order leaves the strict table for `reason` — one
+    /// `OrderDone` when the pine bookkeeping is on (after the order's
+    /// fills, which this record already booked), then the removal.
+    fn retire(&mut self, i: usize, reason: DoneReason) {
+        if let Some(p) = self.pine.as_mut() {
+            let o = self.open[i];
+            let filled_1e6 = p.filled.remove(&(o.strategy_id, o.client_oid)).unwrap_or(0);
+            p.done.push(OrderDone {
+                client_oid: o.client_oid,
+                filled_1e6,
+                reason,
+            });
+        }
+        self.remove_open(i);
+    }
+
+    /// PVM B'3 (impl-Bp §3.8): the body of `intake`, returning the refusal
+    /// `intake` only counts. pin:Bp-intake-checked-by-delta — `intake`
+    /// itself is untouched (byte-identical for its eight callers); the
+    /// refusal is read off the counter `intake` advanced.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn intake_checked(
+        &mut self,
+        order: &Order,
+        emit_virt: u64,
+    ) -> Result<(), IntakeRefusal> {
+        let before = self.refusal_counts();
+        self.intake(order, emit_virt);
+        let after = self.refusal_counts();
+        let mut k = 0;
+        while k < before.len() {
+            if after[k] != before[k] {
+                return Err(IntakeRefusal::ALL[k]);
+            }
+            k += 1;
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn refusal_counts(&self) -> [u64; 7] {
+        [
+            self.unroutable,
+            self.prediction_grid_refused,
+            self.rejected_sym_cap,
+            self.rejected_total_cap,
+            self.lifecycle.refused,
+            self.lifecycle.missed,
+            self.lifecycle.unknown_verb,
+        ]
+    }
+
+    /// PVM B'3: enable the `OrderDone` queue (the pine arm only; reserves
+    /// at boot).
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// PVM B'3 T19b (impl-Bp §4.12 F5): judge activation Δ by the paper
+    /// dispatcher's `symbol_venue_byte` law (8g `--fills judged` only).
+    pub(crate) fn set_paper_delta_law(&mut self, on: bool) {
+        self.delta_by_symbol_venue = on;
+    }
+
+    /// The Δ column of a strict-table order on `sym` whose model venue is
+    /// `model_venue` (pin:Bp-f5-switch-strict-delta).
+    #[inline]
+    fn delta_venue(&self, sym: u32, model_venue: usize) -> usize {
+        if self.delta_by_symbol_venue {
+            symbol_venue_byte(sym) as usize
+        } else {
+            model_venue
+        }
+    }
+
+    pub(crate) fn enable_pine_bookkeeping(&mut self, done_cap: usize) {
+        self.pine = Some(Box::new(PineBook {
+            done: Vec::with_capacity(done_cap),
+            filled: BTreeMap::new(),
+            virt_ns: 0,
+            charges: Vec::with_capacity(done_cap),
+        }));
+    }
+
+    /// PVM B'3 (impl-Bp §4.10 item 3): drain the full-book charges
+    /// recorded since the last call, in booking order (empty unless the
+    /// pine bookkeeping is on).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_fee_charges(&mut self, out: &mut Vec<FeeCharge>) {
+        if let Some(p) = self.pine.as_mut() {
+            out.append(&mut p.charges);
+        }
+    }
+
+    /// PVM B'3: the full book's fee total so far (I22's right-hand side).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn full_fees_1e12(&self) -> i128 {
+        self.full.fees_sum_1e12
+    }
+
+    /// PVM B'3: record one full-book charge (pine bookkeeping only).
+    fn pine_charge(
+        &mut self,
+        sym: u32,
+        row: FeeRowId,
+        bps: u32,
+        notional_1e12: i128,
+        fee_1e12: i128,
+    ) {
+        if let Some(p) = self.pine.as_mut() {
+            p.charges.push(FeeCharge {
+                virt_ns: p.virt_ns,
+                sym,
+                row,
+                bps,
+                notional_1e12,
+                fee_1e12,
+            });
+        }
+    }
+
+    /// PVM B'3 (impl-Bp §4.10 item 3): the row [`Self::fee_rate_for`]
+    /// reads for `(venue, sym, opening)` in column `taker` — pure, so
+    /// the legacy charge is untouched. The option-formula bit is set
+    /// by `book_fill`, where the formula is decided.
+    #[inline]
+    fn fee_row(&self, venue: u8, sym: u32, opening: bool, taker: bool) -> FeeRowId {
+        let Some(class) = self.sym_class.get(&sym).copied() else {
+            return FeeRowId::new(
+                venue,
+                FeeRowId::CLASS_UNKNOWN,
+                FeeRowId::LEG_ORDINARY,
+                taker,
+                false,
+            );
+        };
+        let leg = if opening && self.params.fee_open_bps[venue as usize][class.index()].is_some() {
+            FeeRowId::LEG_OPEN
+        } else {
+            FeeRowId::LEG_ORDINARY
+        };
+        FeeRowId::new(venue, class.index() as u8, leg, taker, false)
+    }
+
+    /// PVM B'3: the settlement row [`Self::fee_settle_rate`] reads.
+    fn fee_settle_row(&self, venue: u8, sym: u32) -> FeeRowId {
+        let Some(class) = self.sym_class.get(&sym).copied() else {
+            return FeeRowId::new(
+                venue,
+                FeeRowId::CLASS_UNKNOWN,
+                FeeRowId::LEG_ORDINARY,
+                true,
+                false,
+            );
+        };
+        let leg = if self.params.fee_settle_bps[venue as usize][class.index()].is_some() {
+            FeeRowId::LEG_SETTLE
+        } else {
+            FeeRowId::LEG_ORDINARY
+        };
+        FeeRowId::new(venue, class.index() as u8, leg, true, false)
+    }
+
+    /// PVM B'3: drain the dispositions produced since the last call, in
+    /// production order.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_done(&mut self, out: &mut Vec<OrderDone>) {
+        if let Some(p) = self.pine.as_mut() {
+            out.append(&mut p.done);
+        }
+    }
+
+    /// PVM B'3: the end of the run — every order still open retires as
+    /// `EndOfRun` (strict-table order). pin:Bp-done-queue-orders — the
+    /// XH2 queue table's orders yield no `OrderDone` yet.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn finish_pine(&mut self) {
+        if self.pine.is_none() {
+            return;
+        }
+        while self.open_len > 0 {
+            self.retire(0, DoneReason::EndOfRun);
+        }
+    }
+
     fn remove_open(&mut self, i: usize) {
         debug_assert!(i < self.open_len);
         let mut j = i;
@@ -1949,11 +2289,25 @@ impl FillEngine {
         fee_bps: u32,
         wall_ns: u64,
     ) -> i128 {
+        self.fee_for_row(sym, notional_1e12, fill_qty, fee_bps, wall_ns)
+            .0
+    }
+
+    /// [`Self::fee_for`] and whether the option-fee formula charged it
+    /// (PVM B'3: the formula bit of the fill's [`FeeRowId`]).
+    fn fee_for_row(
+        &self,
+        sym: u32,
+        notional_1e12: i128,
+        fill_qty: i64,
+        fee_bps: u32,
+        wall_ns: u64,
+    ) -> (i128, bool) {
         let venue = model_venue_byte(sym) as usize;
         // Presence of an index is what CLASSES a sym as fee-capped;
         // `opt_index_1e6` stays that classifier and the fallback value.
         let Some(&last_index_1e6) = self.opt_index_1e6.get(&sym) else {
-            return fee_ceil_1e12(notional_1e12, fee_bps);
+            return (fee_ceil_1e12(notional_1e12, fee_bps), false);
         };
         // F15: the index leg is a fraction of the index notional AT
         // THE FILL, so reading the run's LAST index charged an 8 h-old
@@ -1966,7 +2320,7 @@ impl FillEngine {
         };
         let f = match self.params.opt_fee.get(venue) {
             Some(f) if f.active && index_1e6 > 0 => *f,
-            _ => return fee_ceil_1e12(notional_1e12, fee_bps),
+            _ => return (fee_ceil_1e12(notional_1e12, fee_bps), false),
         };
         let index_notional_1e12 = index_1e6 as i128 * fill_qty as i128;
         // VX: at or after expiry the instrument no longer trades — the
@@ -1983,7 +2337,7 @@ impl FillEngine {
             fee_ceil_1e12(index_notional_1e12, f.index_bps)
         };
         let premium_cap = fee_ceil_1e12(notional_1e12, f.prem_bps);
-        index_leg.min(premium_cap)
+        (index_leg.min(premium_cap), true)
     }
 
     /// XSD-F: record a sym's fee class (boot of the replay loop, from
@@ -2271,11 +2625,15 @@ impl FillEngine {
         let free = self.pm_fee_syms.contains(&sym);
         if qty_full != 0 {
             let n = value as i128 * i128::from(qty_full.unsigned_abs());
-            let fee = if free {
-                0
+            let (fee, capped) = if free {
+                (0, false)
             } else {
-                self.fee_for(sym, n, qty_full.abs(), taker, s.settle_ns)
+                self.fee_for_row(sym, n, qty_full.abs(), taker, s.settle_ns)
             };
+            if self.pine.is_some() {
+                let row = self.fee_settle_row(venue, sym).with_opt_formula(capped);
+                self.pine_charge(sym, row, taker, n, fee);
+            }
             self.full.settle(sym, value, value, fee);
         }
         if qty_oos != 0 {
@@ -2427,7 +2785,15 @@ impl FillEngine {
             // settlement would be worse than charging nothing.
             if qty_full != 0 {
                 let n = value as i128 * i128::from(qty_full.unsigned_abs());
-                let fee = self.fee_for(sym, n, qty_full.abs(), 0, expiry);
+                let (fee, capped) = self.fee_for_row(sym, n, qty_full.abs(), 0, expiry);
+                if self.pine.is_some() {
+                    // pin:Bp-fee-row-opt-settle — the option sweep charges
+                    // bps 0 through the formula: its row is the class's
+                    // settle-leg taker cell with the formula bit.
+                    let v = model_venue_byte(sym);
+                    let row = self.fee_settle_row(v, sym).with_opt_formula(capped);
+                    self.pine_charge(sym, row, 0, n, fee);
+                }
                 self.full.settle(sym, value, mark, fee);
             }
             if qty_oos != 0 {
@@ -2448,6 +2814,7 @@ impl FillEngine {
         fill_qty: i64,
         fee_bps: u32,
         taker: bool,
+        fee_row: FeeRowId,
         mark: i64,
         wall_ns: u64,
         out: &mut Vec<SynthFill>,
@@ -2486,15 +2853,22 @@ impl FillEngine {
         let notional_1e12 = fill_px as i128 * fill_qty as i128;
         // PMJ J10: a Polymarket rolling leg pays the venue's p-dependent
         // taker law at its member's rate, and nothing as a maker.
-        let fee_1e12 = if self.pm_fee_syms.contains(&o.sym) {
-            if taker {
+        let (fee_1e12, capped) = if self.pm_fee_syms.contains(&o.sym) {
+            let f = if taker {
                 pm_taker_fee_ceil_1e12(pm_fee_rate_1e6(o.strategy_id), fill_px, fill_qty)
             } else {
                 0
-            }
+            };
+            (f, false)
         } else {
-            self.fee_for(o.sym, notional_1e12, fill_qty, fee_bps, wall_ns)
+            self.fee_for_row(o.sym, notional_1e12, fill_qty, fee_bps, wall_ns)
         };
+        let fee_row = if fee_row == FeeRowId::NONE {
+            fee_row
+        } else {
+            fee_row.with_opt_formula(capped)
+        };
+        self.pine_charge(o.sym, fee_row, fee_bps, notional_1e12, fee_1e12);
         self.full
             .apply_fill(o.sym, o.side, fill_px, fill_qty, fee_1e12, mark);
         self.bounds_refresh(o.sym, mark);
@@ -2523,6 +2897,9 @@ impl FillEngine {
                 self.binary_fills_undigested += 1;
             }
         }
+        if let Some(p) = self.pine.as_mut() {
+            *p.filled.entry((o.strategy_id, o.client_oid)).or_insert(0) += fill_qty;
+        }
         out.push(SynthFill {
             sym: o.sym,
             side: o.side,
@@ -2531,6 +2908,7 @@ impl FillEngine {
             fee_1e12,
             oos: o.oos,
             client_oid: o.client_oid,
+            fee_row,
         });
     }
 
@@ -5346,6 +5724,7 @@ mod tests {
             fee_1e12: 0,
             oos: false,
             client_oid: 0,
+            fee_row: FeeRowId::default(),
         });
         e.on_trade(&p, HL_D + 20, HL_D + 20, &mut out);
         assert!(out.is_empty(), "the scratch is cleared even when nothing fills");

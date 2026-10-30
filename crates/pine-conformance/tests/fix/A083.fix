@@ -1,0 +1,20 @@
+fix	2
+id	A083
+group	A
+title	bool + int is refused in v6
+script	tests/conformance/fixtures/A/A083.pine
+script_sha256	0000000000000000000000000000000000000000000000000000000000a08301
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	6
+mode	bar_close
+bars	64
+window	head	64
+oracle	authored
+tier	1
+plot	f_A083_val	exact
+refuse	3005

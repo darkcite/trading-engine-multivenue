@@ -48,10 +48,17 @@ pub mod binary;
 pub mod clock;
 pub mod fill;
 pub mod funding;
+/// PVM B'1r (impl-Bp §4.4): which captured records `load_run` admits and stores.
+pub(crate) mod keep;
 /// XSD-F/Tier 3: `--member <name>` — the harness drives a coded member.
 pub mod member;
 /// VRP V2a: the option denomination law + the per-run option registry.
 pub mod opt;
+/// PVM B'3 (impl-Bp §3.6–§3.8, §4.5–§4.7): the streamed pine replay;
+/// `backtest --strategy pine` calls [`run_pine_main`] (T13).
+pub(crate) mod pine;
+pub use pine::boot::{replay_from_boot_main, ReplayArgv};
+pub use pine::run::{run_pine_main, PineArgv, PineExit};
 pub mod regime;
 pub mod stale;
 pub mod xmm_parity;
@@ -78,6 +85,7 @@ use crate::backtest::fill::{
 use crate::backtest::regime::{
     load_set_regime_frames, profile_name, word_string, RegimeMode, RegimeReplay,
 };
+use crate::fee_flags::{parse_fee_bps_flag, FeeLeg};
 
 /// Book capacity the backtest vm is monomorphized with (design §3.6):
 /// the same code as the engine's vm member (VM2 V3: the book
@@ -423,18 +431,6 @@ pub struct ModelParams {
 /// ladder rung.
 pub const OPT_SPREAD_FRAC_MAX: u32 = 1_000_000;
 
-/// Which pair a `--fee-bps <venue>.<class>[.open|.settle]` flag names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FeeLeg {
-    /// The class's ordinary pair (closing trades, and every venue that
-    /// knows no other).
-    Ordinary,
-    /// The charge-once OPENING pair (BIN15 O1).
-    Open,
-    /// The pair charged when a binary instance settles (E7).
-    Settle,
-}
-
 impl Default for ModelParams {
     fn default() -> Self {
         Self {
@@ -617,52 +613,11 @@ pub fn parse_model_params(
         p.latency_ns[vi] = ns;
     }
     for spec in fee_specs {
-        let mut it = spec.split(':');
-        let (vc, mk, tk) = match (it.next(), it.next(), it.next(), it.next()) {
-            (Some(vc), Some(mk), Some(tk), None) => (vc, mk, tk),
-            _ => {
-                return Err(HarnessError::Usage(format!(
-                    "bad --fee-bps {spec:?}: want <venue>[.<class>[.open|.settle]]:<maker_bps>:<taker_bps>"
-                )))
-            }
-        };
-        // XSD-F: `<venue>` = every class (the pre-XSD-F flag, bit for
-        // bit); `<venue>.<class>` = that class alone. Later flags win,
-        // so `bn:10:10 bn.perp:2:5` reads as "spot tier everywhere on
-        // Binance except perps".
-        // BIN15 O1: a trailing `.open` names the OPENING pair of that
-        // class (the charge-once law) instead of its ordinary pair;
-        // E7: a trailing `.settle` names the pair charged when a binary
-        // instance settles. Both require a class — `<venue>.open` reads
-        // as an unknown class, which is the error the operator wants to
-        // see.
-        let (v, class, leg) = match vc.split_once('.') {
-            None => (vc, None, FeeLeg::Ordinary),
-            Some((v, rest)) => {
-                let (c, leg) = if let Some(c) = rest.strip_suffix(".open") {
-                    (c, FeeLeg::Open)
-                } else if let Some(c) = rest.strip_suffix(".settle") {
-                    (c, FeeLeg::Settle)
-                } else {
-                    (rest, FeeLeg::Ordinary)
-                };
-                let class = InstrumentClass::parse_label(c).ok_or_else(|| {
-                    HarnessError::Usage(format!(
-                        "bad --fee-bps {spec:?}: unknown class {c:?} (spot|perp|dated|option|prediction)"
-                    ))
-                })?;
-                (v, Some(class), leg)
-            }
-        };
-        let vi = model_venue(v).ok_or_else(|| {
-            HarnessError::Usage(format!("bad --fee-bps {spec:?}: unknown venue {v:?}"))
-        })?;
-        let mk: u32 = mk.parse().map_err(|_| {
-            HarnessError::Usage(format!("bad --fee-bps {spec:?}: unparseable maker bps"))
-        })?;
-        let tk: u32 = tk.parse().map_err(|_| {
-            HarnessError::Usage(format!("bad --fee-bps {spec:?}: unparseable taker bps"))
-        })?;
+        // T1b (impl-07 §3.13): the per-flag parse lives in `fee_flags` — one grammar, one
+        // function, the same error text; the table writes stay here.
+        let flag = parse_fee_bps_flag(spec).map_err(HarnessError::Usage)?;
+        let (vi, class, leg) = (flag.venue as usize, flag.class, flag.leg);
+        let (mk, tk) = (flag.maker_bps, flag.taker_bps);
         match (class, leg) {
             (None, _) => p.fee_bps[vi] = [(mk, tk); INSTRUMENT_CLASSES],
             (Some(c), FeeLeg::Ordinary) => p.fee_bps[vi][c.index()] = (mk, tk),
@@ -819,6 +774,20 @@ pub enum RecPayload {
     /// `Trade` row (`hl-events.pmlr`) — merged ONLY for `--member xmm`
     /// (see [`MergeLanes`]).
     Trade(TradePrint),
+}
+
+/// PVM B'1r: the (post-remap) sym a record is stored under, for
+/// `KeepPolicy::store_syms`; `None` for a regime frame (venue-global).
+fn record_sym(p: &RecPayload) -> Option<u32> {
+    match p {
+        RecPayload::Tick(t) => Some(t.sym),
+        RecPayload::Event(e) => Some(e.sym),
+        RecPayload::Depth(d) => Some(d.sym),
+        RecPayload::Opt(o) => Some(o.sym),
+        RecPayload::Regime(_) => None,
+        RecPayload::Signal(s) => Some(s.sym),
+        RecPayload::Trade(t) => Some(t.sym),
+    }
 }
 
 /// The lanes a replay merges beyond the ones every replay carries.
@@ -996,6 +965,7 @@ fn load_run(
     binary_underlyings: &BTreeSet<u32>,
     sym_class: &BTreeMap<u32, InstrumentClass>,
     lanes: MergeLanes,
+    keep_policy: &keep::KeepPolicy<'_>,
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
     let mut venue_records = [0u64; VENUE_LABELS.len()];
@@ -1082,7 +1052,11 @@ fn load_run(
             let mut tick = *t;
             // Judged in FILE order on the RAW sym (the estimator is
             // per connection; the remap below is a naming concern).
-            judge.judge(vi, &mut tick, has_venue_time);
+            // PVM B'1r: 8g keeps the captured flag (`rejudge_stale` off);
+            // every legacy caller re-judges, as before.
+            if keep_policy.rejudge_stale {
+                judge.judge(vi, &mut tick, has_venue_time);
+            }
             tick.sym = match map_sym(t.sym, &mut summary_extra.4, &mut dropped_foreign) {
                 Some(s) => s,
                 None => continue,
@@ -1197,11 +1171,19 @@ fn load_run(
                 let is_hl_trade = lanes.hl_trades
                     && e.channel == ChannelId::Trade as u8
                     && e.venue == VenueId::Hyperliquid as u8;
+                // PVM B'1r (pin:Bp-keep-policy-additive): a Trade row the
+                // keep policy routes — filtered by `trade_syms` after the
+                // remap; never when the XH1 lane already takes it (the
+                // legacy flag wins). Empty `trade_syms` (LEGACY) ⇒ false.
+                let is_pine_trade = !is_hl_trade
+                    && !keep_policy.trade_syms.is_empty()
+                    && e.channel == ChannelId::Trade as u8;
                 let keep = e.channel == ChannelId::Funding as u8
                     || e.channel == ChannelId::AssetCtx as u8
                     || e.channel == ChannelId::InstrumentRoll as u8
                     || is_mark
-                    || is_hl_trade;
+                    || is_hl_trade
+                    || is_pine_trade;
                 if !keep {
                     continue;
                 }
@@ -1215,6 +1197,9 @@ fn load_run(
                 // Post-remap, because the set is keyed on the newest
                 // manifest's ordinals like everything else downstream.
                 if is_mark && !binary_underlyings.contains(&ev.sym) {
+                    continue;
+                }
+                if is_pine_trade && !keep_policy.admits_trade(ev.sym) {
                     continue;
                 }
                 if is_hl_trade {
@@ -1453,6 +1438,12 @@ fn load_run(
         });
     }
 
+    // PVM B'1r: the store filter — after the stale judge and the remap
+    // (every record above is already judged and renamed). `None`
+    // (LEGACY) keeps everything, so no legacy record moves.
+    if keep_policy.store_syms.is_some() {
+        recs.retain(|r| keep_policy.stores(record_sym(&r.payload)));
+    }
     order_run(&mut recs);
     Ok((
         recs,
@@ -1562,6 +1553,7 @@ fn load_and_merge(
             &binary_underlyings,
             sym_class,
             lanes,
+            &keep::KeepPolicy::LEGACY,
         )?;
         summary.opt_registry_refused = registry_refused;
         if recs.is_empty() {

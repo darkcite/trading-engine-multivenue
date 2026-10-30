@@ -1,0 +1,7 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+library("Utils")
+export double(float x) =>
+    x * 2

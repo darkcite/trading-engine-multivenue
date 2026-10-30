@@ -1243,10 +1243,44 @@ pub fn spawn_polymarket(
     ))
 }
 
+/// PVM B'1 T5 (impl-Bp §4.1 item 3(d)): the event mask a funding-only
+/// lane spawns with — Binance (single stream), OKX, Deribit, Bybit — the
+/// head's `EVENT_LANE_FUNDING` ORed with the route's trade bit. An empty
+/// route (every boot without the pine slot) is the head mask bit for bit.
+#[must_use]
+pub const fn funding_lane_mask(trade_route: &[core_types::SymbolId]) -> u16 {
+    EVENT_LANE_FUNDING | crate::trade_route::route_bit(trade_route)
+}
+
+/// PVM B'1 T5: the Hyperliquid lane's event mask — the head's law
+/// (VM2 V2 funding rides AssetCtx; BIN15 O2 families add the roll and
+/// the MARK; HC11 `mark_lane` adds the MARK) ORed with the route's trade
+/// bit.
+#[must_use]
+pub const fn hl_lane_mask(
+    has_families: bool,
+    mark_lane: bool,
+    trade_route: &[core_types::SymbolId],
+) -> u16 {
+    let mut m = if has_families {
+        EVENT_LANE_FUNDING
+            | EVENT_LANE_ASSET_CTX
+            | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll)
+            | core_types::event_lane_bit(core_types::ChannelId::Mark)
+    } else {
+        EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX
+    };
+    if mark_lane {
+        m |= core_types::event_lane_bit(core_types::ChannelId::Mark);
+    }
+    m | crate::trade_route::route_bit(trade_route)
+}
+
 /// Spawn the Binance bookTicker ingress thread. One thread per
 /// symbol — caller spawns N of these if they want multi-symbol
 /// coverage. See [`spawn_polymarket`] for the capture-open /
-/// fail-fast contract.
+/// fail-fast contract. PVM B'1 T5: `trade_route` is the Binance lane's
+/// pine Trade route (`TradeRoutes::lanes[lane]`; empty = none).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_binance(
     ep: WssEndpoint,
@@ -1262,6 +1296,7 @@ pub fn spawn_binance(
     epoch_ns: u64,
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
+    trade_route: &'static [core_types::SymbolId],
 ) -> io::Result<JoinHandle<()>> {
     let mut capture = GaugedCapture::new(
         PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?,
@@ -1270,6 +1305,7 @@ pub fn spawn_binance(
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "bn", VenueId::Binance.to_u8())?;
     }
+    let event_mask = funding_lane_mask(trade_route);
     Ok(spawn_or_die(
         thread::Builder::new().name(format!("ingress-binance-{sym}")),
         "ingress-binance",
@@ -1293,6 +1329,7 @@ pub fn spawn_binance(
             };
             // venue default or the operator's `--stale-after-ms bn:<ms>`.
             driver.set_stale_after_ms(stale_after_ms);
+            driver.set_trade_route(trade_route);
             let mut keepalive = Keepalive::new(BN_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
@@ -1325,7 +1362,7 @@ pub fn spawn_binance(
                     ep.path.as_bytes(),
                     &mut producer,
                     &mut event_tx,
-                    EVENT_LANE_FUNDING,
+                    event_mask,
                     &mut opt_tx,
                     &mut poll,
                     &mut events,
@@ -1387,6 +1424,33 @@ pub struct BinanceConnSpec {
     /// derived from `path` (`/ws/<symbol>@bookTicker`). Only meaningful
     /// with `eapi == None && !mark_price`.
     pub spot_sentinel: bool,
+    /// PVM B'1 T8 (Q1 = (a)): true ⇒ a USDⓈ-M bookTicker slot whose sym
+    /// is on the pine Trade route — it also subscribes `<symbol>@aggTrade`
+    /// on the same socket (captured and routed; the feed clock untouched).
+    /// Only meaningful on a USDⓈ-M bookTicker slot (`!spot_sentinel`,
+    /// `!mark_price`, `eapi == None`); every other slot keeps `false`, so
+    /// a non-route socket's traffic is unchanged.
+    pub usdm_trades: bool,
+}
+
+/// PVM B'1 T8: the bookTicker slot's driver — the spot sentinel (VT2),
+/// the USDⓈ-M route slot (`usdm_trades`), or the plain slot. Boot-only;
+/// the caller sets the stale threshold and the route.
+#[must_use]
+pub fn bn_book_driver(spec: &BinanceConnSpec, seed: u64) -> bwl::Driver {
+    match (spec.spot_sentinel, spot_stream_symbol(&spec.path)) {
+        (true, Some(_)) => bwl::Driver::new_spot_sentinel(seed, spec.sym),
+        (false, Some(_)) if spec.usdm_trades => bwl::Driver::new_usdm_routed_trades(seed, spec.sym),
+        _ => bwl::Driver::new(seed, spec.sym),
+    }
+}
+
+/// PVM B'1 T8: mark the USDⓈ-M bookTicker slot of `book` as a route slot
+/// iff its sym is on the Binance lane's Trade route (sorted). The mark
+/// slot and every non-route slot are left exactly as built.
+pub fn bn_usdm_route_slot(book: &mut BinanceConnSpec, trade_route: &[core_types::SymbolId]) {
+    book.usdm_trades =
+        !book.mark_price && book.eapi.is_none() && trade_route.binary_search(&book.sym).is_ok();
 }
 
 /// VT2: the lowercase stream symbol of a `/ws/<symbol>@bookTicker`
@@ -1426,6 +1490,8 @@ pub fn bn_usdm_specs(host: &str, name: &str, sym: core_types::SymbolId) -> [Bina
             mark_price: false,
             // USDS-M bookTicker stamps itself (T/E) — no sentinel.
             spot_sentinel: false,
+            // PVM B'1 T8: set per route by `bn_usdm_route_slot`.
+            usdm_trades: false,
         },
         BinanceConnSpec {
             host: host.to_owned(),
@@ -1434,6 +1500,7 @@ pub fn bn_usdm_specs(host: &str, name: &str, sym: core_types::SymbolId) -> [Bina
             eapi: None,
             mark_price: true,
             spot_sentinel: false,
+            usdm_trades: false,
         },
     ]
 }
@@ -1499,6 +1566,7 @@ pub fn spawn_binance_multi(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
     event_mask: u16,
+    trade_route: &'static [core_types::SymbolId],
 ) -> io::Result<JoinHandle<()>> {
     let mut capture = GaugedCapture::new(
         PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?,
@@ -1507,6 +1575,8 @@ pub fn spawn_binance_multi(
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "bn", VenueId::Binance.to_u8())?;
     }
+    // PVM B'1 T5: the route's trade bit joins the mask the caller built.
+    let event_mask = event_mask | crate::trade_route::route_bit(trade_route);
     Ok(spawn_or_die(
         thread::Builder::new().name(format!("ingress-binance-x{}", specs.len())),
         "ingress-binance",
@@ -1560,20 +1630,18 @@ pub fn spawn_binance_multi(
                     None if spec.mark_price => {
                         bwl::Driver::new_mark_price(now_ns().wrapping_add(i as u64), spec.sym)
                     }
-                    None => {
-                        let seed = now_ns().wrapping_add(i as u64);
-                        // VT2: a spot slot carries the aggTrade sentinel
-                        // (`<symbol>@aggTrade` from the path); USDS-M
-                        // stamps its bookTicker directly.
-                        match (spec.spot_sentinel, spot_stream_symbol(&spec.path)) {
-                            (true, Some(_)) => bwl::Driver::new_spot_sentinel(seed, spec.sym),
-                            _ => bwl::Driver::new(seed, spec.sym),
-                        }
-                    }
+                    // VT2: a spot slot carries the aggTrade sentinel
+                    // (`<symbol>@aggTrade` from the path); USDS-M stamps
+                    // its bookTicker directly — and, PVM B'1 T8, a route
+                    // slot subscribes its aggTrade too.
+                    None => bn_book_driver(&spec, now_ns().wrapping_add(i as u64)),
                 };
                 // One estimator per CONNECTION, same threshold — HK42: the
                 // options slot's too (it judges each mark's `E`).
                 drv.set_stale_after_ms(stale_after_ms);
+                // PVM B'1 T5: every slot holds the lane's route (a print
+                // off it is never pushed).
+                drv.set_trade_route(trade_route);
                 // COPY: the slot (its Driver inline, ≈ 3.5 KB) moves into
                 // the Vec once at boot — see `MultiConn::new`.
                 conns.push(bwl::MultiConn::new(
@@ -1641,6 +1709,7 @@ pub fn spawn_bybit(
     epoch_ns: u64,
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
+    trade_route: &'static [core_types::SymbolId],
 ) -> io::Result<JoinHandle<()>> {
     let mut capture = GaugedCapture::new(
         PmlrCapture::open(run_dir, "bybit", epoch_ns, tap_cfg)?,
@@ -1649,6 +1718,8 @@ pub fn spawn_bybit(
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "bybit", VenueId::Bybit.to_u8())?;
     }
+    // PVM B'1 T5: the head's funding mask | the route's trade bit.
+    let event_mask = funding_lane_mask(trade_route);
     Ok(spawn_or_die(
         thread::Builder::new().name(format!("ingress-bybit-x{}", specs.len())),
         "ingress-bybit",
@@ -1693,6 +1764,7 @@ pub fn spawn_bybit(
                 );
                 // VT2: one estimator per CONNECTION, same threshold.
                 drv.set_stale_after_ms(stale_after_ms);
+                drv.set_trade_route(trade_route);
                 // COPY: the slot (its Driver inline, 6 512 B since HK36) moves into the
                 // Vec once at boot — see `BybitConn::new`.
                 conns.push(ywl::BybitConn::new(
@@ -1708,7 +1780,7 @@ pub fn spawn_bybit(
                 &mut conns,
                 &mut producer,
                 &mut event_tx,
-                EVENT_LANE_FUNDING,
+                event_mask,
                 &mut poll,
                 &mut events,
                 &SHUTDOWN,
@@ -2200,6 +2272,7 @@ pub fn spawn_okx(
     epoch_ns: u64,
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
+    trade_route: &'static [core_types::SymbolId],
 ) -> io::Result<JoinHandle<()>> {
     let mut capture = GaugedCapture::new(
         PmlrCapture::open(run_dir, "okx", epoch_ns, tap_cfg)?,
@@ -2208,6 +2281,8 @@ pub fn spawn_okx(
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "okx", VenueId::Okx.to_u8())?;
     }
+    // PVM B'1 T5: the head's funding mask | the route's trade bit.
+    let event_mask = funding_lane_mask(trade_route);
     Ok(spawn_or_die(
         thread::Builder::new().name("ingress-okx".into()),
         "ingress-okx",
@@ -2228,6 +2303,7 @@ pub fn spawn_okx(
             let mut driver = owl::Driver::new(now_ns(), symbols, depth_enabled, &fam_refs);
             // VT2: venue default or the operator's `--stale-after-ms okx:<ms>`.
             driver.set_stale_after_ms(stale_after_ms);
+            driver.set_trade_route(trade_route);
             let mut keepalive = Keepalive::new(OKX_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
@@ -2260,7 +2336,7 @@ pub fn spawn_okx(
                     ep.path.as_bytes(),
                     &mut producer,
                     &mut event_tx,
-                    EVENT_LANE_FUNDING,
+                    event_mask,
                     &mut depth_tx,
                     &mut opt_tx,
                     &mut poll,
@@ -2490,6 +2566,7 @@ pub fn spawn_deribit(
     epoch_ns: u64,
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
+    trade_route: &'static [core_types::SymbolId],
 ) -> io::Result<JoinHandle<()>> {
     let mut capture = GaugedCapture::new(
         PmlrCapture::open(run_dir, "deribit", epoch_ns, tap_cfg)?,
@@ -2498,6 +2575,8 @@ pub fn spawn_deribit(
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "deribit", VenueId::Deribit.to_u8())?;
     }
+    // PVM B'1 T5: the head's funding mask | the route's trade bit.
+    let event_mask = funding_lane_mask(trade_route);
     Ok(spawn_or_die(
         thread::Builder::new().name("ingress-deribit".into()),
         "ingress-deribit",
@@ -2519,6 +2598,7 @@ pub fn spawn_deribit(
                 dwl::Driver::new_with_dvol(now_ns(), symbols, depth_enabled, &dvol_refs);
             // VT2: venue default or the operator's `--stale-after-ms deribit:<ms>`.
             driver.set_stale_after_ms(stale_after_ms);
+            driver.set_trade_route(trade_route);
             let mut keepalive = Keepalive::new(DERIBIT_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
@@ -2551,7 +2631,7 @@ pub fn spawn_deribit(
                     ep.path.as_bytes(),
                     &mut producer,
                     &mut event_tx,
-                    EVENT_LANE_FUNDING,
+                    event_mask,
                     &mut depth_tx,
                     &mut opt_tx,
                     &mut poll,
@@ -2741,6 +2821,7 @@ pub fn spawn_hyperliquid(
     epoch_ns: u64,
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
+    trade_route: &'static [core_types::SymbolId],
     hot: Arc<core_time::HotCell>,
 ) -> io::Result<JoinHandle<()>> {
     let mut capture = GaugedCapture::new(
@@ -2781,6 +2862,8 @@ pub fn spawn_hyperliquid(
             // XMM XH1: every parsed `trades` row also reaches the
             // engine's trade lane (the driver outlives reconnects).
             driver.set_trade_lane(trade_tx);
+            // PVM B'1 T5: the pine slot's Trade route (empty = none).
+            driver.set_trade_route(trade_route);
             // T2T T1-b: never block inside the window the boot publishes.
             driver.set_hot_cell(hot);
             // VM2 V2: HL funding rides AssetCtx — the lane mask carries
@@ -2789,18 +2872,9 @@ pub fn spawn_hyperliquid(
             // MARK — a member cannot price a HIP-4 binary without the
             // strike's reference, and cannot know which instance its
             // slot holds without the roll.
-            // HC11: slot 7 reads the MARK too (`mark_lane`).
-            let mut event_mask = if has_families {
-                EVENT_LANE_FUNDING
-                    | EVENT_LANE_ASSET_CTX
-                    | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll)
-                    | core_types::event_lane_bit(core_types::ChannelId::Mark)
-            } else {
-                EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX
-            };
-            if mark_lane {
-                event_mask |= core_types::event_lane_bit(core_types::ChannelId::Mark);
-            }
+            // HC11: slot 7 reads the MARK too (`mark_lane`). PVM B'1 T5:
+            // the route's trade bit joins (`hl_lane_mask`).
+            let event_mask = hl_lane_mask(has_families, mark_lane, trade_route);
             let mut keepalive = Keepalive::new(HL_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             let mut last_rediscovery_ns: Option<u64> = None;
@@ -3826,7 +3900,7 @@ pub fn engine_loop_ev_full<D: OrderDispatch>(
     if let Err(reason) = configure_ev(&mut strat, &cfg, artifact_path) {
         return EngineLoopResult::Failed(reason);
     }
-    run_engine_loop(cons, disp, strat, obs)
+    run_engine_loop(cons, disp, strat, obs, NoHook)
 }
 
 /// Run Strategy D (rule-tree). `rules_path` points at a JSON-
@@ -3846,7 +3920,7 @@ pub fn engine_loop_rule_tree_full<D: OrderDispatch>(
     if let Err(reason) = configure_rule_tree(&mut strat, &cfg, rules_path, sym_for_rule) {
         return EngineLoopResult::Failed(reason);
     }
-    run_engine_loop(cons, disp, strat, obs)
+    run_engine_loop(cons, disp, strat, obs, NoHook)
 }
 
 /// Load + configure a rule-tree instance (rules file, params, symbol
@@ -3925,10 +3999,16 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     regime: Option<&RegimeBoot>,
     hyparb: Option<&crate::hyparb_boot::HyparbBoot>,
     har: Option<&crate::har_boot::HarBoot>,
+    pine: Option<crate::pine_boot::PineBoot>,
     pm15: Option<&crate::pm15_boot::Pm15Boot>,
     pmj: Option<&crate::pmj_boot::PmjBoot>,
 ) -> EngineLoopResult {
     let mut configured = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
+    // PVM impl-08 T19: slot 8 is configured exactly when `--pine` built its boot (F19 both ways
+    // was checked before `run`; a requested pine is never dropped silently).
+    if pine.is_some() {
+        configured |= strategy_set::BIT_PINE;
+    }
     if pm15.is_some() {
         configured |= strategy_set::BIT_PM15;
     }
@@ -3973,6 +4053,57 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     }
 
     let mut set = strategy_set::StrategySet::new(mask);
+    let mut pine_hook: Option<crate::pine_delivery::PineHook> = None;
+    // pin:08-verify-queue-sym-ineligible (risk r21 #4): every symbol the paper queue law tracks
+    // at this boot, whichever member block runs first — handed to slot 8's hook right before the
+    // loop starts (its boot record is written after `eng.start()`), so the order of the blocks
+    // below can never leave the record's `queue_syms` short.
+    let mut queue_syms: Vec<core_types::SymbolId> = Vec::new();
+    // PVM impl-08 T19 (pin:08-facts-from-discovery boot order): discovery and facts ran in the
+    // bin; here the wall anchor, `configure`, the warm bars and the boot tell — PAPER ONLY.
+    if let Some(mut pb) = pine {
+        if mask & strategy_set::BIT_PINE != 0 {
+            crate::pine_boot::finish_at_loop(&mut pb.cfg, core_time::WallAnchor::now());
+            let boot_ms = pb.cfg.boot_utc_ms;
+            let (route, tape, n_scripts) =
+                (pb.cfg.route, pb.cfg.tape, pb.cfg.manifest.scripts.len());
+            let needs = match set.pine_mut().configure(pb.cfg) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(refusal = %e, "pine: manifest refused by the member");
+                    return EngineLoopResult::Failed("pine: manifest refused by the member");
+                }
+            };
+            let (slices, cold) = crate::pine_boot::warm(&needs, &pb.bars_root, boot_ms);
+            let warm_rows = slices.len();
+            if set.pine_mut().supply_warm(slices).is_err() {
+                return EngineLoopResult::Failed("pine: warm-up refused");
+            }
+            // The boot tell (§4.2): one line naming the artifact and what is cold.
+            tracing::info!(
+                manifest_sha = %pb.manifest_hex,
+                scripts = n_scripts,
+                route = ?route,
+                rows = needs.len(),
+                warm_rows,
+                cold_rows = %cold.join(","),
+                tape,
+                bars = %pb.bars_root.display(),
+                "pine: slot 8 configured (PAPER ONLY)"
+            );
+            obs.pine_io = Some(crate::pine_metrics::PineIo {
+                pine_dir: pb.pine_dir.clone(),
+                tape,
+                boot_utc_ms: boot_ms,
+            });
+            // R5/R6 (lead ruling 2026-10-17, the typed path): the boot record right after
+            // `eng.start()` and the delivery journal's drains, through the loop hook.
+            pine_hook = pb
+                .run_dir
+                .take()
+                .map(|dir| crate::pine_delivery::PineHook::new(dir, pb.run_epoch_ns, tape));
+        }
+    }
     if let Some(boot) = vrp {
         // VRP V7: the wall anchor is taken HERE, once, right before the
         // engine loop starts — the member maps every tick's monotonic
@@ -4228,7 +4359,8 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         // the first post-only order on each meets a known book.
         let mut i = 0usize;
         while i < boot.params.n_perps as usize {
-            disp.track_queue_sym(boot.params.perps[i].hl_sym);
+            // PVM impl-08 (pin:08-verify-queue-sym-ineligible): kept for slot 8's boot record.
+            track_queue_sym_kept(&mut disp, &mut queue_syms, boot.params.perps[i].hl_sym);
             i += 1;
         }
         tracing::info!("{}", crate::xmm_boot::render_boot_tell(boot));
@@ -4519,7 +4651,27 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         hcv = mask & strategy_set::BIT_HCV != 0,
         "strategy-set: composed"
     );
-    run_engine_loop(cons, disp, set, obs)
+    // risk r21 #4: after every member block, before the loop (and so before the record).
+    if let Some(h) = pine_hook.as_mut() {
+        for s in &queue_syms {
+            h.note_queue_sym(*s);
+        }
+    }
+    run_engine_loop(cons, disp, set, obs, pine_hook)
+}
+
+/// The boot's one door to the paper queue law (pin:08-verify-queue-sym-ineligible, risk r21 #4):
+/// the dispatcher tracks `sym` and `kept` remembers it for slot 8's boot record — one call, so a
+/// tracked symbol can never be missing from the record. Boot only (may allocate).
+fn track_queue_sym_kept<D: OrderDispatch>(
+    disp: &mut D,
+    kept: &mut Vec<core_types::SymbolId>,
+    sym: core_types::SymbolId,
+) {
+    disp.track_queue_sym(sym);
+    if !kept.contains(&sym) {
+        kept.push(sym);
+    }
 }
 
 /// Lower-hex render of a 32-byte hash (boot log; cold path).
@@ -5044,6 +5196,7 @@ impl Observability {
                 vm,
                 xmm,
                 hcv,
+                pine: None,
                 vrp,
                 xsd,
                 bin15,
@@ -5113,6 +5266,7 @@ fn register_ingress_counters(
         event_ring_drops: one("event_ring_drops")?,
         depth_ring_drops: one("depth_ring_drops")?,
         trade_ring_drops: one("trade_ring_drops")?,
+        trade_shed: one("trade_shed")?,
         stale_ticks: one("stale_ticks")?,
         seq_regressions: one("seq_regressions")?,
         feed_delay_ema_ms: reg
@@ -5173,6 +5327,8 @@ pub struct ExecObs {
 /// counters + dashboard snapshots into them.
 #[derive(Default)]
 pub struct Observability {
+    /// PVM impl-08 T19: slot 8's out-of-band files (`None` unless pine is configured).
+    pub pine_io: Option<crate::pine_metrics::PineIo>,
     /// Live metrics registry (counters + gauges). `None` if the
     /// `/metrics` server is disabled.
     pub metrics: Option<Arc<core_metrics::MetricsRegistry>>,
@@ -5282,6 +5438,20 @@ pub struct XsdStateSink {
 }
 
 impl Observability {
+    /// PVM impl-08 T17: register the `engine_pine_*` family — on a pine boot only, right after
+    /// [`Observability::build`] while the registry is still uniquely owned. No-op without metrics.
+    ///
+    /// # Errors
+    /// The registry is full, a name is taken, or the registry was already shared.
+    pub fn with_pine_metrics(mut self) -> Result<Self, &'static str> {
+        let (Some(reg), Some(ids)) = (self.metrics.as_mut(), self.counter_ids.as_mut()) else {
+            return Ok(self);
+        };
+        let reg = Arc::get_mut(reg).ok_or("pine: the metrics registry is already shared")?;
+        ids.pine = Some(crate::pine_metrics::register(reg)?);
+        Ok(self)
+    }
+
     /// Attach a [`LatencyDump`] config. Boot-only; called from the
     /// cli after [`Observability::build`]. Returns `self` so it can
     /// be chained.
@@ -5567,6 +5737,9 @@ pub struct EngineCounters {
     pub xmm: XmmMetricIds,
     /// HC11: the `engine_hcv_*` family (slot 7).
     pub hcv: HcvMetricIds,
+    /// PVM impl-08 T17: the `engine_pine_*` family (slot 8) — registered only on a pine boot
+    /// ([`Observability::with_pine_metrics`], pin:08-metrics-registered-with-pine).
+    pub pine: Option<crate::pine_metrics::PineMetricIds>,
     /// VRP V7: the `engine_vrp_*` family (slot 1).
     pub vrp: VrpMetricIds,
     /// XSD-3: the `engine_xsd_*` family (slot 2).
@@ -5818,6 +5991,10 @@ pub struct IngressCounterIds {
     /// (`engine_ingress_<venue>_trade_ring_drops_total`; the print is
     /// still captured).
     pub trade_ring_drops: core_metrics::CounterId,
+    /// PVM B'1: routed Trade prints shed by the pine slot's event-lane
+    /// route (`engine_ingress_<venue>_trade_shed_total`; the print is
+    /// still captured; non-zero voids the session for 8g).
+    pub trade_shed: core_metrics::CounterId,
     /// VT2: ticks the ingress judged stale
     /// (`engine_ingress_<venue>_stale_ticks_total`).
     pub stale_ticks: core_metrics::CounterId,
@@ -7280,12 +7457,13 @@ const BNARM_COUNTER_NAMES: [&str; BNARM_COUNTERS] = [
     "engine_exec_bn_refused_deadman_down_total",
     "engine_exec_bn_refused_flags_total",
     "engine_exec_bn_refused_not_writable_total",
+    "engine_exec_bn_refused_off_grid_total",
 ];
 
 /// `BinanceArmReport`'s totals in [`BNARM_COUNTER_NAMES`] order: one
 /// literal, built in place (the refusals by index — a change of their
 /// count fails to compile here).
-// COPY: [u64; 43] (344 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 44] (352 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -7315,7 +7493,7 @@ fn bnarm_counter_values(r: &clob_dispatcher::BinanceArmReport) -> [u64; BNARM_CO
         r.events_other,
         r.recon_held,
         f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15], f[16], f[17], f[18], f[19],
-        f[20],
+        f[20], f[21],
     ]
 }
 
@@ -9541,6 +9719,8 @@ fn fill_snapshot<S, D>(
     out.xmm.n_perps = Sc::xmm_perps_view(strat, &mut out.xmm.perps);
     // HC11: slot 7's counters and gauges.
     Sc::hcv_counters(strat, &mut out.hcv.counters);
+    // PVM impl-08 T17: slot 8's counters (zeros when pine is not configured).
+    out.pine.counters = Sc::pine_counters(strat);
 
     // P6: slot 1. Both halves come from the same publish instant, so a
     // strike and the position held against it can never disagree.
@@ -10261,6 +10441,7 @@ struct IngressCountersSnapshot {
     event_ring_drops: u64,
     depth_ring_drops: u64,
     trade_ring_drops: u64,
+    trade_shed: u64,
     stale_ticks: u64,
     seq_regressions: u64,
 }
@@ -10287,6 +10468,7 @@ fn mirror_ingress_counters(
         event_ring_drops: st.event_ring_drops_total(),
         depth_ring_drops: st.depth_ring_drops_total(),
         trade_ring_drops: st.trade_ring_drops_total(),
+        trade_shed: st.trade_shed_total(),
         stale_ticks: st.stale_ticks_total(),
         seq_regressions: st.seq_regressions_total(),
     };
@@ -10314,6 +10496,8 @@ fn mirror_ingress_counters(
         .inc(cur.depth_ring_drops.saturating_sub(last.depth_ring_drops));
     reg.counter(ids.trade_ring_drops)
         .inc(cur.trade_ring_drops.saturating_sub(last.trade_ring_drops));
+    reg.counter(ids.trade_shed)
+        .inc(cur.trade_shed.saturating_sub(last.trade_shed));
     reg.counter(ids.stale_ticks)
         .inc(cur.stale_ticks.saturating_sub(last.stale_ticks));
     reg.counter(ids.seq_regressions)
@@ -10326,11 +10510,52 @@ fn mirror_ingress_counters(
 /// T2T T1-b: how often the engine loop re-reads the hot window.
 const HOT_CHECK_NS: u64 = 100_000;
 
-fn run_engine_loop<S, D>(cons: Consumers, disp: D, strat: S, obs: Observability) -> EngineLoopResult
+/// PVM impl-08 (lead ruling 2026-10-17, the typed path): work an arm does on its CONCRETE
+/// strategy right after `eng.start()` and on the 5 s report cadence — without a strategy-core
+/// or strategy-set trait change. Boot-time and cold; never on the decision path.
+pub trait LoopHook<S> {
+    /// Once, right after `eng.start()` returned `Ok`; `mono_ns` is the engine clock then.
+    fn started(&mut self, strat: &S, mono_ns: u64);
+    /// Every 5 s report block, and once more after the loop's last iteration (before
+    /// `eng.stop()`).
+    fn drain(&mut self, strat: &S);
+}
+
+/// The arms without a hook.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoHook;
+
+impl<S> LoopHook<S> for NoHook {
+    fn started(&mut self, _: &S, _: u64) {}
+    fn drain(&mut self, _: &S) {}
+}
+
+impl<S, H: LoopHook<S>> LoopHook<S> for Option<H> {
+    fn started(&mut self, strat: &S, mono_ns: u64) {
+        if let Some(h) = self.as_mut() {
+            h.started(strat, mono_ns);
+        }
+    }
+    fn drain(&mut self, strat: &S) {
+        if let Some(h) = self.as_mut() {
+            h.drain(strat);
+        }
+    }
+}
+
+fn run_engine_loop<S, D, H>(
+    cons: Consumers,
+    disp: D,
+    strat: S,
+    obs: Observability,
+    hook: H,
+) -> EngineLoopResult
 where
     S: strategy_core::Strategy,
     D: OrderDispatch,
+    H: LoopHook<S>,
 {
+    let mut hook = hook;
     // Phase 8a lane engine: five tick lanes + one signal lane + four
     // fill lanes. The signal lane is bound to the RPC ring — the D2
     // disposition for Stage 1 (per §3.3).
@@ -10439,6 +10664,8 @@ where
         tracing::error!(error = ?e, "engine on_start failed");
         return EngineLoopResult::Failed("engine_loop: on_start failed");
     }
+    // PVM impl-08 R5: the arm's after-start hook (slot 8's boot record), boot-time, once.
+    hook.started(eng.strategy(), now_ns());
 
     let mut next_report = now_ns() + REPORT_PERIOD_NS;
     // RG6: the 1 s `/state` publish gate + the boot-boxed scratch the
@@ -10476,6 +10703,11 @@ where
     let mut xmm_last = strategy_core::XmmCounters::default();
     // HC11 slot-7 family delta snapshot (same bookkeeping).
     let mut hcv_last = strategy_core::HcvCounters::default();
+    // PVM impl-08 T17/T18: slot 8's 5 s drain (mirror, incidents.log, tapes), on a pine boot.
+    let mut pine_drain = obs
+        .pine_io
+        .as_ref()
+        .map(crate::pine_metrics::PineDrain::open);
     let mut vrp_last = strategy_core::VrpCounters::default();
     // VRP V8a: the persisted-state writer. The epoch starts at whatever
     // the member came up with, so a boot that changed nothing rewrites
@@ -10713,6 +10945,32 @@ where
             // were hoisted out of that gate deliberately; these belong
             // beside them.
             flush_member_state!();
+            // PVM impl-08 R6: the arm's 5 s hook (slot 8's delivery journal) — capture
+            // durability, outside the metrics gate like the flushes above.
+            hook.drain(eng.strategy());
+            // PVM impl-08 T17/T18 (pin:08-drain-outside-metrics): slot 8's tapes, `set.tsv`
+            // and `incidents.log` beside it; only the `engine_pine_*` mirror sits in the gate.
+            if let Some(d) = pine_drain.as_mut() {
+                let utc_ms = i64::try_from(core_time::WallAnchor::now().wall_ns / 1_000_000)
+                    .unwrap_or(i64::MAX);
+                // pin:08-set-tsv-matcher-read: the dispatcher's own matcher read.
+                d.drain(
+                    eng.strategy(),
+                    utc_ms,
+                    &clob_dispatcher::OrderDispatch::matcher_counters(eng.dispatcher()),
+                );
+                // PB13 (Binance plan §2.2 G8): Σ the scripts' broker positions vs the router
+                // ledger's slot-8 rows — an ERROR tell on two consecutive differing passes (alarm
+                // only; a dispatcher with no ledger answers `None`: never compared).
+                let disp = eng.dispatcher();
+                d.ledger_pass(eng.strategy(), |sym| {
+                    clob_dispatcher::OrderDispatch::slot_instrument_position_1e6(
+                        disp,
+                        strategy_pine::SLOT_PINE,
+                        sym,
+                    )
+                });
+            }
             // HYPARB H8: hand the period's AMM decisions to the testnet
             // shadow (a ring push each; nothing blocks, nothing is sent
             // from this thread).
@@ -10792,6 +11050,9 @@ where
                 mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
                 mirror_xmm_metrics(reg, &ids.xmm, eng.strategy(), &mut xmm_last);
                 mirror_hcv_metrics(reg, &ids.hcv, eng.strategy(), &mut hcv_last);
+                if let Some(d) = pine_drain.as_mut() {
+                    d.mirror(ids.pine.as_ref().map(|p| (&**reg, p)), eng.strategy());
+                }
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
                 mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
@@ -11138,6 +11399,18 @@ where
     //
     // Unconditional, and a no-op on an unchanged epoch.
     flush_member_state!();
+    // PVM impl-08 R6: the journal's last records (the loop's final iteration).
+    hook.drain(eng.strategy());
+    // pin:08-drain-outside-metrics: and slot 8's last tape / incident records, likewise.
+    if let Some(d) = pine_drain.as_mut() {
+        let utc_ms =
+            i64::try_from(core_time::WallAnchor::now().wall_ns / 1_000_000).unwrap_or(i64::MAX);
+        d.drain(
+            eng.strategy(),
+            utc_ms,
+            &clob_dispatcher::OrderDispatch::matcher_counters(eng.dispatcher()),
+        );
+    }
     eng.stop();
     // H3.7: the state writer stops and is joined FIRST — a write in flight
     // and the forced write below must never share a path's temp file. A

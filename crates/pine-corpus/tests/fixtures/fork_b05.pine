@@ -1,0 +1,11 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+indicator("Bands")
+k = input.float(2.0, "K")
+basis = ta.sma(close, 20)
+dev = k * ta.stdev(close, 20)
+plot(basis)
+plot(basis + dev)
+plot(basis - dev)

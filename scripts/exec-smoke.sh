@@ -118,6 +118,17 @@
 #   66  BX8, the spot battery (`--binance spot`): the gateway's permission
 #       check refused the boot — the account lacks a group the spot row
 #       needs (the bStock check, `--bn-spot-symbol`); NOTHING was placed.
+#   67-68 B'4 T27, the perp limits probe (`--perp-probe`, TESTNET only,
+#       after phases A and B; pinned by `hl_perp_probe::tests`): per coin
+#       of `--perp-coins`, post-only BUYs far below the touch (just under
+#       $10: refused; at the minimum: rests, cancelled by cloid; a six-
+#       figure price and a `szDecimals + 1` size: refused) and an isolated
+#       `updateLeverage`; writes `--perp-out` (default
+#       ~/multivenue/hl-perp-limits.tsv, a runtime artifact), the file the
+#       perp boot requires. 67 a coin's answers did not match (it is left
+#       out of the file), 68 something may be LEFT ON THE TESTNET ACCOUNT
+#       (loudest). `--perp-probe --offline` adds the probe's own offline
+#       self-test (a scripted venue: nothing sent, nothing written).
 # The diagnostics start at 20 because clap exits 2 on any argument
 # error: a release binary too old to have the arm would otherwise have
 # reported itself as a signing failure.
@@ -171,6 +182,7 @@ offline=0
 dry=0
 hlperp=0
 hlout=0
+perpprobe=0
 binance=0
 bnops=0
 drill=0
@@ -182,6 +194,7 @@ prev=""
 for a in "$@"; do
   [ "$a" = "--hl-perp" ] && hlperp=1
   [ "$a" = "--hl-outcome" ] && hlout=1
+  [ "$a" = "--perp-probe" ] && perpprobe=1
   # The account tools first: their names also start `--binance`.
   case "$a" in
     --binance-setup*|--binance-flatten*) bnops=1 ;;
@@ -229,8 +242,12 @@ trap - INT TERM
 case "$rc" in
   0)  if [ "$dry" = 1 ]; then
         echo "exec-smoke: DRY RUN — nothing was sent and NOTHING was verified; the action above is what would go on the wire" >&2
+      elif [ "$offline" = 1 ] && [ "$perpprobe" = 1 ]; then
+        echo "exec-smoke: PASS (offline) — this binary reproduces the venue SDK's bytes for every action type and the perp probe's self-test passed; the venue was NOT contacted and NO probe file was written" >&2
       elif [ "$offline" = 1 ]; then
         echo "exec-smoke: PASS (offline) — this binary reproduces the venue SDK's bytes for every action type; the venue was NOT contacted" >&2
+      elif [ "$perpprobe" = 1 ]; then
+        echo "exec-smoke: PASS (perp probe, TESTNET) — every coin's answers matched the documented rules; the probe file is written (its path is in the report above); nothing rests on the testnet account" >&2
       elif [ "$bnops" = 1 ]; then
         echo "exec-smoke: PASS (Binance account tool, $account account) — the report above names every read, change and answer" >&2
       elif [ "$eqprobe" = 1 ]; then
@@ -292,10 +309,17 @@ case "$rc" in
       else
         echo "exec-smoke: BX8: the permission check refused the boot — the $account account lacks a group the spot row needs (the bStock check); NOTHING was placed" >&2
       fi ;;
+  67) echo "exec-smoke: B'4 perp probe: a coin's answers did NOT match the documented rules — it is left out of the probe file and cannot arm (the report above names the leg); the coins that matched are written" >&2 ;;
+  68) echo "exec-smoke: *** B'4 PERP PROBE: AN ORDER MAY BE LEFT ON THE TESTNET ACCOUNT *** (a cancel failed or an answer was in doubt) — read the account and cancel it by hand before the next run" >&2 ;;
   *) echo "exec-smoke: could not run (exit $rc)" >&2
      # 1 (refused before anything was sent) and 2 (clap) left nothing.
      if [ "$hlperp" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
        echo "exec-smoke: *** the XH4g battery ended abnormally — slot-6 orders or a position may remain on the TESTNET account; the next battery's account check refuses while slot 6's orders rest: clear them first ***" >&2
+     fi
+     # r28 risk review C6: a probe that ended any other way may have left its post-only
+     # orders resting (online only — `--offline` sends nothing).
+     if [ "$perpprobe" = 1 ] && [ "$offline" != 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
+       echo "exec-smoke: *** the B'4 perp probe ended abnormally — an order may rest on the TESTNET account: read the account and cancel it by hand before the next run ***" >&2
      fi
      if [ "$hlout" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
        echo "exec-smoke: *** the XH4i-8 battery ended abnormally — slot-3 orders or a HIP-4 leg may remain on the TESTNET account; the next battery's account check refuses while either is there: clear them first ***" >&2

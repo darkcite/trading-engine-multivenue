@@ -771,6 +771,44 @@ pub fn run_catalog(cfg: &CatalogConfig) -> Result<CatalogOutput, CatalogError> {
     })
 }
 
+/// One local run's span, as `pine handoff` reads it (impl-07 §4.8.3: "local runs from
+/// `cli::capture_catalog::run_catalog`") — a narrow read-only view of the private per-run facts;
+/// nothing about the catalog's own behaviour changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSpan {
+    /// Directory basename (`run-<epoch_ns>`).
+    pub dir_name: String,
+    /// Boot wall stamp from the dir name.
+    pub epoch_ns: u64,
+    /// `max(last_ts) − min(first_ts)` across tick files (the run's own clock).
+    pub duration_ns: u64,
+    /// Total bytes of every direct child file.
+    pub bytes: u64,
+    /// Would `backtest::load_run` accept this run.
+    pub harness_ok: bool,
+    /// At least one tick file, and every one carries venue time (PMLR header version ≥ 3, VT1).
+    pub v3: bool,
+}
+
+/// The runs under `root` (same discovery and per-run inspection as [`run_catalog`]), epoch order.
+pub fn run_spans(root: &Path) -> Result<Vec<RunSpan>, CatalogError> {
+    let entries = discover(root)?;
+    let mut day_ticks: BTreeMap<u64, [u64; VENUE_LABELS.len()]> = BTreeMap::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for e in &entries {
+        let r = inspect_run(e, &mut day_ticks)?;
+        out.push(RunSpan {
+            v3: !r.venues.is_empty() && r.venues.iter().all(|v| v.stale_captured.is_some()),
+            dir_name: r.dir_name,
+            epoch_ns: r.epoch_ns,
+            duration_ns: r.duration_ns,
+            bytes: r.bytes,
+            harness_ok: r.harness_ok,
+        });
+    }
+    Ok(out)
+}
+
 /// The one-line `catalog_version` 1 JSON (hand-rendered — no
 /// serde_json in this crate by doctrine).
 #[allow(clippy::too_many_arguments)]

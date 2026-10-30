@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: re-issues a take-profit with no stop on every bar (Q1's stop-less script, T16).
+strategy("exit stopless (strategy-pine T16)", overlay = true)
+plot(close)
+if strategy.position_size == 0
+    strategy.entry("L", strategy.long)
+strategy.exit("X", limit = close * 1.1)

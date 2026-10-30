@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: one leak-free lookahead_on sub-program (close[1] on 4 h) — the containing-bar probe
+// (impl-08 T10, A2 / CAR-04-1).
+strategy("htf lookahead (strategy-pine T10)", overlay = true)
+p = request.security(syminfo.tickerid, "240", close[1], lookahead = barmerge.lookahead_on)
+plot(p)
+if close > p
+    strategy.entry("L", strategy.long)

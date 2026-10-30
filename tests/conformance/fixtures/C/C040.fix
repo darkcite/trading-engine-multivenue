@@ -1,0 +1,26 @@
+fix	2
+id	C040
+group	C
+title	varip survives the rollback that resets var
+script	tests/conformance/fixtures/C/C040.pine
+script_sha256	e09e52ae77fbe90cac3d4e488f32e13764485ea0adbe7e1018681856b575c41a
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T07:07Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
+driver	rt
+align	step
+dialects	56
+mode	realtime
+bars	80
+window	tail	16
+oracle	tv
+tier	1
+rt	64	16	3	0
+plot	f_C040_rt	exact
+plot	f_C040_done	exact
+plot	f_C040_upd	exact
+plot	f_C040_ok	exact
+relation
+f_C040_ok	1
+end

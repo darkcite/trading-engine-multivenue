@@ -170,6 +170,12 @@ dependencies = [
  "memchr",
  "mio 0.8.11",
  "opt-registry",
+ "pine-broker",
+ "pine-ir",
+ "pine-lang",
+ "pine-screen",
+ "pine-sema",
+ "pine-std",
  "rcgen",
  "research-artifacts",
  "rustls",
@@ -185,6 +191,7 @@ dependencies = [
  "strategy-hyparb",
  "strategy-icdp",
  "strategy-latency-arb",
+ "strategy-pine",
  "strategy-pm15",
  "strategy-pmj",
  "strategy-rule-tree",
@@ -380,6 +387,12 @@ dependencies = [
  "libc",
  "mio 0.8.11",
  "opt-registry",
+ "pine-broker",
+ "pine-ir",
+ "pine-lang",
+ "pine-screen",
+ "pine-sema",
+ "pine-spec",
  "proptest",
  "rcgen",
  "research-artifacts",
@@ -393,6 +406,7 @@ dependencies = [
  "strategy-hcv",
  "strategy-hyparb",
  "strategy-icdp",
+ "strategy-pine",
  "strategy-pm15",
  "strategy-pmj",
  "strategy-rule-tree",
@@ -1557,6 +1571,110 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pine-broker"
+version = "0.1.0"
+dependencies = [
+ "pine-ir",
+ "proptest",
+]
+
+[[package]]
+name = "pine-conformance"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "pine-broker",
+ "pine-ir",
+ "pine-lang",
+ "pine-screen",
+ "pine-sema",
+ "pine-spec",
+ "pine-std",
+ "pine-vm",
+]
+
+[[package]]
+name = "pine-corpus"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "pine-ir",
+ "pine-lang",
+ "pine-spec",
+ "proptest",
+]
+
+[[package]]
+name = "pine-ir"
+version = "0.1.0"
+
+[[package]]
+name = "pine-lang"
+version = "0.1.0"
+dependencies = [
+ "core-alloc",
+ "pine-ir",
+ "proptest",
+]
+
+[[package]]
+name = "pine-screen"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "core-time",
+ "libc",
+ "pine-broker",
+ "pine-ir",
+ "pine-lang",
+ "pine-sema",
+ "pine-std",
+ "pine-vm",
+]
+
+[[package]]
+name = "pine-sema"
+version = "0.1.0"
+dependencies = [
+ "pine-ir",
+ "pine-lang",
+ "pine-spec",
+ "pine-std",
+ "pine-vm",
+ "proptest",
+]
+
+[[package]]
+name = "pine-spec"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "pine-ir",
+ "proptest",
+]
+
+[[package]]
+name = "pine-std"
+version = "0.1.0"
+dependencies = [
+ "core-time",
+ "pine-ir",
+ "pine-spec",
+ "pine-std",
+ "pine-vm",
+ "proptest",
+]
+
+[[package]]
+name = "pine-vm"
+version = "0.1.0"
+dependencies = [
+ "core-alloc",
+ "pine-ir",
+ "pine-vm",
+]
+
+[[package]]
 name = "plotters"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2181,6 +2299,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-pine"
+version = "0.1.0"
+dependencies = [
+ "core-alloc",
+ "core-config",
+ "core-crypto",
+ "core-fill",
+ "core-time",
+ "core-types",
+ "pine-broker",
+ "pine-ir",
+ "pine-lang",
+ "pine-sema",
+ "pine-std",
+ "pine-vm",
+ "strategy-core",
+ "strategy-pine",
+]
+
+[[package]]
 name = "strategy-pm15"
 version = "0.1.0"
 dependencies = [
@@ -2228,6 +2366,7 @@ dependencies = [
  "strategy-core",
  "strategy-hcv",
  "strategy-hyparb",
+ "strategy-pine",
  "strategy-pm15",
  "strategy-pmj",
  "strategy-vm",

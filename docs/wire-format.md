@@ -240,7 +240,7 @@ MUST be zero / `SYMBOL_ID_NONE` / `0xFF`") are pinned in
 |     46 |     2 | flags       | `u16`          | bit0 = expire_on_silence (SetFairValue/SetBias only); others must be 0 |
 |     48 |    16 | _pad        | `[u8; 16]`     | explicit, zeroed (enforced by shape check) |
 
-### `ChannelEvent` — 64 bytes (8e; PMLR `slot_kind = 5` only, never rings)
+### `ChannelEvent` — 64 bytes (8e; PMLR `slot_kind = 5`; since WS10-A also the per-tick-lane venue-event SPSC rings)
 
 Non-tick channel capture written by each ingress thread into its
 per-venue event log (plan §6.5). BBO has no `ChannelId` — BBO flows as
@@ -258,6 +258,32 @@ per-venue event log (plan §6.5). BBO has no `ChannelId` — BBO flows as
 |     32 |     8 | v0            | `i64`          | channel-dependent (px ×1e6, counts, …). Funding rows (channel 3): rate ×1e9 on OKX **and** (WS3) Deribit — the Deribit perp ticker's `current_funding` now emits a paired Funding row (OKX keeps `v1` = next-funding ms) |
 |     40 |     8 | v1            | `i64`          | channel-dependent (qty ×1e6, rate ×1e9, …). Mark rows (channel 2): BIN15 O2 — **Hyperliquid now emits Mark rows too**, beside its AssetCtx row and from the same `activeAssetCtx` frame: `v0` = `markPx` ×1e6, `v1` = `oraclePx` ×1e6, `venue_time_ms` = 0. The ctx parser always lifted both and capture never carried either; a HIP-4 strike IS the perp mark at creation and its settlement is a mark TWAP, so neither was reconstructible from our own tape. ≈ 3 rows/s per perp. WS5 — Binance `@markPrice` rows carry the INDEX price ×1e6 here (OKX Mark rows keep 0); Funding rows: next-funding ms on OKX **and** Binance; Deribit — VM2 V2 (was a constant 0): `funding_8h` ×1e9 from the same ticker frame, the SAME 8-hour rolling series the worker's REST lane samples hourly (`interest_8h`), so the vm's hourly deribit funding sample and `carry_signal`'s ÷8-law windows accumulate one series; 0 when the frame lacked the field (pre-V2 captures replay with the `current_funding` fallback). VM2 V2 lane note: Hyperliquid FUNDING rides its AssetCtx rows (channel 5, `v0` = rate ×1e9 — there is no HL Funding channel), so the HL ingress gained its venue-event lane with spawn mask `EVENT_LANE_FUNDING \| EVENT_LANE_ASSET_CTX` |
 |     48 |    16 | _pad1         | `[u8; 16]`     | explicit, zeroed                        |
+
+Event rings (WS10-A): an ingress pushes a `ChannelEvent` onto its lane's
+`Ring<ChannelEvent, EVENT_RING_SIZE = 1024>` only when the channel's bit
+is set in its spawn-time `event_mask`; capture always comes first.
+
+**Trade on the event lane (PVM B'1, impl-Bp §3.3/§4.3).** `EVENT_LANE_TRADE`
+is set on an ingress's mask only when it hosts a symbol the pine slot
+(`SLOT_PINE` = 8, paper only) routes; a routed print is the capture row's
+event, byte for byte, pushed after the capture. A print never takes the
+ring past `EVENT_RING_SIZE − EVENT_TRADE_RESERVE` (768): beyond that it is
+shed and counted on `engine_ingress_<venue>_trade_shed_total` (non-zero =
+an incomplete print stream; the session is ineligible for 8g).
+`strategy-set` hands Trade to the pine slot and to no other member. XMM's
+Hyperliquid prints ride their own `TradePrint` lane (XH1), unchanged. The
+Trade payload per venue (no scale is picked; `Bar.volume_1e6` is in the
+venue's native unit):
+
+| venue (descriptor namespace) | `venue_seq` | `venue_time_ms` | `v0` | `v1` (+ aggressor bought, − sold) | base quantity for a bar's volume |
+|---|---|---|---|---|---|
+| `binance` (spot, sentinel) | aggregate id | `T` | px ×1e6 | base qty ×1e6 | `\|v1\|` |
+| `binance-usdm` (route symbols only, B'1 T8) | aggregate id | `T` | px ×1e6 | qty ×1e6 as published by `@aggTrade` (base coin on USDⓈ-M) | `\|v1\|` |
+| `okx` | `seqId` | venue ts | px ×1e6 | raw `sz` ×1e6 — **unit unverified (T0.1, Mac item): expected contracts on SWAP/FUTURES, base on SPOT** | SPOT `\|v1\|`; SWAP `\|v1\| × ctVal` once T0.1 lands — until then a routed OKX derivative builds bars in contracts |
+| `deribit` | `trade_seq` | venue ts | px ×1e6 | `amount` ×1e6: USD notional on perpetuals and inverse futures; base coin on options and linear futures | inverse: `\|v1\| × 1e6 / v0` floored (i128), lossy per print; linear / options `\|v1\|` |
+| `hyperliquid` (perp coins) | `tid` | venue `time` | px ×1e6 | `sz` ×1e6, base coin | `\|v1\|` |
+| `bybit`, `bybit-linear` | 0 (UUID ids) | venue ts | px ×1e6 | `v` ×1e6 ("Trade size"; base on spot and linear USDT — **T0.2, Mac item**) | `\|v1\|` |
+| `polymarket` | — | — | — | no Trade event (refused as a route symbol) | — |
 
 ### `OptSummary` — 64 bytes (M2.3; PMLR `slot_kind = 6` + VM2 V2 opt lanes)
 

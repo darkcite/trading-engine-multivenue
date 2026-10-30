@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// EMA ribbon. OUR CODE, typed from the public rule: five EMAs (8, 13, 21, 34, 55) — long while they
+// are strictly stacked, the fastest on top and each slower one below the last; flat when the stack
+// breaks. Five separate ta.ema call sites, each with its own state.
+strategy("PVM7 EMA ribbon", overlay = true, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0)
+
+l1 = input.int(8,  "EMA 1", minval = 1, maxval = 500)
+l2 = input.int(13, "EMA 2", minval = 1, maxval = 500)
+l3 = input.int(21, "EMA 3", minval = 1, maxval = 500)
+l4 = input.int(34, "EMA 4", minval = 1, maxval = 500)
+l5 = input.int(55, "EMA 5", minval = 1, maxval = 500)
+
+e1 = ta.ema(close, l1)
+e2 = ta.ema(close, l2)
+e3 = ta.ema(close, l3)
+e4 = ta.ema(close, l4)
+e5 = ta.ema(close, l5)
+
+// pin:07-ribbon-ascending — "stacked ascending" read as the fast-over-slow (bullish) order.
+stacked = e1 > e2 and e2 > e3 and e3 > e4 and e4 > e5
+
+if stacked
+    strategy.entry("L", strategy.long)
+if not stacked
+    strategy.close("L")
+
+p1 = plot(e1, "EMA 1")
+p2 = plot(e2, "EMA 2")
+p3 = plot(e3, "EMA 3")
+p4 = plot(e4, "EMA 4")
+p5 = plot(e5, "EMA 5")
+fill(p1, p2, color = color.new(color.green, 85))
+fill(p2, p3, color = color.new(color.green, 85))
+fill(p3, p4, color = color.new(color.green, 85))
+fill(p4, p5, color = color.new(color.green, 85))

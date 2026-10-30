@@ -1,0 +1,8 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+indicator("Momentum")
+n = input.int(defval = 12, title = "Bars")
+m = close - close[n]
+plot(m)

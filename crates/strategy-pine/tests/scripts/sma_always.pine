@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: a five-bar SMA and an entry on every bar — the cold-gate probe (impl-08 T9, I16).
+strategy("sma always (strategy-pine T9)", overlay = true)
+s = ta.sma(close, 5)
+plot(s)
+if close > 0
+    strategy.entry("L", strategy.long)

@@ -1,0 +1,24 @@
+fix	2
+id	F071
+group	F
+title	array.size(arr)
+pin	pin:W15-neg-index
+pin	pin:04-collection-edges
+script	tests/conformance/fixtures/F/F071.pine
+script_sha256	044ea9f24a256e49d4ea2977c582d8a6a7cf3ed5d6356a15688d3b3eb46c0ad8
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	5
+twin	F072
+mode	bar_close
+bars	pending
+window	head	64
+oracle	authored
+tier	3
+plot	f_F071_isna	exact
+plot	f_F071_val	exact
+fault	CollectionBounds	0

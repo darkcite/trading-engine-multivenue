@@ -1,0 +1,28 @@
+fix	2
+id	E002
+group	E
+title	strategy.order sized by percent of equity
+script	tests/conformance/fixtures/E/E002.pine
+script_sha256	0000000000000000000000000000000000000000000000000000000000e00201
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2028-02-29T23:59Z
+tv_build	desktop:1.120.4;pine:2026-10
+captured_in	5
+driver	synsig
+align	time
+dialects	56
+mode	realtime
+bars	-
+window	head	2
+oracle	tv
+tier	3
+plot	f_E002_pos	exact
+plot	f_E002_eq	dec	8
+series
+1772668800000	0	100000
+1772672400000	0.25	-inf
+end
+trades
+7	long	1772668800000	-12.3456785	order 1	1772672400000	0.0000005	exit 1	0.25	-0.01	0.00	-	-	-
+8	short	1772672400000	1.5	order 2	1772676000000	1.25	exit 2	0.25	0.06	0.05	0.1	0.2	1
+end

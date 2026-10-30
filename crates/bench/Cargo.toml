@@ -89,6 +89,16 @@ ingress-hyperevm     = { workspace = true }
 core-fill            = { workspace = true }
 # HYPARB H4 gate 68: the slot-0 member — decision, carry, hedge, timer.
 strategy-hyparb      = { workspace = true }
+# gate PVM-1: the Pine front end's read paths (impl-01 section 7.11, D1-e);
+# gates PVM-2/PVM-3: pine-broker's TV bar and native reconcile (impl-05 section 7.11).
+pine-ir              = { workspace = true }
+pine-lang            = { workspace = true }
+pine-broker          = { workspace = true }
+# gates PVM-4/PVM-5: pine-screen's tier-1 bar loop (impl-07 section 7.10) and its bench
+# (benches/pine_screen.rs, section 4.11).
+pine-screen          = { workspace = true }
+pine-sema            = { workspace = true }
+pine-std             = { workspace = true }
 # XMM XH4a gate 95: the order-gateway kit (duplex, in-flight table,
 # deadline queue, reconnect machine, wait policy, latency trackers).
 exec-gateway         = { workspace = true }
@@ -96,6 +106,9 @@ exec-gateway         = { workspace = true }
 strategy-xmm         = { workspace = true }
 # HC11 gate 85: the slot-7 member over the paper held-quote law.
 strategy-hcv         = { workspace = true }
+# PVM impl-08 gates PVM-6..PVM-12 (section 7.10) and benches/pine_runtime.rs (section 7.11): the
+# slot-8 member.
+strategy-pine        = { workspace = true }
 # HYPARB H7c gate 71: the EVM write path either side of the socket.
 # H9 gate 72: its `testnode` serves the HttpsPost cycle from a CHILD
 # process (a server thread here would allocate under the global count).
@@ -119,6 +132,16 @@ engine-snapshot      = { workspace = true }
 
 [[bench]]
 name = "hot_path"
+harness = false
+
+# impl-07 section 4.11: the tier-1 screener's bar loop, open/validate, trade bucketing, barclock.
+[[bench]]
+name = "pine_screen"
+harness = false
+
+# impl-08 section 7.11: the slot-8 runtime (bar confirms, tick evaluations, reconcile, ns per unit).
+[[bench]]
+name = "pine_runtime"
 harness = false
 
 # T2T T0-C: the order path's stage harness (custom main; not in

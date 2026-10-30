@@ -1,0 +1,30 @@
+[package]
+name         = "pine-conformance"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "PVM-6 conformance harness: the .fix fixture format, the catalogue generator, the TV-equivalent host loop, the one tolerance policy, triage, capture distillation and D12 fuzzing. A leaf: nothing depends on it."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "pine-conf"
+path = "src/bin/pine-conf.rs"
+
+# impl-06 §2.2: each lane-A edge lands in the task that first uses it.
+# T1: pine-ir + core-crypto (contract §2's one SHA-256, A2). T4: pine-spec. T13: pine-screen.
+# T14: pine-vm, pine-broker. T15: pine-lang, pine-sema, pine-std. No third-party crate.
+[dependencies]
+pine-ir     = { workspace = true }
+core-crypto = { workspace = true }
+pine-spec   = { workspace = true }
+pine-screen = { workspace = true }
+pine-vm     = { workspace = true }
+pine-broker = { workspace = true }
+pine-lang   = { workspace = true }
+pine-sema   = { workspace = true }
+pine-std    = { workspace = true }

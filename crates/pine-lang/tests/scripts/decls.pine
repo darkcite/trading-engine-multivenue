@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+library("decls")
+import user/lib/7 as l
+import other-user/my.lib/12
+//@type a point
+export type Point
+    float x = 0.0
+    varip int n
+    array<float> xs
+    chart.point p
+type Empty
+enum Side
+    long = "Long"
+    short
+export enum Mode
+    a
+//@function adds
+//@param a the first
+export add(float a, simple int b = 2) =>
+    a + b
+mul(a, b) => a * b
+export method scale(Point this, float k) =>
+    this.x := this.x * k
+    this
+export const float K = 1.5
+arr = array.new<float>(0)
+m = matrix.new<array<float>>(2, 2)
+f = array.new<float[]>(0)
+v = l.fn(1)

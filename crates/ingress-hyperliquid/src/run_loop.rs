@@ -86,9 +86,10 @@ use core_net::{
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock, WallAnchor};
 use core_types::{
-    Capture, ChannelEvent, ChannelId, DepthLevel, DepthPair, DepthTopK, EVENT_RING_SIZE, Price, Qty,
-    Tick, TradePrint, VenueId, DEPTH_K, TICK_FLAG_STALE, TRADE_AGGRESSOR_BUY,
-    TRADE_AGGRESSOR_SELL, TRADE_RING_SIZE,
+    trade_routed, Capture, ChannelEvent, ChannelId, DepthLevel, DepthPair, DepthTopK, Price, Qty,
+    SymbolId, Tick, TradePrint, VenueId, DEPTH_K, EVENT_LANE_TRADE, EVENT_RING_SIZE,
+    EVENT_TRADE_RESERVE, TICK_FLAG_STALE, TRADE_AGGRESSOR_BUY, TRADE_AGGRESSOR_SELL,
+    TRADE_RING_SIZE,
 };
 
 use crate::discovery::{parse_outcome_spec, HlOutcomeSpec};
@@ -348,6 +349,10 @@ pub struct Driver {
     /// go nowhere else — every driver before XH1, and every test that
     /// does not attach one.
     trade_tx: Option<Producer<TradePrint, TRADE_RING_SIZE>>,
+    /// PVM B'1: the pine slot's Trade route on this ingress's event
+    /// lane, attached by [`Self::set_trade_route`] (boot). Empty = no
+    /// Trade event is ever pushed (every boot without the pine slot).
+    trade_route: &'static [SymbolId],
     /// `!Sync` marker — see struct doc.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -401,6 +406,7 @@ impl Driver {
             feed_clock: FeedClock::new(VenueId::Hyperliquid.default_stale_after_ms()),
             coin_seq: [core_types::ArrivalSeq::ZERO; HL_MAX_COINS],
             trade_tx: None,
+            trade_route: &[],
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -412,6 +418,15 @@ impl Driver {
     /// so the lane is attached once per process.
     pub fn set_trade_lane(&mut self, tx: Producer<TradePrint, TRADE_RING_SIZE>) {
         self.trade_tx = Some(tx);
+    }
+
+    /// PVM B'1: attach the pine slot's spawn-time Trade route (≤
+    /// `TRADE_ROUTE_MAX` syms). A routed print is pushed onto the event
+    /// lane as its capture row's `ChannelEvent` only while the spawn
+    /// mask carries `EVENT_LANE_TRADE`. Boot-only.
+    pub fn set_trade_route(&mut self, route: &'static [SymbolId]) {
+        debug_assert!(route.len() <= core_types::TRADE_ROUTE_MAX);
+        self.trade_route = route;
     }
 
     /// T2T T1-b: read the hot window from `cell` (set by the boot once a
@@ -1489,6 +1504,35 @@ fn drain_ws_frames<C: Capture>(
     }
 }
 
+/// PVM B'1 (impl-Bp §3.3): the pine slot's Trade route on this
+/// ingress's event lane, built per `trades` push from the loop's
+/// event producer, spawn mask and the driver's route. One law at all
+/// five ingress sites: mask test first (bit clear = one AND and a
+/// not-taken branch per print), then the route, then the reserve — a
+/// print never takes the ring past `EVENT_RING_SIZE −
+/// EVENT_TRADE_RESERVE`, so a Trade burst cannot cost a Funding /
+/// AssetCtx / Mark / InstrumentRoll push. A refused print is counted on
+/// `trade_shed_total`, never retried.
+struct TradeLane<'a> {
+    tx: &'a mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mask: u16,
+    route: &'static [SymbolId],
+    status: &'a IngressStatus,
+}
+
+impl TradeLane<'_> {
+    #[inline(always)]
+    fn offer(&mut self, ev: &ChannelEvent) {
+        if self.mask & EVENT_LANE_TRADE == 0 || !trade_routed(self.route, ev.sym) {
+            return;
+        }
+        // The ring-slot publish is the designed copy (CLAUDE.md).
+        if self.tx.len() >= EVENT_RING_SIZE - EVENT_TRADE_RESERVE || !self.tx.try_push_ref(ev) {
+            self.status.inc_trade_shed();
+        }
+    }
+}
+
 /// Walk the `trades` rows of one push. Rows are sliced at successive
 /// `"coin":"` markers; each slice parses independently (`side`/`px`/
 /// `sz`/`time`/`tid` all follow `coin` within a row). Each parsed row
@@ -1508,6 +1552,7 @@ fn scan_trades<C: Capture>(
     capture: &mut C,
     mut trade_tx: Option<&mut Producer<TradePrint, TRADE_RING_SIZE>>,
     status: &IngressStatus,
+    lane: &mut TradeLane<'_>,
 ) -> TradeScan {
     const MARKER: &[u8] = b"\"coin\":\"";
     let mut scan = TradeScan {
@@ -1525,7 +1570,7 @@ fn scan_trades<C: Capture>(
             scan.rows_parsed += 1;
             let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
             let now = now_ns();
-            capture.event(&ChannelEvent::new(
+            let ev = ChannelEvent::new(
                 now,
                 VenueId::Hyperliquid,
                 ChannelId::Trade,
@@ -1534,7 +1579,9 @@ fn scan_trades<C: Capture>(
                 t.ts_ns / 1_000_000,
                 t.px_1e6,
                 signed_qty,
-            ));
+            );
+            capture.event(&ev); // capture first, unchanged
+            lane.offer(&ev); // PVM B'1: then the pine route
             if let Some(tx) = trade_tx.as_deref_mut() {
                 let aggressor = if t.side == 1 {
                     TRADE_AGGRESSOR_SELL
@@ -2037,6 +2084,12 @@ fn handle_data_frame<C: Capture>(
                                     capture,
                                     drv.trade_tx.as_mut(),
                                     status,
+                                    &mut TradeLane {
+                                        tx: &mut *event_tx,
+                                        mask: event_mask,
+                                        route: drv.trade_route,
+                                        status,
+                                    },
                                 ),
                             },
                             HlChannel::ActiveAssetCtx => {
@@ -3570,6 +3623,163 @@ mod tests {
         assert_eq!(status.trade_ring_drops_total(), 2);
         assert_eq!(cap.events, 6, "a dropped print is still on the tape");
         assert_eq!(status.ring_drops_total(), 0, "tick loss is a different number");
+    }
+
+    // ── PVM B'1: the pine slot's Trade route (impl-Bp §7.1) ──────────
+
+    const B1_TRADES: &[u8] = br#"{"channel":"trades","data":[{"coin":"BTC","side":"A","px":"64437.5","sz":"0.25","hash":"0x1","time":1789252941000,"tid":71},{"coin":"BTC","side":"B","px":"64438.0","sz":"1.5","hash":"0x2","time":1789252941001,"tid":72}]}"#;
+    static B1_ROUTE: [SymbolId; 1] = [SYM_BTC];
+    static B1_OTHER: [SymbolId; 1] = [SYM_BTC + 1];
+
+    /// Capture double: records every event and the event lane's depth at
+    /// the moment the capture saw it (capture-first ⇒ 0 for a fresh lane).
+    struct B1Cap<'c> {
+        rows: Vec<(ChannelEvent, usize)>,
+        lane: &'c core_ring::Consumer<ChannelEvent, EVENT_RING_SIZE>,
+    }
+    impl core_types::Capture for B1Cap<'_> {
+        fn event(&mut self, e: &ChannelEvent) {
+            self.rows.push((*e, self.lane.len()));
+        }
+    }
+
+    fn b1_key(e: &ChannelEvent) -> (u64, u8, u8, u32, u64, u64, i64, i64) {
+        (
+            e.ts_ns,
+            e.venue,
+            e.channel,
+            e.sym,
+            e.venue_seq,
+            e.venue_time_ms,
+            e.v0,
+            e.v1,
+        )
+    }
+
+    fn b1_scan(
+        route: &'static [SymbolId],
+        mask: u16,
+        tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+        cap: &mut B1Cap<'_>,
+        status: &IngressStatus,
+    ) -> TradeScan {
+        let mut lane = TradeLane {
+            tx,
+            mask,
+            route,
+            status,
+        };
+        scan_trades(B1_TRADES, SYM_BTC, cap, None, status, &mut lane)
+    }
+
+    #[test]
+    fn hl_trade_route_off_pushes_nothing_and_counts_nothing() {
+        let (mut tx, rx) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        let funding = core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX;
+        // Bit clear, route set.
+        b1_scan(&B1_ROUTE, funding, &mut tx, &mut cap, &status);
+        // Bit set, route empty.
+        b1_scan(&[], funding | EVENT_LANE_TRADE, &mut tx, &mut cap, &status);
+        assert_eq!(cap.rows.len(), 4, "captured exactly as before");
+        assert_eq!(rx.len(), 0);
+        assert_eq!(status.trade_shed_total(), 0);
+    }
+
+    #[test]
+    fn hl_routed_trade_is_captured_first_and_byte_identical() {
+        let (mut tx, mut rx) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let rows = {
+            let mut cap = B1Cap {
+                rows: Vec::new(),
+                lane: &rx,
+            };
+            let scan = b1_scan(&B1_ROUTE, EVENT_LANE_TRADE, &mut tx, &mut cap, &status);
+            assert_eq!(scan.rows_parsed, 2);
+            cap.rows
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, 0, "row 1 captured before its push");
+        assert_eq!(rows[1].1, 1, "row 2 captured before its push");
+        for (row, _) in &rows {
+            let got = *rx.try_pop_ref().expect("routed print");
+            assert_eq!(b1_key(&got), b1_key(row));
+        }
+        assert!(rx.try_pop_ref().is_none());
+        assert_eq!(status.trade_shed_total(), 0);
+    }
+
+    #[test]
+    fn hl_unrouted_symbol_prints_are_never_pushed() {
+        let (mut tx, rx) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        b1_scan(&B1_OTHER, EVENT_LANE_TRADE, &mut tx, &mut cap, &status);
+        assert_eq!(cap.rows.len(), 2);
+        assert_eq!(rx.len(), 0);
+        assert_eq!(status.trade_shed_total(), 0);
+    }
+
+    #[test]
+    fn hl_trade_burst_never_costs_a_funding_push() {
+        let (mut tx, rx) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        // A burst far past the ring: 600 pushes × 2 prints.
+        for _ in 0..600 {
+            b1_scan(&B1_ROUTE, EVENT_LANE_TRADE, &mut tx, &mut cap, &status);
+        }
+        assert_eq!(rx.len(), EVENT_RING_SIZE - EVENT_TRADE_RESERVE);
+        let funding = ChannelEvent::new(
+            1,
+            VenueId::Hyperliquid,
+            ChannelId::AssetCtx,
+            SYM_BTC,
+            0,
+            0,
+            1,
+            1,
+        );
+        for _ in 0..EVENT_TRADE_RESERVE {
+            assert!(
+                tx.try_push_ref(&funding),
+                "the reserve holds every non-Trade push"
+            );
+        }
+    }
+
+    #[test]
+    fn hl_every_shed_print_is_counted_once() {
+        let (mut tx, rx) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let status = IngressStatus::new();
+        let mut cap = B1Cap {
+            rows: Vec::new(),
+            lane: &rx,
+        };
+        let pushes = (EVENT_RING_SIZE - EVENT_TRADE_RESERVE) / 2 + 5;
+        for _ in 0..pushes {
+            b1_scan(&B1_ROUTE, EVENT_LANE_TRADE, &mut tx, &mut cap, &status);
+        }
+        let offered = (pushes * 2) as u64;
+        assert_eq!(status.trade_shed_total(), offered - rx.len() as u64);
+        assert_eq!(status.trade_shed_total(), 10);
+        assert_eq!(
+            cap.rows.len() as u64,
+            offered,
+            "a shed print is still captured"
+        );
+        assert_eq!(status.event_ring_drops_total(), 0);
     }
 
     #[test]

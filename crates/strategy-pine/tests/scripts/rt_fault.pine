@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: a realtime entry while flat that faults (the per-evaluation instruction budget runs out) at its first
+// evaluation holding a position — the D13 probe (impl-08 T15: disable, flatten, incident).
+strategy("rt fault (strategy-pine T15)", overlay = true)
+float x = 0.0
+if strategy.position_size > 0
+    for i = 0 to 100000000
+        x := x + 1
+plot(x)
+if strategy.position_size == 0
+    strategy.entry("L", strategy.long)

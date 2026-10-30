@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: a market entry plus a far resting limit entry (a maker that does not cover the
+// position), then a fault (the instruction budget runs out) holding the position — the slow-phase
+// cancel probe (impl-08 T15 risk-review fix (c)).
+strategy("maker fault (strategy-pine T15)", overlay = true, pyramiding = 2)
+float x = 0.0
+if strategy.position_size > 0
+    for i = 0 to 100000000
+        x := x + 1
+plot(x)
+if strategy.position_size == 0
+    strategy.entry("A", strategy.long)
+    strategy.entry("B", strategy.long, limit = close - 50)

@@ -1,0 +1,151 @@
+fix	2
+id	B039
+group	B
+title	ta.change with len 200
+pin	pin:04-ta-reference
+script	tests/conformance/fixtures/B/B039.pine
+script_sha256	60405aeecce60cf58035d7899f1dfc06d6ece2f68e171e1efa0338b060c4f9a4
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T04:43Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	24484
+window	head	128
+oracle	tv
+tier	1
+plot	f_B039_isna	exact
+plot	f_B039_val	exact
+series
+0	1	na
+1	1	na
+2	1	na
+3	1	na
+4	1	na
+5	1	na
+6	1	na
+7	1	na
+8	1	na
+9	1	na
+10	1	na
+11	1	na
+12	1	na
+13	1	na
+14	1	na
+15	1	na
+16	1	na
+17	1	na
+18	1	na
+19	1	na
+20	1	na
+21	1	na
+22	1	na
+23	1	na
+24	1	na
+25	1	na
+26	1	na
+27	1	na
+28	1	na
+29	1	na
+30	1	na
+31	1	na
+32	1	na
+33	1	na
+34	1	na
+35	1	na
+36	1	na
+37	1	na
+38	1	na
+39	1	na
+40	1	na
+41	1	na
+42	1	na
+43	1	na
+44	1	na
+45	1	na
+46	1	na
+47	1	na
+48	1	na
+49	1	na
+50	1	na
+51	1	na
+52	1	na
+53	1	na
+54	1	na
+55	1	na
+56	1	na
+57	1	na
+58	1	na
+59	1	na
+60	1	na
+61	1	na
+62	1	na
+63	1	na
+64	1	na
+65	1	na
+66	1	na
+67	1	na
+68	1	na
+69	1	na
+70	1	na
+71	1	na
+72	1	na
+73	1	na
+74	1	na
+75	1	na
+76	1	na
+77	1	na
+78	1	na
+79	1	na
+80	1	na
+81	1	na
+82	1	na
+83	1	na
+84	1	na
+85	1	na
+86	1	na
+87	1	na
+88	1	na
+89	1	na
+90	1	na
+91	1	na
+92	1	na
+93	1	na
+94	1	na
+95	1	na
+96	1	na
+97	1	na
+98	1	na
+99	1	na
+100	1	na
+101	1	na
+102	1	na
+103	1	na
+104	1	na
+105	1	na
+106	1	na
+107	1	na
+108	1	na
+109	1	na
+110	1	na
+111	1	na
+112	1	na
+113	1	na
+114	1	na
+115	1	na
+116	1	na
+117	1	na
+118	1	na
+119	1	na
+120	1	na
+121	1	na
+122	1	na
+123	1	na
+124	1	na
+125	1	na
+126	1	na
+127	1	na
+end

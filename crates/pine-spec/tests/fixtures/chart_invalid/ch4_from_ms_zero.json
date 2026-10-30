@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "frozen_utc": "2026-10-15",
+  "tv_symbol": "BINANCE:BTCUSDT.P",
+  "symbol_key": "binance_usdm:btcusdt",
+  "candles_descriptor": "binance-usdm:btcusdt",
+  "timeframe_tv": "60",
+  "timeframe_s": 3600,
+  "timezone": "Etc/UTC",
+  "chart_type": "candles",
+  "bar_magnifier": false,
+  "from_ms": 0,
+  "bars": 4320,
+  "warmup_bars": 720,
+  "note": "BINANCE:BTCUSDT.P, 1 h standard candles, UTC. Judged window: `bars` bars from `from_ms`; every replay also feeds the `warmup_bars` bars before it. Definition only: no price data."
+}

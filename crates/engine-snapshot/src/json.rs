@@ -393,6 +393,20 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.i64(hc.marks_unknown);
     c.put(b"}");
 
+    // --- pine (PVM impl-08 T17: slot 8, PAPER ONLY) ---
+    //
+    // Flat: `configured` is `scripts_loaded > 0`; every `PineCounters` field by its own name, in
+    // declaration order. An unconfigured member reads all zeros.
+    let pc = &s.pine.counters;
+    c.key("pine");
+    c.put(b"{\"configured\":");
+    c.u64(u64::from(pc.scripts_loaded > 0));
+    for (k, v) in pine_fields(pc) {
+        c.key(k);
+        c.u64(v);
+    }
+    c.put(b"}");
+
     // --- exec (E6 c4) ---
     //
     // Additive. `halted` is an ARRAY of reason words rather than a
@@ -1695,6 +1709,56 @@ impl<'a> Cursor<'a> {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
+/// `PineCounters` as `(name, value)` rows, declaration order (the `/state` `pine` section).
+fn pine_fields(p: &strategy_core::PineCounters) -> [(&'static str, u64); 44] {
+    [
+        ("scripts_loaded", p.scripts_loaded),
+        ("scripts_enabled", p.scripts_enabled),
+        ("scripts_armed", p.scripts_armed),
+        ("scripts_faulted", p.scripts_faulted),
+        ("scripts_cold", p.scripts_cold),
+        ("bars_confirmed", p.bars_confirmed),
+        ("bars_gapped", p.bars_gapped),
+        ("bars_partial_boot", p.bars_partial_boot),
+        ("prints_late", p.prints_late),
+        ("event_ts_regressions", p.event_ts_regressions),
+        ("bar_evals", p.bar_evals),
+        ("tick_evals", p.tick_evals),
+        ("ticks_coalesced", p.ticks_coalesced),
+        ("ticks_budgeted", p.ticks_budgeted),
+        ("cof_evals", p.cof_evals),
+        ("intents_discarded", p.intents_discarded),
+        ("submits", p.submits),
+        ("modifies", p.modifies),
+        ("cancels", p.cancels),
+        ("submit_errors", p.submit_errors),
+        ("cancel_errors", p.cancel_errors),
+        ("acks", p.acks),
+        ("cancelled_reported", p.cancelled_reported),
+        ("settle_points", p.settle_points),
+        ("fills", p.fills),
+        ("fills_prior_boot", p.fills_prior_boot),
+        ("fills_foreign", p.fills_foreign),
+        ("fills_adopted", p.fills_adopted),
+        ("fills_venue_originated", p.fills_venue_originated),
+        ("late_fills_after_cancel", p.late_fills_after_cancel),
+        ("late_reducer_flips", p.late_reducer_flips),
+        ("fee_modelled_live", p.fee_modelled_live),
+        ("refusal_trips", p.refusal_trips),
+        ("entries_suppressed", p.entries_suppressed),
+        ("flattens_started", p.flattens_started),
+        ("flatten_attempts", p.flatten_attempts),
+        ("flatten_stuck", p.flatten_stuck),
+        ("boot_guard_flattens", p.boot_guard_flattens),
+        ("incidents", p.incidents),
+        ("seq_records", p.seq_records),
+        ("seq_dropped", p.seq_dropped),
+        ("tape_records", p.tape_records),
+        ("tape_dropped", p.tape_dropped),
+        ("callbacks_ignored", p.callbacks_ignored),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1903,7 +1967,7 @@ mod tests {
             "{body}"
         );
         assert!(
-            body.contains("\"refused\":{\"unbound\":4,\"not_live\":0,") && body.contains("\"deadman_down\":0,\"flags\":9,\"not_writable\":7}}},\"halted\":["),
+            body.contains("\"refused\":{\"unbound\":4,\"not_live\":0,") && body.contains("\"deadman_down\":0,\"flags\":9,\"not_writable\":7,\"off_grid\":0}}},\"halted\":["),
             "{body}"
         );
         // Between the other two: one comma each.
@@ -1912,7 +1976,7 @@ mod tests {
         let n = encode_state_json(&s, &mut buf).unwrap();
         let body = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(body.contains("\"session_pnl_usd_1e6\":0},\"binance_gw\":{\"slot\":2,"), "{body}");
-        assert!(body.contains("\"not_writable\":7}},\"hyperliquid_gw\":{\"slot\":0,"), "{body}");
+        assert!(body.contains("\"not_writable\":7,\"off_grid\":0}},\"hyperliquid_gw\":{\"slot\":0,"), "{body}");
         assert_eq!(crate::bn_mode_word(2), "pm_pro");
         assert_eq!(crate::sweep_word(0), "clear");
         assert_eq!(crate::sweep_word(7), "unknown");

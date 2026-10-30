@@ -77,6 +77,7 @@ pub use ledger::{
     INST_EXPOSURE_MAX, INST_WRITABLE, LAW_INVERSE, LAW_LINEAR, LAW_OPTION, LAW_SPOT,
     LEDGER_INSTRUMENTS, LEDGER_RESTING, LEDGER_ROWS,
 };
+pub use ledger::{LedgerError, PerpVenuePos, PERP_ROWS};
 pub use mode::ExecMode;
 pub use null::NullLiveDispatcher;
 pub use route::{

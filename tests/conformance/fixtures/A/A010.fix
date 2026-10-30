@@ -1,0 +1,86 @@
+fix	2
+id	A010
+group	A
+title	history on the first bar · int
+script	tests/conformance/fixtures/A/A010.pine
+script_sha256	f7429686f68280460c36964c76d53a3fe7594886ed01d476ea03a708f6531475
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T04:33Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	24484
+window	head	64
+oracle	tv
+tier	1
+plot	f_A010_isna	exact
+plot	f_A010_val	exact
+series
+0	1	na
+1	0	7
+2	1	na
+3	1	na
+4	0	7
+5	0	7
+6	1	na
+7	0	7
+8	0	7
+9	0	7
+10	0	7
+11	1	na
+12	1	na
+13	1	na
+14	1	na
+15	0	7
+16	0	7
+17	1	na
+18	0	7
+19	0	7
+20	0	7
+21	1	na
+22	1	na
+23	0	7
+24	1	na
+25	0	7
+26	0	7
+27	1	na
+28	1	na
+29	0	7
+30	1	na
+31	1	na
+32	0	7
+33	0	7
+34	1	na
+35	0	7
+36	0	7
+37	0	7
+38	1	na
+39	0	7
+40	0	7
+41	0	7
+42	0	7
+43	1	na
+44	1	na
+45	1	na
+46	0	7
+47	1	na
+48	1	na
+49	1	na
+50	1	na
+51	1	na
+52	1	na
+53	0	7
+54	0	7
+55	0	7
+56	1	na
+57	1	na
+58	1	na
+59	0	7
+60	0	7
+61	0	7
+62	0	7
+63	0	7
+end

@@ -1,0 +1,89 @@
+fix	2
+id	F070
+group	F
+title	array.get(arr, 2)
+pin	pin:W15-neg-index
+pin	pin:04-collection-edges
+script	tests/conformance/fixtures/F/F070.pine
+script_sha256	3c23b4145fba73c1c492ad0e5d8bab6cdd2ea640aff6edea5747d354da334bc1
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T04:11Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
+driver	syn
+align	step
+dialects	6
+twin	F069
+mode	bar_close
+bars	24484
+window	head	64
+oracle	tv
+tier	3
+plot	f_F070_isna	exact
+plot	f_F070_val	exact
+series
+0	0	9
+1	0	9
+2	0	9
+3	0	9
+4	0	9
+5	0	9
+6	0	9
+7	0	9
+8	0	9
+9	0	9
+10	0	9
+11	0	9
+12	0	9
+13	0	9
+14	0	9
+15	0	9
+16	0	9
+17	0	9
+18	0	9
+19	0	9
+20	0	9
+21	0	9
+22	0	9
+23	0	9
+24	0	9
+25	0	9
+26	0	9
+27	0	9
+28	0	9
+29	0	9
+30	0	9
+31	0	9
+32	0	9
+33	0	9
+34	0	9
+35	0	9
+36	0	9
+37	0	9
+38	0	9
+39	0	9
+40	0	9
+41	0	9
+42	0	9
+43	0	9
+44	0	9
+45	0	9
+46	0	9
+47	0	9
+48	0	9
+49	0	9
+50	0	9
+51	0	9
+52	0	9
+53	0	9
+54	0	9
+55	0	9
+56	0	9
+57	0	9
+58	0	9
+59	0	9
+60	0	9
+61	0	9
+62	0	9
+63	0	9
+end

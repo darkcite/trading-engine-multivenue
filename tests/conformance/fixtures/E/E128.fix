@@ -1,0 +1,31 @@
+fix	2
+id	E128
+group	E
+title	strategy.order with a negative qty
+pin	pin:05-bad-qty
+script	tests/conformance/fixtures/E/E128.pine
+script_sha256	86618de3cc9c81c3d363017db5d60baeac54e9d502124ab171e4331d3c5d3dac
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T12:47Z
+tv_build	web:Claude-2.42304.0/Chrome-152.0.7977.149;pine:2026-09
+captured_in	6
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	pending
+window	head	2
+oracle	tv
+tier	1
+plot	f_E128_pos	exact
+refuse	3007
+reading	refuse_literal
+refuse	3007
+end
+reading	runtime_fault
+fault	ScriptRefused	0
+end
+reading	ignored
+0	0.0
+1	0.0
+end

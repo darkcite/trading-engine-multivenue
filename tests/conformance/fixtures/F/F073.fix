@@ -1,0 +1,32 @@
+fix	2
+id	F073
+group	F
+title	PROJ of color.red, color.teal, color.yellow
+pin	pin:00-color-consts
+script	tests/conformance/fixtures/F/F073.pine
+script_sha256	9127322936b703701173dc3f5d23377df8ea63e57f0d4b4c37bd27531f5be7ff
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T04:32Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	5
+driver	syn
+align	step
+dialects	5
+twin	F074
+mode	bar_close
+bars	24484
+window	head	1
+oracle	tv
+tier	1
+plot	f_F073_val1	exact
+plot	f_F073_val2	exact
+plot	f_F073_val3	exact
+series
+0	16732754	35195	16771899
+end
+reading	v5_values
+0	16732754.0	35195.0	16771899.0
+end
+reading	v6_values
+0	15873605.0	563585.0	16635957.0
+end

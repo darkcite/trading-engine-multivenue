@@ -1,0 +1,23 @@
+fix	2
+id	C043
+group	C
+title	a varip array
+script	tests/conformance/fixtures/C/C043.pine
+script_sha256	8aab02bb49aa8b7026d021ff27fbe199bd978f0bcc9d1f0edb57b856e6c736bd
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	rt
+align	step
+dialects	56
+mode	realtime
+bars	pending
+window	tail	16
+oracle	declined
+tier	3
+rt	64	16	3	0
+plot	f_C043_rt	exact
+plot	f_C043_done	exact
+plot	f_C043_val	exact
+refuse	3048

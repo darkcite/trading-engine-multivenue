@@ -446,7 +446,8 @@ fn render_strategies(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s:
     f.render_widget(t, area);
 }
 
-/// S16-5: a reserved slot (8 and 10–15 since PM15-5, no member) earns a row only when
+/// S16-5: a reserved slot (10–15 since PVM impl-08 T4 built slot 8 and PM15-5
+/// built slot 9; no member) earns a row only when
 /// something is set on it — a mask bit, a gate, an order — so the panel
 /// keeps its member rows on a normal boot while an anomaly on a
 /// reserved slot still shows. A member's row always shows.
@@ -794,7 +795,11 @@ mod tests {
         let mut s = Box::new(EngineSnapshot::empty());
         let shown = |s: &EngineSnapshot| (0..SNAPSHOT_SLOTS).filter(|&i| slot_shown(s, i)).count();
         assert_eq!(SNAPSHOT_SLOTS, 16);
-        assert_eq!(shown(&s), 10, "an idle boot shows the ten members (pm15 at 9, pmj at 11)");
+        // PVM impl-08 T4 (pine, slot 8), PM15-5 (pm15, slot 9) and PMJ (pmj, slot 11):
+        // eleven members, each row always shown.
+        assert_eq!(shown(&s), 11, "an idle boot shows the eleven members");
+        assert!(slot_shown(&s, 8), "pine is a member");
+        assert!(slot_shown(&s, 11), "pmj is a member");
         assert!(slot_shown(&s, 9), "pm15 is a member");
         assert!(slot_shown(&s, 11), "pmj is a member");
         s.boot.configured_mask = 1 << 10;
@@ -806,9 +811,9 @@ mod tests {
         s.regime.gates[12] = 1;
         assert!(slot_shown(&s, 12));
         s.regime.gates[12] = 0;
-        s.slots[8] = strategy_core::SlotCounters::new(0, 1, 0, 0);
-        assert!(slot_shown(&s, 8));
-        assert_eq!(shown(&s), 11);
+        s.slots[12] = strategy_core::SlotCounters::new(0, 1, 0, 0);
+        assert!(slot_shown(&s, 12));
+        assert_eq!(shown(&s), 12);
     }
 
     #[test]

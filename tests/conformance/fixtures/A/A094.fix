@@ -1,0 +1,23 @@
+fix	2
+id	A094
+group	A
+title	na in a collection · bool
+pin	pin:W13-bool-na
+pin	pin:04-collection-edges
+script	tests/conformance/fixtures/A/A094.pine
+script_sha256	a08330c22a74053eaf2ea640c3f2777d74ce490e23d06307a1950718331cbfdb
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	6
+twin	A078
+mode	bar_close
+bars	pending
+window	head	64
+oracle	authored
+tier	3
+plot	f_A094_val	exact
+refuse	3007

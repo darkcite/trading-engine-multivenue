@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: a 5-minute sub-program that runs out of its instruction budget on its first bar at or
+// after 2026-01-01T00:00Z (the tests' boot instant) — the sub-fault probe (impl-08 T15, I35).
+strategy("htf fault (strategy-pine T15)", overlay = true)
+f() =>
+    float x = 0.0
+    if time >= 1767225600000
+        for i = 0 to 100000000
+            x := x + 1
+    x + close
+v = request.security(syminfo.tickerid, "5", f())
+plot(v)
+strategy.entry("L", strategy.long)

@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: a realtime limit entry that follows the close — rests a maker, requotes it (Modify,
+// E-7) and cancels it every fifth bar — the dispatch-order probe (impl-08 T12, I26).
+strategy("rt maker (strategy-pine T12)", overlay = true)
+plot(close)
+if bar_index % 5 == 4
+    strategy.cancel("L")
+else
+    strategy.entry("L", strategy.long, limit = close - 0.5)

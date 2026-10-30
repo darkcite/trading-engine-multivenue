@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+indicator("probe00", overlay = false)
+// probe-00-export · impl-06 §4.7.2 H+0:15 (R6, R11) · half display.data_window, half display.all
+plot(1.0, "p_one", display = display.data_window)
+plot(0.5, "p_half", display = display.all)
+plot(1.0 / 3.0, "p_third", display = display.data_window)
+plot(0.1 + 0.2, "p_tenths", display = display.all)
+plot(1.0 + math.pow(2, -52), "p_ulp", display = display.data_window)
+plot(1e-300, "p_tiny", display = display.all)
+plot(1e300, "p_huge", display = display.data_window)
+plot(float(na), "p_na", display = display.all)
+plot(0.0 * -1.0, "p_negzero", display = display.data_window)
+plot(1e308 * 10, "p_inf", display = display.all)
+plot(-1e308 * 10, "p_neginf", display = display.data_window)
+plot(syminfo.mintick, "p_mintick", display = display.all)
+plot(syminfo.pointvalue, "p_pointvalue", display = display.data_window)

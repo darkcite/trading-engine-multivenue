@@ -15,9 +15,8 @@
 use core_types::{Fill, Order, SlotMask, MAX_STRATEGY_SLOTS};
 use strategy_core::{
     HarCounters, HarSeriesView, HcvCounters, HyparbCoinView, HyparbCounters, HyparbPoolView,
-    RegimeCounters,
-    RegimeRelView, SlotCounters, VmRowView, VrpCounters, VrpSnapshotView, XmmCounters,
-    XmmPerpView, HAR_VIEW_SERIES,
+    PineCounters, RegimeCounters, RegimeRelView, SlotCounters, VmRowView, VrpCounters,
+    VrpSnapshotView, XmmCounters, XmmPerpView, HAR_VIEW_SERIES,
 };
 
 /// JSON schema version of `/state` (`"v"`). Bump on any field removal
@@ -31,7 +30,8 @@ use strategy_core::{
 /// **3 (S16-5, ruling S16-R6):** every per-slot array — `slots`,
 /// `regime.gates`, `exec.halted` — grows from 8 to [`SNAPSHOT_SLOTS`]
 /// (16) entries; an index means the same slot in both versions, slots
-/// 8–15 are `"reserved"` (no member). Masks were already `SlotMask`s
+/// 8–15 are `"reserved"` (no member; slot 8 is `"pine"` since PVM impl-08
+/// T4, additive). Masks were already `SlotMask`s
 /// in schema 2. The dashboard reads either version.
 pub const SNAPSHOT_SCHEMA: u32 = 3;
 /// Orders kept in the `recent` ring.
@@ -81,10 +81,11 @@ pub const RUN_DIR_MAX: usize = 160;
 /// (the name, `"reserved"` → `"hcv"`, is additive).
 /// **Slots 8–15 appeared in schema 3 (S16-5)** as
 /// [`RESERVED_SLOT_NAME`]; a member taking one later is additive in the
-/// same way. **Slot 9 is `strategy-pm15` since PM15-5 (2026-10-17)** —
-/// additive (`"reserved"` → `"pm15"`). **Slot 11 is `strategy-pmj` since
-/// PMJ J4 (2026-10-18)** — additive (`"reserved"` → `"pmj"`); 8, 10 and
-/// 12–15 stay reserved. This is a copy of the `strategy-set` member table's names
+/// same way — **slot 8 is `"pine"` since PVM impl-08 T4** (2026-10-16; the
+/// Pine member, paper only), **slot 9 is `strategy-pm15` since PM15-5
+/// (2026-10-17)** and **slot 11 is `strategy-pmj` since PMJ J4 (2026-10-18)** —
+/// each additive (`"reserved"` → a name); 10 and 12–15 stay
+/// reserved. This is a copy of the `strategy-set` member table's names
 /// (the snapshot crate does not link the members): the cli's
 /// `exec_boot` snapshot-parity test is the guard against drift.
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
@@ -96,7 +97,7 @@ pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
     "vm",
     "xmm",
     "hcv",
-    RESERVED_SLOT_NAME,
+    "pine",
     "pm15",
     RESERVED_SLOT_NAME,
     "pmj",
@@ -381,6 +382,16 @@ pub struct XmmSnapshot {
 pub struct HcvSnapshot {
     /// The member's counters and gauges.
     pub counters: HcvCounters,
+}
+
+/// PVM impl-08 T17: the slot-8 member (Pine, PAPER ONLY): its aggregate counters at one
+/// publish instant. The per-script rows (`PineScriptView`, 8 × 128 B) do not fit the 32 KB
+/// budget this file pins; they stay on `/metrics` and the boot tell until a budget ruling.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct PineSnapshot {
+    /// The member's counters (all zero when slot 8 is not configured).
+    pub counters: PineCounters,
 }
 
 /// P6: the VRP member (slot 1).
@@ -705,7 +716,8 @@ pub fn deadman_availability_word(v: u8) -> &'static str {
 /// **BX11 — the Binance arm's local refusal reasons, spelled**, index =
 /// `exec_binance::arm::Refusal` (its `REFUSAL_WORDS`). A copy for the
 /// reason [`HALT_REASON_WORDS`] is one; `cli` pins the two together.
-pub const BN_REFUSAL_WORDS: [&str; 21] = [
+/// PVM PB2: + `off_grid` (additive).
+pub const BN_REFUSAL_WORDS: [&str; 22] = [
     "unbound",
     "not_live",
     "not_owner",
@@ -727,6 +739,7 @@ pub const BN_REFUSAL_WORDS: [&str; 21] = [
     "deadman_down",
     "flags",
     "not_writable",
+    "off_grid",
 ];
 
 /// BX11: the Binance account mode (`exec_binance::mode::AccountMode`, its
@@ -1032,7 +1045,7 @@ pub struct BinanceGwSnapshot {
     /// See [`Self::account_mode`].
     pub demo: u8,
     /// Local refusals by reason ([`BN_REFUSAL_WORDS`]).
-    pub refused: [u32; 21],
+    pub refused: [u32; 22],
     /// The gateway's halt word (0 = running).
     pub halt_reason: u64,
     /// Orders pushed and not terminal / in doubt now / ever put in doubt.
@@ -1122,7 +1135,8 @@ pub struct BinanceGwSnapshot {
     pub margin_options_1e6: i64,
 }
 
-const _: () = assert!(core::mem::size_of::<BinanceGwSnapshot>() == 424);
+// PVM PB2: + the `off_grid` refusal (4 B, padded to the next 8).
+const _: () = assert!(core::mem::size_of::<BinanceGwSnapshot>() == 432);
 
 /// The whole snapshot — see the module docs and plan §6.1.
 #[derive(Copy, Clone)]
@@ -1164,6 +1178,8 @@ pub struct EngineSnapshot {
     pub xmm: XmmSnapshot,
     /// HC11: the slot-7 member.
     pub hcv: HcvSnapshot,
+    /// PVM impl-08 T17: the slot-8 member.
+    pub pine: PineSnapshot,
     /// The VRP member.
     pub vrp: VrpSnapshot,
     /// HYPARB H6: the slot-0 member.
@@ -1211,6 +1227,7 @@ impl EngineSnapshot {
             vm: VmSnapshot::empty(),
             xmm: XmmSnapshot::default(),
             hcv: HcvSnapshot::default(),
+            pine: PineSnapshot::default(),
             vrp: VrpSnapshot::default(),
             hyparb: HyparbSnapshot::default(),
             har: HarSnapshot::default(),
@@ -1274,11 +1291,15 @@ mod tests {
         // same alignment: still 31,872 B. S16-5's schema 3 widens the
         // per-slot arrays 8 → 16: `slots` +192 B (three 64 B lines);
         // `exec.halted`'s +8 B fit the 64 B alignment. 32,064 B, 704 B
-        // left. O-WSG1's hold (`exec.held` 16 B and two counters) crosses
-        // one alignment: 32,128 B, 640 B left.
+        // left. PVM impl-08 T17's `pine` section (`PineCounters`, 336 B) makes it 32,384 B
+        // (it fit the previous alignment slack): 384 B left. PVM PB2's
+        // `off_grid` refusal (+8 B in `BinanceGwSnapshot`, 432 B) crosses a
+        // 64 B line: 32,448 B, 320 B left.
+        // Merged with main's O-WSG1 hold (`exec.held` 16 B and two counters) in the r40
+        // merge (2026-10-29): they fit the same 64 B alignment — still 32,448 B, 320 B left.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
-        assert_eq!(n, 32_128, "the O-WSG1 figure: a change states its own");
+        assert_eq!(n, 32_448, "the r40 merge figure (PB2 + O-WSG1): a change states its own");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);
         assert_eq!(core::mem::size_of::<HarSnapshot>(), 2_216);
     }

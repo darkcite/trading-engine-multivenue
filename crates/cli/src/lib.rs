@@ -57,6 +57,8 @@ pub mod evm_live;
 pub mod evm_shadow;
 pub mod evm_testnet;
 pub mod exec_boot;
+/// impl-07 T1b: the one `--fee-bps` parser (backtest, `pine`, lane B'3).
+pub mod fee_flags;
 /// HAR H3.4: `har.toml` + the seeds + the engine's own state → the long-tenor set.
 pub mod har_boot;
 /// HAR H3.7: the long-tenor state files, rendered and written off the engine thread.
@@ -64,6 +66,9 @@ pub mod har_writer;
 /// BIN15 H90 L4: the late window's live dust test (`hl-outcome-probe`) —
 /// MAINNET, the operator's to run (ruling O-H90-3).
 pub mod hl_outcome_probe;
+/// B'4 T27: `exec-smoke --perp-probe` — the Hyperliquid perp limits probe
+/// (TESTNET; writes `hl-perp-limits.tsv`, which the perp boot requires).
+pub mod hl_perp_probe;
 /// PMJ J4: `pmj.toml` → slot 11's member (paper).
 pub mod pmj_boot;
 pub mod pmj_dust;
@@ -90,10 +95,31 @@ pub mod paper;
 /// HC11b: a member's persisted state, rendered and written off the engine
 /// thread (the long-tenor series' and slot 7's book).
 pub mod persist;
+/// impl-07 T11+: `multivenue-engine pine <SUBVERB>` — the tier-1 Pine screener's operator verbs.
+pub mod pine;
+/// PVM impl-08: the slot-8 (Pine member) boot seam — today the F19 refusal of a requested,
+/// unconfigurable slot 8.
+pub mod pine_boot;
+/// Binance plan PB1 / PB5 / PB9: Pine on Binance USDⓈ-M — live facts from the arm's bound row,
+/// the D19 snapshot, the boot rules (dark: nothing arms).
+pub mod pine_bn;
+/// B'4 T26: the Hyperliquid perp boot state — the router's perp seed (D19) and PL3's rows (dark:
+/// nothing arms).
+pub mod pine_hl;
+/// PVM impl-08 T17: slot 8's `engine_pine_*` family (5 s mirror) and the incident drain / log line.
+pub mod pine_metrics;
+/// PVM impl-08 T18: the `--pine-tape` writer (`seq.bin`, `decisions.bin`, `set.tsv`).
+pub mod pine_tape;
+/// PVM impl-08 (R5/R6): slot 8's loop hook — the boot record and the delivery journal.
+pub mod pine_delivery;
+/// PVM impl-08 T21: `pine-verify`, the 8g-A determinism gate (`VerifyCtx`, eligibility, pooling).
+pub mod pine_verify;
 pub mod pinning;
 pub mod regime_boot;
 pub mod sigint;
 pub mod state_file;
+/// PVM B'1 (impl-Bp §3.5): the pine slot's per-lane Trade route, resolved at boot.
+pub mod trade_route;
 pub mod universe_boot;
 /// VRP V5: the VRP member's boot artifacts (`vrp.toml` + `vrp-seed.tsv`).
 pub mod vrp_boot;
@@ -112,22 +138,22 @@ pub mod xmm_preflight;
 pub mod hcv_boot;
 
 pub use paper::{
-    bn_coinm_specs, bn_options_path, bn_usdm_specs, boot_discovery, boot_info, build_ai_universe,
-    build_deribit_symbol_table, build_hl_coin_table, build_hl_families, build_okx_symbol_table,
-    engine_loop_ev_full, engine_loop_ev_paper, engine_loop_rule_tree_full, engine_loop_set_full,
-    extend_deribit_table_with_combos, extend_deribit_table_with_options,
-    extend_okx_table_with_options, hyperevm_pool_table, join_reverse, log_hl_families,
-    new_capture_run_dir, open_events_capture, open_fills_capture, open_latency_capture,
-    open_orders_capture,
+    bn_book_driver, bn_coinm_specs, bn_options_path, bn_usdm_route_slot, bn_usdm_specs,
+    boot_discovery, boot_info, build_ai_universe, build_deribit_symbol_table, build_hl_coin_table,
+    build_hl_families, build_okx_symbol_table, engine_loop_ev_full, engine_loop_ev_paper,
+    engine_loop_rule_tree_full, engine_loop_set_full, extend_deribit_table_with_combos,
+    extend_deribit_table_with_options, extend_okx_table_with_options, funding_lane_mask,
+    hl_lane_mask, hyperevm_pool_table, join_reverse, log_hl_families, new_capture_run_dir,
+    open_events_capture, open_fills_capture, open_latency_capture, open_orders_capture,
     parse_ai_hmac_key, parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai,
     spawn_binance, spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall,
-    spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_pm15, spawn_pm5, spawn_polymarket,
-    spawn_rpc,
+    spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_pm15, spawn_pm5,
+    spawn_polymarket, spawn_rpc,
     split_host_port, state_writer, AiIngressCounterIds, AiIngressStatus, BinanceConnSpec,
     BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters,
     EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds, HypercallSpec, IngressCounterIds,
-    IngressStatusSet, LatencyDump, Pm15MetricIds, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
-    RawTapConfig, Rings, RunDirGuard, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
+    IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
+    Pm15MetricIds, RawTapConfig, Rings, RunDirGuard, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};
 pub use sigint::{install_sigint_handler, shutdown_requested, SHUTDOWN};

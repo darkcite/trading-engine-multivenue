@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// Bollinger breakout. OUR CODE, typed from the public rule: Bollinger bands (20, 2.0) — long on a
+// close above the upper band, flat on a close back below the basis.
+strategy("PVM7 Bollinger breakout", overlay = true, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0)
+
+len  = input.int(20, "Length", minval = 2, maxval = 500)
+mult = input.float(2.0, "Multiple", minval = 0.5, maxval = 5.0, step = 0.1)
+
+[basis, upperB, lowerB] = ta.bb(close, len, mult)
+breakUp  = ta.crossover(close, upperB)
+backDown = ta.crossunder(close, basis)
+
+if breakUp
+    strategy.entry("L", strategy.long)
+if backDown
+    strategy.close("L")
+
+pU = plot(upperB, "Upper")
+pL = plot(lowerB, "Lower")
+plot(basis, "Basis")
+fill(pU, pL, color = color.new(color.blue, 90))

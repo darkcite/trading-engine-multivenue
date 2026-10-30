@@ -1,0 +1,25 @@
+[package]
+name                   = "pine-corpus"
+version                = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description = "PVM-9 offline corpus tool: manual intake, parse, fork-dedup, built-in histograms and top-N over a hand-curated Pine corpus read at run time. Nothing in the workspace depends on it."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "pine-corpus"
+path = "src/bin/pine-corpus.rs"
+
+[dependencies]
+pine-ir     = { path = "../pine-ir" }
+pine-lang   = { path = "../pine-lang" }
+pine-spec   = { path = "../pine-spec" }
+core-crypto = { path = "../core-crypto" }     # CAR-09-1
+
+[dev-dependencies]
+proptest = { workspace = true }

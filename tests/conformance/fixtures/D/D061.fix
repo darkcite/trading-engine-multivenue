@@ -1,0 +1,21 @@
+fix	2
+id	D061
+group	D
+title	a currency-converted request
+script	tests/conformance/fixtures/D/D061.pine
+script_sha256	2f28d2e4291a078d09dfdf46cb594b9d77829cc480b889342424825b4939ab47
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	declined
+tier	2
+plot	f_D061_isna	exact
+plot	f_D061_val	exact
+refuse	3053

@@ -1,0 +1,7 @@
+//@version=5
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// OUR CODE — not harvested
+indicator("Scale")
+x = close * 1.0
+plot(x)

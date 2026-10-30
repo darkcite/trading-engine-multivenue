@@ -1,0 +1,86 @@
+fix	2
+id	C002
+group	C
+title	plain inside if_block
+script	tests/conformance/fixtures/C/C002.pine
+script_sha256	59155f36d12312ea9ca67a93498e9aeb4cc4edadca76763311460201a635faf5
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T04:40Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	24484
+window	head	64
+oracle	tv
+tier	1
+plot	f_C002_isna	exact
+plot	f_C002_val	exact
+series
+0	0	1
+1	1	na
+2	1	na
+3	0	1
+4	0	1
+5	1	na
+6	0	1
+7	0	1
+8	0	1
+9	0	1
+10	1	na
+11	1	na
+12	1	na
+13	1	na
+14	0	1
+15	0	1
+16	1	na
+17	0	1
+18	0	1
+19	0	1
+20	1	na
+21	1	na
+22	0	1
+23	1	na
+24	0	1
+25	0	1
+26	1	na
+27	1	na
+28	0	1
+29	1	na
+30	1	na
+31	0	1
+32	0	1
+33	1	na
+34	0	1
+35	0	1
+36	0	1
+37	1	na
+38	0	1
+39	0	1
+40	0	1
+41	0	1
+42	1	na
+43	1	na
+44	1	na
+45	0	1
+46	1	na
+47	1	na
+48	1	na
+49	1	na
+50	1	na
+51	1	na
+52	0	1
+53	0	1
+54	0	1
+55	1	na
+56	1	na
+57	1	na
+58	0	1
+59	0	1
+60	0	1
+61	0	1
+62	0	1
+63	1	na
+end

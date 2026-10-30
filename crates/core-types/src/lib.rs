@@ -2625,6 +2625,43 @@ pub const EVENT_LANE_FUNDING: u16 = event_lane_bit(ChannelId::Funding);
 /// engine treats HL AssetCtx events as funding samples.
 pub const EVENT_LANE_ASSET_CTX: u16 = event_lane_bit(ChannelId::AssetCtx);
 
+/// B'1 (PVM lane B', 00-INDEX §3.15.2): the Trade lane bit. An ingress
+/// sets it on its spawn-time `event_mask` only when it hosts a symbol
+/// the pine slot routes; `strategy-set` forwards Trade to the pine slot
+/// and to no other member. An engine-wide Trade lane would change slot
+/// 5's input: strategy-vm learns its wall offset from every event it
+/// sees. pin:Bp-slot-pine — the spec's "slot 7" is `SLOT_PINE` (8).
+pub const EVENT_LANE_TRADE: u16 = event_lane_bit(ChannelId::Trade);
+
+/// B'1: event-ring slots a Trade print may never occupy. A print that
+/// finds the ring at `EVENT_RING_SIZE - EVENT_TRADE_RESERVE` or fuller
+/// is shed and counted, never queued, so a Trade burst cannot cost a
+/// Funding / AssetCtx / Mark / InstrumentRoll push.
+pub const EVENT_TRADE_RESERVE: usize = EVENT_RING_SIZE / 4;
+
+/// B'1: the most symbols one ingress routes to the pine slot
+/// (strategy-pine hosts at most eight).
+pub const TRADE_ROUTE_MAX: usize = 16;
+
+const _: () = assert!(EVENT_TRADE_RESERVE > 0 && EVENT_TRADE_RESERVE < EVENT_RING_SIZE);
+
+/// B'1: whether `sym` is on an ingress's spawn-time Trade route. Index
+/// loop over at most [`TRADE_ROUTE_MAX`] entries; the empty route
+/// routes nothing.
+#[inline(always)]
+pub fn trade_routed(route: &[SymbolId], sym: SymbolId) -> bool {
+    debug_assert!(route.len() <= TRADE_ROUTE_MAX);
+    let mut i = 0;
+    while i < route.len() {
+        // SAFETY: `i < route.len()` is the loop condition.
+        if unsafe { *route.get_unchecked(i) } == sym {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Capacity of every OptSummary SPSC lane (VM2 V2 — the kind-6
 /// channel enters the engine for the first time; capture-only
 /// before). OKX `opt-summary` pushes whole-family bursts (the capped
@@ -2659,9 +2696,11 @@ pub const STRATEGY_SLOT_NONE: u8 = 0xFF;
 /// `AiCmd::strategy_id`, …) was always a full `u8` on every wire and in
 /// every capture, so the change moved no format.
 ///
-/// Slots 0–7 are the built members (hyparb, vrp, xsd, bin15, ai-exec,
-/// vm, xmm, hcv); 8–15 are RESERVED (S16-R5): no member stands there,
-/// `strategy_set::BUILT_MASK` (`0x00FF`) never sets their bits, and an
+/// Slots 0–8 are the built members (hyparb, vrp, xsd, bin15, ai-exec,
+/// vm, xmm, hcv, and pine since PVM impl-08, 2026-10-16 — PAPER ONLY by
+/// ruling, outside `all`: `strategy_set::ALL_MASK` is `0x00FF`,
+/// `strategy_set::BUILT_MASK` `0x01FF`); 9–15 are RESERVED (S16-R5): no
+/// member stands there, `BUILT_MASK` never sets their bits, and an
 /// enable, a command or a live arm naming one is refused. `/state`
 /// carries all sixteen since its schema 3 (S16-5), the reserved ones
 /// named `reserved`.
@@ -2675,8 +2714,9 @@ pub const MAX_STRATEGY_SLOTS: u8 = 16;
 /// false`, where a `u8` shift by a slot ≥ 8 silently lands on slot
 /// `s & 7` (slot 11 → slot 3, BIN15) — debug builds panic on it instead,
 /// which is why every mask path has tests at slots 8, 11 and 15.
-/// Bits 8–15 name the reserved slots (see [`MAX_STRATEGY_SLOTS`]): a
-/// set built from members alone never has them.
+/// Bits 9–15 name the reserved slots (see [`MAX_STRATEGY_SLOTS`]; bit 8
+/// is pine's since PVM impl-08): a set built from members alone never
+/// has them.
 pub type SlotMask = u16;
 
 const _: () = assert!(
@@ -4713,6 +4753,31 @@ mod tests {
             (p.ts_ns, p.sym, p.side, p.kind, p.px, p.qty, p.client_oid, p.ttl_ns),
             (o.ts_ns, o.sym, o.side, o.kind, o.px, o.qty, o.client_oid, o.ttl_ns)
         );
+    }
+
+    #[test]
+    fn trade_routed_empty_route_routes_nothing() {
+        assert!(!trade_routed(&[], 0));
+        assert!(!trade_routed(&[], SYMBOL_ID_NONE));
+    }
+
+    #[test]
+    fn trade_routed_finds_members_only() {
+        let route: [SymbolId; 3] = [3, 9, 40];
+        assert!(trade_routed(&route, 3));
+        assert!(trade_routed(&route, 9));
+        assert!(trade_routed(&route, 40));
+        assert!(!trade_routed(&route, 4));
+        assert!(!trade_routed(&route, SYMBOL_ID_NONE));
+    }
+
+    #[test]
+    fn event_trade_reserve_leaves_room_for_every_non_trade_channel() {
+        let reserve = EVENT_TRADE_RESERVE;
+        assert!(reserve > 0 && reserve < EVENT_RING_SIZE);
+        assert!(reserve >= 128);
+        assert_eq!(EVENT_LANE_TRADE & EVENT_LANE_FUNDING, 0);
+        assert_eq!(EVENT_LANE_TRADE & EVENT_LANE_ASSET_CTX, 0);
     }
 
     #[test]

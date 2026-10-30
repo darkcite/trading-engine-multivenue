@@ -452,6 +452,13 @@ pub struct ExecFile {
     /// **BX6** — `[exec.binance]`, the Binance arm's account and venue
     /// knobs (plan §3.12). Required when a live slot names binance.
     pub binance: Option<ExecBinance>,
+    /// **PVM impl-08 T2** — `[exec.slot.8.pine]`, the Pine member's slot-level
+    /// knobs (impl-08 §4.8, re-baselined to slot 8). `None` = the section is
+    /// absent: the artifact parses exactly as before the section existed (I42).
+    pub pine8: Option<crate::pine::PineSlotCfg>,
+    /// **B'4** — `[exec.hl_perp]`, when present. `None` = absent: the
+    /// artifact parses exactly as before the section existed.
+    pub hl_perp: Option<ExecHlPerp>,
 }
 
 impl ExecFile {
@@ -812,6 +819,63 @@ fn finish_binance(kv: &Kv, line: usize) -> Result<ExecBinance, ExecError> {
     })
 }
 
+/// **B'4 — `[exec.hl_perp]`** (impl-Bp §3.12): Hyperliquid native perps.
+/// Every key is required when the section is present (a live slot that
+/// routes a Hyperliquid perp cannot boot without it — `cli::exec_boot`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecHlPerp {
+    /// Must be 1: isolated margin per coin (REVIEW §5).
+    pub isolated: bool,
+    /// `1..=meta maxLeverage`, set once per coin at boot (the `meta`
+    /// bound is judged at boot; here `1..=u16::MAX`).
+    pub leverage: u16,
+    /// The probe artifact (§4.13), as written (`~` expanded by the cli);
+    /// a coin absent from it cannot arm.
+    pub limits: String,
+    /// The section's line.
+    pub line: usize,
+}
+
+/// Keys `[exec.hl_perp]` accepts — all required.
+const HL_PERP_KEYS: [&str; 3] = ["isolated", "leverage", "limits"];
+
+/// Finish `[exec.hl_perp]`.
+fn finish_hl_perp(kv: &Kv, line: usize) -> Result<ExecHlPerp, ExecError> {
+    let need = |key: &str| {
+        err(format!(
+            "[exec.hl_perp] at line {line}: `{key}` is required (every key of the section is)"
+        ))
+    };
+    let (iso, iso_ln) = take_int(kv, "isolated")?.ok_or_else(|| need("isolated"))?;
+    if iso != 1 {
+        return Err(err(format!(
+            "[exec.hl_perp] line {iso_ln}: `isolated = {iso}` — must be 1 (isolated margin per coin)"
+        )));
+    }
+    let (lev, lev_ln) = take_int(kv, "leverage")?.ok_or_else(|| need("leverage"))?;
+    if lev < 1 || lev > i64::from(u16::MAX) {
+        return Err(err(format!(
+            "[exec.hl_perp] line {lev_ln}: `leverage = {lev}` must be 1..={}",
+            u16::MAX
+        )));
+    }
+    let limits = match kv.iter().find(|(k, _, _)| k == "limits") {
+        Some((_, Value::Str(s), _)) if !s.trim().is_empty() => s.clone(),
+        Some((_, _, ln)) => {
+            return Err(err(format!(
+                "[exec.hl_perp] line {ln}: `limits` must be a non-empty path string"
+            )))
+        }
+        None => return Err(need("limits")),
+    };
+    Ok(ExecHlPerp {
+        isolated: true,
+        leverage: lev as u16,
+        limits,
+        line,
+    })
+}
+
 /// Section the parser is currently inside.
 #[derive(Clone, PartialEq, Eq)]
 enum Sec {
@@ -819,6 +883,24 @@ enum Sec {
     Policy(usize),
     Slot(usize, usize),
     Binance(usize),
+    /// PVM impl-08 T2: `[exec.slot.8.pine]` at this line.
+    Pine8(usize),
+    /// B'4: `[exec.hl_perp]` at this line.
+    HlPerp(usize),
+}
+
+/// PVM impl-08 T2: a `core_config::pine` refusal as an `ExecError` whose
+/// message starts with the code, names the section, the line and the key
+/// (impl-08 §3.3: `6005 [exec.slot.8.pine] line 212: missing key …`).
+fn pine_err(e: &crate::pine::PineCfgError) -> ExecError {
+    err(format!(
+        "{} [{}] line {}: {} {}",
+        e.code,
+        crate::pine::PINE_SECTION,
+        e.line,
+        e.why,
+        e.key
+    ))
 }
 
 type Kv = Vec<(String, Value, usize)>;
@@ -950,6 +1032,19 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         line,
     };
     let names = |venue: &str| venue_id_from_name(venue).is_some_and(|id| s.venues.contains(&id));
+
+    // PVM impl-08 T2 (operator ruling 2026-10-16, pin:08-slot8-paper-only):
+    // slot 8 holds the Pine member — third-party scripts — and is PAPER ONLY.
+    // A live slot 8 is refused HERE, at parse, before any other live rule is
+    // judged (I42), whatever its name, venues or `[exec.slot.8.pine]`
+    // section say; `cli::exec_boot` refuses `--arm-live 8` on its own too.
+    if s.is_live() && slot == crate::pine::PINE_SLOT {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `mode = \"live\"` is refused — slot {slot} is the Pine \
+             member, PAPER ONLY by ruling (2026-10-16). Arming it is its own live-arming \
+             ruling; use \"paper\" or \"off\"."
+        )));
+    }
 
     // A live slot with no venue can never dispatch anything — it would
     // refuse every order it emitted with `NoLiveRoute` and look like a
@@ -1219,13 +1314,20 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
     let mut policy: Option<Kv> = None;
     let mut slots: Vec<ExecSlot> = Vec::new();
     let mut binance: Option<ExecBinance> = None;
+    let mut pine8: Option<crate::pine::PineSlotCfg> = None;
+    let mut pine8_seen = false;
+    let mut hl_perp: Option<ExecHlPerp> = None;
+    let mut hl_perp_seen = false;
 
+    #[allow(clippy::too_many_arguments)]
     fn close(
         sec: &Sec,
         cur: &mut Kv,
         policy: &mut Option<Kv>,
         slots: &mut Vec<ExecSlot>,
         binance: &mut Option<ExecBinance>,
+        pine8: &mut Option<crate::pine::PineSlotCfg>,
+        hl_perp: &mut Option<ExecHlPerp>,
     ) -> Result<(), ExecError> {
         let kv = std::mem::take(cur);
         match sec {
@@ -1233,6 +1335,10 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
             Sec::Policy(_) => *policy = Some(kv),
             Sec::Slot(n, ln) => slots.push(finish_slot(&kv, *n, *ln)?),
             Sec::Binance(ln) => *binance = Some(finish_binance(&kv, *ln)?),
+            Sec::Pine8(_) => {
+                *pine8 = Some(crate::pine::parse_slot8(&kv).map_err(|e| pine_err(&e))?);
+            }
+            Sec::HlPerp(ln) => *hl_perp = Some(finish_hl_perp(&kv, *ln)?),
         }
         Ok(())
     }
@@ -1248,8 +1354,46 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
                 .strip_suffix(']')
                 .ok_or_else(|| err(format!("line {ln}: unterminated section header")))?
                 .trim();
-            close(&sec, &mut cur, &mut policy, &mut slots, &mut binance)?;
+            close(
+                &sec,
+                &mut cur,
+                &mut policy,
+                &mut slots,
+                &mut binance,
+                &mut pine8,
+                &mut hl_perp,
+            )?;
             sec = match name {
+                // B'4: `[exec.hl_perp]`, at most once.
+                "exec.hl_perp" if hl_perp_seen => {
+                    return Err(err(format!("line {ln}: duplicate section [exec.hl_perp]")))
+                }
+                "exec.hl_perp" => {
+                    hl_perp_seen = true;
+                    Sec::HlPerp(ln)
+                }
+                // PVM impl-08 T2 (§4.8): recognised ONLY as `[exec.slot.8.pine]`,
+                // anywhere after `[exec]`, at most once. Any other
+                // `[exec.slot.<n>.pine]` falls to the slot arm below and is
+                // refused there (not an integer slot).
+                crate::pine::PINE_SECTION if pine8_seen => {
+                    return Err(err(format!(
+                        "{} [{}] line {ln}: duplicate section",
+                        crate::pine::CODE_OUT_OF_RANGE,
+                        crate::pine::PINE_SECTION
+                    )))
+                }
+                crate::pine::PINE_SECTION if policy.is_none() => {
+                    return Err(err(format!(
+                        "{} [{}] line {ln}: the section must come after [exec]",
+                        crate::pine::CODE_UNKNOWN_KEY,
+                        crate::pine::PINE_SECTION
+                    )))
+                }
+                crate::pine::PINE_SECTION => {
+                    pine8_seen = true;
+                    Sec::Pine8(ln)
+                }
                 "exec" if policy.is_none() => Sec::Policy(ln),
                 "exec" => return Err(err(format!("line {ln}: duplicate section [exec]"))),
                 "exec.binance" if binance.is_none() => Sec::Binance(ln),
@@ -1292,21 +1436,54 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
             Sec::Policy(_) => &EXEC_KEYS,
             Sec::Slot(_, _) => &SLOT_KEYS,
             Sec::Binance(_) => &BINANCE_KEYS,
+            Sec::Pine8(_) => &crate::pine::SLOT_KEYS,
+            Sec::HlPerp(_) => &HL_PERP_KEYS,
         };
+        let pine = matches!(sec, Sec::Pine8(_));
         // Law 1: an optional key must still be a KNOWN key.
         if !known.contains(&key) {
+            if pine {
+                return Err(err(format!(
+                    "{} [{}] line {ln}: unknown key {key}",
+                    crate::pine::CODE_UNKNOWN_KEY,
+                    crate::pine::PINE_SECTION
+                )));
+            }
             return Err(err(format!("line {ln}: unknown key `{key}`")));
         }
         if cur.iter().any(|(k, _, _)| k == key) {
+            if pine {
+                return Err(err(format!(
+                    "{} [{}] line {ln}: duplicate key {key}",
+                    crate::pine::CODE_OUT_OF_RANGE,
+                    crate::pine::PINE_SECTION
+                )));
+            }
             return Err(err(format!("line {ln}: duplicate key `{key}`")));
         }
-        cur.push((
-            key.to_owned(),
-            parse_value(val, ln).map_err(|e| err(e.0))?,
-            ln,
-        ));
+        let value = match parse_value(val, ln) {
+            Ok(v) => v,
+            Err(e) if pine => {
+                return Err(err(format!(
+                    "{} [{}] line {ln}: malformed value {key} ({})",
+                    crate::pine::CODE_OUT_OF_RANGE,
+                    crate::pine::PINE_SECTION,
+                    e.0
+                )))
+            }
+            Err(e) => return Err(err(e.0)),
+        };
+        cur.push((key.to_owned(), value, ln));
     }
-    close(&sec, &mut cur, &mut policy, &mut slots, &mut binance)?;
+    close(
+        &sec,
+        &mut cur,
+        &mut policy,
+        &mut slots,
+        &mut binance,
+        &mut pine8,
+        &mut hl_perp,
+    )?;
 
     let policy = policy.ok_or_else(|| err("missing `[exec]` section"))?;
     // BX6: a live slot on binance reads the arm's account knobs; without
@@ -1332,6 +1509,8 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
         enabled: enabled_i == 1,
         slots,
         binance,
+        pine8,
+        hl_perp,
     })
 }
 
@@ -1382,6 +1561,58 @@ mode = "paper"
             e.0.contains(needle),
             "error `{}` did not contain `{needle}`",
             e.0
+        );
+    }
+
+    /// B'4 — `[exec.hl_perp]`: every key required, `isolated = 1`,
+    /// leverage ≥ 1, unknown keys and a second section refused; absent
+    /// leaves the artifact as it was.
+    #[test]
+    fn hl_perp_section_requires_every_key_and_isolated_one() {
+        const OK: &str = "[exec]\n[exec.hl_perp]\nisolated = 1\nleverage = 3\nlimits = \"~/multivenue/hl-perp-limits.tsv\"\n";
+        let f = parse(OK).expect("ok");
+        let p = f.hl_perp.expect("section");
+        assert!(p.isolated);
+        assert_eq!(p.leverage, 3);
+        assert_eq!(p.limits, "~/multivenue/hl-perp-limits.tsv");
+        assert_eq!(p.line, 2);
+        assert_eq!(parse("[exec]\n").expect("bare").hl_perp, None);
+
+        expect_err(
+            "[exec]\n[exec.hl_perp]\nleverage = 3\nlimits = \"x\"\n",
+            "`isolated` is required",
+        );
+        expect_err(
+            "[exec]\n[exec.hl_perp]\nisolated = 1\nlimits = \"x\"\n",
+            "`leverage` is required",
+        );
+        expect_err(
+            "[exec]\n[exec.hl_perp]\nisolated = 1\nleverage = 3\n",
+            "`limits` is required",
+        );
+        expect_err(
+            "[exec]\n[exec.hl_perp]\nisolated = 0\nleverage = 3\nlimits = \"x\"\n",
+            "must be 1",
+        );
+        expect_err(
+            "[exec]\n[exec.hl_perp]\nisolated = 1\nleverage = 0\nlimits = \"x\"\n",
+            "`leverage = 0` must be 1..=",
+        );
+        expect_err(
+            "[exec]\n[exec.hl_perp]\nisolated = 1\nleverage = 70000\nlimits = \"x\"\n",
+            "must be 1..=",
+        );
+        expect_err(
+            "[exec]\n[exec.hl_perp]\nisolated = 1\nleverage = 3\nlimits = \"\"\n",
+            "non-empty path",
+        );
+        expect_err(
+            "[exec]\n[exec.hl_perp]\nisolated = 1\nleverage = 3\nlimits = \"x\"\ncross = 1\n",
+            "unknown key `cross`",
+        );
+        expect_err(
+            "[exec]\n[exec.hl_perp]\nisolated = 1\nleverage = 3\nlimits = \"x\"\n[exec.hl_perp]\n",
+            "duplicate section [exec.hl_perp]",
         );
     }
 

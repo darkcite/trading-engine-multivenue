@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "captured_utc": "2026-10-15",
+  "sources": {"v5": "v5", "v6": "v6", "migration": "mg"},
+  "namespaces": [],
+  "switches": [],
+  "deltas": [{"id": "W1", "what": "x", "mech": "switch", "switch": "nope", "subjects": [], "source": "", "pin": ""}],
+  "entries": []
+}

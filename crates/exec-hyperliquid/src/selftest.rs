@@ -286,6 +286,15 @@ fn check_encoders() -> Result<u32, SelfTestErr> {
     let n = crate::action::encode_update_leverage(&mut buf, 1, true, 3)
         .map_err(|_| SelfTestErr::Encode("updateLeverage"))?;
     want("update_leverage_cross", &buf[..n], "updateLeverage")?;
+    // B'4 (impl-Bp §4.13): the perp boot's own shape — isolated, set once
+    // per coin. The E3 gate's `--offline` form gains this vector.
+    let n = crate::action::encode_update_leverage(&mut buf, 0, false, 10)
+        .map_err(|_| SelfTestErr::Encode("updateLeverage (isolated)"))?;
+    want(
+        "update_leverage_isolated",
+        &buf[..n],
+        "updateLeverage (isolated)",
+    )?;
 
     let n = crate::action::encode_schedule_cancel(&mut buf, Some(1_789_000_005_000))
         .map_err(|_| SelfTestErr::Encode("scheduleCancel"))?;
@@ -307,7 +316,7 @@ fn check_encoders() -> Result<u32, SelfTestErr> {
     .map_err(|_| SelfTestErr::Encode("order (priority)"))?;
     want("order_alo_priority", &buf[..n], "order (priority)")?;
 
-    Ok(9)
+    Ok(10)
 }
 
 /// The cloid `gen_vectors.py` used for the cloid-bearing cases.
@@ -381,7 +390,7 @@ mod tests {
         let r = run().expect("the embedded vectors must reproduce");
         assert_eq!(r.rows, VECTOR_ROWS, "{r:?}");
         assert_eq!(
-            r.encoders, 9,
+            r.encoders, 10,
             "one case per action type and the priority grouping, no fewer"
         );
     }

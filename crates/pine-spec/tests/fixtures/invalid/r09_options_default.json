@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "captured_utc": "2026-10-15",
+  "sources": {"v5": "v5", "v6": "v6", "migration": "mg"},
+  "namespaces": ["input"],
+  "switches": [],
+  "deltas": [],
+  "entries": [
+    {"ns": "input", "name": "int", "tier": 1, "scope": "in", "decline": "", "type_name": false, "doc": "", "values": [], "overloads": [{"id": "INPUT_INT", "versions": [5, 6], "params": [{"name": "options", "ty": "int", "qual": "const", "flags": ["optional"], "default": {"k": "na"}, "options": true}], "ret": ["int"], "ret_qual": "input", "abi": "folded", "bf": [], "state": {"k": "none"}, "warmup": {"k": "none"}, "na": "custom", "sx": [], "plot": null, "input": "int"}]}
+  ]
+}

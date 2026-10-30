@@ -1,0 +1,34 @@
+fix	2
+id	F109
+group	F
+title	array.sort and sort_indices by a UDT field
+script	tests/conformance/fixtures/F/F109.pine
+script_sha256	0da67c69a0b0aeaa7e9419e9bb8fafdd3a87c23531c789227a569e792e762bc6
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	5
+twin	F108
+mode	bar_close
+bars	pending
+window	head	16
+oracle	authored
+tier	3
+plot	f_F109_id0_na	exact
+plot	f_F109_id0	exact
+plot	f_F109_id1_na	exact
+plot	f_F109_id1	exact
+plot	f_F109_id2_na	exact
+plot	f_F109_id2	exact
+plot	f_F109_id3_na	exact
+plot	f_F109_id3	exact
+plot	f_F109_ix0_na	exact
+plot	f_F109_ix0	exact
+plot	f_F109_ix3_na	exact
+plot	f_F109_ix3	exact
+plot	f_F109_wid0_na	exact
+plot	f_F109_wid0	exact
+refuse	3005

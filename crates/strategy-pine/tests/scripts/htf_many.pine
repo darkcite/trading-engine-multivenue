@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: eight request.security sub-programs on eight higher timeframes (the 6011 row probe).
+strategy("htf many (strategy-pine T6)", overlay = true)
+a = request.security(syminfo.tickerid, "3", close)
+b = request.security(syminfo.tickerid, "5", close)
+c = request.security(syminfo.tickerid, "15", close)
+d = request.security(syminfo.tickerid, "30", close)
+e = request.security(syminfo.tickerid, "60", close)
+f = request.security(syminfo.tickerid, "120", close)
+g = request.security(syminfo.tickerid, "240", close)
+h = request.security(syminfo.tickerid, "360", close)
+s = a + b + c + d + e + f + g + h
+plot(s)
+if close > s / 8
+    strategy.entry("L", strategy.long)

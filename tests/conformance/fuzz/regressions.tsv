@@ -1,0 +1,9 @@
+# fix-fuzz 1 · D12 regressions (impl-06 §4.8.5): grammar TAB seed TAB id TAB bucket; id `-` = an engine-panic finding with no fixture yet (pin:06-regressions-panic-rows)
+# 2026-10-17 r21: seeds 4 (ta.highestbars int output) and 692 (ta.cmo inf−inf pair) FIXED in pine-std; their classes left KNOWN_PANICS, so both rows must now run clean
+# 2026-10-17 r22: GRAMMAR_VERSION 2 (bare input with a constant defval admitted); each row replays under its own grammar column, grammar-1 programs byte-identical (pin:06-fuzz-grammar-version-gate)
+# 2026-10-17 r27b: GRAMMAR_VERSION 3 (the rows pine-std began serving: ta.max ta.min ta.range math.round(x,p)); grammar-3 seeds 286 and 456 (ta.tsi inf-inf change) FIXED in pine-std, so both rows must run clean
+grammar	seed	id	bucket
+1	4	-	SemanticBug
+1	692	-	SemanticBug
+3	286	-	SemanticBug
+3	456	-	SemanticBug

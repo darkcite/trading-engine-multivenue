@@ -1,0 +1,21 @@
+fix	2
+id	D038
+group	D
+title	timeframe 2D
+script	tests/conformance/fixtures/D/D038.pine
+script_sha256	6bd647d8ac7baa06500d7a1f487623ebb3ee083b7e777979018b2870ac13e344
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	chart
+align	time
+dialects	56
+mode	bar_close
+bars	-
+window	tail	256
+oracle	declined
+tier	2
+plot	f_D038_isna	exact
+plot	f_D038_val	exact
+refuse	5001

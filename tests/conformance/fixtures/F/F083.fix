@@ -1,0 +1,31 @@
+fix	2
+id	F083
+group	F
+title	a reassigned length passed to a simple length parameter
+pin	pin:02-var-qualifier
+script	tests/conformance/fixtures/F/F083.pine
+script_sha256	074337bbf5499e13f6e86a4fde508c6cf36f6a3807710874f0c8029b7eeeef09
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T06:38Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	5
+driver	syn
+align	step
+dialects	5
+twin	F084
+mode	bar_close
+bars	24486
+window	head	1
+oracle	tv
+tier	1
+plot	f_F083_isna	exact
+plot	f_F083_val	exact
+series
+0	1	na
+end
+reading	series
+refuse	3008
+end
+reading	join
+0	1.0	na
+end

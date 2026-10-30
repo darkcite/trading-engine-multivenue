@@ -53,6 +53,7 @@ use crate::cloid::encode as encode_cloid;
 use crate::config::HlConfig;
 use crate::http::HlHttp;
 use crate::nonce::{NonceSource, SharedNonce};
+use crate::perp::{self, PerpBootError, PerpRefusals, PerpSpec, PerpTable, PerpWant};
 use crate::request::{envelope_close, envelope_open, order_json};
 use crate::response::{scan, HlOk, HlResponse};
 use crate::sign::{sign_action, Network, Vault};
@@ -397,6 +398,10 @@ enum Spend {
     Submit,
     /// An exit. Counted, never refused.
     Cancel,
+    /// **B'4** — a control action with no items (`updateLeverage` at
+    /// boot): refused at the floor like a submit; accepted only as the
+    /// `{"type":"default"}` answer.
+    Control,
 }
 
 /// A leg whose resting orders have not been taken off the book yet: its
@@ -785,6 +790,14 @@ pub struct HlExchange<const FILL_N: usize> {
     topup_next_at: Instant,
     /// Where `exec-topup.state` lives — beside the budget file.
     topup_path: PathBuf,
+    /// **B'4 (LAW E-4P)** — the native perps THIS boot bound from the
+    /// venue's `meta` answer ([`HlExchange::boot_perps`]); empty unless a
+    /// live slot routes a perp. A symbol here takes the perp arm of
+    /// submit / modify / cancel; every other symbol the HIP-4 path.
+    perps: PerpTable,
+    /// B'4 — one counter per [`perp::PerpRefusal`] (each also counted in
+    /// `refused_local`).
+    perp_refusals: PerpRefusals,
 }
 
 impl<const FILL_N: usize> HlExchange<FILL_N> {
@@ -888,6 +901,8 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             anchor_set_s,
             topup_next_at: Instant::now(),
             topup_path,
+            perps: PerpTable::new(),
+            perp_refusals: PerpRefusals::default(),
         })
     }
 
@@ -927,6 +942,128 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     #[must_use]
     pub fn counters(&self) -> &HlExecCounters {
         &self.counters
+    }
+
+    /// **B'4** — the perps this boot bound (LAW E-4P), read-only.
+    #[inline]
+    #[must_use]
+    pub const fn perps(&self) -> &PerpTable {
+        &self.perps
+    }
+
+    /// **B'4** — one counter per perp refusal.
+    #[inline]
+    #[must_use]
+    pub const fn perp_refusals(&self) -> &PerpRefusals {
+        &self.perp_refusals
+    }
+
+    /// **B'4, impl-Bp §4.13 steps 2–4 — boot only.** Bind every `want`
+    /// from this boot's `{"type":"meta"}` answer, hand each bound coin to
+    /// `tell` (the boot tell), then send `updateLeverage {asset, isCross:
+    /// false, leverage}` exactly once per coin. A refused binding or a
+    /// non-ok leverage answer refuses the boot, and the arm's table is
+    /// left as it was: a coin is tradeable only once its isolated
+    /// leverage is confirmed. There is no other leverage verb — leverage
+    /// never changes at runtime.
+    ///
+    /// # Errors
+    /// [`PerpBootError`].
+    pub fn boot_perps<T: FnMut(&PerpSpec)>(
+        &mut self,
+        meta_body: &[u8],
+        want: &[PerpWant<'_>],
+        tell: T,
+    ) -> Result<(), PerpBootError> {
+        let mut table = self.perps;
+        perp::boot_bind_and_lever(&mut table, meta_body, want, tell, |asset, lev| {
+            self.send_isolated_leverage(asset, lev).is_ok()
+        })?;
+        self.perps = table;
+        Ok(())
+    }
+
+    /// **TEST-ONLY (`testvenue`)** — bind perps from a `meta` answer
+    /// WITHOUT the leverage step, so a test or an alloc gate can drive
+    /// the perp arm with no venue. Never in a build that ships.
+    ///
+    /// # Errors
+    /// [`perp::PerpError`].
+    #[cfg(feature = "testvenue")]
+    pub fn bind_perps_unlevered(
+        &mut self,
+        meta_body: &[u8],
+        want: &[PerpWant<'_>],
+    ) -> Result<(), perp::PerpError> {
+        self.perps.bind_from_meta(meta_body, want)
+    }
+
+    /// `updateLeverage {asset, isCross: false, leverage}` — signed, posted,
+    /// judged as a control action (`{"type":"default"}` is the only
+    /// acceptance). Reached from [`Self::boot_perps`] only, with an asset
+    /// the same call just bound from `meta` (LAW E-4P).
+    fn send_isolated_leverage(&mut self, asset: u32, leverage: u16) -> Result<(), DispatchError> {
+        let lev = u32::from(leverage);
+        let Ok(mp_n) = crate::action::encode_update_leverage(&mut self.mp, asset, false, lev)
+        else {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            return Err(DispatchError::EncodeOverflow);
+        };
+        let head = self.open_action()?;
+        let Ok(aj_n) = crate::request::update_leverage_json(
+            &mut self.http.body_mut()[head..],
+            asset,
+            false,
+            lev,
+        ) else {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            return Err(DispatchError::EncodeOverflow);
+        };
+        self.send_action(mp_n, head + aj_n, 1, Spend::Control)
+            .map(|_| ())
+    }
+
+    /// **B'4 — the perp arm's head** (impl-Bp §4.13): `None` for a symbol
+    /// the perp table does not hold (the HIP-4 path follows, unchanged —
+    /// LAW E-4); `Some(Ok(asset))` for a bound perp whose order passes
+    /// [`perp::check`]; `Some(Err)` otherwise, counted in `refused_local`
+    /// and its own refusal counter, before anything is signed.
+    #[inline(always)]
+    fn perp_asset(&mut self, order: &Order) -> Option<Result<u32, DispatchError>> {
+        let p = self.perps.get(order.sym)?;
+        if let Err(r) = perp::check(p, order.strategy_id, order.px.raw(), order.qty.raw()) {
+            self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+            self.perp_refusals.bump(r);
+            return Some(Err(DispatchError::NoLiveRoute));
+        }
+        Some(Ok(p.asset))
+    }
+
+    /// **B'4 — a perp exit is reduce-only AT THE VENUE** (r28 risk review
+    /// B2): a bound perp's order carrying `ORDER_FLAG_REDUCE_ONLY` goes out
+    /// with the wire's `r: true`, so stacked exits the router judged as
+    /// reductions can never open the other side — the venue refuses what
+    /// would. A HIP-4 order is unchanged byte for byte (`perp` is false
+    /// off the perp table; `hip4_orders_render_identical_bytes_…`). `perp`:
+    /// [`Self::perp_asset`] bound the symbol (no second table search).
+    #[inline(always)]
+    fn perp_reduce_only(perp: bool, order: &Order, wire: OrderWire) -> OrderWire {
+        if perp && order.flags & core_types::ORDER_FLAG_REDUCE_ONLY != 0 {
+            wire.reduce_only()
+        } else {
+            wire
+        }
+    }
+
+    /// The bytes an encode half left behind: the msgpack the signer reads
+    /// (`mp[..mp_n]`) and the `/exchange` window up to the end of the
+    /// action JSON. For tests and gates that compare what would be signed.
+    #[inline]
+    pub fn staged(&mut self, mp_n: usize, action_end: usize) -> (&[u8], &[u8]) {
+        let mp_n = mp_n.min(self.mp.len());
+        let body = self.http.body_mut();
+        let end = action_end.min(body.len());
+        (&self.mp[..mp_n], &body[..end])
     }
 
     /// Requests believed to remain before the venue's cliff.
@@ -2027,7 +2164,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         // EXIT and a cap that can stop a position being closed is not a
         // risk control.
         let barred = match spend {
-            Spend::Submit => self.budget.may_submit().is_err(),
+            Spend::Submit | Spend::Control => self.budget.may_submit().is_err(),
             Spend::Cancel => !self.budget.may_cancel(),
         };
         if barred {
@@ -2064,6 +2201,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         let outcome_seen = |ok: &HlOk| match spend {
             Spend::Submit => ok.any_resting || ok.any_filled,
             Spend::Cancel => ok.any_success,
+            Spend::Control => ok.is_default(),
         };
         match scanned {
             Ok(HlResponse::Ok(ok)) if ok.accepted() && outcome_seen(&ok) => {
@@ -2403,21 +2541,28 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         strategy_id: u8,
         client_oid: u64,
     ) -> Result<(), DispatchError> {
-        let asset = self
-            .assets
-            .lookup(sym, core_types::instance_of(client_oid))
-            .map_err(|e| {
-                if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
-                    self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
-                    // E6 commit 3: CONSECUTIVE. One is a race with a
-                    // roll; a streak is a member quoting an instance
-                    // that no longer exists.
-                    self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
-                }
-                self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
-                self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
-                DispatchError::NoLiveRoute
-            })?;
+        // B'4: a bound perp's cancel takes its asset from the perp table
+        // (impl-Bp §4.13). An exit: no owner or grid check
+        // (pin:bp4-cancel-asset-only — `check` is the submit/modify law).
+        let perp_asset = self.perps.get(sym).map(|p| p.asset);
+        let asset = if let Some(a) = perp_asset {
+            a
+        } else {
+            self.assets
+                .lookup(sym, core_types::instance_of(client_oid))
+                .map_err(|e| {
+                    if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
+                        self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
+                        // E6 commit 3: CONSECUTIVE. One is a race with a
+                        // roll; a streak is a member quoting an instance
+                        // that no longer exists.
+                        self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
+                    }
+                    self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+                    self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
+                    DispatchError::NoLiveRoute
+                })?
+        };
         let c = [crate::action::CancelByCloidWire {
             asset,
             cloid: encode_cloid(strategy_id, client_oid),
@@ -2468,21 +2613,34 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         prev_client_oid: u64,
         order: &Order,
     ) -> Result<(usize, usize), DispatchError> {
-        let asset = self
-            .assets
-            .lookup(order.sym, core_types::instance_of(order.client_oid))
-            .map_err(|e| {
-                if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
-                    self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
-                    // E6 commit 3: CONSECUTIVE. One is a race with a
-                    // roll; a streak is a member quoting an instance
-                    // that no longer exists.
-                    self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
-                }
-                self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+        // B'4: a bound perp's replacement passes the same owner / grid /
+        // minimum checks a submit does, before anything is encoded.
+        let mut perp = false;
+        let asset = match self.perp_asset(order) {
+            Some(Ok(a)) => {
+                perp = true;
+                a
+            }
+            Some(Err(e)) => {
                 self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
-                DispatchError::NoLiveRoute
-            })?;
+                return Err(e);
+            }
+            None => self
+                .assets
+                .lookup(order.sym, core_types::instance_of(order.client_oid))
+                .map_err(|e| {
+                    if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
+                        self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
+                        // E6 commit 3: CONSECUTIVE. One is a race with a
+                        // roll; a streak is a member quoting an instance
+                        // that no longer exists.
+                        self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
+                    }
+                    self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+                    self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
+                    DispatchError::NoLiveRoute
+                })?,
+        };
         // The same scale guards `submit` has, for the same reason:
         // saturation clamps to a POSITIVE i64::MAX and would sail past
         // the `<= 0` check below.
@@ -2504,8 +2662,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
             return Err(DispatchError::NoLiveRoute);
         };
-        let wire = OrderWire::new(asset, order.side == Side::Bid, px, sz, tif)
-            .with_cloid(encode_cloid(order.strategy_id, order.client_oid));
+        let wire = Self::perp_reduce_only(
+            perp,
+            order,
+            OrderWire::new(asset, order.side == Side::Bid, px, sz, tif)
+                .with_cloid(encode_cloid(order.strategy_id, order.client_oid)),
+        );
         let m = [crate::action::ModifyWire {
             order: wire,
             oid: 0,
@@ -2578,51 +2740,61 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
     }
 
-    fn persist_budget(&mut self) {
-        if self.last_persist.elapsed() < PERSIST_EVERY {
-            return;
-        }
-        self.last_persist = Instant::now();
-        let _ = budget::store(&self.budget_path, &self.budget);
-    }
-}
-
-impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
-    fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
-        // 1. LAW E-4 — bound, never derived. An unbound symbol is a
-        //    refusal, not an arithmetic problem.
-        //
-        //    THE INSTANCE COMES FROM THE ORDER. This read `0` until the
-        //    roll handler existed, which was harmless only while the
-        //    table was empty: a hardcoded 0 compares 0 to 0 forever, so
-        //    the staleness check LAW E-4 exists for could never fire
-        //    and a stale asset id would have sailed through. The member
-        //    already states which instance it believes it is trading,
-        //    in `client_oid`'s low bits (`core_types::instance_of`), so
-        //    the table is asked about THAT one — and a table that has
-        //    rolled refuses instead of sending an order to someone
-        //    else's market.
-        let asset = self
-            .assets
-            .lookup(order.sym, core_types::instance_of(order.client_oid))
-            .map_err(|e| {
-                // A STALE instance gets its own counter. It is the one
-                // thing this module exists to catch — an order naming
-                // an instance that has rolled is an order bound for
-                // someone else's market — and folded into
-                // `refused_local` it is indistinguishable from a spent
-                // budget or an unbound symbol. This diff is what makes
-                // it reachable for the first time.
-                if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
-                    self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
-                    // E6 commit 3: CONSECUTIVE. One is a race with a
-                    // roll; a streak is a member quoting an instance
-                    // that no longer exists.
-                    self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
-                }
-                self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
-                DispatchError::NoLiveRoute
-            })?;
+    /// The ENCODE half of `submit`: the asset, the scale guards, the TIF,
+    /// the LAW E-9 cloid, msgpack into `self.mp` and the action JSON in
+    /// place behind the envelope head. Returns `(mp_n, action_end)` for
+    /// [`Self::seal`] / `send_action`. Touches no socket and spends no
+    /// budget. Public, like [`Self::stage_modify`], so a gate can drive
+    /// the exact bytes a submit signs (B'4: `perp_submit_path_is_zero_alloc`,
+    /// `hip4_orders_render_identical_bytes_with_a_perp_table_bound`).
+    ///
+    /// # Errors
+    /// Every local refusal of `submit`, counted here.
+    pub fn stage_submit(&mut self, order: &Order) -> Result<(usize, usize), DispatchError> {
+        // 0. B'4 (impl-Bp §4.13) — a bound perp: owner, grid and minimum
+        //    first (refused, never rounded), then its boot-bound asset.
+        //    Every other symbol takes the HIP-4 path below, unchanged.
+        let mut perp = false;
+        let asset = match self.perp_asset(order) {
+            Some(r) => {
+                perp = true;
+                r?
+            }
+            // 1. LAW E-4 — bound, never derived. An unbound symbol is a
+            //    refusal, not an arithmetic problem.
+            //
+            //    THE INSTANCE COMES FROM THE ORDER. This read `0` until the
+            //    roll handler existed, which was harmless only while the
+            //    table was empty: a hardcoded 0 compares 0 to 0 forever, so
+            //    the staleness check LAW E-4 exists for could never fire
+            //    and a stale asset id would have sailed through. The member
+            //    already states which instance it believes it is trading,
+            //    in `client_oid`'s low bits (`core_types::instance_of`), so
+            //    the table is asked about THAT one — and a table that has
+            //    rolled refuses instead of sending an order to someone
+            //    else's market.
+            None => self
+                .assets
+                .lookup(order.sym, core_types::instance_of(order.client_oid))
+                .map_err(|e| {
+                    // A STALE instance gets its own counter. It is the one
+                    // thing this module exists to catch — an order naming
+                    // an instance that has rolled is an order bound for
+                    // someone else's market — and folded into
+                    // `refused_local` it is indistinguishable from a spent
+                    // budget or an unbound symbol. This diff is what makes
+                    // it reachable for the first time.
+                    if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
+                        self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
+                        // E6 commit 3: CONSECUTIVE. One is a race with a
+                        // roll; a streak is a member quoting an instance
+                        // that no longer exists.
+                        self.asset_refusal_streak = self.asset_refusal_streak.saturating_add(1);
+                    }
+                    self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+                    DispatchError::NoLiveRoute
+                })?,
+        };
 
         // 2. The budget is checked ONCE, inside `send_action` — still
         //    before the signature, and now in the one place that knows
@@ -2648,10 +2820,14 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
             return Err(DispatchError::NoLiveRoute);
         };
-        let wire = OrderWire::new(asset, order.side == Side::Bid, px, sz, tif)
-            // 3. LAW E-9 — the slot travels in the cloid, so the fill can
-            //    be routed without a table when it comes back.
-            .with_cloid(encode_cloid(order.strategy_id, order.client_oid));
+        let wire = Self::perp_reduce_only(
+            perp,
+            order,
+            OrderWire::new(asset, order.side == Side::Bid, px, sz, tif)
+                // 3. LAW E-9 — the slot travels in the cloid, so the fill can
+                //    be routed without a table when it comes back.
+                .with_cloid(encode_cloid(order.strategy_id, order.client_oid)),
+        );
 
         // Every local failure from here on bumps a counter. Without
         // that they are invisible: `stats()` reports nothing for this
@@ -2674,12 +2850,29 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             order_json(&mut self.http.body_mut()[head..], &[wire], b"na"),
             &mut self.counters,
         )?;
+        Ok((mp_n, head + aj_n))
+    }
+
+    fn persist_budget(&mut self) {
+        if self.last_persist.elapsed() < PERSIST_EVERY {
+            return;
+        }
+        self.last_persist = Instant::now();
+        let _ = budget::store(&self.budget_path, &self.budget);
+    }
+}
+
+impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
+    fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
+        // 1–3: the asset (the B'4 perp arm, else LAW E-4), the scale
+        // guards, the LAW E-9 cloid and the encode — see `stage_submit`.
+        let (mp_n, action_end) = self.stage_submit(order)?;
 
         // The nonce is taken LAST among the things that can fail, so a
         // local refusal cannot burn one. (HL only requires strictly
         // increasing nonces, so a gap is harmless — but not burning
         // one at all is simpler to reason about.)
-        self.send_action(mp_n, head + aj_n, 1, Spend::Submit)?;
+        self.send_action(mp_n, action_end, 1, Spend::Submit)?;
         self.counters.submitted = self.counters.submitted.wrapping_add(1);
         // WHO trades this leg — recorded on ACCEPTANCE, not on intent.
         // The venue settles a binary with a cloid-less fill, so

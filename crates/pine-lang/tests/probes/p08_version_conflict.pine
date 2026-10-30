@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+// PIN: pin:01-version-conflict
+// OURS: reject 2105
+// TV: pending
+//@version=5
+//@version=6
+indicator("p08")
+plot(close)

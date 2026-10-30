@@ -1,0 +1,32 @@
+fix	2
+id	F126
+group	F
+title	array.percentrank without na and with one
+pin	pin:04-array-percentrank
+script	tests/conformance/fixtures/F/F126.pine
+script_sha256	4172fc28c0964afd41deb38558d986cb6f1bdcb04079b11b595de0d8b6a4f844
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-29T10:16Z
+tv_build	web:Claude-4.29.0/Chrome-152.0.7977.167;pine:2026-10
+captured_in	56
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	24778
+window	head	1
+oracle	tv
+tier	3
+plot	f_F126_top	exact
+plot	f_F126_second	exact
+plot	f_F126_natop	exact
+plot	f_F126_int	exact
+series
+0	100	33.333333333333336	66.66666666666667	100
+end
+reading	size_minus_one
+0	100.0	33.333333333333336	66.66666666666667	100.0
+end
+reading	non_na_count
+0	75.0	25.0	66.66666666666667	75.0
+end

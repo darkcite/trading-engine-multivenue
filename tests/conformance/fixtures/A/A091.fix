@@ -1,0 +1,22 @@
+fix	2
+id	A091
+group	A
+title	na through four bars of history · bool
+pin	pin:W13-bool-na
+script	tests/conformance/fixtures/A/A091.pine
+script_sha256	58ec452cdb2842550cc437e403adb75ffc804ae303df8961fea58d99f5d11e44
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	6
+twin	A075
+mode	bar_close
+bars	pending
+window	head	64
+oracle	authored
+tier	1
+plot	f_A091_val	exact
+refuse	3007

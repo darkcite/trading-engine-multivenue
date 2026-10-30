@@ -1,0 +1,32 @@
+fix	2
+id	F111
+group	F
+title	array.sort by a UDT field: ties told apart by another field
+script	tests/conformance/fixtures/F/F111.pine
+script_sha256	3a0b0c25441467e1bb35669edaefb5dc053cf68a8274ef5eb8f120864af8fa17
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	n/a
+tv_build	n/a
+captured_in	n/a
+driver	syn
+align	step
+dialects	5
+twin	F110
+mode	bar_close
+bars	pending
+window	head	1
+oracle	authored
+tier	3
+plot	f_F111_asc0	exact
+plot	f_F111_asc1	exact
+plot	f_F111_asc2	exact
+plot	f_F111_asc3	exact
+plot	f_F111_asc4	exact
+plot	f_F111_asc5	exact
+plot	f_F111_desc0	exact
+plot	f_F111_desc1	exact
+plot	f_F111_desc2	exact
+plot	f_F111_desc3	exact
+plot	f_F111_desc4	exact
+plot	f_F111_desc5	exact
+refuse	3005

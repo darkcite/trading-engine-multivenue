@@ -1,0 +1,86 @@
+fix	2
+id	C018
+group	C
+title	varip inside fn_body
+script	tests/conformance/fixtures/C/C018.pine
+script_sha256	2c2fa2dba0ca295750dc3f88e7ee52ebc5ad03dfc7b222a6cba1b08873661748
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T04:41Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	56
+driver	syn
+align	step
+dialects	56
+mode	bar_close
+bars	24484
+window	head	64
+oracle	tv
+tier	1
+plot	f_C018_isna	exact
+plot	f_C018_val	exact
+series
+0	0	1
+1	0	2
+2	0	3
+3	0	4
+4	0	5
+5	0	6
+6	0	7
+7	0	8
+8	0	9
+9	0	10
+10	0	11
+11	0	12
+12	0	13
+13	0	14
+14	0	15
+15	0	16
+16	0	17
+17	0	18
+18	0	19
+19	0	20
+20	0	21
+21	0	22
+22	0	23
+23	0	24
+24	0	25
+25	0	26
+26	0	27
+27	0	28
+28	0	29
+29	0	30
+30	0	31
+31	0	32
+32	0	33
+33	0	34
+34	0	35
+35	0	36
+36	0	37
+37	0	38
+38	0	39
+39	0	40
+40	0	41
+41	0	42
+42	0	43
+43	0	44
+44	0	45
+45	0	46
+46	0	47
+47	0	48
+48	0	49
+49	0	50
+50	0	51
+51	0	52
+52	0	53
+53	0	54
+54	0	55
+55	0	56
+56	0	57
+57	0	58
+58	0	59
+59	0	60
+60	0	61
+61	0	62
+62	0	63
+63	0	64
+end

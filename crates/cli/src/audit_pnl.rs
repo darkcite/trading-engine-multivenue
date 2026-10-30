@@ -151,7 +151,8 @@ pub const AUDIT_PNL_VERSION: u32 = 2;
 /// Slot 7 was reserved until HC11 (2026-09-26, the hcv member).
 ///
 /// The names are the member table's ([`crate::exec_boot::SLOT_NAMES`],
-/// derived from `strategy_set::MEMBERS`): slots 8–15 (S16) read
+/// derived from `strategy_set::MEMBERS`): slot 8 is `pine` since PVM
+/// impl-08 T4, slots 9–15 (S16) read
 /// `reserved` — no member stands there, so a row under one is an
 /// anomaly worth seeing by its number rather than as `unknown`.
 fn strategy_label(id: u8) -> &'static str {
@@ -2578,18 +2579,21 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
 mod tests {
     use super::*;
 
-    /// S16-5: sixteen slot labels — the members at 0–7, `reserved` at
-    /// 8–15 — and the two sentinels past them.
+    /// S16-5: sixteen slot labels — the members at 0–8 (8 = pine since PVM
+    /// impl-08 T4), `reserved` at 9–15 — and the two sentinels past them.
     #[test]
     fn strategy_labels_cover_sixteen_slots() {
-        let members = ["hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv"];
+        let members = [
+            "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv", "pine", "pm15",
+        ];
         for (i, m) in members.iter().enumerate() {
             assert_eq!(strategy_label(i as u8), *m);
         }
+        assert_eq!(strategy_label(8), "pine");
         assert_eq!(strategy_label(9), "pm15");
         assert_eq!(strategy_label(11), "pmj");
-        for id in 8..MAX_STRATEGY_SLOTS {
-            if id != 9 && id != 11 {
+        for id in 10..MAX_STRATEGY_SLOTS {
+            if id != 11 {
                 assert_eq!(strategy_label(id), "reserved", "slot {id}");
             }
         }

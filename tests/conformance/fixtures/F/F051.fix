@@ -1,0 +1,88 @@
+fix	2
+id	F051
+group	F
+title	synb or rhs(k)
+pin	pin:W3-lazy-and-or
+script	tests/conformance/fixtures/F/F051.pine
+script_sha256	9a4007da27a5aa0987448710fac0224835098e8142aa54be6a624f7cc83f285d
+chart_sha256	06a9d4c0119fd7ebb45b68c67e0f46ea4eb362423ffd596e4e4dfc78b056f19f
+captured	2026-10-17T04:11Z
+tv_build	web:Claude-2.37337.1/Chrome-152.0.7977.130;pine:2026-09
+captured_in	6
+driver	syn
+align	step
+dialects	6
+twin	F030
+mode	bar_close
+bars	24484
+window	head	64
+oracle	tv
+tier	1
+plot	f_F051_val	exact
+plot	f_F051_cnt	exact
+series
+0	1	0
+1	0	1
+2	0	2
+3	1	2
+4	1	2
+5	0	3
+6	1	3
+7	1	3
+8	1	3
+9	1	3
+10	0	4
+11	1	5
+12	1	6
+13	1	7
+14	1	7
+15	1	7
+16	1	8
+17	1	8
+18	1	8
+19	1	8
+20	1	9
+21	1	10
+22	1	10
+23	1	11
+24	1	11
+25	1	11
+26	1	12
+27	1	13
+28	1	13
+29	1	14
+30	1	15
+31	1	15
+32	1	15
+33	1	16
+34	1	16
+35	1	16
+36	1	16
+37	1	17
+38	1	17
+39	1	17
+40	1	17
+41	1	17
+42	1	18
+43	1	19
+44	1	20
+45	1	20
+46	1	21
+47	1	22
+48	1	23
+49	1	24
+50	1	25
+51	1	26
+52	1	26
+53	1	26
+54	1	26
+55	1	27
+56	1	28
+57	1	29
+58	1	29
+59	1	29
+60	1	29
+61	1	29
+62	1	29
+63	1	30
+end

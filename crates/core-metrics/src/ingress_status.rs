@@ -251,6 +251,13 @@ pub struct IngressStatus {
     /// XMM XH1: trade-lane pushes refused by a full ring (the print is
     /// still captured). Same separation rationale as the three above.
     trade_ring_drops_total: AtomicU64,
+    /// PVM B'1: Trade prints on the pine slot's event-lane route that
+    /// were shed (reserve reached or ring full). Separate from
+    /// `event_ring_drops_total` for the reason that one is separate from
+    /// ticks. Any non-zero value is an operator alert: the pine slot built
+    /// bars from an incomplete print stream, and the session is not
+    /// eligible for the 8g gate.
+    trade_shed_total: AtomicU64,
     /// T1(a) diag: `ERR_SITE_*` of the first fatal error this
     /// session (0 = none). First-error-wins; cleared by the venue
     /// loop via [`Self::take_last_err`] (same thread as the writer).
@@ -291,6 +298,7 @@ impl IngressStatus {
             depth_ring_drops_total: AtomicU64::new(0),
             opt_ring_drops_total: AtomicU64::new(0),
             trade_ring_drops_total: AtomicU64::new(0),
+            trade_shed_total: AtomicU64::new(0),
             last_err_site: AtomicU8::new(0),
             last_err_io_kind: AtomicU8::new(0),
             feed_delay_ema_ms: AtomicU16::new(0),
@@ -417,6 +425,13 @@ impl IngressStatus {
     #[inline(always)]
     pub fn inc_trade_ring_drops(&self) {
         self.trade_ring_drops_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one routed Trade print shed by the pine route (PVM B'1 —
+    /// see `trade_shed_total` field docs).
+    #[inline(always)]
+    pub fn inc_trade_shed(&self) {
+        self.trade_shed_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count one tick the ingress judged stale (VT2).
@@ -552,6 +567,12 @@ impl IngressStatus {
     #[inline]
     pub fn trade_ring_drops_total(&self) -> u64 {
         self.trade_ring_drops_total.load(Ordering::Relaxed)
+    }
+
+    /// Total routed Trade prints shed by the pine route (PVM B'1).
+    #[inline]
+    pub fn trade_shed_total(&self) -> u64 {
+        self.trade_shed_total.load(Ordering::Relaxed)
     }
 
     /// Total ticks judged stale by the ingress (VT2).
@@ -708,6 +729,20 @@ mod tests {
         assert_eq!(s.ring_drops_total(), 0);
         assert_eq!(s.sub_drops_total(), 0);
         assert_eq!(s.depth_ring_drops_total(), 0);
+    }
+
+    #[test]
+    fn trade_shed_counter_accumulates_independently() {
+        // PVM B'1: a shed routed print advances trade_shed ONLY — never
+        // the event-lane, trade-lane or tick drop counters.
+        let s = IngressStatus::new();
+        assert_eq!(s.trade_shed_total(), 0);
+        s.inc_trade_shed();
+        s.inc_trade_shed();
+        assert_eq!(s.trade_shed_total(), 2);
+        assert_eq!(s.event_ring_drops_total(), 0);
+        assert_eq!(s.trade_ring_drops_total(), 0);
+        assert_eq!(s.ring_drops_total(), 0);
     }
 
     #[test]

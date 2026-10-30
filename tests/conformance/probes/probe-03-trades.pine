@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+strategy("probe03", overlay = false, commission_type = strategy.commission.percent, commission_value = 0.1, margin_long = 2, margin_short = 2)
+// probe-03-trades · impl-06 §4.7.2 H+1:00 (R8, R12) · entry, exit, close, close_all, a margin call,
+// a strategy.risk flatten and one trade left open, all in the last 1000 bars; MCL/MCS hold 99 % of
+// equity as margin, so either side is margin-called by a small adverse move
+strategy.risk.max_intraday_filled_orders(3)
+int L = last_bar_index
+int s = L - 1000
+int p = bar_index - s
+int k = int(math.floor(p / 20.0))
+int ph = p % 20
+if bar_index >= s and bar_index < L - 500
+    if k % 3 == 0
+        if ph == 0
+            strategy.entry("L", strategy.long, qty = 0.01)
+        strategy.exit("XL", "L", profit = 2000, loss = 2000)
+        if ph == 10
+            strategy.close("L")
+    else if k % 3 == 1
+        if ph == 0
+            strategy.entry("S", strategy.short, qty = 0.01)
+        if ph == 8
+            strategy.close_all()
+    else
+        if ph == 0
+            strategy.entry("L2", strategy.long, qty = 0.01)
+        if ph == 5
+            strategy.close("L2")
+if bar_index == L - 450
+    strategy.entry("MCL", strategy.long, qty = 0.99 * strategy.equity / (0.02 * close))
+if bar_index == L - 420
+    strategy.close("MCL")
+if bar_index == L - 400
+    strategy.entry("MCS", strategy.short, qty = 0.99 * strategy.equity / (0.02 * close))
+if bar_index == L - 370
+    strategy.close("MCS")
+if bar_index >= L - 300 and bar_index < L - 280
+    if (bar_index - (L - 300)) % 2 == 0
+        strategy.entry("R", strategy.long, qty = 0.01)
+    else
+        strategy.close("R")
+if bar_index == L - 50
+    strategy.entry("OPEN", strategy.long, qty = 0.01)
+plot(strategy.position_size, "p_pos", display = display.data_window)
+plot(strategy.closedtrades, "p_closed", display = display.data_window)

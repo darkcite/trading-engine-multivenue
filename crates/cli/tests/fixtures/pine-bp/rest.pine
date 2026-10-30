@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: while flat, keeps two long limit entries resting far below the market — the B'3 T18
+// max-open probe (impl-Bp I21, rule U2: the second maker the venue-slot budget refuses).
+strategy("bp rest (cli B'3 T18)", overlay = true)
+plot(close)
+if strategy.position_size == 0
+    strategy.entry("L1", strategy.long, limit = close * 0.5)
+    strategy.entry("L2", strategy.long, limit = close * 0.4)

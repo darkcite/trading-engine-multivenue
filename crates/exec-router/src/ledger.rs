@@ -182,6 +182,53 @@ pub const INST_CALL: u8 = 1 << 1;
 /// it OPENS nothing ([`InstRefusal::Unpriced`]; an exit passes), and its
 /// exposure keeps the last values until a fresh mark clears it.
 const INST_STALE: u8 = 1 << 7;
+/// **B'4** — the ledger's own bit: a Hyperliquid perp row
+/// ([`Ledger::bind_perp`]). Priced at its last fill on both sides of every
+/// test but the order's own coin, which is priced at the order's limit
+/// (impl-Bp §3.12); a venue mark never reprices it.
+const INST_PERP: u8 = 1 << 6;
+/// **B'4** — the ledger's own bit: the perp row took its boot seed
+/// ([`Ledger::seed_perp`]); a second seed is refused.
+const INST_SEEDED: u8 = 1 << 5;
+
+/// **B'4 — perp rows the ledger can hold** (impl-Bp §3.12), one per
+/// Hyperliquid perp coin a boot binds (`exec_hyperliquid::perp::PERP_SLOTS`).
+/// Each is an owned [`LAW_LINEAR`] instrument row carrying the perp bit,
+/// so a perp fill books to its row by the instrument path and never to
+/// [`LedgerCounters::fills_unbound`].
+pub const PERP_ROWS: usize = 8;
+
+/// Why a B'4 perp binding or seed refused. Boot-only; the boot refuses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LedgerError {
+    /// The instrument row could not be bound ([`Ledger::bind_instrument`]),
+    /// or the owner is no slot.
+    Bind(InstrumentBindErr),
+    /// [`PERP_ROWS`] perps are bound already.
+    PerpRowsFull,
+    /// The id has no perp row.
+    NotPerp,
+    /// The row was seeded already — one venue answer per boot.
+    SeededTwice,
+    /// A non-zero position without a positive price, a negative day
+    /// notional, or a position no `i64` magnitude holds.
+    BadSeed,
+}
+
+/// **B'4** — one venue perp position as the reconciler read it
+/// (`clearinghouseState`), for [`Ledger::perp_drift_1e6`].
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PerpVenuePos {
+    /// The engine id of the coin.
+    pub sym: SymbolId,
+    /// The venue's signed size `szi` ×1e6.
+    pub szi_1e6: i64,
+    /// The venue's `entryPx` ×1e6 — the drift's price only where the row
+    /// has no fill price yet (pin:bp4-drift-price).
+    pub px_1e6: i64,
+}
+const _: () = assert!(core::mem::size_of::<PerpVenuePos>() == 24);
 
 /// **One row's exposure for one slot is clamped here**, USD ×1e6 (about
 /// $9 bn). Every sum over [`LEDGER_INSTRUMENTS`] rows — and every sum
@@ -347,7 +394,9 @@ impl InstrumentRow {
     /// its limit, so a low limit alone would understate what it adds).
     #[inline]
     const fn one_price(&self, buy: bool, px_1e6: i64) -> i64 {
-        if buy {
+        // B'4: a perp row's order is priced at its limit on both sides
+        // (impl-Bp §3.12, §4.13 — pin:bp4-perp-one-price-is-the-limit).
+        if buy || self.flags & INST_PERP != 0 {
             px_1e6
         } else {
             self.cap_price(px_1e6)
@@ -848,6 +897,15 @@ pub struct Ledger {
     /// modify's lookup. Kept by [`Self::occupy`] and [`Self::release`]
     /// alone, the only two places a row's liveness changes.
     resting_hi: u16,
+    /// **B'4** — the perp rows' ids, in bind order; `perp_n` of them.
+    perp_syms: [SymbolId; PERP_ROWS],
+    /// **B'4** — perp rows bound.
+    perp_n: u32,
+    /// **B'4** — index = slot: today's filled OPENING notional on the
+    /// slot's perp rows (the part of a fill that grew `|pos|`, either
+    /// side), plus the boot seed's; USD ×1e6. Reset at 00:00Z with the
+    /// day turnover, which carries the same amounts.
+    perp_day_open_1e6: [i64; EXEC_SLOTS],
 }
 
 // **No `Default`.** A `Ledger` needs the boot's monotonic→wall
@@ -866,10 +924,15 @@ const _: () = assert!(LEDGER_RESTING <= u16::MAX as usize);
 // arrays 512 → 1 024 rows (+28 KiB), the 16 family rows 192 → 320 B
 // (+2 KiB) and the per-slot arrays doubled. The S16-3 review's
 // `resting_hi` (u16) sits in the 2 B the u16 `seeded` and the u32 `inst_n`
-// left as padding: the size is unchanged. PM15-5 re-pin (146 048 →
-// 151 168 B): the family rows 16 → 32 (+16 × 320 B). PMJ J1b re-pin
-// (151 168 → 161 408 B): the family rows 32 → 64 (+32 × 320 B).
-const _: () = assert!(core::mem::size_of::<Ledger>() == 161_408);
+// left as padding: the size is unchanged.
+// B'4 re-pin (146 048 → 146 240 B): the perp rows' ids (32 B), their
+// count (4 B) and the per-slot opening notional (128 B), rounded to the
+// struct's 64 B alignment. PM15-5 re-pin (+5 120 B): the family rows
+// 16 → 32 (+16 × 320 B). Merged (main into pvm-pine-engine, 2026-10-19):
+// 146 048 + 164 + 5 120 rounded to 64 B.
+// PMJ J1b re-pin (main, +10 240 B): the family rows 32 → 64 (+32 × 320 B).
+// Merged in r40 (2026-10-29): 161 408 + 164 rounded to 64 B.
+const _: () = assert!(core::mem::size_of::<Ledger>() == 161_600);
 
 impl Ledger {
     /// An empty, UNSEEDED ledger: nothing bound, nothing held,
@@ -900,6 +963,9 @@ impl Ledger {
             resting_asked_oid: [0; LEDGER_RESTING],
             resting_usd_1e6: [0; EXEC_SLOTS],
             resting_hi: 0,
+            perp_syms: [SYMBOL_ID_NONE; PERP_ROWS],
+            perp_n: 0,
+            perp_day_open_1e6: [0; EXEC_SLOTS],
         }
     }
 
@@ -1198,6 +1264,7 @@ impl Ledger {
         } else if epoch > self.day_epoch {
             self.day_epoch = epoch;
             self.day_turnover_1e6 = [0; EXEC_SLOTS];
+            self.perp_day_open_1e6 = [0; EXEC_SLOTS];
             self.counters.day_rollovers = self.counters.day_rollovers.saturating_add(1);
         }
     }
@@ -1501,6 +1568,284 @@ impl Ledger {
         };
         self.inst_n += 1;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // B'4 — Hyperliquid perp rows (impl-Bp §3.12, §4.13; CAR-Bp-2)
+    // -----------------------------------------------------------------
+
+    /// **B'4 — boot: `sym` is a Hyperliquid perp owned by `slot`.** An
+    /// owned [`LAW_LINEAR`] instrument row with the perp bit: its fills
+    /// book to it (never to `fills_unbound`), another slot's order on it
+    /// is [`InstRefusal::Foreign`], and the router judges it by the three
+    /// perp cap laws ([`Self::perp_projection_1e6`],
+    /// [`Self::perp_opening_1e6`]).
+    ///
+    /// # Errors
+    /// [`LedgerError`] — the slot is none, [`PERP_ROWS`] are bound, or the
+    /// instrument bind refused (a duplicate id, a full table).
+    pub fn bind_perp(&mut self, sym: SymbolId, slot: u8) -> Result<(), LedgerError> {
+        // `OWNER_NONE` is a byte too: a perp row always has an owner.
+        if usize::from(slot) >= EXEC_SLOTS {
+            return Err(LedgerError::Bind(InstrumentBindErr::BadSpec));
+        }
+        let n = self.perp_n as usize;
+        if n >= PERP_ROWS {
+            return Err(LedgerError::PerpRowsFull);
+        }
+        self.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0).owned_by(slot))
+            .map_err(LedgerError::Bind)?;
+        let Some(i) = self.inst_find(sym) else {
+            // Bound one line above; unreachable, refused rather than assumed.
+            return Err(LedgerError::NotPerp);
+        };
+        self.inst[i].flags |= INST_PERP;
+        self.perp_syms[n] = sym;
+        self.perp_n += 1;
+        Ok(())
+    }
+
+    /// **B'4 — boot (D19): the venue's position and today's opening
+    /// notional, before the first order.** `pos_1e6` is the venue's signed
+    /// `szi`, `avg_px_1e6` its `entryPx` (the row's price until a fill),
+    /// `day_open_1e6` the opening notional the venue's fills since 00:00Z
+    /// report for the coin (`perp_recon::scan_fills_by_time`). Charged to
+    /// the owner slot's day turnover and its perp share.
+    ///
+    /// pin:bp4-seed-perp-refuses — §3.12's signature returns nothing; a seed
+    /// on an unbound id, a second seed or a malformed one would lose a venue
+    /// position silently (a cap failing open), so it is an `Err` the boot
+    /// refuses on.
+    ///
+    /// # Errors
+    /// [`LedgerError::NotPerp`], [`LedgerError::SeededTwice`],
+    /// [`LedgerError::BadSeed`].
+    pub fn seed_perp(
+        &mut self,
+        sym: SymbolId,
+        pos_1e6: i64,
+        avg_px_1e6: i64,
+        day_open_1e6: i64,
+    ) -> Result<(), LedgerError> {
+        let i = self.perp_find(sym).ok_or(LedgerError::NotPerp)?;
+        if self.inst[i].flags & INST_SEEDED != 0 {
+            return Err(LedgerError::SeededTwice);
+        }
+        if day_open_1e6 < 0 || pos_1e6 == i64::MIN || (pos_1e6 != 0 && avg_px_1e6 <= 0) {
+            return Err(LedgerError::BadSeed);
+        }
+        let slot = usize::from(self.inst[i].owner);
+        if slot >= EXEC_SLOTS {
+            return Err(LedgerError::NotPerp);
+        }
+        let r = &mut self.inst[i];
+        r.flags |= INST_SEEDED;
+        r.pos_1e6[slot] = pos_1e6;
+        if avg_px_1e6 > 0 {
+            r.last_px_1e6 = avg_px_1e6;
+        }
+        self.refresh_instrument(i);
+        self.day_turnover_1e6[slot] = self.day_turnover_1e6[slot].saturating_add(day_open_1e6);
+        self.perp_day_open_1e6[slot] = self.perp_day_open_1e6[slot].saturating_add(day_open_1e6);
+        Ok(())
+    }
+
+    /// The perp row bound for `sym`.
+    #[inline]
+    fn perp_find(&self, sym: SymbolId) -> Option<usize> {
+        if self.perp_n == 0 {
+            return None;
+        }
+        let i = self.inst_find(sym)?;
+        if self.inst[i].flags & INST_PERP != 0 {
+            Some(i)
+        } else {
+            None
+        }
+    }
+
+    /// **B'4** — whether `sym` is a perp row. One compare when no perp is
+    /// bound.
+    #[inline(always)]
+    #[must_use]
+    pub fn is_perp(&self, sym: SymbolId) -> bool {
+        self.perp_find(sym).is_some()
+    }
+
+    /// **B'4** — the perp row's owner slot, if `sym` is one.
+    #[inline]
+    #[must_use]
+    pub fn perp_owner(&self, sym: SymbolId) -> Option<u8> {
+        self.perp_find(sym).map(|i| self.inst[i].owner)
+    }
+
+    /// **B'4 — `(current, projected)` exposure of `slot`, USD ×1e6, if an
+    /// order of `side`, `qty` at `px` filled completely**: Σ over the
+    /// slot's perp rows of `|pos| × price` — the order's coin at `px` on
+    /// BOTH sides of the test, every other row at its last fill price
+    /// (i128 products, saturating sums). A `sym` that is not one of the
+    /// slot's perp rows adds nothing to either side.
+    #[must_use]
+    pub fn perp_projection_1e6(
+        &self,
+        slot: u8,
+        sym: SymbolId,
+        side: core_types::Side,
+        qty_1e6: i64,
+        px_1e6: i64,
+    ) -> (i64, i64) {
+        let s = usize::from(slot);
+        if s >= EXEC_SLOTS {
+            return (0, 0);
+        }
+        let buy = side == core_types::Side::Bid;
+        let mut cur = 0i64;
+        let mut next = 0i64;
+        let n = (self.perp_n as usize).min(PERP_ROWS);
+        let mut k = 0usize;
+        while k < n {
+            let ks = self.perp_syms[k];
+            k += 1;
+            let Some(i) = self.inst_find(ks) else {
+                continue;
+            };
+            let r = &self.inst[i];
+            if r.owner != slot {
+                continue;
+            }
+            let pos = r.pos_1e6[s];
+            if ks == sym {
+                let after = if buy {
+                    pos.saturating_add(qty_1e6)
+                } else {
+                    pos.saturating_sub(qty_1e6)
+                };
+                cur = cur.saturating_add(mul_1e6(pos.saturating_abs(), px_1e6));
+                next = next.saturating_add(mul_1e6(after.saturating_abs(), px_1e6));
+            } else {
+                let e = mul_1e6(pos.saturating_abs(), r.last_px_1e6);
+                cur = cur.saturating_add(e);
+                next = next.saturating_add(e);
+            }
+        }
+        (cur, next)
+    }
+
+    /// **B'4** — the part of an order's notional that would increase
+    /// `|pos|` of the row's owner, USD ×1e6 at `px` (0 for a pure
+    /// reduction, an unbound id, or a non-positive quantity or price).
+    #[must_use]
+    pub fn perp_opening_1e6(
+        &self,
+        sym: SymbolId,
+        side: core_types::Side,
+        qty_1e6: i64,
+        px_1e6: i64,
+    ) -> i64 {
+        let Some(i) = self.perp_find(sym) else {
+            return 0;
+        };
+        let r = &self.inst[i];
+        let s = usize::from(r.owner);
+        if s >= EXEC_SLOTS || qty_1e6 <= 0 || px_1e6 <= 0 {
+            return 0;
+        }
+        let pos = r.pos_1e6[s];
+        let buy = side == core_types::Side::Bid;
+        let opposes = (pos > 0 && !buy) || (pos < 0 && buy);
+        let mag = pos.saturating_abs();
+        let inc = if !opposes {
+            qty_1e6
+        } else if qty_1e6 > mag {
+            qty_1e6 - mag
+        } else {
+            0
+        };
+        mul_1e6(inc, px_1e6)
+    }
+
+    /// **B'4** — today's filled opening notional of `slot`'s perps, the
+    /// boot seed's included (reset at 00:00Z with the day roll), USD ×1e6.
+    #[inline]
+    #[must_use]
+    pub fn perp_day_open_1e6(&self, slot: u8) -> i64 {
+        let s = usize::from(slot);
+        if s >= EXEC_SLOTS {
+            return 0;
+        }
+        self.perp_day_open_1e6[s]
+    }
+
+    /// **B'4** — the slot's perp rows' share of
+    /// [`Self::slot_exposure_1e6`] (each at its last fill price), USD ×1e6.
+    #[must_use]
+    pub fn perp_exposure_1e6(&self, slot: u8) -> i64 {
+        let s = usize::from(slot);
+        if s >= EXEC_SLOTS {
+            return 0;
+        }
+        let mut total = 0i64;
+        let n = (self.perp_n as usize).min(PERP_ROWS);
+        let mut k = 0usize;
+        while k < n {
+            if let Some(i) = self.inst_find(self.perp_syms[k]) {
+                if self.inst[i].owner == slot {
+                    total = total.saturating_add(self.inst[i].exp_1e6[s]);
+                }
+            }
+            k += 1;
+        }
+        total
+    }
+
+    /// **B'4 (I32) — the reconciliation drift of `slot`'s perps**, USD
+    /// ×1e6: Σ over the slot's perp rows of `|ledger pos − venue szi| × px`.
+    /// A row the venue lists no position for is held against zero.
+    ///
+    /// pin:bp4-drift-price — §4.13 names `px` without a source: the row's
+    /// last fill price (its pricing law), else the venue's `entryPx` for
+    /// the coin. A venue position on a coin no perp row of the slot binds
+    /// is not this slot's to judge (the boot refuses an unknown one).
+    #[must_use]
+    pub fn perp_drift_1e6(&self, slot: u8, venue: &[PerpVenuePos]) -> i64 {
+        let s = usize::from(slot);
+        if s >= EXEC_SLOTS {
+            return 0;
+        }
+        let mut total = 0i64;
+        let n = (self.perp_n as usize).min(PERP_ROWS);
+        let mut k = 0usize;
+        while k < n {
+            let ks = self.perp_syms[k];
+            k += 1;
+            let Some(i) = self.inst_find(ks) else {
+                continue;
+            };
+            let r = &self.inst[i];
+            if r.owner != slot {
+                continue;
+            }
+            let mut szi = 0i64;
+            let mut vpx = 0i64;
+            let mut j = 0usize;
+            while j < venue.len() {
+                if venue[j].sym == ks {
+                    szi = venue[j].szi_1e6;
+                    vpx = venue[j].px_1e6;
+                    break;
+                }
+                j += 1;
+            }
+            let px = if r.last_px_1e6 > 0 {
+                r.last_px_1e6
+            } else {
+                vpx
+            };
+            let d = (i128::from(r.pos_1e6[s]) - i128::from(szi)).unsigned_abs();
+            let d = i64::try_from(d).unwrap_or(i64::MAX);
+            total = total.saturating_add(mul_1e6(d, px));
+        }
+        total
     }
 
     /// Instrument rows bound. Cold.
@@ -1837,7 +2182,9 @@ impl Ledger {
     /// mark prices. Every position or mark change passes here.
     fn refresh_instrument(&mut self, i: usize) {
         let r = &mut self.inst[i];
-        let bare = r.law == LAW_LINEAR && r.mark_1e6 <= 0;
+        // B'4: a perp row is priced at its last fill by law, never by a
+        // mark, so it is never "unmarked" (pin:bp4-perp-row-last-fill-price).
+        let bare = r.law == LAW_LINEAR && r.mark_1e6 <= 0 && r.flags & INST_PERP == 0;
         let mut s = 0usize;
         while s < EXEC_SLOTS {
             // `s < EXEC_SLOTS <= SlotMask::BITS`: the shift is exact.
@@ -1878,10 +2225,12 @@ impl Ledger {
         let Some(i) = self.inst_find(sym) else {
             return;
         };
-        if self.inst[i].law == LAW_OPTION {
+        // B'4: a perp row is priced at its last fill (impl-Bp §3.12), not
+        // by a mark (pin:bp4-perp-row-last-fill-price).
+        if self.inst[i].law == LAW_OPTION || self.inst[i].flags & INST_PERP != 0 {
             return;
         }
-        let dev = (mark_1e6 as i128 - index_1e6 as i128).abs();
+        let dev =(mark_1e6 as i128 - index_1e6 as i128).abs();
         if mark_1e6 <= 0 || index_1e6 <= 0 || dev * 1_000_000 > MARK_INDEX_MAX_DEV_1E6 as i128 * index_1e6 as i128 {
             self.counters.marks_refused = self.counters.marks_refused.saturating_add(1);
             return;
@@ -2005,6 +2354,10 @@ impl Ledger {
                 mul_1e6(inc, px)
             };
             self.day_turnover_1e6[slot] = self.day_turnover_1e6[slot].saturating_add(add);
+            // B'4: the perp rows' share of it — the opening notional.
+            if r.flags & INST_PERP != 0 {
+                self.perp_day_open_1e6[slot] = self.perp_day_open_1e6[slot].saturating_add(add);
+            }
         }
         self.refresh_instrument(i);
         self.counters.fills_booked = self.counters.fills_booked.saturating_add(1);

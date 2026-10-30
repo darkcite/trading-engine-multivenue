@@ -71,6 +71,21 @@ members = [
     "crates/strategy-vrp",
     "crates/strategy-xsd",
 
+    # --- pine execution (PVM lane) ---
+    "crates/pine-broker",
+    "crates/pine-ir",
+    "crates/pine-lang",
+    "crates/pine-screen",
+    "crates/pine-conformance",
+    # impl-09 (R-P33, 2026-10-29): the offline harvest corpus tool — nothing depends on it (I18)
+    "crates/pine-corpus",
+    "crates/pine-sema",
+    "crates/pine-spec",
+    "crates/pine-std",
+    "crates/pine-vm",
+    # impl-08 T4: the slot-8 Pine member (PAPER ONLY, ruling 2026-10-16)
+    "crates/strategy-pine",
+
     # --- execution ---
     "crates/clob-dispatcher",
     "crates/exec-router",
@@ -242,6 +257,18 @@ strategy-set          = { path = "crates/strategy-set" }
 strategy-vm           = { path = "crates/strategy-vm" }
 strategy-vrp          = { path = "crates/strategy-vrp" }
 strategy-xsd          = { path = "crates/strategy-xsd" }
+
+# --- pine execution (PVM lane) ---
+pine-broker = { path = "crates/pine-broker" }
+pine-ir = { path = "crates/pine-ir" }
+pine-lang = { path = "crates/pine-lang" }
+pine-screen = { path = "crates/pine-screen" }
+pine-conformance = { path = "crates/pine-conformance" }
+pine-sema = { path = "crates/pine-sema" }
+pine-spec = { path = "crates/pine-spec" }
+pine-std = { path = "crates/pine-std" }
+pine-vm = { path = "crates/pine-vm" }
+strategy-pine = { path = "crates/strategy-pine" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 exec-router     = { path = "crates/exec-router" }

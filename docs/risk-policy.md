@@ -7024,6 +7024,13 @@ are `docs/binance-runbook.md`.
   `prices_and_quantities_are_cut_the_venues_way`; gate 92.
 * **Open.** The risk gate judges the order before quantization: a SELL
   may price one tick above what it judged ("BX6").
+* **As built — slot 8 (PB2, PB3; PB0.2 recorded 2026-10-29, R-P32):** a
+  strict owner (the Pine slot alone, `bn_live::strict_grid_for`) refuses
+  an off-grid price or size (`Refusal::OffGrid`, word `off_grid`) instead
+  of quantizing, so the "Open" above does not apply to it; its USDⓈ-M
+  reduce-only PLACE below MIN_NOTIONAL is exempt from the local minimum
+  (`-4164`), its MODIFY never is (`-5029`); `minQty` binds. Every other
+  owner keeps this section unchanged. Slot 8 stays paper only.
 
 #### BX-6 (clock)
 
@@ -16566,7 +16573,7 @@ doc `claude/s16-plan-2026-10-15.md` (inventory:
 | S16-R2 | **`LEDGER_RESTING` 512 → 1 024**: 64 open orders per slot × 16. The sweep-deferral argument is re-derived below. |
 | S16-R3 | **One declarative member table** in strategy-set, and one `+`-joined `STRATEGY` parser over it in place of the whole-string allow-lists. Overlapping or repeated segments (`ai+vm`, `vrp+vrp`) are ACCEPTED as the union. launchd may boot ANY combination of named members; `all` is refused at the wrapper. |
 | S16-R4 | One commit per cut on `main`, prefix `S16:`; release build and restart at a quiet point; push at the end. |
-| S16-R5 | **Slots 8–15 are RESERVED**: no member, `BUILT_MASK` stays 0x00FF. Adding a member there needs its own ruling. |
+| S16-R5 | **Slots 8–15 are RESERVED**: no member, `BUILT_MASK` stays 0x00FF. Adding a member there needs its own ruling. *Amended 2026-10-16 (PVM, operator ruling): slot 8 holds the Pine member, PAPER ONLY; `BUILT_MASK` is 0x01FF and `all` is `ALL_MASK` 0x00FF; 9–15 stay reserved — see "PVM — slot 8, paper only".* |
 | S16-R6 | The `/state` snapshot schema 2 → 3 (S16-5): per-slot arrays grow to 16, index paths unchanged, the dashboard reads both. |
 
 ### The hazard: a shift that lands on BIN15
@@ -16611,6 +16618,9 @@ doc `claude/s16-plan-2026-10-15.md` (inventory:
   exists.** Today none can (no member sits there); the first member at 8–15
   closes the door, which is one reason it needs its own ruling.
 - A binary rollback also needs the wrapper rolled back (S16-1, below).
+- *Amended 2026-10-16 (PVM):* slot 8 is built (the Pine member) and PAPER ONLY, so the
+  S16-R5 refusal now names 9–15 and slot 8 is refused by its own paper-only checks; no live
+  order from slot 8 can exist, so the door stays shut ("PVM — slot 8, paper only").
 
 ### Formats: no version bump
 
@@ -16874,6 +16884,9 @@ check. Then `git push origin main` (S16-R4).
 
 - **A member at slots 8–15** (S16-R5): its own ruling. Its first live order
   closes the rollback door above.
+- *Amended 2026-10-16 (PVM):* slot 8 now holds the Pine member by its own ruling — paper
+  only, so it places no live order and the door stays shut; slots 9–15 remain open
+  questions ("PVM — slot 8, paper only").
 
 ## HK, part 4 — Hyperliquid's parse errors and the u32 `venue_seq` (2026-10-16)
 
@@ -17090,6 +17103,511 @@ first two minutes: `binance_options_seq_regressions_total` 0,
 141 → 58–68 ms as the clock learned (bookTicker's `binance` delay 8–36
 ms); `binance_seq_regressions_total` and `…_stale_ticks_total` 0; okx and
 HL 0. Then `git push origin main`.
+
+## PVM — slot 8, paper only (operator ruling 2026-10-16)
+
+**Ruling (operator, 2026-10-16):** the Pine member (`crates/strategy-pine`, PVM impl-08 —
+third-party Pine scripts, every order through `pine-broker`'s `NativeBroker`) takes **slot 8,
+PAPER ONLY**: it is refused in every live arm. The running engine's `~/multivenue` configs,
+wrapper and `strategy.conf` are untouched. The live venues for a later ruling are Binance and
+Hyperliquid (O-PVM-2). Lead ruling: `all` keeps meaning the eight production members.
+
+| fact | value |
+|---|---|
+| member table | nine rows; slot 8 = `pine` (`strategy_set::SLOT_PINE`, `BIT_PINE` 0x0100), no `regime.toml` label |
+| `strategy_set::BUILT_MASK` | **0x01FF** (the OR of the rows; `StrategySet::new` clamps to it) |
+| `strategy_set::ALL_MASK` | **0x00FF = `--strategy all`**, unchanged; pine is selectable by name only (`…+pine`) |
+| slots 9–15 | still RESERVED: S16-R5's refusal (`(artifact \| flag) & !BUILT_MASK`) names them |
+| unattributed fills | `UNATTRIBUTED_FILL_MASK = BUILT_MASK & !BIT_PINE`: slot 8 receives only fills attributed to it |
+| surfaces | `/state` slot 8 reads `"pine"` (schema 3, additive — the HC11 precedent); audit-pnl labels it `pine`; the tui shows it as a member row |
+
+**The refusals — each fail-closed, each on its own:**
+
+1. **Parse.** `core_config::exec` refuses `[exec.slot.8] mode = "live"` before any other live
+   rule, whatever its name, venues or `[exec.slot.8.pine]` say. The `[exec.slot.8.pine]` section
+   (impl-08 §4.8: `min_coalesce_ms`, `event_insn_budget`, `boot_exit_policy`, …) is recognised
+   only at slot 8, after `[exec]`, once; its refusals start with their code (`6004` unknown key,
+   `6006` out of range, `6005` missing on Live). Without it the artifact parses exactly as
+   before.
+2. **Boot (`cli::exec_boot::resolve`).** `(artifact live mask | --arm-live) & PAPER_ONLY_MASK`
+   (= `BIT_PINE`) refuses FIRST — before the S16-R5 check and before the interlock compare — so
+   `--arm-live 8` is refused beside any artifact. The per-slot table build refuses a Live mode
+   at `PINE_SLOT` on its own as well.
+3. **AI plane.** `EnableStrategy(8)` is refused and counted (`enable_refused`): the AI never
+   arms third-party code. `DisableStrategy(8)` and `HaltRequest` are honoured.
+4. **The T19 boot — `--pine <manifest>` is required both ways (F19).** Slot 8 boots in PAPER
+   only, and only with `--pine`. The set arm boots `requested & configured`, so without this
+   check `ai+pine` would boot as `ai`, silently. The `run` command checks it in `Cmd::Run`, before
+   `run` is entered: before the config load, the ingress threads, the exec artifact and every live
+   or gateway arm (`cli::pine_boot::check_run`, exit 1). Each of these refuses: a `--strategy`
+   naming pine without `--pine`; `--pine` without pine in the mask; `--pine` beside a `--strategy`
+   that is not a set mask (a legacy arm such as `ev` or `rule-tree`, or a typo,
+   `pin:08-run-legacy-strategy-refused`). `strategy-mask` still resolves the name (`pine` →
+   `256\tpine`), so a `STRATEGY` naming it passes the wrapper and the boot decides. The
+   unconfigured member's own `on_start` refuses too (F19). A configured boot (`pine_boot::build`,
+   then the member's load) holds each of the following, fail-closed:
+   - **Facts come from venue discovery** (operator ruling R-08-T19-1, 2026-10-17,
+     `pin:08-facts-from-discovery`). Every route symbol's `PineSymbolFacts` is read from the boot
+     REST discovery the run already performs: Hyperliquid `meta` `szDecimals`, Binance
+     `exchangeInfo` filters. A missing fact refuses the boot. There is never a default.
+   - **Slot 8's route is paper or off.** It is the router's resolved row (`ExecBoot::slots`). A
+     live slot 8 never reaches here (refusals 1–2).
+   - **Paper boots flat.** A non-empty `boot_state` off Live is refused (`6013`,
+     `pin:08-boot-state-live-only`).
+   - **The boot adoption is asserted at both ends (I38).** `reconcile_boot` silently changes
+     nothing on a broker that is no longer pristine, and a flat adoption cannot be told from a
+     skipped one by the position alone (risk review r15). So `arm::adopt` asserts
+     `NativeBroker::is_pristine()` BEFORE `reconcile_boot` (a sequencing defect of the member
+     otherwise), and after it that the adoption took: no longer pristine, the venue's position
+     and, when not flat, its average price on the book. Both are `assert!` in every build.
+   - **`oid_epoch != 0`.** An epoch of 0 is refused at load (`6006`, `pin:08-epoch-zero-refused`).
+     With epoch 0, every own fill decodes as a prior boot's and paper re-fires without bound. The
+     epoch is the boot's UTC second.
+   - **The 2^29 broker-oid bound** (`1 ≤ oid < 2^29`, what the client oid can carry) is an
+     `assert!` in every build, not a `debug_assert!` (`host::dispatch_one`, impl-08 §4.6).
+   - **No slot-8 order carries `ORDER_FLAG_POST_ONLY`** (`pin:08-no-post-only-paper`). The bit
+     selects the paper queue law, under which a cancel or modify `Ok` means only "sent". Slot 8
+     settles on `Ok`, and with the bit it would share xmm's 32-order / 8-symbol queue table.
+     `ORDER_KIND_MAKER` keeps the strict-cross law.
+   - **`ORDER_FLAG_REDUCE_ONLY` goes on reducing orders only** (the broker's reduce-only sizing:
+     exits, closes, the D13 flatten, the guards' `CloseAll`; `pin:08-order-flags-set`). The
+     paper matcher ignores the bit, so on paper the broker's sizing is the guard. Live, it is a
+     second guard against a flip: the exec router reads it on a Hyperliquid perp row (only a
+     flagged reduction is an exit there, "B'4" below), and both arms send it to the venue —
+     exec-hyperliquid on a perp row (`r: true`), exec-binance on USDⓈ-M (r28 risk review B2, C4).
+   - **`activation_ns` is taken from the matcher's table** (`pin:08-activation-from-matcher-table`,
+     found by G5). It is `core_fill::ACTIVATION_NS_DEFAULT[..8]`, the table `PaperMatcher` judges
+     by. With zeros, an IoC was reported cancelled and then filled.
+
+**`[exec] enabled = 0`** (`pin:08-exec-boot-resolved`). Slot 8's route is the router's resolved
+row (above). Under `[exec] enabled = 0` that row is the paper default: `[exec.slot.8]`'s mode
+(including `off`), caps and venues are ignored; only `[exec.slot.8.pine]` still applies.
+`enabled = 0` disarms live, it does not stop slot 8: to stop it, drop pine from `STRATEGY` (and
+`--pine`) or `DisableStrategy(8)`.
+
+**Fees and bar marks.** R7 bar marks (`take_bar_marks`, `pin:08-bar-marks-replay-only`) and R8
+noted fees (`note_fill_fee`) are replay-host only: the B'3 harness drains the marks and notes
+each fill's fee; the engine records no marks and notes no fee. Engine paper books every slot-8
+fill at the `[exec.slot.8.pine]` fee model (`fee_taker_ppm` / `fee_maker_ppm`), rounded up
+(`fills::model_fee_1e12`). A negative noted fee aborts in every build, never clamped
+(`pin:08-noted-fee-non-negative`); a note naming another fill books the model and is counted
+in release (`noted_fee_mismatched`, `pin:08-noted-fee-one-fill`).
+
+**No rollback door is needed.** No live order from slot 8 can exist (refusals 1–3), so an
+older binary never meets a slot-8 cloid or cid; S16-R5's door stays shut. Slot 8's live-arming
+ruling must reopen this.
+
+**The pine-broker requote cap (`pin:05-requote-replaces-prev`; operator ruling 2026-10-17:
+ACCEPTED).** A requote is one `Modify` (E-7). An increasing `Modify` is judged in gates 5–6
+with `prev`'s unfilled quantity **replaced** by the new size, not added to it
+(`outstanding − prev + new`). Every other outstanding order still counts, a `Replaced`
+predecessor included. **The documented bound:** exposure may exceed `cap_instance` (and
+`cap_day`) only by `prev`'s fill that is in flight when the `Modify` lands, which is at most
+`prev`'s unfilled quantity. Reducing requotes are unchanged (`new ≤ |pos| − R`, with `prev`
+still in `R`). Counting `prev` beside its own replacement refused every requote at a
+`cap_instance` of one unit and turned each into Cancel + Submit. **Re-review this before any
+live pine route.** The spec text is impl-05 §4.12.4 rule 4 and I39 (amendment AMEND-05).
+
+**The pine-broker day roll.**
+- `pin:05-boot-day-seed-kept` (R-08-T16-1): the first roll, with no adopted day, adopts its UTC
+  day and keeps the `reconcile_boot` seed. Zeroing the seed there let a restart spend the day
+  cap twice.
+- `pin:05-roll-day-forward-only`: an earlier day never rolls. A stale event therefore cannot
+  zero the day notional or lift a day-scoped halt, and its notional counts toward the adopted
+  day.
+- **Open — FIX-BEFORE-LIVE:** a forward jump caused by one future-stamped venue fill still rolls
+  the day. That zeroes the day notional and lifts a day-scoped halt early. Before any live pine
+  route, cap a forward roll at the event clock's day.
+
+**B'1 trade routing.** Trade events reach slot 8 only. `StrategySet::on_venue_event` hands a
+`ChannelId::Trade` event to the pine member, when it is enabled, and returns before the regime
+tap and the member fan-out. Every other member's event stream is therefore byte-identical to
+the pre-B'1 one (xmm's prints ride their own `TradePrint` lane).
+- An ingress sheds a routed print, and counts it once, when the event ring is at
+  `EVENT_RING_SIZE − EVENT_TRADE_RESERVE` or fuller. Since
+  `EVENT_TRADE_RESERVE = EVENT_RING_SIZE / 4`, a Trade burst always leaves room for every
+  non-trade channel (Funding, AssetCtx, Mark, InstrumentRoll).
+- Any non-zero `engine_ingress_<venue>_trade_shed_total` is an alert, and it makes that session
+  ineligible for 8g.
+- The route is EMPTY, so no lane pushes a Trade for slot 8, unless `--pine` names route
+  symbols. A route symbol on a lane without Trade capture refuses (`6006`).
+- The commit that wires the route into the boot carries its own risk review.
+
+**Observability.** *Amended 2026-10-17 (lead ruling, pin:08-drain-outside-metrics):* slot 8's
+durable outputs — the T18 tapes (`seq.bin`, `decisions.bin`, `set.tsv`) and `incidents.log` —
+drain on every 5 s block beside the loop hook's drain, OUTSIDE the metrics gate, and once more
+after the loop's last iteration (before `eng.stop()`), with or without `--metrics`: they are
+capture durability, not an observability option. Only the `engine_pine_*` mirror stays inside the
+`/metrics` block; a pine boot without `--metrics` mirrors nothing. Tests: `cli` `pine_metrics`
+`metrics_off_boot_still_drains_incidents_and_tapes`,
+`engine_loop_drains_pine_outside_the_metrics_gate`.
+*Amended 2026-10-17 (risk r21 #3, `pin:08-tape-buffered`):* the tapes exist only with
+`--pine-tape`. Each engine-thread writer (`seq.bin`, `decisions.bin`, `set.tsv`,
+`pine-delivery.bin`) is a 64 KiB `BufWriter` allocated when it opens at boot. A 5 s pass costs
+one flush per file, plus a write(2) per full 64 KiB buffer, and no fsync; the final drain flushes
+too. A write or flush error is logged at ERROR; it never stops the engine. *Amended 2026-10-17
+(risk r23 B3):* what "void" means per file. The tapes' cursors move per record written and the
+buffer keeps unwritten bytes, so a later pass retries without duplicates; a failure that persists
+leaves a shorter tape (8g-A red, or an honest shorter window). The delivery journal is voided by
+a file: see `pine-delivery.void` below. *Amended 2026-10-17 (risk r24):* voiding costs the 5 s
+pass once per boot, and only on that failure: `void()` opens the marker `O_CREAT|O_EXCL`
+(`create_new`), makes a few small unbuffered writes with no fsync, and drops the journal writer
+(one last flush attempt, the close, and the free of its 64 KiB buffer and 8 KiB drain slice).
+On the write-error branch the marker's `write\t<error>` line formats the OS error, which may
+allocate once (the existing `error = %e` log line on that branch already did). Every later pass
+skips the journal.
+
+**The boot record and `pine-verify` (risk review r21, 2026-10-17).**
+- **`<run>/pine-boot.tsv`** (`# pvm-boot-1`) is written once, atomically, right after
+  `eng.start()`. It carries the boot's per-symbol facts, `queue_syms` (every symbol the paper
+  queue law tracks at this boot), `exec_sha256` (the SHA-256 of `exec.toml`'s bytes, zeros
+  without `--exec`) and `boot_utc_ms` (the live tape's label, `pin:08-boot-record-boot-utc-ms`).
+  The parse is strict: a record missing any of these fails closed. A failed write is logged at
+  ERROR, never refused; that run then cannot be replayed from boot.
+- **Queue symbols.** The boot reaches the queue law only through one call that also keeps the
+  symbol. The kept list goes to slot 8's hook after every member block, so the record cannot
+  miss one, whatever the block order (r21 #4).
+- **`<run>/pine-delivery.bin`** (R6) is written with `--pine-tape` only. Raw 32 B records,
+  append-only; a gap voids the window. *Amended 2026-10-17 (risk r23 B3,
+  `pin:08-delivery-void-file`, `pin:08-delivery-cursor-per-record`):* the cursor moves per record
+  written, so a retried drain never writes a record twice. A gap or a write / flush error closes
+  the journal for the rest of the boot and creates `<run>/pine-delivery.void` once
+  (`create_new`; `# pvm-delivery-void-1`, then `gap\t<n>` or `write\t<error>`).
+  `backtest --replay-from-boot` refuses a `--delivery-journal` with that file beside it, exit 6,
+  before any record. *Amended 2026-10-17 (risk r24, `pin:08-delivery-journal-canonical`):* it
+  first resolves `--delivery-journal` with `std::fs::canonicalize` (a path that does not resolve
+  is refused, exit 6), looks for the marker beside the resolved file, and reads that file. The
+  guarantee is exactly this, with two limits:
+  - **A copied journal carries no marker.** The marker is looked up beside the journal's
+    canonical path only, so a symlink to the run's journal is judged by the run's marker, but a
+    journal COPIED elsewhere (into a hand-built window root beside `pine-boot.tsv`, say) is read
+    as if whole. `--delivery-journal` must be the live run's own `<run>/pine-delivery.bin`.
+  - **A marker that cannot be created is only logged**: ERROR `pine: delivery void marker NOT
+    written` (with `error` and `path`), after the ERROR that voided the journal; the run goes on.
+    The records carry no journal ordinal, so nothing else on disk marks that hole: those two log
+    lines are then the only record that the journal is void.
+- **`pine-verify` is offline and read-only.** It opens no socket, reads no `.env` and arms
+  nothing. It replays on its own slot-8-only `PaperMatcher`. An armed `exec.toml` is loaded under
+  its own arming: rule 3 is a re-hash of the bytes against `exec_sha256`, never the two-switch
+  interlock (r21 #1).
+- **What makes a window ineligible.** Listed with its reason, never counted, never red:
+  - a pine symbol that is also in `queue_syms` (`pin:08-verify-queue-sym-ineligible`);
+  - rules 4/6 that cannot be shown: no `set.tsv` rows, a row gap over 10 s, a short row, or a
+    non-zero `rejected_open_cap`.
+- **What is red.** A fill the replayed matcher still holds after the replay counts as a diff
+  (r21 #2).
+- **Replay tapes never append.** `backtest --replay-from-boot --tape-out` names its tape directory
+  from the record's `boot_utc_ms` and creates every file new. An existing tape is refused with
+  exit 2 (r21 #5). `pine-verify --cross` therefore pairs live and replay tapes exactly.
+
+**8g-B pairing and the output paths (risk review r22, 2026-10-17).**
+- **The pairing rule (B1, N1).** `pine-verify --cross <root>` pairs the live tape
+  `tape/<boot_utc_ms>/` with `<root>/<boot_utc_ms>/`, made by
+  `backtest --replay-from-boot --fills recorded --tape-out <root>` over that boot's run (same
+  label, same `oid_epoch`). Each of the following makes the window ineligible: listed with its
+  reason, never counted, never red.
+  - No tape under the label (rule 7).
+  - A seq gap in either replay tape.
+  - A replay `BOOT_HDR` that does not read route Paper, host Replay, and the live header's
+    `oid_epoch` and `boot_utc_ms`; or a live header whose host is not Engine. The live tape is
+    never paired with itself (`pin:08-cross-pair-is-replay`).
+  - A replay made in the other mode. `--tape-out` writes `replay.tsv` (`# pvm-replay-1`, then
+    `fills\t<mode>`), created new. 8g-B pairs with `recorded` only. Absent, malformed or
+    `judged` is ineligible (`pin:08-cross-replay-fills-file`). *Amended 2026-10-17 (risk r23
+    B2, `pin:08-replay-file-after-clean-drive`):* `replay.tsv` is written last, after the final
+    flush, and only by a drive that finished clean. A replay that faulted (exit 4), diverged
+    (exit 5) or aborted on an I/O error has tapes but no `replay.tsv`; its window is ineligible
+    ("unrecorded or unfinished replay"). impl-08 §4.9 names no mode;
+    impl-Bp §4.12 recommends `recorded` as the member-determinism gate
+    (`pin:08-cross-fills-recorded`).
+  - Different `BOOT_SCRIPT` sets on the two tapes (`pin:08-cross-boot-scripts`).
+- **Four tape fields are NOT compared (N2, `pin:08-cross-fields-listed`).** A pair is equal iff
+  the fields impl-08 §4.9.1 lists for its kind are equal. `DISPATCH`: a, b, c, bar, oid, px,
+  qty, id, previous oid. `DISPOSITION`: a, oid. `FILL`: oid, px, signed qty, fee, `time_ms`.
+  The four fields outside those lists:
+  - `DISPOSITION.b`, the rule. It is the host's: 1 (paper evidence) live, 3 on the replay.
+  - `FILL.a`, the origin. It is the host's.
+  - `FILL.b`, the side. The signed qty carries it.
+  - `FILL.bar_index`. §4.9.1's `FILL` list names no bar.
+
+  8g-B cannot see a difference in these four.
+- **The wall anchor (`pin:08-boot-record-anchor`, lead ruling R3; retires
+  `pin:Bp-recorded-wall-map`).** The boot record carries the live member's wall anchor, exact
+  in ns. The replayed member runs on the identity anchor. The harness maps every record and
+  journal stamp onto the live anchor: `wall = anchor_wall + (ts − anchor_mono)`. The
+  `BOOT_HDR` anchor words (x0, x1) are therefore not compared.
+- **`set.tsv` must cover the window (C1, `pin:08-set-rows-span`).** Rules 4/6 hold only when
+  all of the following do; else the window is ineligible.
+  - Rows strictly increase, each at most 10 s after the one before (`0 < d ≤ 10 000` ms,
+    overflow-checked).
+  - The first row is at most 10 s after the boot.
+  - The last row is at least `min(boot + 2 h, last in-window seq record's wall) − 10 s`. With
+    no seq record, the boot stands in.
+  - Every row has slot 8's bit set, and every row reads `rejected_open_cap` 0 (a short row
+    fails).
+- **`--report-out` and `--tape-out` refusals (C2, C3).** Each path is judged on its canonical
+  form (`pin:08-out-canonical`): the longest existing prefix goes through `canonicalize`, which
+  follows every symlink; the remainder is applied lexically. A dangling link cannot be
+  resolved: exit 6.
+  - Inside a git working tree, a symlink into one included: exit 6.
+  - A report under `~/multivenue/` but not under `~/multivenue/pine/` (both canonical): exit 6
+    (`pin:08-report-out-pine-only`).
+  - An existing report: exit 2, before any record. The one write is `create_new`, so a report
+    is never overwritten (`pin:08-report-out-create-new`).
+  - The replay's default report, `~/multivenue/pine/8g/<run>.jsonl`, is checked the same way.
+  - `--tape-out` gets the git refusal only, not the pine-only rule (risk r23): a tape under the
+    live root `~/multivenue/pine/tape/` is accepted. Harmless: every file is created new (an
+    existing label exits 2, never appended), and a replay tape carries host Replay, so rule 1
+    (host Engine) makes a window read from it ineligible.
+  - `--report-out` belongs to the pine arms only (`--strategy pine`, `--replay-from-boot`). The
+    legacy ruleset arm refuses it at parse (C4, `pin:Bp-8g-report-out-shared`).
+- **The live tape is created new (`pin:08-live-tape-create-new`; retires the live
+  create-or-append).** The live `--pine-tape` creates every file under
+  `~/multivenue/pine/tape/<boot_utc_ms>/` new. A second boot on the same label, or a clock
+  stepped back onto an earlier one, finds the files (a dangling link counts). That boot's tapes
+  are then OFF, with one ERROR line (`pine: --pine-tape not opened — tapes OFF for this boot,
+  window void`). Nothing is appended to the earlier tape. The boot itself never fails because
+  of a tape: `incidents.log` still appends and the member runs.
+
+**Bench.** `bench/benches/hot_path.rs` builds `StrategySet::new(BUILT_MASK)`, so
+`strategy_set/on_tick_all` now includes the inert pine member (one branch and one counter); a
+`bench-check` drift there is this, and the re-baseline is the operator's.
+
+**Re-baselined in the r40 merge (2026-10-29, ruling R-P35).** Merging main `df543c33` (pm15 slot 9,
+pmj slot 11) into the branch made pine one of eleven built rows: `strategy_set/on_tick_all` 4.63 →
+5.87 ns and `on_tick_none` 3.06 → 3.32 ns (one cycle). Evidence: an interleaved A/B, six rounds of the
+`strategy_set` benches with bench-check's settings, A = main `df543c33`, B = the merged tree, both
+engines running — on_tick_all A 5.1–5.4 / B 5.86–5.90 ns on the steady rounds, on_tick_none A 3.06 /
+B 3.31 ns; `on_timer_all` and `on_fill_routed` unmoved. The rounds and the values' derivation are in
+`crates/bench/baselines/hot_path.json`. A set-bit fan-in (cost by enabled members, not built rows)
+stays the possible later lane.
+
+**Tests:** `core-config` `tests/pine_manifest.rs` (`slot8_live_section_is_refused_paper_only`,
+`slot8_section_defaults_and_ranges`, `slot8_live_requires_three_keys`,
+`exec_toml_without_slot8_section_is_unchanged`); `cli` `exec_boot`
+`pine_slot_8_is_refused_in_every_live_arm`; `cli` `pine_boot`
+`pine_requires_the_flag_both_ways`, `pine_with_a_legacy_strategy_refuses`,
+`tests/pine_boot_refusal.rs` (the real binary) and `tests/pine_t19.rs`
+(`facts_come_from_discovery`, `build_is_paper_flat_and_configures`,
+`exec_disabled_slot8_is_the_paper_default`); `strategy-set`
+`pine_is_slot_8_by_name_only_and_all_excludes_it`, `pine_enable_8_refused_disable_8_honoured`,
+`pine_receives_only_fills_attributed_to_slot_8`, `a_trade_print_changes_no_existing_member`;
+`strategy-pine` `tests/fault.rs` `no_slot8_order_is_post_only`, `tests/readback.rs`
+(`noted_fee_negative_fails_fast`, `noted_fee_mismatch_is_counted`); `pine-broker`
+`tests/native_maker.rs` (`a_requote_at_a_cap_of_one_unit_is_one_modify_not_cancel_and_submit`,
+`a_requote_keeps_every_other_outstanding_order_in_its_gates_and_never_passes_the_cap`) and
+`native` `an_event_stamped_on_an_earlier_day_never_rolls_the_day`; `ingress-binance`
+`binance_every_shed_print_is_counted_once`; `cli` `tests/pine_verify.rs` (incl.
+`verify_rule3_rehashes_an_armed_exec_toml`, `verify_counts_a_fill_left_in_the_matcher_as_a_diff`,
+`verify_queue_tracked_pine_symbol_is_ineligible`), `tests/pine_hook.rs`, `pine_tape`
+`create_new_refuses_an_existing_tape`, `pine_delivery`
+`queue_syms_reach_the_boot_record_whatever_the_block_order`; `strategy-pine` `bootrec`
+(`boot_record_round_trips`, `boot_record_parse_is_strict`,
+`boot_record_carries_the_live_wall_anchor`) and `tests/bootrec.rs`. Risk review r22: `cli`
+`backtest::pine::fees` (`a_symlink_into_a_git_tree_is_refused`,
+`a_report_under_multivenue_must_be_under_pine`, `a_report_is_created_new_and_never_overwritten`),
+`drive8g` (`report_out_and_tape_out_refuse_git_and_a_symlink_into_git`,
+`an_existing_report_out_is_refused_and_kept`,
+`tape_out_writes_the_replay_tapes_under_the_boot_label`), `backtest::pine::run`
+`report_out_refuses_git_a_link_into_git_and_an_existing_file`, `tests/backtest_pine_gate.rs`
+`report_out_is_refused_by_the_legacy_ruleset_arm`, `pine_tape`
+`live_open_refuses_a_second_boot_on_the_same_label`, `pine_metrics`
+`a_second_boot_on_the_same_label_runs_with_tapes_off`, `pine_verify`
+(`set_rules_require_increasing_rows_at_most_10_s_apart`,
+`set_rules_require_the_rows_to_cover_the_window`), `pine_verify::cross`
+(`cross_refuses_the_live_tape_as_its_own_replay`,
+`cross_refuses_a_replay_made_in_the_wrong_fills_mode`, `cross_compares_only_the_listed_fields`),
+`tests/pine_verify.rs` (`cross_pairs_a_live_paper_window_with_its_replay_from_boot`,
+`replay_from_boot_recorded_mode_reproduces_the_live_fills`).
+
+## B'4 — Hyperliquid perps (impl-Bp §4.13–§4.14; DARK until the operator arms it, 2026-10-17)
+
+**Status: written BEFORE any perp arms** ("no subsequent E-phase may arm a venue without its own
+entry here first", "Phased loosening"). A perp is a new instrument class on the armed venue.
+**Nothing arms by default:** slot 8 (Pine) stays PAPER ONLY — refusals 1–3 of "PVM — slot 8,
+paper only" stand unchanged, and the cli never sets the PL2 live permit. The code below builds and
+judges the perp half of a boot; wiring it into a live boot and arming are the operator's acts.
+`risk-reviewer` closes this entry before R2. **OPEN until then.**
+
+**Risk review 2026-10-29 (r40, R-P32 "Paperwork only") — NOT CLOSED.** The laws below (E-4P,
+refuse-never-round, isolated margin, one owner per coin, the three cap laws, recon) hold for the
+code that exists (`exec_hyperliquid::perp`, `perp_recon`, `cli::pine_hl`, `exec_boot::boot_hl_perps`).
+Blocking before it can close (vault `pvm/live/risk-review-2026-10-29.md`,
+`pvm/live/hl-overlap-2026-10-29.md`):
+- **RH-1** T0.6 (the E7 anchor with the perp `accountValue`) is unanswered — arming is blocked by
+  this entry's own text.
+- **RH-2** **The perp-overlap rule does not cover slot 8.** `xmm_live::check_perp_overlap` lists
+  hyparb, vrp and hcv as slot 6's others; no check compares slot 8's perps with slot 6's quotes or
+  the hedges, in either direction. And no in-engine check can see the standalone engines
+  (XMM on EC2, HYPARB on EC2, BIN15 on the Mac) that trade Hyperliquid on their own accounts.
+  Required at the arming change: slot 8 in both directions of the overlap check, and **a Hyperliquid
+  account (master or sub-account) used only by slot 8**, never one another engine or slot trades.
+- **RH-3** The pine perp path is not assembled: `boot_hl_perps`, `pine_hl::hl_perp_boot` /
+  `seed_router_perps` / `live_rows_from_hl` are called by tests only; slot 8 has no gateway arm,
+  no `NonceStreams` stream and no dead-man binding. The review re-runs on the assembled boot.
+
+**LAW E-4P.** A perp asset id is valid only when bound at THIS boot from the venue's own `meta`
+answer, by exact coin name, from an entry that is not delisted; never derived, never carried
+across a boot (`exec_hyperliquid::perp::PerpTable::bind_from_meta`). Refused at boot: a coin
+absent from `meta`, delisted, leverage 0 or above its `maxLeverage`, a coin or symbol routed
+twice. Perps do not roll; the boot binding replaces E-4's roll binding. One boot tell per coin
+(`perp coin=… asset=… szDecimals=… maxLev=… lev=… min=$…`): read the asset id off it.
+
+**Refuse, never round.** A perp order whose price breaks the venue grid (more than 5 significant
+figures and not an integer, or more than `6 − szDecimals` decimals), whose size has more than
+`szDecimals` decimals, or whose value is below the coin's minimum is refused locally before
+signing (`perp::check`; counted in `refused_local` and per `PerpRefusal`). Nothing is rounded.
+impl-08's tick is `perp::tick_1e6(ref, szDecimals)`; past that price decade an off-grid limit is
+refused, never rounded.
+
+**The minimum.** `min_notional_1e6 = max($10 documented, the probe's value)`. The probe file
+(`~/multivenue/hl-perp-limits.tsv`, written by `scripts/exec-smoke.sh --perp-probe`, testnet) is
+an **arming precondition**: a coin absent from it cannot arm (`exec_boot::hl_perp_wants`). The
+slot's `max_order_usd_1e6` must clear every routed coin's minimum or no order passes both
+(impl-08 `6009`).
+
+**Isolated margin, leverage fixed at boot.** `[exec.hl_perp] isolated = 1` is required (any other
+value refuses the boot); `updateLeverage {asset, isCross: false, leverage}` once per coin at boot,
+a non-`default` answer refuses the boot; leverage never changes at runtime. A venue position that
+is not isolated, or whose leverage differs from `exec.toml`, refuses the boot. One coin's loss
+cannot consume another's margin.
+
+**One owner slot per coin.** A bound perp coin has exactly one `owner_slot`; another slot's order
+is refused (`NotOwner`). impl-08 allows one enabled script per (venue, coin) on Live (`6007`).
+
+**The three cap laws for a perp row (O-E4: caps stay exactly paper's).**
+- `max_order_usd` = `px × qty`, unchanged; `max_open_orders` unchanged — it counts every PLACE,
+  an exit's too (O-BX25).
+- **An EXIT** is a pure reduction (its opening part 0) that carries `ORDER_FLAG_REDUCE_ONLY`; the
+  arm sends the flag to the venue (`r: true`, submit and modify), so N stacked exits cannot flip
+  the coin — the venue refuses what would. An exit is exempt from `max_order_usd` alone (L1, "a
+  cap never blocks an exit"). A reduction without the flag is judged by every clamp, inside the
+  stated worst case `cap_instance + max_open_orders × max_order` (r28 risk review B2;
+  `pin:bp4-perp-exit-exempt-clamp-1`).
+- `cap_instance_usd` = `Σ |pos| × price` over the slot's perp rows. The order's coin is priced at
+  the order's limit on BOTH sides of the test; every other row at its last fill. Refused iff
+  `projected > cap && projected > current`: a reduction is never refused.
+- `cap_day_usd` = filled OPENING notional (the part of a fill that increases `|pos|`, either
+  side); a reduction adds nothing, so exiting stays always possible.
+- A perp fill books to its row, never `fills_unbound`.
+
+**Reconciliation and halts.** Each recon cycle reads `clearinghouseState` (counted by the budget
+governor); drift = `Σ |ledger pos − szi| × px` (USD ×1e6) against `halt_on_recon_drift_usd_1e6`
+— a sticky halt; `halt_on_recon_stale_ms` unchanged. The boot seeds each row from
+`clearinghouseState` and today's opening notional from `userFillsByTime` (00:00Z, paged). **The
+anchor extension (T0.6):** the E7 P&L halts must include the perp `accountValue` before a perp
+arms — until T0.6 answers, arming is blocked. What stops it: `exec.HALT`, the E6 halts, the
+drift and stale halts, the E7 bound; **a cancel is never blocked by a cap** (E6).
+
+**Fees.** Measured from `userFills.fee` after the first live fills; an arming decision reads a
+measured row (§4.10).
+
+**What the operator must do to arm (none of it is done by code):**
+1. Run `scripts/exec-smoke.sh --perp-probe --perp-coins <coins> --perp-leverage <lev>` on the
+   TESTNET account (after phases A and B); exit 0, and `hl-perp-limits.tsv` lists every coin to
+   arm. Exit 67: a coin's answers did not match the documented rules (it is left out); exit 68:
+   something may be LEFT ON THE TESTNET ACCOUNT — read and clear it. `--perp-probe --offline` is
+   the cost-free self-test.
+2. `[exec.hl_perp]` in `exec.toml` (`isolated = 1`, `leverage`, `limits`), the slot's caps at
+   paper's (O-E4) with `max_order_usd_1e6 ≥` every coin's minimum.
+3. T0.6 answered and the anchor extension reviewed; impl-08's R0–R4 ramp, **R2 the first perp
+   signature on mainnet**, one coin, the smallest size.
+4. The live-arming ruling for slot 8 (it lifts refusals 1–3 and sets the PL2 permit — the cli
+   never does), and `risk-reviewer` closing this entry.
+
+## PVM — slot 8 on Binance USDⓈ-M (DARK until the operator arms it; PB14, R-P11, 2026-10-17)
+
+**Status: written BEFORE anything arms.** Slot 8 stays PAPER ONLY (refusals 1–3 of "PVM — slot 8,
+paper only" stand; the cli never sets the PL2 permit). Rulings adopted (R-P11, as recommended):
+OD-1 USDⓈ-M only; OD-3 cross margin; OD-5 slot 8 sole owner; OD-6, OD-7, OD-8, OD-11–OD-14. OD-2
+(symbols), OD-4 (caps) and OD-9 / OD-10 (arming) stay the operator's. `risk-reviewer` closes this
+entry before any arming. **OPEN until then.**
+
+**Risk review 2026-10-29 (r40, R-P32 "Paperwork only") — NOT CLOSED.** Reviewed against E-1, E-5,
+E-6, E-7, E-9, O-E4, the two-switch interlock and the code at `c107bde0`: items 1–7 and 9–13 hold
+as written (PB0.2 recorded, item 4). Blocking before it can close (vault
+`pvm/live/risk-review-2026-10-29.md`):
+- **RB-1** item 8's own residual (a script already disabled and flattening when a venue fill
+  arrives keeps its flatten) needs a ruling or a fix.
+- **RB-2** D19 fails open on a missing `entryPrice`: the USDⓈ-M scan reads it as optional (0), and
+  `pine_bn::live_rows_from_bn` → `attach_live_boot` adopts a held position at average 0. A held
+  position without an entry price must refuse `6013` (and PB0.3 — the field on this account's
+  `v2/account.status` — must be read). **FIXED 2026-10-29 (r40, ruled "Fix now"):**
+  `pine_boot::attach_live_boot` refuses `6013` for any held row with `entry_px_1e6 ≤ 0`, on both
+  venues (test `a_held_position_without_an_entry_price_refuses_6013`). Until PB0.3 shows a source
+  for the price, a Binance boot with a held position refuses — flatten before booting. PB0.3
+  stays open.
+- **RB-3** OD-2 (symbols), OD-4 (caps) and the dedicated account do not exist yet; the entry's
+  numbers are reviewed with them, at the arming change.
+
+1. **BX-1…BX-20 apply unchanged**, except where stated here.
+2. **The facts law (I-PB1).** On a Live route, every Pine symbol's tick, step, `minQty` and
+   minimum are this boot's bound row in the arm (`BnInstHot`). A difference refuses the boot
+   (`6013`). An inexact tick or step at 1e-6, a non-PERPETUAL / non-USDT / TradFi / dated symbol
+   refuses (`6006`); `minQty ≠ stepSize` refuses (`6009`); the minimum is CEILED, never floored.
+   On a Live route the boot's facts come through `pine_boot::symbol_facts` → `pine_bn::live_facts`
+   (the refusing conversion); paper keeps discovery's. Wired, and unreachable until the arming
+   change (a live slot 8 is refused at parse); `check_facts_against_arm` then compares the grid
+   with the arm's bound row (r28 risk review C1).
+3. **BX-5 for slot 8: refuse, never round (I-PB2, OD-7).** A slot-8 order off the bound grid is
+   refused and counted (`Refusal::OffGrid`, word `off_grid`); an on-grid order leaves
+   byte-identical. Non-Pine owners (the batteries) keep BX-5's rounding.
+4. **The minimum.** Refused locally for opening orders. A USDⓈ-M reduce-only **place** below it
+   is exempt (OD-6): **PB0.2 RECORDED 2026-10-29** from Binance's docs (R-P32; no Demo drill) —
+   the `-4164` text ("unless you choose reduce only") and the minimum-notional rule
+   announcements ("Reduce-Only orders are not affected"); vault `pvm/live/pb0-2-2026-10-29.md`.
+   A **modify** is never exempt (`-5029` MODIFICATION_MIN_NOTIONAL has no reduce-only clause;
+   `pin:cli-pb3-modify-not-exempt`); `minQty` and the strict grid always bind (I-PB3). In code
+   the exemption is the arm's `ro_min_exempt` knob, off by default and honoured only for a strict
+   (Pine) owner: the cli sets it from `bn_live::PB0_2_RECORDED` (**true** since this change);
+   the batteries never take it (r28 risk review B1). Not proven by the docs (a Demo drill would):
+   today's per-symbol minimums observed live, a reduce-only GTX maker below the minimum, a
+   reduce-only order larger than the venue position. BTCUSDT's minimum is **50 USDT** (PB0,
+   2026-10-17).
+5. **Margin (OD-3, R-P11).** CROSSED margin, one-way, single-asset, on a **dedicated
+   sub-account used only by slot 8**; leverage set by `exec-smoke --binance-setup` and asserted
+   at boot, **≤ 3** (`max_leverage`: PB9 refuses an artifact above 3 — `pine-verify --check
+   --exec` now, `exec_boot` at the arming change; the arm asserts every owned row's leverage ≤
+   `max_leverage` at boot, BX-19; r28 risk review C2); the account funded ≥ the slot's
+   `cap_instance_usd_1e6` so
+   account leverage stays ≤ 1×; `halt_on_margin_ratio_1e6` required, well under 800 000. (HL
+   perps stay ISOLATED per coin — "B'4" above.)
+6. **Ownership.** Slot 8 is the arm's one owner (BX-7 as built); every Binance router row is
+   owned by it (PB8), so another slot's order is refused by the router (`Foreign`) and the arm
+   (`NotOwner`).
+7. **D19 — the boot snapshot.** `VenueBootState` per Pine symbol is the gateway's own Ready
+   snapshot: position, entry price (0 when flat), today's notional both ways, the orphan sweep.
+   Refusals: `6013` on a missing or unread row (a full trades page), on resting orders not swept,
+   on a position on a bound symbol no enabled script trades; `6005` on a Live boot without
+   `boot_exit_policy` (OD-11: `protective`). A venue read failure refuses the boot (OD-11).
+8. **Venue-originated fills (I-PB5, OD-8).** An adopted fill is counted, never booked. A
+   liquidation / ADL / orphan / settlement fill (`order_id = 0`, venue origin) is counted, raises
+   one `VENUE_FILL` incident and **disables the script that trades the symbol, without a
+   flatten**; it is never booked by a broker. Its resting makers are cancelled in the same
+   callback (never a submit), a refused cancel re-sent at each later confirmed bar
+   (`pin:pb6-cancel-*`; r28 risk review C3). Residual, open before arming: a script already
+   disabled and flattening when the venue fill arrives keeps its flatten (reduce-only at the
+   venue bounds it).
+9. **The cap laws.** BX3's linear rows; exits exempt from the money clamps; O-BX25; the per-script
+   nesting (`6008`); O-E4: live caps equal paper's. OD-4's shape: per script `unit ≥ 1.5 ×
+   minimum`, `cap_instance = unit`, `cap_day ≈ 8 × unit`, `max_open ≤ 2`; the slot's `max_order
+   ≥ 2 × cap_instance`.
+10. **What stops it.** `exec.HALT`, the E6 halts, `MarginRisk`, `VenueLock`, `ScanFailure`, the
+    E7 bound, the arm's drift halt; a cancel is never blocked. Venue rejects stay invisible to
+    Pine for the first arm (OD-13): the settle window and the slot's reject halt cover them.
+    **The Pine-vs-ledger alarm (PB13, G8):** each cold 5 s pass sums the scripts' broker
+    positions per symbol against the router ledger's row; a difference on two consecutive
+    passes raises one ERROR tell and `engine_pine_ledger_drift` (`_total` counts episodes). An
+    alarm, not a halt — the arm's drift halt stays the venue guard.
+11. **Fees (OD-12).** The account's read rate (`/fapi/v1/commissionRate`, BNB burn off),
+    flagged modelled, until `bn-fees` has N = 30 measured trades (runbook §14).
+12. **The arming preconditions** (runbook §15): the BX13 R0 record on this account; impl-08 R0
+    and R1 artifacts; `pin:U17-barstate-table` pinned; Q1 ruled; measured or declared fees; the
+    setup tool applied; BNB burn off; PB15 green; `risk-reviewer` closed this entry.
+13. **The ramp.** impl-08 R0–R4, **R2 the first Pine order on Binance mainnet**: one script, one
+    symbol, the smallest size. The arming change (lifting the paper-only refusals for slot 8 on
+    Binance only, PB9 called from `exec_boot`, the PL2 permit, the operator's `exec.toml`) is the
+    operator's act at R2 — no session makes it.
 
 ## PM15 — slot 9: H90 on Polymarket's 15-minute up/down markets (2026-10-17)
 

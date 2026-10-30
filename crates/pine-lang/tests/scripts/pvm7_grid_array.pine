@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// Five-level grid, array form. OUR CODE, typed from the public rule of pvm7_grid.pine (five levels
+// stepPct apart around a slow-MA anchor, one unit bought per level touched, take-profit one step up)
+// with the levels held in array.new_float / array.get / array.set. Not one of the ten screened
+// scripts: compiled only when SCREEN_LIMITS.active_tiers has bit 2 (lane D's Tier 3).
+strategy("PVM7 Grid (array)", overlay = true, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 5,
+     calc_on_every_tick = true)
+
+stepPct   = input.float(0.5, "Step %", minval = 0.1, maxval = 5.0, step = 0.1)
+anchorLen = input.int(200, "Anchor length", minval = 10, maxval = 1000)
+
+anchor = ta.sma(close, anchorLen)
+stp    = anchor * stepPct / 100
+
+var levels = array.new_float(5, na)
+for i = 0 to 4
+    array.set(levels, i, math.round_to_mintick(anchor + (i - 2) * stp))
+
+strategy.cancel_all()
+if not na(anchor)
+    for i = 0 to 4
+        lv = array.get(levels, i)
+        id = "B" + str.tostring(i + 1)
+        strategy.order(id, strategy.long, 1, limit = lv, oca_name = "G" + str.tostring(i + 1), oca_type = strategy.oca.cancel)
+        strategy.exit("T" + str.tostring(i + 1), id, limit = math.round_to_mintick(lv + stp))
+
+plot(anchor, "Anchor")

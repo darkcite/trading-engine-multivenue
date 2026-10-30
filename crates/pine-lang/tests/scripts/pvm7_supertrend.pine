@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// Supertrend trend-follow. OUR CODE, typed from the public rule: an ATR band is drawn either side of
+// hl2, the band ratchets in the direction of the trend, and the trend flips when the close crosses
+// it. Long when the close moves above the line, flat when it moves below. Nothing here was copied.
+strategy("PVM7 Supertrend", overlay = true, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0)
+
+atrLen = input.int(10, "ATR length", minval = 1, maxval = 200)
+factor = input.float(3.0, "Factor", minval = 0.5, maxval = 10.0, step = 0.1)
+
+[st, stDir] = ta.supertrend(factor, atrLen)
+up = close > st
+
+if up and not up[1]
+    strategy.entry("L", strategy.long)
+if not up and up[1]
+    strategy.close("L")
+
+plot(st, "Supertrend", color = up ? color.green : color.red)

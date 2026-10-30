@@ -50,7 +50,7 @@ use tracing_subscriber::EnvFilter;
 /// and was ignored (`--bn-um-symbol ETHUSDT` beside a flatten closed every
 /// position). Each tool names all of these as conflicts instead; a test
 /// keeps the list whole for the flags to come.
-const BN_TOOL_CONFLICTS: [&str; 57] = [
+const BN_TOOL_CONFLICTS: [&str; 61] = [
     "asset",
     "offline",
     "lifecycle",
@@ -108,6 +108,10 @@ const BN_TOOL_CONFLICTS: [&str; 57] = [
     "bn_eq_ttl_ms",
     "bn_confirm_mainnet",
     "bn_mainnet",
+    "perp_probe",
+    "perp_coins",
+    "perp_leverage",
+    "perp_out",
 ];
 
 /// Top-level CLI.
@@ -140,6 +144,12 @@ enum Cmd {
     /// stderr; exit 0 only when a trustworthy report was printed.
     /// H1 slice: hold-model accounting — the §4 fill model lands in H2.
     Backtest(BacktestArgs),
+    /// impl-07: the tier-1 Pine Script screener's operator verbs (`pine prepare` …) — offline,
+    /// over bar files; exit codes per impl-07 §3.11.
+    Pine(cli::pine::PineArgs),
+    /// PVM impl-08 T21 (§4.9.6): the 8g determinism gate over slot 8's `--pine-tape` windows,
+    /// or `--check <manifest>` (8a offline). Exit 0 green, 1 a difference, 2 unusable.
+    PineVerify(cli::pine_verify::PineVerifyArgs),
     /// XMM XH2 parity gate (plan §7.3): replay ONE window of one capture
     /// run through the xmm member on the queue law, on the XMM
     /// simulator's venue clock and S1 latencies, and write one TSV row
@@ -755,6 +765,39 @@ struct ExecSmokeArgs {
     #[arg(long, default_value_t = 5, requires = "hl_outcome")]
     outcome_usd: i64,
 
+    /// **B'4 T27 — the perp limits probe** (`cli::hl_perp_probe`, impl-Bp
+    /// §4.13): after phases A and B, on the TESTNET host only, per coin of
+    /// `--perp-coins`: a post-only BUY just under $10 (refused), one at the
+    /// minimum (rests, then cancelled by cloid), a six-figure price and a
+    /// `szDecimals + 1` size (both refused), `updateLeverage` isolated at
+    /// `--perp-leverage`; writes `--perp-out`, the file the perp boot
+    /// requires (a coin absent from it cannot arm). With `--offline`: the
+    /// probe's offline self-test (a scripted venue; nothing sent, nothing
+    /// written). Exit 67: a coin's answers did not match (left out of the
+    /// file); 68: something may be LEFT ON THE ACCOUNT.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = [
+            "lifecycle", "dry_run", "fill", "sweep", "requote", "recon", "watch",
+            "binance", "binance_probe"
+        ]
+    )]
+    perp_probe: bool,
+
+    /// T27: the perps to probe (comma-separated venue names, ≤ 8).
+    #[arg(long, default_value = "BTC,ETH", requires = "perp_probe")]
+    perp_coins: String,
+
+    /// T27: the isolated leverage the probe sets (exec.toml's
+    /// `[exec.hl_perp] leverage`).
+    #[arg(long, default_value_t = 1, requires = "perp_probe")]
+    perp_leverage: u16,
+
+    /// T27: the probe file (a runtime artifact, never in git).
+    #[arg(long, default_value = cli::hl_perp_probe::DEFAULT_OUT, requires = "perp_probe")]
+    perp_out: String,
+
     /// Show exactly what phase C WOULD send, and send nothing.
     ///
     /// Phase C is the only thing here that can create state on a
@@ -1318,11 +1361,20 @@ struct XmmParityArgs {
     tail_s: u64,
 }
 
+/// pin:Bp-8g-report-out-shared (risk r22 C4): `--report-out` belongs to the Pine arms only —
+/// `--strategy pine` or `--replay-from-boot` (the group `pine_report_arm`); the legacy ruleset /
+/// member arm refuses it at parse.
 #[derive(Debug, Parser)]
+#[command(group(clap::ArgGroup::new("pine_report_arm").args(["strategy", "replay_from_boot"])))]
 struct BacktestArgs {
     /// Candidate ruleset JSON artifact (8g §4.1 grammar). Required
     /// unless `--member` names a coded member (Tier 3).
-    #[arg(long, required_unless_present = "member", conflicts_with = "member")]
+    /// PVM B'3: `--strategy pine` replaces it (impl-Bp §3.6).
+    #[arg(
+        long,
+        required_unless_present_any = ["member", "strategy", "replay_from_boot"],
+        conflicts_with = "member"
+    )]
     ruleset: Option<PathBuf>,
     /// Tier 3 (statarb doc 08 §6.2): drive a CODED member through the
     /// harness instead of the ruleset VM — `icdp` (with `--icdp <toml>`;
@@ -1375,13 +1427,15 @@ struct BacktestArgs {
     hyparb_universe: Option<PathBuf>,
     /// Capture source: a single `run-<epoch_ns>` directory or a log
     /// root (`MULTIVENUE_LOG_DIR`) containing `run-*` children.
-    #[arg(long)]
-    replay_dir: PathBuf,
+    /// PVM B'3: `--cut-plan` replaces it under `--strategy pine`.
+    #[arg(long, required_unless_present_any = ["cut_plan", "replay_from_boot"])]
+    replay_dir: Option<PathBuf>,
     /// IS/OOS split `N/M`: integers, `N + M == 100`, both >= 10 — or
     /// the carved all-OOS monitor form `0/100` (design §3.4). Echoed
     /// verbatim into the schema-1 report.
-    #[arg(long)]
-    split: String,
+    /// PVM B'3: `--split-at-ms` replaces it under `--strategy pine`.
+    #[arg(long, required_unless_present_any = ["split_at_ms", "replay_from_boot"])]
+    split: Option<String>,
     /// §4.3 fee override `<venue>[.<class>[.open|.settle]]:<maker_bps>:<taker_bps>`,
     /// repeatable (venues: pm|bn|okx|deribit|hl|bybit; XSD-F classes:
     /// spot|perp|dated|option|prediction — a bare venue sets all five;
@@ -1454,6 +1508,108 @@ struct BacktestArgs {
     /// features then warm from the window's own prints).
     #[arg(long)]
     funding_seed: Option<PathBuf>,
+    /// PVM B'3 (impl-Bp §3.6): run the Pine arm (slot 8, tier 2). Paper only.
+    #[arg(long, value_parser = ["pine"], conflicts_with_all = ["ruleset", "member"],
+          requires_all = ["pine_manifest", "trial_id_src"])]
+    strategy: Option<String>,
+    /// B'3: the 00-INDEX §3.14 manifest the arm boots from.
+    /// pin:Bp-8g-manifest-flag — shared with `--replay-from-boot` (8g, which requires it),
+    /// so its `requires = "strategy"` is dropped; the legacy arm never reads it.
+    #[arg(long)]
+    pine_manifest: Option<PathBuf>,
+    /// B'3: directory the manifest's `file` entries resolve against.
+    #[arg(long, requires = "pine_manifest")]
+    pine_dir: Option<PathBuf>,
+    /// B'3 (pin:Bp-screen-universe-flag): the facts' screen universe
+    /// (default `~/multivenue/pine/screen-universe.tsv`; missing = exit 6).
+    #[arg(long, requires = "strategy")]
+    screen_universe: Option<PathBuf>,
+    /// B'3: a `pvm-cutplan-1` file (§3.7).
+    #[arg(long, requires = "strategy", conflicts_with = "replay_dir")]
+    cut_plan: Option<PathBuf>,
+    /// B'3: the spool directory of the READY/DONE handshake.
+    #[arg(long, requires = "cut_plan")]
+    cut_spool: Option<PathBuf>,
+    /// B'3: seconds to wait for one cut's READY marker.
+    #[arg(long, default_value_t = 900, requires = "cut_spool")]
+    cut_wait_s: u64,
+    /// B'3: null arms, comma-separated, in row order. REQUIRED with --strategy.
+    #[arg(long, value_delimiter = ',',
+          value_parser = ["sign-flip", "phase-random", "cadence-match"],
+          required_if_eq("strategy", "pine"), requires = "null_seed_src")]
+    null_arm: Vec<String>,
+    /// B'3: one seed for every null replicate …
+    #[arg(long, group = "null_seed_src")]
+    null_seed: Option<u64>,
+    /// B'3: … or one seed per replicate, one u64 per line.
+    #[arg(long, group = "null_seed_src")]
+    null_seeds: Option<PathBuf>,
+    /// B'3: replicates per null mode.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=128))]
+    null_replicates: u32,
+    /// B'3: the signal trial's id, 64 hex …
+    #[arg(long, group = "trial_id_src")]
+    trial_id: Option<String>,
+    /// B'3: … or every trial id, one 64-hex line each.
+    #[arg(long, group = "trial_id_src")]
+    trial_ids: Option<PathBuf>,
+    /// B'3: research artifact directory (refused inside a git tree).
+    #[arg(long, requires = "strategy")]
+    out_dir: Option<PathBuf>,
+    /// B'3: the tier-2 rows file (default `<out-dir>/rows.t2`).
+    #[arg(long, requires = "strategy")]
+    rows_out: Option<PathBuf>,
+    /// B'3: the daily return series directory (default `<out-dir>/ret`).
+    #[arg(long, requires = "strategy")]
+    ret_dir: Option<PathBuf>,
+    /// B'3: also write the `pvm-t2-1` report line here; 8g: the `pvm-8g-1` lines (default
+    /// `~/multivenue/pine/8g/<run-id>.jsonl`). pin:Bp-8g-report-out-shared — shared with
+    /// `--replay-from-boot`: it requires `--strategy` or `--replay-from-boot` (risk r22 C4), so
+    /// the legacy arm refuses it.
+    #[arg(long, requires = "pine_report_arm")]
+    report_out: Option<PathBuf>,
+    /// B'3: the scoring window `<from_ms>:<to_ms>`.
+    #[arg(long, requires = "strategy")]
+    window_ms: Option<String>,
+    /// B'3: the hold horizon H in ms (the spread rule).
+    #[arg(long, requires = "window_ms")]
+    hold_ms: Option<i64>,
+    /// B'3: declare a fee row MEASURED, repeatable.
+    #[arg(long, requires = "strategy")]
+    fee_measured: Vec<String>,
+    /// B'3: refuse unless every chart symbol's fee rows are declared measured.
+    #[arg(long, requires = "strategy")]
+    require_measured_fees: bool,
+    /// B'3: OOS begins at this UTC ms (pin:Bp-split-at-ms-pine-only: requires --strategy, so
+    /// the legacy argv keeps its required --split).
+    #[arg(long, conflicts_with = "split", requires = "strategy")]
+    split_at_ms: Option<i64>,
+    /// 8g (impl-Bp §3.10, §4.12): replay the first ≤ 2 h window of a run from its boot.
+    #[arg(long, requires = "pine_manifest",
+          conflicts_with_all = ["ruleset", "member", "strategy", "null_arm", "cut_plan",
+                                "replay_dir", "split", "split_at_ms", "latency_ns",
+                                "latency_ns_venue", "stale_after_ms"])]
+    replay_from_boot: Option<PathBuf>,
+    /// 8g: the boot record (default `<window-root>/pine-boot.tsv`).
+    #[arg(long, requires = "replay_from_boot")]
+    boot_record: Option<PathBuf>,
+    /// 8g: `recorded` (the delivery journal's order, fills from engine-fills.pmlr; needs
+    /// --delivery-journal) or `judged` (the model judges slot 8's orders; a diagnostic).
+    #[arg(long, value_parser = ["recorded", "judged"], default_value = "recorded",
+          requires = "replay_from_boot")]
+    fills: String,
+    /// 8g: impl-08's input journal (`<run>/pine-delivery.bin`).
+    #[arg(long, requires = "replay_from_boot")]
+    delivery_journal: Option<PathBuf>,
+    /// 8g (impl-08 §4.9, 8g-B): write the replay's decision tapes to
+    /// `<dir>/<boot_utc_ms>/` (seq.bin, decisions.bin, set.tsv) for `pine-verify --cross`.
+    /// Refused inside git.
+    #[arg(long, requires = "replay_from_boot")]
+    tape_out: Option<PathBuf>,
+    /// 8g: the warm-up bar root the paper boot read (its `--pine-bars`); the replay warms from
+    /// it as the boot did. Absent: no bar file is read (a warm-booted record refuses, exit 6).
+    #[arg(long, requires = "replay_from_boot")]
+    pine_bars: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -1505,6 +1661,16 @@ struct RunArgs {
     /// needs one, because it is the direction that cannot.
     #[arg(long)]
     halt_slot: Option<String>,
+    /// PVM impl-08 T19: the slot-8 Pine manifest (`--pine <manifest.toml>`). F19 both ways: a
+    /// `--strategy` naming `pine` needs it, and it needs `pine` in `--strategy`. PAPER ONLY.
+    #[arg(long)]
+    pine: Option<PathBuf>,
+    /// PVM impl-08 T18/T19: write slot 8's 8g tapes under `~/multivenue/pine/tape/<boot_ms>/`.
+    #[arg(long, default_value_t = false, requires = "pine")]
+    pine_tape: bool,
+    /// PVM impl-08 T19: the warm-up bar files' root (default `~/multivenue/pine/bars`).
+    #[arg(long, requires = "pine")]
+    pine_bars: Option<PathBuf>,
     /// Universe config file (M1; TOML subset — see
     /// `universe.toml.example`). Explicit path must exist. Absent:
     /// `~/multivenue/universe.toml` is used IF present, else the
@@ -1849,6 +2015,9 @@ fn main() -> ExitCode {
         Cmd::StrategyMask(args) => strategy_mask(&args),
         Cmd::Run(args) => {
             init_tracing();
+            if let Some(code) = pine_refusal(&args.strategy, args.pine.is_some()) {
+                return code;
+            }
             run(args)
         }
         Cmd::PrintConfig(args) => {
@@ -1862,6 +2031,15 @@ fn main() -> ExitCode {
         Cmd::Backtest(args) => {
             init_tracing_stderr();
             backtest(args)
+        }
+        Cmd::Pine(args) => {
+            init_tracing_stderr();
+            ExitCode::from(cli::pine::main(&args))
+        }
+        Cmd::PineVerify(args) => {
+            // stdout carries the window lines and the `8g` line only.
+            init_tracing_stderr();
+            ExitCode::from(cli::pine_verify::main(&args))
         }
         Cmd::XmmParity(args) => {
             init_tracing_stderr();
@@ -2035,6 +2213,28 @@ fn main() -> ExitCode {
                     ExitCode::from(1)
                 }
             }
+        }
+    }
+}
+
+/// PVM impl-08 (F19 both ways, risk-policy "PVM — slot 8, paper only"):
+/// slot 8 (pine) is configured only from T19's `--pine <manifest>`, and the
+/// set arm would otherwise DROP it silently (`engine_loop_set_full` boots
+/// `requested & configured`, so `ai+pine` would boot as `ai`). So a
+/// `--strategy` naming `pine` without `--pine`, `--pine` without `pine` in
+/// the mask, and `--pine` beside a legacy standalone arm (`ev`,
+/// `rule-tree`) are refused in the `Cmd::Run` arm, before `run` is entered —
+/// before the config load, the ingress threads, the exec artifact and every
+/// live or gateway arm — so there is nothing started to join.
+/// `Some(exit 1)` when refused.
+fn pine_refusal(strategy: &str, pine: bool) -> Option<ExitCode> {
+    // Risk review r15 (pin:08-run-legacy-strategy-refused): `--pine` beside a `--strategy` the
+    // set parser refuses (`ev`, `rule-tree`, a typo) refuses too — `check_run`, not `.ok()?`.
+    match cli::pine_boot::check_run(strategy, pine) {
+        Ok(()) => None,
+        Err(reason) => {
+            error!("{reason}");
+            Some(ExitCode::from(1))
         }
     }
 }
@@ -2558,6 +2758,15 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     // socket. Do it before anything can fail for a reason that has
     // nothing to do with this binary's signing.
     if args.offline {
+        // T27: `--perp-probe --offline` adds the probe's own self-test (a
+        // scripted venue: nothing sent, nothing written).
+        if args.perp_probe {
+            if let Err(e) = cli::hl_perp_probe::self_test() {
+                error!("exec-smoke --perp-probe: the probe's OFFLINE SELF-TEST FAILED: {e}");
+                return ExitCode::from(exec_hyperliquid::EXIT_SELFTEST as u8);
+            }
+            info!("exec-smoke --perp-probe: the probe's offline self-test passed");
+        }
         return match exec_hyperliquid::smoke::self_test_only() {
             Ok(r) => {
                 println!(
@@ -2730,6 +2939,9 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
                 "exec-smoke: PASSED — the venue verified this binary's signature and rejected a \
                  corrupted one"
             );
+            if args.perp_probe {
+                return exec_perp_probe(&cfg, &args);
+            }
             if args.lifecycle && args.hl_perp {
                 return exec_hl_perp(&cfg, &args);
             }
@@ -3346,6 +3558,27 @@ fn exec_requote(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitC
 /// XMM XH4g: the testnet battery on slot 6's gateway arm
 /// (`cli::xmm_battery`). Runs only after phases A and B, like phase C,
 /// and only against the testnet host.
+/// B'4 T27: the perp limits probe (`cli::hl_perp_probe::run`), TESTNET only.
+fn exec_perp_probe(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    if !cfg.is_testnet() {
+        error!("exec-smoke --perp-probe: the probe runs on TESTNET only");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let run_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX));
+    let spec = match cli::hl_perp_probe::ProbeSpec::new(&args.perp_coins, args.perp_leverage, run_s)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            error!("exec-smoke --perp-probe: {e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+        }
+    };
+    let tls = TlsTransport::default_client_config();
+    ExitCode::from(cli::hl_perp_probe::run(cfg, tls, &spec, &args.perp_out))
+}
+
 fn exec_hl_perp(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
     if !cfg.is_testnet() {
         error!("exec-smoke --hl-perp: the battery runs on TESTNET only");
@@ -3594,6 +3827,31 @@ fn capture_catalog(args: CaptureCatalogArgs) -> ExitCode {
 /// reason to stderr only and exits nonzero (the worker maps every
 /// nonzero to `BacktestError` — "harness output untrusted").
 fn backtest(args: BacktestArgs) -> ExitCode {
+    // PVM B'3 T13 (impl-Bp §3.6): the Pine arm, its own exit codes.
+    if args.strategy.is_some() {
+        return backtest_pine(args);
+    }
+    // PVM B'3 T19 (impl-Bp §4.12): 8g replay from boot.
+    if let Some(window_root) = args.replay_from_boot {
+        let x = cli::backtest::replay_from_boot_main(&cli::backtest::ReplayArgv {
+            window_root,
+            manifest: args.pine_manifest.unwrap_or_default(),
+            boot_record: args.boot_record,
+            fills: args.fills,
+            delivery_journal: args.delivery_journal,
+            pine_dir: args.pine_dir,
+            report_out: args.report_out,
+            tape_out: args.tape_out,
+            pine_bars: args.pine_bars,
+        });
+        if !x.stdout.is_empty() {
+            println!("{}", x.stdout);
+        }
+        if !x.stderr.is_empty() {
+            eprintln!("{}", x.stderr);
+        }
+        return ExitCode::from(x.code);
+    }
     // Tier 3: `--member <kind>` selects the coded-member arm; the
     // parameter file is the member's own boot artifact.
     let member = match args.member.as_deref() {
@@ -3680,8 +3938,9 @@ fn backtest(args: BacktestArgs) -> ExitCode {
     };
     let cfg = cli::backtest::BacktestConfig {
         ruleset: args.ruleset.unwrap_or_default(),
-        replay_dir: args.replay_dir,
-        split: args.split,
+        // clap: both are required without `--strategy` (which returned above).
+        replay_dir: args.replay_dir.unwrap_or_default(),
+        split: args.split.unwrap_or_default(),
         fee_bps: args.fee_bps,
         latency_ns: args.latency_ns,
         latency_ns_venue: args.latency_ns_venue,
@@ -3709,6 +3968,48 @@ fn backtest(args: BacktestArgs) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// PVM B'3 T13: `backtest --strategy pine` — the `pvm-t2-1` report on
+/// stdout, the reason on stderr, the §3.6 exit code.
+fn backtest_pine(args: BacktestArgs) -> ExitCode {
+    let argv = cli::backtest::PineArgv {
+        manifest: args.pine_manifest.unwrap_or_default(),
+        pine_dir: args.pine_dir,
+        screen_universe: args.screen_universe,
+        replay_dir: args.replay_dir,
+        cut_plan: args.cut_plan,
+        cut_spool: args.cut_spool,
+        cut_wait_s: args.cut_wait_s,
+        split: args.split,
+        split_at_ms: args.split_at_ms,
+        window_ms: args.window_ms,
+        hold_ms: args.hold_ms,
+        fee_bps: args.fee_bps,
+        latency_ns: args.latency_ns,
+        latency_ns_venue: args.latency_ns_venue,
+        stale_after_ms: args.stale_after_ms,
+        fee_measured: args.fee_measured,
+        require_measured_fees: args.require_measured_fees,
+        null_arm: args.null_arm,
+        null_seed: args.null_seed,
+        null_seeds: args.null_seeds,
+        null_replicates: args.null_replicates,
+        trial_id: args.trial_id,
+        trial_ids: args.trial_ids,
+        out_dir: args.out_dir,
+        rows_out: args.rows_out,
+        ret_dir: args.ret_dir,
+        report_out: args.report_out,
+    };
+    let x = cli::backtest::run_pine_main(&argv);
+    if !x.stderr.is_empty() {
+        eprintln!("{}", x.stderr);
+    }
+    if !x.stdout.is_empty() {
+        println!("{}", x.stdout);
+    }
+    ExitCode::from(x.code)
 }
 
 fn audit_replay(args: AuditReplayArgs) -> ExitCode {
@@ -4133,6 +4434,10 @@ fn run(args: RunArgs) -> ExitCode {
     // reader below. `Err` is a legacy standalone arm (`rule-tree`, `ev`)
     // or the refusal at the arm match, which logs the error.
     let set_mask = strategy_set::parse_strategy(&args.strategy);
+    // PVM impl-08 (F19 both ways): a `--strategy` naming slot 8 (pine)
+    // gets here only WITH `--pine` (T19), and `--pine` only with a set mask
+    // naming pine — the `Cmd::Run` arm refused every other pairing first
+    // ([`pine_refusal`]), a legacy `ev` / `rule-tree` with `--pine` included.
     let cfg = match Config::load(args.env_file.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -4467,6 +4772,64 @@ fn run(args: RunArgs) -> ExitCode {
             "discovery: configured symbol(s) missing from venue universe — continuing in paper mode"
         );
     }
+    // PVM impl-08 T19 (pin:08-facts-from-discovery): slot 8's facts come from THIS discovery;
+    // the member is configured at the engine loop. A missing fact refuses the boot here, before
+    // any ingress thread exists.
+    let pine_boot = match args.pine.as_deref() {
+        None => None,
+        Some(manifest) => {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let pine_dir = home.join("multivenue").join("pine");
+            let flags = cli::pine_boot::PineFlags {
+                manifest: manifest.to_path_buf(),
+                tape: args.pine_tape,
+                bars_root: args
+                    .pine_bars
+                    .clone()
+                    .unwrap_or_else(|| pine_dir.join("bars")),
+                pine_dir,
+            };
+            let facts = cli::pine_boot::DiscoveredFacts {
+                hl_sz_decimals: &discovery.hl_sz_decimals,
+                bn_usdm: &discovery.bn_fapi_rows,
+                bn_spot: &discovery.bn_spot_rows,
+            };
+            // impl-08 §3.6 (risk review r15): the RESOLVED artifact — no second read.
+            match cli::pine_boot::build(
+                &flags,
+                exec_boot.as_ref(),
+                |k| cli::pine_boot::resolve_key(&boot.allocated, k),
+                &facts,
+            ) {
+                Ok(mut b) => {
+                    // R5/R6: the boot record and the delivery journal live in the run dir.
+                    b.run_dir = Some(run_dir.clone());
+                    b.run_epoch_ns = epoch_ns;
+                    Some(b)
+                }
+                Err(reason) => {
+                    error!(reason, "pine: slot 8 refused — boot aborted");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    };
+    // PVM B'1 T5 (impl-Bp §4.1 item 3): the pine slot's Trade routes, resolved before any
+    // ingress spawns. Without `--pine` (F19: pine not in the mask) every lane gets the empty
+    // route and every spawn's mask is the head's bit for bit; a route symbol on a lane without
+    // Trade capture refuses the boot with 6006.
+    let trade_routes = match cli::trade_route::boot_routes(
+        pine_boot.as_ref().map(|b| &b.cfg.manifest),
+        &boot.allocated,
+    ) {
+        Ok(r) => r,
+        Err(refusal) => {
+            error!(%refusal, "pine: Trade route refused — boot aborted");
+            return ExitCode::from(1);
+        }
+    };
     // BX9 (Q-5; the R3 ruling 2026-10-11): the options a live Binance
     // arm's account holds OUTSIDE the paper-selected chain join it here —
     // before the manifests, the descriptor table and the options lane's
@@ -4992,6 +5355,19 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // PVM impl-08 T17: the `engine_pine_*` family, on a pine boot only.
+    let obs = if pine_boot.is_some() {
+        match obs.with_pine_metrics() {
+            Ok(o) => o,
+            Err(reason) => {
+                error!(reason, "pine: metrics registration failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        obs
+    };
     // Resolve latency-dump destination. Defaults to
     // `<cfg.log_dir>/latency` so an operator who already set
     // `MULTIVENUE_LOG_DIR` doesn't need a second flag.
@@ -5136,6 +5512,7 @@ fn run(args: RunArgs) -> ExitCode {
                 // VT2: spot bookTicker carries no venue stamp — the
                 // aggTrade sentinel rides the same socket.
                 spot_sentinel: true,
+                usdm_trades: false,
             });
         }
         for inst in boot
@@ -5147,7 +5524,11 @@ fn run(args: RunArgs) -> ExitCode {
             // BX0-F1: bookTicker on the legacy `/ws/` path (still
             // delivering), markPrice on the routed `/market/ws/` path —
             // one builder shared with the live smoke.
-            let [book, mark] = cli::bn_usdm_specs(&cfg.binance_fut_ws_host, &inst.name, inst.sym);
+            let [mut book, mark] =
+                cli::bn_usdm_specs(&cfg.binance_fut_ws_host, &inst.name, inst.sym);
+            // PVM B'1 T8 (Q1 = (a)): a route symbol's bookTicker socket also
+            // carries its `@aggTrade`; every other socket is unchanged.
+            cli::bn_usdm_route_slot(&mut book, trade_routes.of(core_types::VenueId::Binance));
             specs.push(book);
             specs.push(mark);
         }
@@ -5196,6 +5577,7 @@ fn run(args: RunArgs) -> ExitCode {
                 eapi: Some(table),
                 mark_price: false,
                 spot_sentinel: false,
+                usdm_trades: false,
             });
         }
         info!(
@@ -5232,6 +5614,7 @@ fn run(args: RunArgs) -> ExitCode {
             } else {
                 core_types::EVENT_LANE_FUNDING
             },
+            trade_routes.of(core_types::VenueId::Binance),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -5264,6 +5647,7 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.bn,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_bn)),
+            trade_routes.of(core_types::VenueId::Binance),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -5301,6 +5685,7 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.okx,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_okx)),
+            trade_routes.of(core_types::VenueId::Okx),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -5357,6 +5742,7 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.deribit,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_deribit)),
+            trade_routes.of(core_types::VenueId::Deribit),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -5434,6 +5820,7 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.hl,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hyperliquid)),
+            trade_routes.of(core_types::VenueId::Hyperliquid),
             std::sync::Arc::clone(&hl_hot),
         ) {
             Ok(h) => h,
@@ -5507,6 +5894,7 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.bybit,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_bybit)),
+            trade_routes.of(core_types::VenueId::Bybit),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -6656,6 +7044,7 @@ fn run(args: RunArgs) -> ExitCode {
                         regime_boot.as_ref(),
                         hyparb_boot.as_ref(),
                         har_boot.as_ref(),
+                        pine_boot,
                         pm15_boot.as_ref(),
                         pmj_boot.as_ref(),
                     )
@@ -6795,6 +7184,10 @@ fn run(args: RunArgs) -> ExitCode {
                     // instruments bound from the boot discovery's rows, its
                     // gateway BOOTED (the BX-19 assertions held, the orphans
                     // swept, the day read) before any member can order.
+                    // PB5 (D19 for Binance): the gateway's Ready snapshot for a
+                    // LIVE slot 8 on the arm — never set while slot 8 is paper
+                    // only (`exec_boot` refuses it live; arming is the operator's).
+                    let mut pine_bn_rows: Option<Vec<cli::pine_boot::LiveBootRow>> = None;
                     let bn_arm = if eb.binance_slot().is_some() {
                         let Some(f4p) = bn_fill_prod.take() else {
                             error!("exec: fill lane 4 producer already taken — boot aborted");
@@ -6877,6 +7270,25 @@ fn run(args: RunArgs) -> ExitCode {
                             Ok(b) => {
                                 warn!("{}", b.tell);
                                 handles.push(b.handle);
+                                // PB1 (I-PB1) + PB5: slot 8 as the arm's owner —
+                                // its facts must be the bound rows (6013), and
+                                // its D19 rows are the gateway's snapshot.
+                                if eb.binance_slot() == Some(core_config::pine::PINE_SLOT) {
+                                    if let Some(pb) = pine_boot.as_ref() {
+                                        if let Err(reason) = cli::pine_bn::check_facts_against_arm(
+                                            &pb.cfg.symbols,
+                                            b.arm.inst(),
+                                        ) {
+                                            error!(reason, "pine: slot 8's facts are not the arm's rows — boot aborted");
+                                            join_reverse(handles);
+                                            return ExitCode::from(1);
+                                        }
+                                    }
+                                    pine_bn_rows = Some(cli::pine_bn::live_rows_from_bn(
+                                        &b.boot_rows,
+                                        b.arm.inst(),
+                                    ));
+                                }
                                 Some((b.arm, b.specs))
                             }
                             Err(reason) => {
@@ -7078,6 +7490,33 @@ fn run(args: RunArgs) -> ExitCode {
                     // keeps the refusing stub, so LAW E-1 stays true by
                     // construction. A Binance shape splits by route venue
                     // (`VenueSplit`), built from the router's own route.
+                    //
+                    // PVM PL3 (impl-08 §4.7.5, D19): the seam where the
+                    // live arm's boot snapshot reaches slot 8's
+                    // configuration — after the arms' venue reads, before
+                    // the loop configures the member. Slot 8 is PAPER
+                    // ONLY: no arm reads for it (`None`), so a paper boot
+                    // passes untouched; the cli never sets the live permit
+                    // (PL2), and arming is the operator's act.
+                    let mut pine_boot = pine_boot;
+                    if let Some(pb) = pine_boot.as_mut() {
+                        if let Err(reason) =
+                            cli::pine_boot::attach_live_boot(&mut pb.cfg, pine_bn_rows.as_deref())
+                        {
+                            error!(
+                                reason,
+                                "pine: slot 8's live boot state refused — boot aborted"
+                            );
+                            if let Some(s) = &xmm_stop {
+                                s.release();
+                            }
+                            if let Some(s) = &bin15_stop {
+                                s.release();
+                            }
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
                     let anchor = core_time::WallAnchor::now();
                     let paper = clob_dispatcher::PaperDispatcher::new()
                         .with_pm5_held_delay_ns(pm5_held_delay_ns);
@@ -7099,6 +7538,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                                 har_boot.as_ref(),
+                                pine_boot,
                                 pm15_boot.as_ref(),
                                 pmj_boot.as_ref(),
                             )

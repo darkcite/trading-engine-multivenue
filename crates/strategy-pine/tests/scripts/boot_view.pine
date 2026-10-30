@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: plots the broker's position (the D19 adoption probe, impl-08 T16) and enters long
+// while flat.
+strategy("boot view (strategy-pine T16)", overlay = true)
+plot(strategy.position_size)
+if strategy.position_size == 0
+    strategy.entry("L", strategy.long)

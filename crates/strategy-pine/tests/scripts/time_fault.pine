@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+//@version=6
+//
+// OUR CODE: enters on every bar and faults (the per-evaluation instruction budget runs out) at its first bar at or
+// after 2026-01-01T00:00Z, the tests' boot instant — the route-off / enabled-0 probe (T16).
+strategy("time fault (strategy-pine T16)", overlay = true)
+float x = 0.0
+if time >= 1767225600000
+    for i = 0 to 100000000
+        x := x + 1
+plot(x)
+strategy.entry("L", strategy.long)
