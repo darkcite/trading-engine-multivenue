@@ -1,0 +1,25 @@
+[package]
+name         = "terminal"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "TERM: `multivenue-terminal`, the operator's terminal server — a COLD process (T-L1: no venue key, no order socket, never sources .env). Serves the WASM bundle under the CSP, speaks term-proto over one loopback WebSocket, and feeds it from --synthetic, --replay or public market data."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "multivenue-terminal"
+path = "src/bin/multivenue-terminal.rs"
+
+[dependencies]
+term-proto  = { workspace = true }
+core-crypto = { workspace = true }
+core-net    = { workspace = true }
+mio         = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

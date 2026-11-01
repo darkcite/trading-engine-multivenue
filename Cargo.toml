@@ -122,6 +122,7 @@ members = [
 
     # --- TERM (cold): the terminal's shared wire ---
     "crates/term-proto",
+    "crates/terminal",
 ]
 
 # Fuzz targets live in fuzz/Cargo.toml (cargo-fuzz convention) and are NOT
@@ -290,6 +291,7 @@ engine          = { path = "crates/engine" }
 engine-snapshot = { path = "crates/engine-snapshot" }
 tui             = { path = "crates/tui" }
 term-proto      = { path = "crates/term-proto" }
+terminal        = { path = "crates/terminal" }
 
 # ---------------------------------------------------------------
 # Profiles

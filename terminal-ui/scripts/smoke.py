@@ -16,6 +16,9 @@ import playwright.sync_api
 OUT = sys.argv[1]
 MODE = sys.argv[2]
 TIMEOUT = float(sys.argv[3]) if len(sys.argv) > 3 else 1500.0
+# With a login token the smoke runs against multivenue-terminal itself:
+# POST /login (exact Origin) sets the session cookie before the page loads.
+TOKEN = sys.argv[4] if len(sys.argv) > 4 else ""
 ARGS = ["--enable-unsafe-swiftshader", "--use-angle=swiftshader", "--ignore-gpu-blocklist"]
 if MODE == "webgpu":
     ARGS += ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-webgpu-adapter=swiftshader"]
@@ -45,7 +48,12 @@ def on_console(msg):
 
 with playwright.sync_api.sync_playwright() as pw:
     browser = pw.chromium.launch(headless=True, args=ARGS)
-    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    context = browser.new_context(viewport={"width": 1600, "height": 1000})
+    if TOKEN:
+        r = context.request.post("http://127.0.0.1:9393/login", data=TOKEN,
+                                 headers={"Origin": "http://127.0.0.1:9393", "Content-Type": "text/plain"})
+        assert r.status == 204, f"login: {r.status}"
+    page = context.new_page()
     page.on("console", on_console)
     page.on("pageerror", lambda e: errors.append("pageerror: " + str(e)))
     T0 = time.time()
