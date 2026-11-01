@@ -461,6 +461,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ingress-term"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "core-ring",
+ "mio",
+]
+
+[[package]]
 name = "jobserver"
 version = "0.1.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -562,6 +571,7 @@ dependencies = [
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
+ "ingress-term",
  "libfuzzer-sys",
  "pine-ir",
  "pine-lang",
@@ -723,6 +733,7 @@ version = "0.1.0"
 dependencies = [
  "core-crypto",
  "core-net",
+ "ingress-term",
  "mio",
  "rustls",
  "rustls-pki-types",

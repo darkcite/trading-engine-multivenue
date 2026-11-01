@@ -30,6 +30,8 @@ exec-binance     = { path = "../crates/exec-binance" }
 term-proto       = { path = "../crates/term-proto" }
 # TERM live-feed scanners: term_live_scan.
 terminal         = { path = "../crates/terminal" }
+# TERM door frame law: term_door_frame.
+ingress-term     = { path = "../crates/ingress-term" }
 # cargo-fuzz runtime.
 libfuzzer-sys = "0.4"
 # pine_lex_parse: the PVM lane's Pine v5/v6 front end (impl-01 section 7.12).
@@ -592,6 +594,13 @@ bench  = false
 [[bin]]
 name   = "term_live_scan"
 path   = "fuzz_targets/term_live_scan.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "term_door_frame"
+path   = "fuzz_targets/term_door_frame.rs"
 test   = false
 doc    = false
 bench  = false

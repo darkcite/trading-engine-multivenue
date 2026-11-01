@@ -132,9 +132,11 @@ pub struct TermStrategy {
     /// When the door last reported the terminal gone; growing commands
     /// received before it are stale.
     disconnected_at: NsTs,
-    touch: [Touch; MAX_SYMS],
-    pos: [Pos; MAX_SYMS],
-    open: [Option<Open>; MAX_OPEN],
+    // Boxed once at `new` (the set is built by value; four TERM members
+    // inline would add ~32 KB to it and overflow a test thread's stack).
+    touch: Box<[Touch; MAX_SYMS]>,
+    pos: Box<[Pos; MAX_SYMS]>,
+    open: Box<[Option<Open>; MAX_OPEN]>,
     seq: u64,
     beat_ns: NsTs,
     beat_seen: bool,
@@ -157,9 +159,9 @@ impl TermStrategy {
             evt_tx: None,
             halted: false,
             disconnected_at: 0,
-            touch: [Touch::default(); MAX_SYMS],
-            pos: [Pos::default(); MAX_SYMS],
-            open: [None; MAX_OPEN],
+            touch: Box::new([Touch::default(); MAX_SYMS]),
+            pos: Box::new([Pos::default(); MAX_SYMS]),
+            open: Box::new([None; MAX_OPEN]),
             seq: 0,
             beat_ns: 0,
             beat_seen: false,
@@ -693,6 +695,12 @@ mod tests {
             c.qty = qty;
             c
         }
+    }
+
+    #[test]
+    fn the_member_stays_small_inline() {
+        // The set holds four of these by value.
+        assert!(std::mem::size_of::<TermStrategy>() <= 512, "{}", std::mem::size_of::<TermStrategy>());
     }
 
     #[test]
