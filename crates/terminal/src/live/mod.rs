@@ -100,6 +100,18 @@ struct Snap {
     res: Result<(u64, Vec<(Side, i64, i64)>), String>,
 }
 
+/// REST bar history for one instrument (HL `candleSnapshot`, 1m).
+struct History {
+    instr: usize,
+    bars: Vec<Bar>,
+}
+
+/// Heat columns are emitted on a fixed cadence from the current book, so a
+/// venue that republishes its book slowly still scrolls.
+const HEAT_EVERY: Duration = Duration::from_millis(250);
+/// One minute bars, six hours back.
+const HISTORY_MINUTES: u64 = 360;
+
 struct Inst {
     def: InstrDef,
     sym: String,
@@ -124,6 +136,26 @@ struct Inst {
     tick_known: bool,
     /// Re-announce the `InstrDef` (its tick changed).
     redef: bool,
+    /// History arrived: clients need a fresh snapshot to see it.
+    history: bool,
+}
+
+/// One HL candle (`{"t":ms,"o":"..","h":"..","l":"..","c":"..","v":".."}`)
+/// as a 1-minute `Bar`; aggressor delta is unknown for history (0).
+fn hl_candle(instr: u16, c: &[u8]) -> Option<Bar> {
+    let t = scan::int(scan::get(c, b"t")?)?;
+    let b = Bar {
+        instr,
+        tf_s: BAR_TF_S,
+        bar: (t / 1000 / BAR_TF_S as u64) as i64,
+        o: scan::dec(scan::get(c, b"o")?)?,
+        h: scan::dec(scan::get(c, b"h")?)?,
+        l: scan::dec(scan::get(c, b"l")?)?,
+        c: scan::dec(scan::get(c, b"c")?)?,
+        vol: scan::dec(scan::get(c, b"v")?)?,
+        delta: 0,
+    };
+    (b.l <= b.h && (b.l..=b.h).contains(&b.o) && (b.l..=b.h).contains(&b.c) && b.vol >= 0).then_some(b)
 }
 
 /// Hyperliquid perps quote 5 significant figures: the tick at `px_1e6`.
@@ -170,6 +202,9 @@ pub struct Live {
     ins: Vec<Inst>,
     snap_tx: mpsc::Sender<Snap>,
     snap_rx: mpsc::Receiver<Snap>,
+    hist_rx: mpsc::Receiver<History>,
+    last_heat: Instant,
+    heat_due: bool,
     scratch: Vec<u8>,
     seq: u32,
     t_ns: u64,
@@ -231,16 +266,35 @@ impl Live {
                     last_rest: None,
                     tick_known: venue != Venue::Hyperliquid,
                     redef: false,
+                    history: false,
                 }
             })
             .collect();
         let (snap_tx, snap_rx) = mpsc::channel();
+        let (hist_tx, hist_rx) = mpsc::channel();
         let mut hl = Feed::new(Token(1));
         let mut bn = Feed::new(Token(2));
         hl.stopped = cfg.hl.is_empty();
         bn.stopped = cfg.bn.is_empty();
         let tls = tls_config(&cfg.extra_ca).map_err(std::io::Error::other)?;
-        Ok(Live { poll: Poll::new()?, events: Events::with_capacity(64), tls, hl, bn, ins, snap_tx, snap_rx, scratch: vec![0u8; term_proto::MAX_FRAME], seq: 0, t_ns: 0, stats: LiveStats::default() })
+        // Bar history: one HL candleSnapshot per coin at boot (≈ 26 weight
+        // for 360 candles — inside R-T17's 40 weight/min for market data).
+        for (k, coin) in cfg.hl.iter().enumerate() {
+            let (tls, tx, coin) = (tls.clone(), hist_tx.clone(), coin.clone());
+            std::thread::spawn(move || {
+                let now_ms = core_time_now() / 1_000_000;
+                let body = format!(r#"{{"type":"candleSnapshot","req":{{"coin":"{coin}","interval":"1m","startTime":{},"endTime":{now_ms}}}}}"#, now_ms - HISTORY_MINUTES * 60_000);
+                let mut out = Vec::with_capacity(1 << 20);
+                match core_net::boot_http::https_post(&tls, HL_HOST, 443, "/info", UA, b"application/json", body.as_bytes(), &mut out, 4 << 20, Duration::from_secs(10)) {
+                    Ok(r) => {
+                        let bars = scan::items(&out[r]).filter_map(|c| hl_candle(k as u16, c)).collect();
+                        let _ = tx.send(History { instr: k, bars });
+                    }
+                    Err(e) => eprintln!("live: hyperliquid candle history for {coin}: {e}"),
+                }
+            });
+        }
+        Ok(Live { poll: Poll::new()?, events: Events::with_capacity(64), tls, hist_rx, last_heat: Instant::now(), heat_due: false, hl, bn, ins, snap_tx, snap_rx, scratch: vec![0u8; term_proto::MAX_FRAME], seq: 0, t_ns: 0, stats: LiveStats::default() })
     }
 
     fn seq(&mut self) -> u32 {
@@ -389,6 +443,15 @@ impl Live {
         }
         while let Ok(s) = self.snap_rx.try_recv() {
             self.on_snapshot(s);
+        }
+        while let Ok(h) = self.hist_rx.try_recv() {
+            let i = &mut self.ins[h.instr];
+            let live_from = i.bars.first().map(|b| b.bar).or(i.bar.map(|b| b.bar)).unwrap_or(i64::MAX);
+            let mut merged: Vec<Bar> = h.bars.into_iter().filter(|b| b.bar < live_from).collect();
+            merged.append(&mut i.bars);
+            let n = merged.len().saturating_sub(MAX_BARS);
+            i.bars = merged.split_off(n);
+            i.history = true;
         }
     }
 
@@ -617,6 +680,19 @@ impl Live {
 
     fn emit(&mut self, k: usize, out: &mut Vec<u8>) {
         let t = self.t_ns;
+        if self.ins[k].history {
+            // Late history reaches already-subscribed clients through the
+            // stream itself (Bar frames are idempotent by bar index).
+            self.ins[k].history = false;
+            let bars = std::mem::take(&mut self.ins[k].bars);
+            for b in &bars {
+                let seq = self.seq();
+                if let Ok(n) = b.encode(seq, t, &mut self.scratch) {
+                    out.extend_from_slice(&self.scratch[..n]);
+                }
+            }
+            self.ins[k].bars = bars;
+        }
         if self.ins[k].redef {
             self.ins[k].redef = false;
             let d = self.ins[k].def;
@@ -656,6 +732,10 @@ impl Live {
             }
             self.ins[k].sent_b = tb.iter().copied().collect();
             self.ins[k].sent_a = ta.iter().copied().collect();
+            self.flow_and_heat(k, &tb, &ta, out);
+        } else if self.heat_due && !self.ins[k].sent_b.is_empty() && !self.ins[k].sent_a.is_empty() {
+            let tb: Vec<(i64, i64)> = self.ins[k].sent_b.iter().rev().map(|(p, q)| (*p, *q)).collect();
+            let ta: Vec<(i64, i64)> = self.ins[k].sent_a.iter().map(|(p, q)| (*p, *q)).collect();
             self.flow_and_heat(k, &tb, &ta, out);
         }
         if !self.ins[k].trades.is_empty() {
@@ -774,6 +854,10 @@ impl Source for Live {
     fn tick(&mut self, t_ns: u64, out: &mut Vec<u8>) {
         self.t_ns = t_ns;
         self.pump();
+        self.heat_due = self.last_heat.elapsed() >= HEAT_EVERY;
+        if self.heat_due {
+            self.last_heat = Instant::now();
+        }
         for k in 0..self.ins.len() {
             self.emit(k, out);
         }
@@ -792,6 +876,14 @@ mod tests {
 
     fn depth(first: u64, last: u64, prev: u64, bid: (&str, &str)) -> Vec<u8> {
         format!(r#"{{"stream":"btcusdt@depth@100ms","data":{{"e":"depthUpdate","E":1,"T":1,"s":"BTCUSDT","U":{first},"u":{last},"pu":{prev},"b":[["{}","{}"]],"a":[]}}}}"#, bid.0, bid.1).into_bytes()
+    }
+
+    #[test]
+    fn hl_candles() {
+        let c = br#"{"t":1761980040000,"T":1761980099999,"s":"BTC","i":"1m","o":"78000.0","c":"78010.0","h":"78020.0","l":"77990.0","v":"12.345","n":321}"#;
+        let b = hl_candle(0, c).unwrap();
+        assert_eq!((b.bar, b.o, b.h, b.vol), (1761980040 / 60, 78_000_000_000, 78_020_000_000, 12_345_000));
+        assert!(hl_candle(0, br#"{"t":1,"o":"5","h":"4","l":"3","c":"4","v":"1"}"#).is_none(), "open above high");
     }
 
     #[test]

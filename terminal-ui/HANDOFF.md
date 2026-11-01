@@ -23,12 +23,33 @@ T-L12, T-L13, T-L14, and "research never enters git" (measurements and
 status docs go to the project, not here). No venue key exists in the cloud
 box, so nothing built here can trade.
 
-## State at 685171b (T0, cloud half)
+## State (2026-11-01, after M4)
 
-Done: `crates/term-proto` (T0 subset), `terminal-ui/` workspace with the four
-pipelines, chart core, synthetic market, spike; build script, CSP harness,
-headless smoke — PASS on WebGL2 (no CSP violation, no page error,
-Hidden/Visible reported). Host + wasm clippy clean; 12 + 7 tests.
+- **M0** done: T0 smoke PASS on WebGL2; WebGPU over SwiftShader also runs
+  every phase. On WebGPU the device reports the browser's limits, so the
+  no-storage-buffer guarantee rests on the naga shader test.
+- **M1** done: term-proto, 23 kinds, wire v1, fuzz targets.
+- **M2** done: `crates/terminal` (multivenue-terminal): auth, CSP, WS,
+  synthetic, recorder, replay. The bundle is public on loopback (no
+  secret, T-L13); `/ws` is the only door to data.
+- **M3** done: `--live` HL + Binance USDⓈ-M public feeds, scanners
+  (fuzz `term_live_scan`), Binance sync, HL candle history at boot (≈ 26
+  weight), heat every 250 ms. From the cloud box Binance answers 451 and
+  stops (geo-block); TLS there needs `--extra-ca` (the sandbox re-signs).
+- **M4** done (first cut): the app — login form, WebSocket link with the
+  one COPY, chart / heatmap / ladder / tape / flow from server frames.
+  `scripts/app_smoke.py` signs in through the form; PASS on synthetic and
+  on live HL.
+- **Owed**: M5 (member + door, paper, in-process door tests only), M6
+  (gates: lint, nextest, license-check, copy-audit, license-deps, fuzz 60 s
+  per touched target on nightly). Follow-ups: HL coarse `nSigFigs` book for
+  the heatmap; footprint and VP frames from the server; drawing tools,
+  crosshair, panes; kittest; the glue byte-compare gate; `build.rs`
+  embedding under `web-bundle`; T0's Mac half (Safari 26, a real GPU).
+- **Local notes for the cloud box**: build with `RUSTFLAGS=-C
+  target-cpu=native` in a separate target dir (the repo's `znver3` flag
+  traps on this CPU); kill the server with `pkill -x multivenue-term`, never
+  `pgrep -f` (it matches the calling shell).
 
 ## Work plan (milestones = commits)
 
