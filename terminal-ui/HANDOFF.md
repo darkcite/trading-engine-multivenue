@@ -60,14 +60,29 @@ box, so nothing built here can trade.
   **Still owed from M5**: the PMLR kind for `term-cmds.pmlr` (every reader +
   the worker pin, Mac), publishing the boot epoch in `/state`, algos over
   the door, a `term.toml` for per-slot caps, refusals shown in the UI.
-- **Owed**: M6
-  (gates: lint, nextest, license-check, copy-audit, license-deps, fuzz 60 s
-  per touched target on nightly). Follow-ups: HL coarse `nSigFigs` book for
-  the heatmap; footprint and VP frames from the server; drawing tools,
-  crosshair, panes; kittest; the glue byte-compare gate; `build.rs`
-  embedding under `web-bundle`; T0's Mac half (Safari 26, a real GPU).
+- **M6 done on the cloud box** (2026-11-01): `make lint` PASS (whole
+  workspace), `license-check` OK, `copy-audit` new=0 (TERM crates under the
+  ratchet), `cargo test --workspace --no-fail-fast`: 415 test binaries, all
+  pass after M6a/M6b (two TERM regressions found and fixed: a stack overflow
+  in the set built by value, and tui's slot-row pin). Fuzz on nightly, 60 s
+  each, clean: term_proto_frame, term_proto_intent, term_proto_dec,
+  term_live_scan, term_door_frame. `license-deps` not triggered (no new
+  third-party crate).
+- **Owed to the Mac**: alloc-assert, bench-check, the worker's pytest pin
+  (`claude-worker/tests/test_news_cascade.py` asserts "8..15 are reserved":
+  already stale before TERM, now 12–15 are TERM's), the `term-cmds.pmlr`
+  PMLR kind (every reader + the worker), publishing the boot epoch in
+  `/state`, Safari 26 + a real GPU for T0, and a first paper session through
+  the real door (`STRATEGY=…+term-hl`, `term.env` 0600, the terminal with
+  `--door … --route …`).
+- **Follow-ups**: HL coarse `nSigFigs` book for the heatmap; footprint and
+  VP frames; drawing tools, crosshair, panes; the blotter and refusal
+  display; algos over the door; `term.toml` caps; kittest; the glue
+  byte-compare gate; `build.rs` embedding under `web-bundle`.
 - **Local notes for the cloud box**: build with `RUSTFLAGS=-C
-  target-cpu=native` in a separate target dir (the repo's `znver3` flag
+  target-cpu=native` in a separate target dir; the sandbox caps disk at
+  ~19 GB, so test with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`; detached jobs die between
+  turns, so poll long runs within one turn (the repo's `znver3` flag
   traps on this CPU); kill the server with `pkill -x multivenue-term`, never
   `pgrep -f` (it matches the calling shell).
 

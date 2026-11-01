@@ -795,25 +795,28 @@ mod tests {
         let mut s = Box::new(EngineSnapshot::empty());
         let shown = |s: &EngineSnapshot| (0..SNAPSHOT_SLOTS).filter(|&i| slot_shown(s, i)).count();
         assert_eq!(SNAPSHOT_SLOTS, 16);
-        // PVM impl-08 T4 (pine, slot 8), PM15-5 (pm15, slot 9) and PMJ (pmj, slot 11):
-        // eleven members, each row always shown.
-        assert_eq!(shown(&s), 11, "an idle boot shows the eleven members");
+        // PVM impl-08 T4 (pine, slot 8), PM15-5 (pm15, slot 9), PMJ (pmj, slot 11)
+        // and TERM (12–15, O-T17): fifteen members, each row always shown.
+        assert_eq!(shown(&s), 15, "an idle boot shows the fifteen members");
         assert!(slot_shown(&s, 8), "pine is a member");
-        assert!(slot_shown(&s, 11), "pmj is a member");
         assert!(slot_shown(&s, 9), "pm15 is a member");
         assert!(slot_shown(&s, 11), "pmj is a member");
+        assert!((12..=15).all(|i| slot_shown(&s, i)), "TERM is four members");
+        // Slot 10, the one reserved slot, shows only when something is set.
+        assert!(!slot_shown(&s, 10));
         s.boot.configured_mask = 1 << 10;
         assert!(slot_shown(&s, 10));
         s.boot.configured_mask = 0;
-        s.enabled_mask = 1 << 15;
-        assert!(slot_shown(&s, 15));
+        s.enabled_mask = 1 << 10;
+        assert!(slot_shown(&s, 10));
         s.enabled_mask = 0;
-        s.regime.gates[12] = 1;
-        assert!(slot_shown(&s, 12));
-        s.regime.gates[12] = 0;
-        s.slots[12] = strategy_core::SlotCounters::new(0, 1, 0, 0);
-        assert!(slot_shown(&s, 12));
-        assert_eq!(shown(&s), 12);
+        s.regime.gates[10] = 1;
+        assert!(slot_shown(&s, 10));
+        s.regime.gates[10] = 0;
+        assert!(!slot_shown(&s, 10));
+        s.slots[10] = strategy_core::SlotCounters::new(0, 1, 0, 0);
+        assert!(slot_shown(&s, 10));
+        assert_eq!(shown(&s), 16);
     }
 
     #[test]
