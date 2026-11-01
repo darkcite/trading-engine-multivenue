@@ -42,7 +42,15 @@ box, so nothing built here can trade.
   one COPY, chart / heatmap / ladder / tape / flow from server frames.
   `scripts/app_smoke.py` signs in through the form; PASS on synthetic and
   on live HL.
-- **Owed**: M5 (member + door, paper, in-process door tests only), M6
+- **M5a/b** done: `crates/ingress-term` (the door: frames, accept order,
+  rings, the 0600 UDS thread) and `crates/strategy-term` (the member: reduce
+  first, pre-gate, watchdog, slot-scoped halt, flatten, modify), both under
+  copy-audit. **M5c owed**: wire the member into `strategy-set`'s
+  `member_table!` on slots 12–15 (BUILT_MASK and its pins move), the
+  `STRATEGY` alias `term`, `term.toml`, the boot that spawns the door and
+  attaches the rings, the terminal's door client, and the PMLR kind for
+  `term-cmds.pmlr` (every reader + the worker pin, on the Mac).
+- **Owed**: M6
   (gates: lint, nextest, license-check, copy-audit, license-deps, fuzz 60 s
   per touched target on nightly). Follow-ups: HL coarse `nSigFigs` book for
   the heatmap; footprint and VP frames from the server; drawing tools,

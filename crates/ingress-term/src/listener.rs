@@ -97,6 +97,8 @@ fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut reduce: Red
                             closed = true;
                             break;
                         }
+                        // COPY: socket read ≤ 4 KiB → the frame-assembly buffer — UDS reads
+                        // land on arbitrary boundaries — reading straight into rx's spare capacity rejected (needs unsafe set_len).
                         Ok(n) => c.rx.extend_from_slice(&buf[..n]),
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(_) => {
@@ -121,12 +123,15 @@ fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut reduce: Red
                         if !grow.try_push_ref(&t) {
                             TermEvt::refused(&t.cmd, Reason::RingFull, mono).write_le(&mut rec);
                             seal_frame(cfg.door.key(), &rec, &mut out);
+                            // COPY: one 82 B sealed frame → the send buffer — the socket may take
+                            // part of it — sealing straight into tx rejected (tx is a Vec, frames vary in count).
                             c.tx.extend_from_slice(&out);
                         }
                     }
                     Err((refusal, cmd)) => {
                         TermEvt::refused(&cmd, refusal.reason(), mono).write_le(&mut rec);
                         seal_frame(cfg.door.key(), &rec, &mut out);
+                        // COPY: one 82 B sealed refusal → the send buffer (as above).
                         c.tx.extend_from_slice(&out);
                     }
                 }
@@ -138,6 +143,7 @@ fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut reduce: Red
                 e.write_le(&mut rec);
                 drop(e);
                 seal_frame(cfg.door.key(), &rec, &mut out);
+                // COPY: one 82 B sealed member event → the send buffer (as above).
                 c.tx.extend_from_slice(&out);
             }
             while !c.tx.is_empty() {

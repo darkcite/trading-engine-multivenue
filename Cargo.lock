@@ -2386,6 +2386,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-term"
+version = "0.1.0"
+dependencies = [
+ "core-fill",
+ "core-time",
+ "core-types",
+ "ingress-term",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-vm"
 version = "0.1.0"
 dependencies = [

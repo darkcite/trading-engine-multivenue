@@ -121,6 +121,8 @@ pub enum ShapeError {
 }
 
 fn rd8(b: &[u8; REC_LEN], o: usize) -> u64 {
+    // COPY: 8 B field → stack array — the record is unaligned bytes — read_unaligned
+    // via unsafe rejected (the crate has no unsafe; 8 B costs nothing).
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[o..o + 8]);
     u64::from_le_bytes(a)
@@ -156,10 +158,14 @@ impl TermCmd {
         b[3] = self.okind;
         b[4] = self.flags;
         b[5..8].fill(0);
+        // COPY: scalar → LE bytes, ≤ 8 B per field, 64 B per record — the wire is a
+        // fixed little-endian layout — a #[repr(C)] transmute rejected (endianness, padding).
         b[8..12].copy_from_slice(&self.seq.to_le_bytes());
         b[12..16].copy_from_slice(&self.sym.to_le_bytes());
         b[16..24].copy_from_slice(&self.px.to_le_bytes());
         b[24..32].copy_from_slice(&self.qty.to_le_bytes());
+        // COPY: scalar → LE bytes, ≤ 8 B per field, 64 B per record — the wire is a
+        // fixed little-endian layout — a #[repr(C)] transmute rejected (endianness, padding).
         b[32..40].copy_from_slice(&self.target_oid.to_le_bytes());
         b[40..48].copy_from_slice(&self.nonce.to_le_bytes());
         b[48..56].copy_from_slice(&self.boot_epoch.to_le_bytes());
@@ -266,10 +272,14 @@ impl TermEvt {
         b[1] = self.slot;
         b[2] = self.reason;
         b[3] = self.side;
+        // COPY: scalar → LE bytes, ≤ 8 B per field, 64 B per record — the wire is a
+        // fixed little-endian layout — a #[repr(C)] transmute rejected (endianness, padding).
         b[8..12].copy_from_slice(&self.sym.to_le_bytes());
         b[16..24].copy_from_slice(&self.nonce.to_le_bytes());
         b[24..32].copy_from_slice(&self.client_oid.to_le_bytes());
         b[32..40].copy_from_slice(&self.px.to_le_bytes());
+        // COPY: scalar → LE bytes, ≤ 8 B per field, 64 B per record — the wire is a
+        // fixed little-endian layout — a #[repr(C)] transmute rejected (endianness, padding).
         b[40..48].copy_from_slice(&self.qty.to_le_bytes());
         b[48..56].copy_from_slice(&self.ts_ns.to_le_bytes());
         b[56..64].copy_from_slice(&self.extra.to_le_bytes());
@@ -318,6 +328,8 @@ pub fn open_frame<'a>(key: &[u8; 32], f: &'a [u8; FRAME_LEN]) -> Result<&'a [u8;
 
 /// Seal a 64-B record into a frame under `key`.
 pub fn seal_frame(key: &[u8; 32], rec: &[u8; REC_LEN], out: &mut [u8; FRAME_LEN]) {
+    // COPY: 64 B record + 18 B header/tag into the 82 B frame — the frame is the
+    // one buffer the socket writes — writev of three slices rejected (one syscall per frame).
     out[..2].copy_from_slice(&LEN_FIELD_VALUE.to_le_bytes());
     out[2..TAG_OFFSET].copy_from_slice(rec);
     let tag = hmac_sha256_tag16(key, rec);

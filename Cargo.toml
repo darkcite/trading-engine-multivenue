@@ -124,6 +124,7 @@ members = [
     "crates/term-proto",
     "crates/terminal",
     "crates/ingress-term",
+    "crates/strategy-term",
 ]
 
 # Fuzz targets live in fuzz/Cargo.toml (cargo-fuzz convention) and are NOT
@@ -294,6 +295,7 @@ tui             = { path = "crates/tui" }
 term-proto      = { path = "crates/term-proto" }
 terminal        = { path = "crates/terminal" }
 ingress-term    = { path = "crates/ingress-term" }
+strategy-term   = { path = "crates/strategy-term" }
 
 # ---------------------------------------------------------------
 # Profiles

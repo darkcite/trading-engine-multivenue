@@ -88,6 +88,7 @@ if [ "$#" -eq 0 ]; then
            crates/ingress-hyperliquid crates/ingress-mexc crates/ingress-bybit \
            crates/ingress-polymarket crates/ingress-rpc crates/ingress-hyperevm \
            crates/ingress-hypercall crates/exec-hypercall \
+           crates/ingress-term crates/strategy-term \
            crates/core-amm crates/strategy-hyparb crates/strategy-xmm crates/strategy-hcv \
            crates/core-fill crates/engine \
            crates/exec-gateway \
