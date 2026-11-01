@@ -1,0 +1,19 @@
+[package]
+name = "term-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+egui.workspace = true
+egui-wgpu.workspace = true
+bytemuck.workspace = true
+wgpu = { workspace = true, features = ["std", "wgsl"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, features = ["std", "wgsl", "webgpu", "webgl", "fragile-send-sync-non-atomic-wasm"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+naga = { version = "27", features = ["wgsl-in"] }

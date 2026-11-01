@@ -1,0 +1,13 @@
+[package]
+name = "term-ui-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+term-proto.workspace = true
+term-render = { path = "../term-render" }
+egui.workspace = true
+egui-wgpu.workspace = true

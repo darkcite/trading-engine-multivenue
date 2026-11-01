@@ -1,0 +1,23 @@
+[package]
+name = "term-ui-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Everything web-only sits behind the wasm32 cfg, so a host build never
+# compiles native eframe or winit (plan v2.1 §4.11.1).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+term-ui-core = { path = "../term-ui-core" }
+term-proto.workspace = true
+eframe = { workspace = true, features = ["wgpu", "default_fonts"] }
+egui-wgpu.workspace = true
+wgpu = { workspace = true, features = ["std", "wgsl", "webgpu", "webgl", "fragile-send-sync-non-atomic-wasm"] }
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["Window", "Document", "Location", "Performance", "HtmlCanvasElement", "console", "VisibilityState", "EventTarget", "Event"] }
