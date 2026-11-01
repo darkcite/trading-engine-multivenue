@@ -138,6 +138,22 @@ struct Inst {
     redef: bool,
     /// History arrived: clients need a fresh snapshot to see it.
     history: bool,
+    /// HL's coarse (nSigFigs 4) book, for the heatmap only.
+    coarse: Vec<(i64, i64)>,
+}
+
+/// HL's 4-significant-figure book: every price on a 10-tick grid and every
+/// gap at least 10 ticks (a 5-figure book has 1-tick gaps near the touch).
+pub fn is_coarse(lv: &[(Side, i64, i64)], tick: i64) -> bool {
+    let step = tick.saturating_mul(10);
+    if lv.len() < 4 || step <= 0 {
+        return false;
+    }
+    let grid = lv.iter().all(|&(_, p, _)| p % step == 0);
+    let mut bids: Vec<i64> = lv.iter().filter(|x| x.0 == Side::Buy).map(|x| x.1).collect();
+    bids.sort_unstable();
+    let gaps_ok = bids.windows(2).all(|w| w[1] - w[0] >= step);
+    grid && gaps_ok
 }
 
 /// One HL candle (`{"t":ms,"o":"..","h":"..","l":"..","c":"..","v":".."}`)
@@ -218,6 +234,7 @@ pub struct LiveStats {
     pub bad_msgs: u64,
     pub resyncs: u64,
     pub crossed: u64,
+    pub coarse_books: u64,
 }
 
 fn ns() -> u64 {
@@ -267,6 +284,7 @@ impl Live {
                     tick_known: venue != Venue::Hyperliquid,
                     redef: false,
                     history: false,
+                    coarse: Vec::new(),
                 }
             })
             .collect();
@@ -348,6 +366,10 @@ impl Live {
                         let m = format!(r#"{{"method":"subscribe","subscription":{{"type":"{ty}","coin":"{coin}"}}}}"#);
                         let _ = c.queue_text(&[m.as_bytes()]);
                     }
+                    // The heatmap's wider book: 4 significant figures (one
+                    // more subscription per coin; 3 per coin, budget 40).
+                    let m = format!(r#"{{"method":"subscribe","subscription":{{"type":"l2Book","coin":"{coin}","nSigFigs":4}}}}"#);
+                    let _ = c.queue_text(&[m.as_bytes()]);
                 }
                 let _ = c.flush(self.poll.registry());
             }
@@ -520,6 +542,13 @@ impl Live {
                 let mut lv = Vec::with_capacity(64);
                 if scan::hl_levels(levels, |s, p, q| lv.push((s, p, q))).is_none() {
                     self.stats.bad_msgs += 1;
+                    return;
+                }
+                // The coarse book (no echo of nSigFigs): every price a
+                // multiple of 10 ticks and every gap at least 10 ticks.
+                if self.ins[k].tick_known && is_coarse(&lv, self.ins[k].def.tick_1e6) {
+                    self.ins[k].coarse = lv.iter().map(|&(_, p, q)| (p, q)).collect();
+                    self.stats.coarse_books += 1;
                     return;
                 }
                 let i = &mut self.ins[k];
@@ -790,10 +819,14 @@ impl Live {
         // Heat: rows of `heat_scale` ticks around the mid, ln-quantized.
         let tick = i.def.tick_1e6;
         let mid_tick = (bp + ap) / 2 / tick;
-        let base = mid_tick - (HEAT_ROWS as i64 / 2) * i.heat_scale;
+        // HL's coarse book, when it has one, spans ten times the range.
+        let use_coarse = !i.coarse.is_empty();
+        let scale = if use_coarse { i.heat_scale * 10 } else { i.heat_scale };
+        let base = mid_tick - (HEAT_ROWS as i64 / 2) * scale;
         let mut acc = [0i64; HEAT_ROWS];
-        for &(p, q) in tb.iter().chain(ta.iter()) {
-            let r = (p / tick - base).div_euclid(i.heat_scale);
+        let levels: Vec<(i64, i64)> = if use_coarse { i.coarse.clone() } else { tb.iter().chain(ta.iter()).copied().collect() };
+        for &(p, q) in &levels {
+            let r = (p / tick - base).div_euclid(scale);
             if (0..HEAT_ROWS as i64).contains(&r) {
                 acc[r as usize] += q;
             }
@@ -805,7 +838,7 @@ impl Live {
         }
         let col = i.col;
         i.col = col.wrapping_add(1);
-        let scale = i.heat_scale as u16;
+        let scale = scale as u16;
         let seq = self.seq();
         if let Ok(n) = fp.encode(seq, t, &mut self.scratch) {
             out.extend_from_slice(&self.scratch[..n]);
@@ -884,6 +917,15 @@ mod tests {
         let b = hl_candle(0, c).unwrap();
         assert_eq!((b.bar, b.o, b.h, b.vol), (1761980040 / 60, 78_000_000_000, 78_020_000_000, 12_345_000));
         assert!(hl_candle(0, br#"{"t":1,"o":"5","h":"4","l":"3","c":"4","v":"1"}"#).is_none(), "open above high");
+    }
+
+    #[test]
+    fn coarse_books_are_told_apart() {
+        let t = 1_000_000; // $1
+        let fine: Vec<(Side, i64, i64)> = (0..5).map(|k| (Side::Buy, 78_000_000_000 - k * t, 1)).chain((1..5).map(|k| (Side::Sell, 78_000_000_000 + k * t, 1))).collect();
+        assert!(!is_coarse(&fine, t));
+        let coarse: Vec<(Side, i64, i64)> = (0..5).map(|k| (Side::Buy, 78_000_000_000 - k * 10 * t, 1)).chain((1..5).map(|k| (Side::Sell, 78_000_000_000 + k * 10 * t, 1))).collect();
+        assert!(is_coarse(&coarse, t));
     }
 
     #[test]
