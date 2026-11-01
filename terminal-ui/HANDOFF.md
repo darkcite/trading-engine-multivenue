@@ -45,9 +45,11 @@ box, so nothing built here can trade.
 - **M5a/b** done: `crates/ingress-term` (the door: frames, accept order,
   rings, the 0600 UDS thread) and `crates/strategy-term` (the member: reduce
   first, pre-gate, watchdog, slot-scoped halt, flatten, modify), both under
-  copy-audit. **M5c owed**: wire the member into `strategy-set`'s
-  `member_table!` on slots 12–15 (BUILT_MASK and its pins move), the
-  `STRATEGY` alias `term`, `term.toml`, the boot that spawns the door and
+  copy-audit. **M5c part 1 done**: `strategy-set` builds TERM on 12–15
+  (`Term<SLOT>`, names term-hl/-bn/-pm/-hc, outside `all`, BUILT_MASK
+  0xFBFF, slot 10 the only reserved slot); an unwired member is inert
+  (timer period u64::MAX); the AI is refused EnableStrategy(12–15) like
+  pine. **M5c owed**: `term.toml`, the boot that spawns the door and
   attaches the rings, the terminal's door client, and the PMLR kind for
   `term-cmds.pmlr` (every reader + the worker pin, on the Mac).
 - **Owed**: M6

@@ -523,8 +523,81 @@ impl Strategy for TermStrategy {
         let now = ctx.now_ns();
         self.cancel_where(ctx, now, None);
     }
+    /// Inert until the boot attaches the door's rings: an unwired TERM
+    /// slot never lowers the set's timer cadence (the `pmj` precedent).
     fn timer_period_ns(&self) -> u64 {
-        TIMER_NS
+        if self.reduce.is_some() {
+            TIMER_NS
+        } else {
+            u64::MAX
+        }
+    }
+}
+
+/// The set's view of one TERM slot: `member_table!` builds members with a
+/// zero-argument `new()`, so the slot is a const parameter (O-T17).
+pub struct Term<const SLOT: u8>(pub TermStrategy);
+
+pub type TermHl = Term<{ ingress_term::SLOT_TERM_HL }>;
+pub type TermBn = Term<{ ingress_term::SLOT_TERM_BN }>;
+pub type TermPm = Term<{ ingress_term::SLOT_TERM_PM }>;
+pub type TermHc = Term<{ ingress_term::SLOT_TERM_HC }>;
+
+impl<const SLOT: u8> Term<SLOT> {
+    /// Paper parameters for the slot's venue (live caps are R-T5's).
+    pub fn new() -> Self {
+        let mut p = TermParams::paper_hl();
+        p.venue = match SLOT {
+            ingress_term::SLOT_TERM_BN => VenueId::Binance,
+            ingress_term::SLOT_TERM_PM => VenueId::Polymarket,
+            _ => VenueId::Hyperliquid,
+        };
+        Term(TermStrategy::new(SLOT, p))
+    }
+}
+
+impl<const SLOT: u8> Default for Term<SLOT> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const SLOT: u8> StrategyCounters for Term<SLOT> {
+    fn orders_emitted(&self) -> u64 {
+        self.0.orders_emitted()
+    }
+}
+
+impl<const SLOT: u8> Strategy for Term<SLOT> {
+    fn on_start<C: Ctx>(&mut self, ctx: &mut C) -> Result<(), StrategyError> {
+        self.0.on_start(ctx)
+    }
+    fn on_tick<C: Ctx>(&mut self, t: &Tick, ctx: &mut C) {
+        self.0.on_tick(t, ctx)
+    }
+    fn on_signal<C: Ctx>(&mut self, s: &Signal, ctx: &mut C) {
+        self.0.on_signal(s, ctx)
+    }
+    fn on_fill<C: Ctx>(&mut self, f: &Fill, ctx: &mut C) {
+        self.0.on_fill(f, ctx)
+    }
+    fn on_ai<C: Ctx>(&mut self, c: &AiCmd, ctx: &mut C) {
+        self.0.on_ai(c, ctx)
+    }
+    fn on_depth<C: Ctx>(&mut self, d: &DepthTopK, ctx: &mut C) {
+        self.0.on_depth(d, ctx)
+    }
+    fn on_order_event<C: Ctx>(&mut self, e: &OrderEvent, ctx: &mut C) {
+        self.0.on_order_event(e, ctx)
+    }
+    fn on_timer<C: Ctx>(&mut self, now: NsTs, ctx: &mut C) {
+        self.0.on_timer(now, ctx)
+    }
+    fn on_stop<C: Ctx>(&mut self, ctx: &mut C) {
+        self.0.on_stop(ctx)
+    }
+    fn timer_period_ns(&self) -> u64 {
+        self.0.timer_period_ns()
     }
 }
 
