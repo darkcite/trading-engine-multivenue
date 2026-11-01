@@ -1277,6 +1277,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ingress-term"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "core-ring",
+ "mio 0.8.11",
+ "proptest",
+]
+
+[[package]]
 name = "instability"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -13,6 +13,8 @@ Never take an armed or live state from this file.
 |---|---|
 | **O-T14** | **Git override, scoped to this branch.** The CLAUDE.md git law (no branches, no session pushes, git write-ops on the Mac) is waived for `term-t0-spike` only: sessions may commit and push to it from the cloud container. `main` is never touched; no force-push, rebase or history rewrite; staging is explicit-path only; one commit per milestone, authored `darkcite`. The token is the operator's and is never written to disk or config. |
 | **O-T15** | **Scope includes the money path.** This run covers T1a (server), T1b (UI) and the engine side: the `strategy-term` member and the `ingress-term` door. R-T8, R-T18 and R-T19 (a) are taken as recommended. T0's Mac half (WebGPU, Safari 26) is still owed and does not block. |
+| **O-T17** | **TERM slots amended (R-T1 was stale: PMJ owns 11).** term-hl **12**, term-bn **13**, term-pm **14**, term-hc **15**. Slot 10 stays reserved. |
+| **O-T18** | **M5 scope from the cloud box:** the member and the door in paper, tested only against an in-process door with a per-run key. alloc-assert, bench-check and the worker's pytest pin stay owed to the Mac. |
 | **O-T16** | **Root workspace and live public feeds.** `term-proto` and `crates/terminal` join the root workspace on this branch. The cloud box may open live **public** market-data feeds (no keys), inside the plan's budgets. |
 
 Laws that still hold in full: T-L1 (the terminal holds no venue key and opens

@@ -1,0 +1,20 @@
+[package]
+name         = "ingress-term"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "TERM door: the HMAC UDS door between multivenue-terminal and the strategy-term member (TERM plan §4.2) — 64-B TermCmd/TermEvt, the accept order, and the reduce/grow core-ring hand-off."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-crypto = { workspace = true }
+core-ring   = { workspace = true }
+mio         = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
