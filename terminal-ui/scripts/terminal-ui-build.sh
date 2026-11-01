@@ -14,8 +14,9 @@ if grep -nE '^name = "(tokio|serde_json|reqwest|async-std|ethers|alloy|openssl)"
   echo "banned crate in terminal-ui/Cargo.lock" >&2; exit 1
 fi
 cargo build -p term-ui-web --target wasm32-unknown-unknown --release
+TGT="${CARGO_TARGET_DIR:-target}"
 rm -rf dist && mkdir -p dist
-wasm-bindgen target/wasm32-unknown-unknown/release/term_ui_web.wasm \
+wasm-bindgen "$TGT/wasm32-unknown-unknown/release/term_ui_web.wasm" \
   --target web --no-typescript --out-name term_ui --out-dir dist
 if [[ "${WASM_OPT:-0}" == 1 ]] && command -v wasm-opt >/dev/null; then
   wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int --enable-reference-types \

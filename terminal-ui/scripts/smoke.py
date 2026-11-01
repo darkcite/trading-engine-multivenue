@@ -23,6 +23,9 @@ if MODE == "webgpu":
 os.makedirs(OUT, exist_ok=True)
 lines, errors, csp = [], [], []
 pending_shots = []
+# A screenshot can fail on a busy WebGPU canvas in headless Chromium; that
+# is recorded, not fatal: the gate is the phases, CSP and errors.
+shot_errors = []
 
 
 def on_console(msg):
@@ -56,13 +59,19 @@ with playwright.sync_api.sync_playwright() as pw:
         while pending_shots and pending_shots[0][0] <= now:
             _, after = pending_shots.pop(0)
             shot_n += 1
-            page.screenshot(path=os.path.join(OUT, f"{shot_n:02d}-after-{after}.png"))
+            try:
+                page.screenshot(path=os.path.join(OUT, f"{shot_n:02d}-after-{after}.png"))
+            except playwright.sync_api.Error as e:
+                shot_errors.append(f"{after}: {e}".splitlines()[0])
         if any(r.get("event") == "done" for r in lines) and not pending_shots:
             break
         if errors and not lines:
             break
     page.wait_for_timeout(3000)
-    page.screenshot(path=os.path.join(OUT, f"{shot_n + 1:02d}-interactive.png"))
+    try:
+        page.screenshot(path=os.path.join(OUT, f"{shot_n + 1:02d}-interactive.png"))
+    except playwright.sync_api.Error as e:
+        shot_errors.append(f"interactive: {e}".splitlines()[0])
     # Hidden / Visible reporting: override the read-only property and fire.
     for state in ("hidden", "visible"):
         page.evaluate("""s => { Object.defineProperty(document, 'visibilityState', {value: s, configurable: true});
@@ -81,6 +90,7 @@ result = {
     "controls": controls,
     "csp_violations": csp,
     "errors": errors,
+    "screenshot_errors": shot_errors,
 }
 result["pass"] = (result["done"] and not csp and not errors
                   and controls[-2:] == ["Hidden", "Visible"])
