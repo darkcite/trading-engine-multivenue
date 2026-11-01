@@ -140,7 +140,7 @@ proptest! {
     }
 
     #[test]
-    fn decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..512), kind in 1u8..=23) {
+    fn decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..512), kind in 1u8..=24) {
         let mut b = bytes;
         if b.len() >= HDR_LEN {
             b[0] = kind;
@@ -281,6 +281,17 @@ fn ascii_and_records() {
     let dr = Drawing { instr: 1, id: 3, kind: DrawKind::HLine, rgba: 0xffffffff, pts: [ChartPt { bar: 5, px: 7 }, ChartPt::default()] };
     let k = dr.encode(1, 1, &mut buf).unwrap();
     assert_eq!(Drawing::parse(rt(&buf[..k], Kind::Drawing).body).unwrap(), dr);
+}
+
+#[test]
+fn intent_acks() {
+    let mut buf = [0u8; 64];
+    let a = IntentAck { nonce: 9, slot: 12, accepted: false, source: AckSource::Engine, reason: 7 };
+    let k = a.encode(1, 1, &mut buf).unwrap();
+    assert_eq!(IntentAck::parse(rt(&buf[..k], Kind::IntentAck).body).unwrap(), a);
+    assert_eq!(decode_from_ui(&buf[..k]).unwrap_err(), Error::Direction, "server → UI only");
+    let bad = IntentAck { accepted: true, ..a };
+    assert_eq!(bad.encode(1, 1, &mut buf), Err(Error::BadValue), "an acceptance has no reason");
 }
 
 #[test]

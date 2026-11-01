@@ -493,19 +493,30 @@ impl Server {
             Kind::Intent => {
                 let Ok(intent) = term_proto::exec::Intent::parse(f.body) else { return };
                 let trading = w.trading;
-                let (accepted, why) = if !order_entry {
-                    (false, "order entry disabled (replay / no door)")
+                use term_proto::exec::*;
+                let (accepted, why, code) = if !order_entry {
+                    (false, "order entry disabled (replay / no door)", ACK_ORDER_ENTRY_OFF)
                 } else if !trading {
-                    (false, "trading is off for this session")
+                    (false, "trading is off for this session", ACK_TRADING_OFF)
                 } else {
                     match self.cfg.door.as_mut() {
-                        None => (false, "no door configured"),
+                        None => (false, "no door configured", ACK_NO_DOOR),
                         Some(d) => match d.intent(&intent, wall_ns()) {
-                            Ok(()) => (true, "sent to the door"),
-                            Err(e) => (false, e),
+                            Ok(()) => (true, "sent to the door", 0),
+                            Err(e) if e.starts_with("no route") => (false, e, ACK_NO_ROUTE),
+                            Err(e) => (false, e, ACK_DOOR_LOST),
                         },
                     }
                 };
+                // The server's own refusals are answered at once; the
+                // engine's verdict on a sent intent comes back via the door.
+                if !accepted {
+                    let mut b = [0u8; 64];
+                    let ack = IntentAck { nonce: intent.nonce, slot: intent.slot, accepted: false, source: AckSource::Server, reason: code };
+                    if let (Ok(n), Some(c)) = (ack.encode(0, 0, &mut b), self.clients[i].as_mut()) {
+                        ws::write_binary(&b[..n], &mut c.tx);
+                    }
+                }
                 self.note(Event::Intent { nonce: intent.nonce, accepted, why });
             }
             _ => {} // Layout / Drawing / KeyMap / LiveConfirm: stored in later milestones.

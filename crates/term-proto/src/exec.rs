@@ -470,3 +470,70 @@ impl LiveConfirm {
         })
     }
 }
+
+// ---- IntentAck (server → UI) ------------------------------------------------
+
+/// Who decided.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AckSource {
+    /// The terminal server (session, routing, door state).
+    Server = 1,
+    /// The engine: the door or the member's pre-gate.
+    Engine = 2,
+}
+
+/// Server reasons (source = Server).
+pub const ACK_ORDER_ENTRY_OFF: u8 = 1;
+pub const ACK_TRADING_OFF: u8 = 2;
+pub const ACK_NO_DOOR: u8 = 3;
+pub const ACK_NO_ROUTE: u8 = 4;
+pub const ACK_DOOR_LOST: u8 = 5;
+
+/// The verdict on one intent: `nonce u64 · slot u8 · accepted u8 · source u8
+/// · reason u8`. Engine reasons are `ingress_term::Reason` codes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IntentAck {
+    pub nonce: u64,
+    pub slot: u8,
+    pub accepted: bool,
+    pub source: AckSource,
+    pub reason: u8,
+}
+
+impl IntentAck {
+    pub fn parse(body: &[u8]) -> Result<IntentAck> {
+        let mut r = Rd::new(body);
+        let nonce = r.u64()?;
+        let slot = slot_ok(r.u8()?)?;
+        let accepted = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::BadValue),
+        };
+        let source = match r.u8()? {
+            1 => AckSource::Server,
+            2 => AckSource::Engine,
+            _ => return Err(Error::BadValue),
+        };
+        let reason = r.u8()?;
+        r.end()?;
+        // An acceptance carries no reason; a refusal always does.
+        if nonce == 0 || accepted == (reason != 0) {
+            return Err(Error::BadValue);
+        }
+        Ok(IntentAck { nonce, slot, accepted, source, reason })
+    }
+    pub fn encode(&self, seq: u32, ts: u64, out: &mut [u8]) -> Result<usize> {
+        if self.nonce == 0 || self.accepted == (self.reason != 0) {
+            return Err(Error::BadValue);
+        }
+        encode(Kind::IntentAck, seq, ts, out, |w| {
+            w.u64(self.nonce)?;
+            w.u8(self.slot)?;
+            w.u8(self.accepted as u8)?;
+            w.u8(self.source as u8)?;
+            w.u8(self.reason)
+        })
+    }
+}

@@ -13,7 +13,8 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use egui_wgpu::RenderState;
 use term_proto::ctl::{Beat, Control, CtlOp, InstrDef, CH_ALL};
 use term_proto::dec::format_1e6;
-use term_proto::exec::EngineStatus;
+use term_proto::ctl::Venue;
+use term_proto::exec::{EngineStatus, FillView, Intent, IntentAck, Op, OrderKind, OrderStatus, OrderView, PositionView, AckSource, FLAG_REDUCE_ONLY};
 use term_proto::md::*;
 use term_proto::{Kind, Side};
 use term_render::{CircleInst, HeatU, PaneDraw, RectInst, TermGpu, ViewU, HEAT_COLS, HEAT_ROWS};
@@ -66,6 +67,59 @@ pub struct App<P: Platform, L: Link> {
     grid_ticks: [i64; 64],
     fmt: [u8; 28],
     last_log: f64,
+    // Order entry (T2 first cut): off at login (§4.11.6).
+    trading: bool,
+    nonce: u64,
+    px_text: String,
+    qty_text: String,
+    reduce_only: bool,
+    entry_err: Option<&'static str>,
+    orders: BTreeMap<u64, OrderView>,
+    positions: BTreeMap<(u8, u16), PositionView>,
+    fills: Vec<FillView>,
+    acks: Vec<IntentAck>,
+}
+
+/// The TERM slot an instrument trades on (O-T17: HL 12, Binance 13,
+/// Polymarket 14, Hypercall 15).
+pub fn term_slot(v: Venue) -> u8 {
+    match v {
+        Venue::Hyperliquid => 12,
+        Venue::Binance => 13,
+        Venue::Polymarket => 14,
+        Venue::Hypercall => 15,
+    }
+}
+
+/// A readable reason for an ack (server codes from `term_proto::exec`,
+/// engine codes are `ingress_term::Reason`).
+pub fn ack_reason(a: &IntentAck) -> &'static str {
+    if a.accepted {
+        return "accepted";
+    }
+    match (a.source, a.reason) {
+        (AckSource::Server, 1) => "order entry is off (replay or no door)",
+        (AckSource::Server, 2) => "trading is off for this session",
+        (AckSource::Server, 3) => "no door to the engine",
+        (AckSource::Server, 4) => "no route for this instrument, or an op not carried yet",
+        (AckSource::Server, 5) => "the door socket failed",
+        (AckSource::Engine, 1) => "malformed",
+        (AckSource::Engine, 2) => "out of sequence",
+        (AckSource::Engine, 3) => "another engine boot",
+        (AckSource::Engine, 4) => "too old",
+        (AckSource::Engine, 5) => "the engine is busy (ring full)",
+        (AckSource::Engine, 6) => "the slot is halted",
+        (AckSource::Engine, 7) => "outside the price band",
+        (AckSource::Engine, 8) => "below the venue minimum",
+        (AckSource::Engine, 9) => "over the order notional cap",
+        (AckSource::Engine, 10) => "over the position cap",
+        (AckSource::Engine, 11) => "rate limited",
+        (AckSource::Engine, 12) => "no fresh engine price",
+        (AckSource::Engine, 13) => "unknown order",
+        (AckSource::Engine, 14) => "the venue path refused it",
+        (AckSource::Engine, 15) => "instrument not allowed",
+        _ => "refused",
+    }
 }
 
 impl<P: Platform, L: Link> App<P, L> {
@@ -89,6 +143,16 @@ impl<P: Platform, L: Link> App<P, L> {
             grid_ticks: [0; 64],
             fmt: [0; 28],
             last_log: 0.0,
+            trading: false,
+            nonce: 0,
+            px_text: String::new(),
+            qty_text: String::new(),
+            reduce_only: false,
+            entry_err: None,
+            orders: BTreeMap::new(),
+            positions: BTreeMap::new(),
+            fills: Vec::with_capacity(64),
+            acks: Vec::with_capacity(32),
         }
     }
 
@@ -204,6 +268,37 @@ impl<P: Platform, L: Link> App<P, L> {
                     }
                 }
             }
+            Kind::OrderView => {
+                if let Ok(o) = OrderView::parse(f.body) {
+                    let oid = u64::from_le_bytes([o.cloid[0], o.cloid[1], o.cloid[2], o.cloid[3], o.cloid[4], o.cloid[5], o.cloid[6], o.cloid[7]]);
+                    if matches!(o.status, OrderStatus::Open | OrderStatus::Partial | OrderStatus::Pending) {
+                        self.orders.insert(oid, o);
+                    } else {
+                        self.orders.remove(&oid);
+                    }
+                }
+            }
+            Kind::PositionView => {
+                if let Ok(p) = PositionView::parse(f.body) {
+                    self.positions.insert((p.slot, p.instr), p);
+                }
+            }
+            Kind::FillView => {
+                if let Ok(x) = FillView::parse(f.body) {
+                    if self.fills.len() == 64 {
+                        self.fills.remove(0);
+                    }
+                    self.fills.push(x);
+                }
+            }
+            Kind::IntentAck => {
+                if let Ok(a) = IntentAck::parse(f.body) {
+                    if self.acks.len() == 32 {
+                        self.acks.remove(0);
+                    }
+                    self.acks.push(a);
+                }
+            }
             Kind::Heartbeat => {
                 // The web link echoes from its socket handler already; this
                 // is only for a link that does not (native, tests).
@@ -215,6 +310,9 @@ impl<P: Platform, L: Link> App<P, L> {
 
     pub fn ui(&mut self, ctx: &egui::Context, rs: Option<&RenderState>) {
         if let (Some(rs), false) = (rs, self.gpu_ready) {
+            // The terminal is dark whatever the browser prefers: its panes,
+            // heatmap and palette are designed for it.
+            ctx.set_visuals(egui::Visuals::dark());
             let gpu = TermGpu::new(&rs.device, &rs.queue, rs.target_format, &term_render::heat_lut());
             rs.renderer.write().callback_resources.insert(gpu);
             self.gpu_ready = true;
@@ -258,12 +356,17 @@ impl<P: Platform, L: Link> App<P, L> {
             let side_w = 280.0f32.min(body.width() * 0.3);
             let left = Rect::from_min_max(body.min, Pos2::new(body.max.x - side_w - 6.0, body.max.y));
             let right = Rect::from_min_max(Pos2::new(body.max.x - side_w, body.min.y), body.max);
-            let split = left.min.y + left.height() * 0.62;
-            let chart = Rect::from_min_max(left.min, Pos2::new(left.max.x, split - 3.0));
-            let heat = Rect::from_min_max(Pos2::new(left.min.x, split + 3.0), left.max);
-            let lsplit = right.min.y + right.height() * 0.62;
-            let ladder = Rect::from_min_max(right.min, Pos2::new(right.max.x, lsplit - 3.0));
+            let s1 = left.min.y + left.height() * 0.52;
+            let s2 = left.min.y + left.height() * 0.76;
+            let chart = Rect::from_min_max(left.min, Pos2::new(left.max.x, s1 - 3.0));
+            let heat = Rect::from_min_max(Pos2::new(left.min.x, s1 + 3.0), Pos2::new(left.max.x, s2 - 3.0));
+            let blotter = Rect::from_min_max(Pos2::new(left.min.x, s2 + 3.0), left.max);
+            let ticket = Rect::from_min_max(right.min, Pos2::new(right.max.x, right.min.y + 196.0));
+            let lsplit = ticket.max.y + 6.0 + (right.max.y - ticket.max.y) * 0.62;
+            let ladder = Rect::from_min_max(Pos2::new(right.min.x, ticket.max.y + 6.0), Pos2::new(right.max.x, lsplit - 3.0));
             let tape = Rect::from_min_max(Pos2::new(right.min.x, lsplit + 3.0), right.max);
+            self.ticket(ui, ticket);
+            self.blotter(ui, blotter);
             if let Some(rs) = rs {
                 self.chart(ui, rs, chart);
                 self.heat(ui, rs, heat);
@@ -505,6 +608,137 @@ impl<P: Platform, L: Link> App<P, L> {
     }
 }
 
+impl<P: Platform, L: Link> App<P, L> {
+    fn send_intent(&mut self, mut i: Intent) {
+        self.nonce += 1;
+        i.nonce = (self.plat.now_ms() as u64).wrapping_mul(1000).wrapping_add(self.nonce) | 1;
+        match i.encode(0, 0, &mut self.out) {
+            Ok(n) => {
+                self.link.send(&self.out[..n]);
+                self.entry_err = None;
+            }
+            Err(_) => self.entry_err = Some("that order is malformed (price and size must be above zero)"),
+        }
+    }
+
+    fn place(&mut self, side: Side, ioc: bool) {
+        let Some(def) = self.ins.get(self.sel).and_then(|i| i.def) else { return };
+        let (Ok(px), Ok(qty)) = (term_proto::dec::parse_1e6(self.px_text.trim().as_bytes()), term_proto::dec::parse_1e6(self.qty_text.trim().as_bytes())) else {
+            self.entry_err = Some("price and size: plain decimals, at most 6 places");
+            return;
+        };
+        let mut i = Intent::blank(1, term_slot(def.venue), def.instr, Op::Place);
+        i.side = side as u8;
+        i.kind = if ioc { OrderKind::Ioc as u8 } else { OrderKind::Limit as u8 };
+        i.flags = if self.reduce_only { FLAG_REDUCE_ONLY } else { 0 };
+        i.px = px;
+        i.qty = qty;
+        self.send_intent(i);
+    }
+
+    fn simple(&mut self, op: Op) {
+        let Some(def) = self.ins.get(self.sel).and_then(|i| i.def) else { return };
+        self.send_intent(Intent::blank(1, term_slot(def.venue), def.instr, op));
+    }
+
+    fn ticket(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        ui.painter_at(rect).rect_filled(rect, 0.0, PANE);
+        let inner = rect.shrink(8.0);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.horizontal(|ui| {
+                let label = if self.trading { "Trading ON" } else { "Trading OFF" };
+                let col = if self.trading { Color32::from_rgb(UP[0], UP[1], UP[2]) } else { MUTED };
+                if ui.add(egui::Button::new(egui::RichText::new(label).color(col))).clicked() {
+                    self.trading = !self.trading;
+                    let op = if self.trading { CtlOp::TradingEnable } else { CtlOp::TradingDisable };
+                    if let Ok(n) = Control::op(op).encode(0, 0, &mut self.out) {
+                        self.link.send(&self.out[..n]);
+                    }
+                }
+                ui.checkbox(&mut self.reduce_only, "reduce-only");
+            });
+            ui.horizontal(|ui| {
+                ui.label("px");
+                ui.add(egui::TextEdit::singleline(&mut self.px_text).desired_width(90.0));
+                ui.label("qty");
+                ui.add(egui::TextEdit::singleline(&mut self.qty_text).desired_width(70.0));
+            });
+            ui.add_enabled_ui(self.trading, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Buy limit").clicked() {
+                        self.place(Side::Buy, false);
+                    }
+                    if ui.button("Sell limit").clicked() {
+                        self.place(Side::Sell, false);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Buy IoC").clicked() {
+                        self.place(Side::Buy, true);
+                    }
+                    if ui.button("Sell IoC").clicked() {
+                        self.place(Side::Sell, true);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel all").clicked() {
+                        self.simple(Op::CancelAll);
+                    }
+                    if ui.button("Flatten").clicked() {
+                        self.simple(Op::Flatten);
+                    }
+                    if ui.button(egui::RichText::new("Halt slot").color(Color32::from_rgb(DOWN[0], DOWN[1], DOWN[2]))).clicked() {
+                        self.simple(Op::Halt);
+                    }
+                });
+            });
+            if let Some(e) = self.entry_err {
+                ui.label(egui::RichText::new(e).color(Color32::from_rgb(DOWN[0], DOWN[1], DOWN[2])).size(11.0));
+            }
+        });
+    }
+
+    fn blotter(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        ui.painter_at(rect).rect_filled(rect, 0.0, PANE);
+        let inner = rect.shrink(6.0);
+        let mut cancel: Option<(u8, u16, [u8; 16])> = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.columns(3, |cols| {
+                cols[0].label(egui::RichText::new("Orders").color(MUTED).size(11.0));
+                for o in self.orders.values() {
+                    cols[0].horizontal(|ui| {
+                        let n = format_1e6(o.px, 2, &mut self.fmt);
+                        let px = std::str::from_utf8(&self.fmt[..n]).unwrap_or("").to_owned();
+                        let side = if o.side == Side::Buy { "B" } else { "S" };
+                        ui.label(egui::RichText::new(format!("{side} {px} ×{} s{}", o.qty, o.slot)).size(11.0).monospace());
+                        if ui.small_button("✕").clicked() {
+                            cancel = Some((o.slot, o.instr, o.cloid));
+                        }
+                    });
+                }
+                cols[1].label(egui::RichText::new("Positions · fills").color(MUTED).size(11.0));
+                for p in self.positions.values().filter(|p| p.qty != 0) {
+                    cols[1].label(egui::RichText::new(format!("s{} #{} {:+} @ {}", p.slot, p.instr, p.qty, p.avg_px / 1_000_000)).size(11.0).monospace());
+                }
+                for f in self.fills.iter().rev().take(6) {
+                    let side = if f.side == Side::Buy { "B" } else { "S" };
+                    cols[1].label(egui::RichText::new(format!("fill {side} {} ×{}", f.px / 1_000_000, f.qty)).size(11.0).monospace().color(MUTED));
+                }
+                cols[2].label(egui::RichText::new("Acks").color(MUTED).size(11.0));
+                for a in self.acks.iter().rev().take(8) {
+                    let col = if a.accepted { Color32::from_rgb(UP[0], UP[1], UP[2]) } else { Color32::from_rgb(DOWN[0], DOWN[1], DOWN[2]) };
+                    cols[2].label(egui::RichText::new(format!("#{} {}", a.nonce % 100_000, ack_reason(a))).size(11.0).color(col));
+                }
+            });
+        });
+        if let Some((slot, instr, cloid)) = cancel {
+            let mut i = Intent::blank(1, slot, instr, Op::Cancel);
+            i.target = cloid;
+            self.send_intent(i);
+        }
+    }
+}
+
 /// Decimals to show for a tick (×1e6): 1.0 → 0, 0.1 → 1, 0.01 → 2 …
 pub fn decimals(tick_1e6: i64) -> u32 {
     let mut d = 6;
@@ -519,6 +753,16 @@ pub fn decimals(tick_1e6: i64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slots_and_reasons() {
+        assert_eq!(term_slot(Venue::Hyperliquid), 12);
+        assert_eq!(term_slot(Venue::Hypercall), 15);
+        let a = IntentAck { nonce: 1, slot: 12, accepted: false, source: AckSource::Engine, reason: 7 };
+        assert_eq!(ack_reason(&a), "outside the price band");
+        let a = IntentAck { nonce: 1, slot: 12, accepted: false, source: AckSource::Server, reason: 2 };
+        assert_eq!(ack_reason(&a), "trading is off for this session");
+    }
 
     #[test]
     fn decimals_follow_the_tick() {

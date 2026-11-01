@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 
 use ingress_term::{open_frame, seal_frame, CmdKind, EvtKind, TermCmd, TermEvt, FRAME_LEN, OKIND_IOC, OKIND_LIMIT, REC_LEN};
-use term_proto::exec::{FillView, Intent, Op, OrderKind, OrderStatus, OrderView, PositionView};
+use term_proto::exec::{AckSource, FillView, Intent, IntentAck, Op, OrderKind, OrderStatus, OrderView, PositionView};
 use term_proto::Side;
 
 /// Where an allow-listed instrument trades (R-T9): its TERM slot and the
@@ -200,6 +200,17 @@ impl DoorClient {
         let mut b = [0u8; 256];
         let instr = self.instr_of(e.slot, e.sym);
         let side = if e.side == 0 { Side::Buy } else { Side::Sell };
+        // The engine's verdict on the intent this event answers.
+        let ack = match EvtKind::from_u8(e.kind) {
+            Some(EvtKind::Refused) if e.nonce != 0 && e.reason != 0 => Some(IntentAck { nonce: e.nonce, slot: e.slot, accepted: false, source: AckSource::Engine, reason: e.reason }),
+            Some(EvtKind::Sent) if e.nonce != 0 => Some(IntentAck { nonce: e.nonce, slot: e.slot, accepted: true, source: AckSource::Engine, reason: 0 }),
+            _ => None,
+        };
+        if let Some(a) = ack {
+            if let Ok(k) = a.encode(0, ts, &mut b) {
+                out.extend_from_slice(&b[..k]);
+            }
+        }
         let n = match EvtKind::from_u8(e.kind) {
             Some(EvtKind::Sent) if e.px > 0 && e.qty > 0 => {
                 self.open.push((e.client_oid, e.slot, instr, side, e.px, e.qty));
@@ -284,7 +295,10 @@ mod tests {
         }
         let mut out = Vec::new();
         dc.views(&evs[0], 1, &mut out);
-        let (f, _) = term_proto::decode(&out).unwrap();
+        let (a, used) = term_proto::decode(&out).unwrap();
+        let a = IntentAck::parse(a.body).unwrap();
+        assert_eq!((a.nonce, a.accepted, a.source), (41, true, AckSource::Engine));
+        let (f, _) = term_proto::decode(&out[used..]).unwrap();
         let v = OrderView::parse(f.body).unwrap();
         assert_eq!((v.slot, v.instr, v.side, v.status, oid_of(&v.cloid)), (12, 0, Side::Sell, OrderStatus::Open, 0x0C00_0001_0000_0000));
         stop.store(true, Ordering::Relaxed);

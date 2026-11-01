@@ -75,10 +75,12 @@ pub enum Kind {
     KeyMap = 21,
     LiveConfirm = 22,
     InstrDef = 23,
+    /// Server → UI: the verdict on one intent (additive in wire v1).
+    IntentAck = 24,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 23] = [
+    pub const ALL: [Kind; 24] = [
         Kind::BookSnap,
         Kind::BookDelta,
         Kind::TradeBatch,
@@ -102,10 +104,11 @@ impl Kind {
         Kind::KeyMap,
         Kind::LiveConfirm,
         Kind::InstrDef,
+        Kind::IntentAck,
     ];
 
     pub const fn from_u8(v: u8) -> Option<Kind> {
-        if v >= 1 && v <= 23 {
+        if v >= 1 && v <= 24 {
             Some(Kind::ALL[(v - 1) as usize])
         } else {
             None
@@ -461,5 +464,6 @@ pub fn validate(kind: Kind, body: &[u8]) -> Result<()> {
         Kind::Drawing => ctl::Drawing::parse(body).map(drop),
         Kind::KeyMap => ctl::KeyMap::parse(body).map(drop),
         Kind::InstrDef => ctl::InstrDef::parse(body).map(drop),
+        Kind::IntentAck => exec::IntentAck::parse(body).map(drop),
     }
 }

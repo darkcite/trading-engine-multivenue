@@ -202,6 +202,11 @@ fn session_streams_and_refuses_intents_without_a_door() {
     i.nonce = 42;
     let n = i.encode(2, 0, &mut b).unwrap();
     ws.send(&b[..n]);
+    // The refusal comes back as an IntentAck from the server.
+    let acks = ws.kinds(Duration::from_millis(300));
+    let ack = acks.iter().find(|(k, _)| *k == Kind::IntentAck).expect("an ack");
+    let a = term_proto::exec::IntentAck::parse(&ack.1[term_proto::HDR_LEN..]).unwrap();
+    assert_eq!((a.nonce, a.accepted, a.reason), (42, false, term_proto::exec::ACK_TRADING_OFF));
     // Hidden: deltas stop.
     let n = Control::op(CtlOp::Hidden).encode(3, 0, &mut b).unwrap();
     ws.send(&b[..n]);
