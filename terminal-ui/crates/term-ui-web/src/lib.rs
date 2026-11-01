@@ -6,6 +6,8 @@
 //! build never compiles eframe or winit.
 #![cfg(target_arch = "wasm32")]
 
+mod link;
+
 use std::sync::Arc;
 
 use eframe::egui;
@@ -29,14 +31,20 @@ impl Platform for WebPlatform {
     }
 }
 
-struct App {
-    spike: Spike<WebPlatform>,
+enum App {
+    Spike(Box<Spike<WebPlatform>>),
+    Term(Box<term_ui_core::app::App<WebPlatform, link::WebLink>>),
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let cpu_ms = frame.info().cpu_usage.map(|s| s * 1000.0);
-        self.spike.ui(ctx, frame.wgpu_render_state(), cpu_ms);
+        match self {
+            App::Spike(s) => {
+                let cpu_ms = frame.info().cpu_usage.map(|s| s * 1000.0);
+                s.ui(ctx, frame.wgpu_render_state(), cpu_ms);
+            }
+            App::Term(a) => a.ui(ctx, frame.wgpu_render_state()),
+        }
     }
 }
 
@@ -61,13 +69,16 @@ fn listen(target: &web_sys::EventTarget, event: &str, f: impl FnMut() + 'static)
     Ok(())
 }
 
-/// `#gl` → WebGL2 only, `#webgpu` → WebGPU only, otherwise WebGPU first with
-/// the WebGL2 fallback.
+/// `#gl…` → WebGL2 only, `#webgpu…` → WebGPU only, otherwise WebGPU first
+/// with the WebGL2 fallback. A hash containing `spike` runs the T0 render
+/// spike instead of the terminal.
 fn backends(hash: &str) -> wgpu::Backends {
-    match hash {
-        "#gl" => wgpu::Backends::GL,
-        "#webgpu" => wgpu::Backends::BROWSER_WEBGPU,
-        _ => wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+    if hash.starts_with("#gl") {
+        wgpu::Backends::GL
+    } else if hash.starts_with("#webgpu") {
+        wgpu::Backends::BROWSER_WEBGPU
+    } else {
+        wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL
     }
 }
 
@@ -102,7 +113,18 @@ pub async fn start(canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
     listen(&doc_t, "resume", || report(CtlOp::Resumed))?;
 
     let plat = WebPlatform { perf };
+    let spike = hash.contains("spike");
     eframe::WebRunner::new()
-        .start(canvas, opts, Box::new(move |_cc| Ok(Box::new(App { spike: Spike::new(plat) }))))
+        .start(
+            canvas,
+            opts,
+            Box::new(move |_cc| {
+                Ok(Box::new(if spike {
+                    App::Spike(Box::new(Spike::new(plat)))
+                } else {
+                    App::Term(Box::new(term_ui_core::app::App::new(plat, link::WebLink::new())))
+                }))
+            }),
+        )
         .await
 }

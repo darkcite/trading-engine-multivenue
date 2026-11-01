@@ -57,7 +57,7 @@ with playwright.sync_api.sync_playwright() as pw:
     page.on("console", on_console)
     page.on("pageerror", lambda e: errors.append("pageerror: " + str(e)))
     T0 = time.time()
-    page.goto("http://127.0.0.1:9393/#" + ("gl" if MODE == "gl" else "webgpu"))
+    page.goto("http://127.0.0.1:9393/#" + ("gl" if MODE == "gl" else "webgpu") + "-spike")
     page.evaluate("""() => { window.__csp = [];
         document.addEventListener('securitypolicyviolation', e => window.__csp.push(e.violatedDirective + ' ' + e.blockedURI)); }""")
     shot_n = 0

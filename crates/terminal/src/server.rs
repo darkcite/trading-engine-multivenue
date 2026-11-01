@@ -4,9 +4,11 @@
 //! A COLD process (it may allocate; buffers are still sized once per
 //! client). T-L1: it holds no venue key and opens no order socket.
 //!
-//! Routes: `GET /` and the bundle files (cookie required); `POST /login`
-//! (the one-time token in the body, exact Origin); `GET /ws` (cookie, exact
-//! Origin, RFC 6455). Every answer carries the plan's CSP (§3).
+//! Routes: `GET /` and the bundle files (no session needed: the bundle holds
+//! no secret, T-L13, and its login form is how a session starts);
+//! `POST /login` (the one-time token in the body, exact Origin); `GET /ws`
+//! (session cookie, exact Origin, RFC 6455) — the only door to data and to
+//! order entry. Every answer carries the plan's CSP (§3).
 
 use std::io::{ErrorKind, Read, Write};
 use std::time::{Duration, Instant};
@@ -389,9 +391,6 @@ impl Server {
                 self.send_frames(i);
             }
             (b"GET", path) => {
-                if !self.auth.session_ok(req.cookie) && path != b"/" {
-                    return self.reply(i, 401, "text/plain", b"login first", false);
-                }
                 match self.cfg.bundle.files.iter().position(|f| self.cfg.bundle.get(path).is_some_and(|g| std::ptr::eq(g, f))) {
                     Some(k) => {
                         let f = &self.cfg.bundle.files[k];
