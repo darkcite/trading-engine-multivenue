@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod bundle;
+pub mod door;
 pub mod http;
 pub mod live;
 pub mod probe;

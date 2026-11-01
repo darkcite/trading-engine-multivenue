@@ -1131,6 +1131,18 @@ impl StrategySet {
         &mut self.pmj
     }
 
+    /// A TERM member by slot (12–15, O-T17), for the boot that attaches
+    /// the door's rings; `None` for any other slot.
+    pub fn term_mut(&mut self, slot: u8) -> Option<&mut strategy_term::TermStrategy> {
+        match slot {
+            ingress_term::SLOT_TERM_HL => Some(&mut self.term_hl.0),
+            ingress_term::SLOT_TERM_BN => Some(&mut self.term_bn.0),
+            ingress_term::SLOT_TERM_PM => Some(&mut self.term_pm.0),
+            ingress_term::SLOT_TERM_HC => Some(&mut self.term_hc.0),
+            _ => None,
+        }
+    }
+
     /// The pmj member (cli: boot tells).
     #[inline]
     pub fn pmj(&self) -> &strategy_pmj::PmjStrategy {

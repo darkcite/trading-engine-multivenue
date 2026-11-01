@@ -26,6 +26,10 @@ use crate::spool::Recorder;
 use crate::ws;
 
 pub const MAX_CLIENTS: usize = 8;
+
+fn wall_ns() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+}
 const LISTENER: Token = Token(usize::MAX);
 const RX_CAP: usize = 192 * 1024;
 const TX_CAP: usize = 4 << 20;
@@ -43,6 +47,8 @@ pub struct Config {
     pub tick: Duration,
     /// Replay and `--no-door` sessions never accept intents.
     pub order_entry: bool,
+    /// The engine's TERM door; intents go nowhere without it.
+    pub door: Option<crate::door::DoorClient>,
 }
 
 #[derive(Default)]
@@ -165,7 +171,17 @@ impl Server {
             if now >= next_beat {
                 next_beat += Duration::from_secs(1);
                 self.heartbeat();
+                // The member's watchdog hears the UI through these beats;
+                // with no UI connected they stop and it cancels (R-T15).
+                let ui = self.clients.iter().flatten().any(|c| matches!(c.state, State::Ws(_)));
+                if let (true, Some(d)) = (ui, self.cfg.door.as_mut()) {
+                    if d.beat(wall_ns()).is_err() {
+                        self.cfg.door = None;
+                        self.note(Event::Refused("door lost"));
+                    }
+                }
             }
+            self.door_events();
             for i in 0..MAX_CLIENTS {
                 self.flush(i);
                 if self.clients[i].as_ref().is_some_and(|c| c.dead) {
@@ -465,17 +481,48 @@ impl Server {
                 self.note(Event::Control(c.op));
             }
             Kind::Intent => {
-                let nonce = term_proto::exec::Intent::parse(f.body).map(|x| x.nonce).unwrap_or(0);
-                let why = if !order_entry {
-                    "order entry disabled (replay / no door)"
-                } else if !w.trading {
-                    "trading is off for this session"
+                let Ok(intent) = term_proto::exec::Intent::parse(f.body) else { return };
+                let trading = w.trading;
+                let (accepted, why) = if !order_entry {
+                    (false, "order entry disabled (replay / no door)")
+                } else if !trading {
+                    (false, "trading is off for this session")
                 } else {
-                    "no door wired yet (M5)"
+                    match self.cfg.door.as_mut() {
+                        None => (false, "no door configured"),
+                        Some(d) => match d.intent(&intent, wall_ns()) {
+                            Ok(()) => (true, "sent to the door"),
+                            Err(e) => (false, e),
+                        },
+                    }
                 };
-                self.note(Event::Intent { nonce, accepted: false, why });
+                self.note(Event::Intent { nonce: intent.nonce, accepted, why });
             }
             _ => {} // Layout / Drawing / KeyMap / LiveConfirm: stored in later milestones.
+        }
+    }
+
+    /// Door events → views for every connected UI.
+    fn door_events(&mut self) {
+        let Some(d) = self.cfg.door.as_mut() else { return };
+        let mut evs = Vec::new();
+        if d.poll(|e| evs.push(e)).is_err() {
+            self.cfg.door = None;
+            self.note(Event::Refused("door lost"));
+            return;
+        }
+        if evs.is_empty() {
+            return;
+        }
+        let t = self.start.elapsed().as_nanos() as u64;
+        self.one.clear();
+        for e in &evs {
+            d.views(e, t, &mut self.one);
+        }
+        for i in 0..MAX_CLIENTS {
+            if self.clients[i].as_ref().is_some_and(|c| matches!(c.state, State::Ws(_))) {
+                self.send_frames(i);
+            }
         }
     }
 

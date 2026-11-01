@@ -49,9 +49,17 @@ box, so nothing built here can trade.
   (`Term<SLOT>`, names term-hl/-bn/-pm/-hc, outside `all`, BUILT_MASK
   0xFBFF, slot 10 the only reserved slot); an unwired member is inert
   (timer period u64::MAX); the AI is refused EnableStrategy(12–15) like
-  pine. **M5c owed**: `term.toml`, the boot that spawns the door and
-  attaches the rings, the terminal's door client, and the PMLR kind for
-  `term-cmds.pmlr` (every reader + the worker pin, on the Mac).
+  pine. **M5c part 2 done**: `cli::term_boot` (only when the mask names a TERM
+  slot: `~/multivenue/term.env` must be 0600, one ring lane per enabled
+  slot, the door on `~/multivenue/term.sock`, the epoch in
+  `~/multivenue/term.epoch`), called from `engine_loop_set`; `/state`
+  names 12–15 (engine-snapshot); TERM is PAPER ONLY in `exec_boot`
+  (`--arm-live 12` and a live `[exec.slot.12]` are refused, like pine);
+  the terminal's door client (`--door/--door-key/--door-epoch/--route
+  instr:slot:sym`, beats while a UI is connected, events → views).
+  **Still owed from M5**: the PMLR kind for `term-cmds.pmlr` (every reader +
+  the worker pin, Mac), publishing the boot epoch in `/state`, algos over
+  the door, a `term.toml` for per-slot caps, refusals shown in the UI.
 - **Owed**: M6
   (gates: lint, nextest, license-check, copy-audit, license-deps, fuzz 60 s
   per touched target on nightly). Follow-ups: HL coarse `nSigFigs` book for

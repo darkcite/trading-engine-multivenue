@@ -2592,8 +2592,11 @@ mod tests {
         assert_eq!(strategy_label(8), "pine");
         assert_eq!(strategy_label(9), "pm15");
         assert_eq!(strategy_label(11), "pmj");
+        for (id, name) in [(12, "term-hl"), (13, "term-bn"), (14, "term-pm"), (15, "term-hc")] {
+            assert_eq!(strategy_label(id), name, "slot {id} (O-T17)");
+        }
         for id in 10..MAX_STRATEGY_SLOTS {
-            if id != 11 {
+            if id == 10 {
                 assert_eq!(strategy_label(id), "reserved", "slot {id}");
             }
         }

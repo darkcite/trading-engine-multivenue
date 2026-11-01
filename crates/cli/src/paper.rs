@@ -4336,6 +4336,20 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         }
         tracing::info!("{}", crate::pmj_boot::render_boot_tell(boot));
     }
+    // TERM (O-T17/O-T18): only when the mask names a TERM slot. The guard
+    // keeps the door up for this loop and stops it when the loop returns.
+    let _term_door = match crate::term_boot::wire(&mut set) {
+        Ok(g) => {
+            if let Some(g) = &g {
+                tracing::info!("{}", g.tell);
+            }
+            g
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "term: wiring refused");
+            return EngineLoopResult::Failed("engine_loop_set: term wiring refused");
+        }
+    };
     if let Some(boot) = hyparb {
         // HYPARB H5. The wall anchor is taken HERE, once — the member's
         // day cap is UTC-aligned from this instant on (the icdp law).

@@ -71,6 +71,8 @@ pub mod hl_outcome_probe;
 pub mod hl_perp_probe;
 /// PMJ J4: `pmj.toml` → slot 11's member (paper).
 pub mod pmj_boot;
+// TERM M5c: the door and the member rings (O-T17, paper O-T18).
+pub mod term_boot;
 pub mod pmj_dust;
 /// PMJ J16: slot 11's gate-line grammar (`PMJ-DUST-GATE: ruled YYYY-MM-DD`),
 /// shared with `build.rs` through `include!` — one parser, unit-tested here.

@@ -1809,7 +1809,7 @@ mod tests {
         assert!(body.ends_with("\"fills\":[]}}"), "{body}");
         assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"hyparb\""));
         // S16-5 (schema 3): sixteen rows, the reserved last.
-        assert!(body.contains("{\"slot\":15,\"name\":\"reserved\","));
+        assert!(body.contains("{\"slot\":15,\"name\":\"term-hc\","));
         assert!(body.contains("\"venue\":\"rpc\""));
         // MX2: MEXC is appended after rpc — the array order is the
         // `/state` contract, so it must render LAST.

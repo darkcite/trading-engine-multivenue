@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ingress_term::listener::{spawn, DoorCfg};
+use ingress_term::listener::{spawn, DoorCfg, Lane};
 use ingress_term::*;
 
 fn clock() -> (u64, u64) {
@@ -29,8 +29,11 @@ fn door_loopback() {
     let key = per_run_key();
     let path = std::env::temp_dir().join(format!("term-door-{}.sock", std::process::id()));
     let ((rtx, gtx, erx), (mut rrx, mut grx, mut etx)) = rings();
+    let ((rtx2, gtx2, erx2), (mut rrx2, _grx2, _etx2)) = rings();
     let stop = Arc::new(AtomicBool::new(false));
-    let h = spawn(DoorCfg { path: path.clone(), door: Door::new(key, 5, 2_000_000_000), clock }, rtx, gtx, erx, stop.clone()).unwrap();
+    let h = spawn(DoorCfg { path: path.clone(), door: Door::new(key, 5, 2_000_000_000), clock },
+        vec![Lane { slot: SLOT_TERM_HL, reduce: rtx, grow: gtx, evt: erx }, Lane { slot: SLOT_TERM_BN, reduce: rtx2, grow: gtx2, evt: erx2 }],
+        stop.clone()).unwrap();
     let mode = std::fs::metadata(&path).unwrap();
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(mode.permissions().mode() & 0o777, 0o600);
@@ -57,7 +60,7 @@ fn door_loopback() {
     s.write_all(&mk(3, CmdKind::Place, 11)).unwrap(); // PMJ's slot: refused
     let t0 = Instant::now();
     let (mut g, mut r) = (None, None);
-    while (g.is_none() || r.is_none()) && t0.elapsed() < Duration::from_secs(2) {
+    while g.is_none() && t0.elapsed() < Duration::from_secs(2) {
         if let Some(x) = grx.try_pop_ref() {
             g = Some(*x);
         }
@@ -66,7 +69,7 @@ fn door_loopback() {
         }
     }
     assert_eq!(g.unwrap().cmd.kind, CmdKind::Place as u8);
-    assert_eq!(r.unwrap().cmd.kind, CmdKind::Halt as u8);
+    assert!(r.is_none(), "slot 12's reduce lane sees no halt meant for 13");
     // The refusal comes back sealed.
     let mut f = [0u8; FRAME_LEN];
     s.read_exact(&mut f).unwrap();
@@ -84,6 +87,12 @@ fn door_loopback() {
         d = rrx.try_pop_ref().map(|x| *x);
     }
     assert_eq!(d.unwrap().cmd.kind, CmdKind::Disconnect as u8);
+    // The halt went to slot 13's lane; Disconnect reached it too.
+    let mut lane2 = Vec::new();
+    while let Some(x) = rrx2.try_pop_ref() {
+        lane2.push(x.cmd.kind);
+    }
+    assert_eq!(lane2, [CmdKind::Halt as u8, CmdKind::Disconnect as u8]);
     stop.store(true, Ordering::Relaxed);
     h.join().unwrap();
     assert!(!path.exists());

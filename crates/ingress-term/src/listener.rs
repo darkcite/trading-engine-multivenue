@@ -17,6 +17,15 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::{seal_frame, CmdKind, Door, EvtRx, GrowTx, ReduceTx, TermCmd, TermEvt, TermIn, Reason, FRAME_LEN, REC_LEN};
 
+/// One TERM slot's ring set, door side. The door routes each accepted
+/// command to its slot's lane; `Disconnect` goes to every lane.
+pub struct Lane {
+    pub slot: u8,
+    pub reduce: ReduceTx,
+    pub grow: GrowTx,
+    pub evt: EvtRx,
+}
+
 const LISTENER: Token = Token(0);
 const CLIENT: Token = Token(1);
 
@@ -41,22 +50,21 @@ pub fn disconnect(recv_ns: u64) -> TermIn {
     TermIn { cmd: TermCmd { kind: CmdKind::Disconnect as u8, slot: 0xFF, ..TermCmd::default() }, recv_ns }
 }
 
-pub fn spawn(cfg: DoorCfg, reduce: ReduceTx, grow: GrowTx, evt: EvtRx, stop: Arc<AtomicBool>) -> std::io::Result<std::thread::JoinHandle<()>> {
+pub fn spawn(cfg: DoorCfg, lanes: Vec<Lane>, stop: Arc<AtomicBool>) -> std::io::Result<std::thread::JoinHandle<()>> {
     let _ = std::fs::remove_file(&cfg.path);
     let mut listener = UnixListener::bind(&cfg.path)?;
     std::fs::set_permissions(&cfg.path, std::fs::Permissions::from_mode(0o600))?;
     let poll = Poll::new()?;
     poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
-    std::thread::Builder::new().name("term-door".into()).spawn(move || run(cfg, poll, listener, reduce, grow, evt, stop))
+    std::thread::Builder::new().name("term-door".into()).spawn(move || run(cfg, poll, listener, lanes, stop))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut reduce: ReduceTx, mut grow: GrowTx, mut evt: EvtRx, stop: Arc<AtomicBool>) {
+fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut lanes: Vec<Lane>, stop: Arc<AtomicBool>) {
     let mut events = Events::with_capacity(16);
     let mut client: Option<Client> = None;
-    // A reducing command the ring could not take yet: backpressure, never
-    // a drop. While it is pending, nothing more is read.
-    let mut pending: Option<TermIn> = None;
+    // Reducing commands a lane could not take yet: backpressure, never a
+    // drop. While any is pending, nothing more is read.
+    let mut pending: Vec<(usize, TermIn)> = Vec::with_capacity(lanes.len() * 2);
     let mut rec = [0u8; REC_LEN];
     let mut out = [0u8; FRAME_LEN];
     while !stop.load(Ordering::Relaxed) {
@@ -81,15 +89,11 @@ fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut reduce: Red
                 Err(_) => break,
             }
         }
-        if let Some(p) = pending {
-            if reduce.try_push_ref(&p) {
-                pending = None;
-            }
-        }
+        pending.retain(|(k, t)| !lanes[*k].reduce.try_push_ref(t));
         let mut closed = false;
         if let Some(c) = client.as_mut() {
             // Read whole frames, unless backpressured.
-            if pending.is_none() {
+            if pending.is_empty() {
                 let mut buf = [0u8; 4096];
                 loop {
                     match c.s.read(&mut buf) {
@@ -109,18 +113,27 @@ fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut reduce: Red
                 }
             }
             let mut used = 0;
-            while pending.is_none() && c.rx.len() - used >= FRAME_LEN {
+            while pending.is_empty() && c.rx.len() - used >= FRAME_LEN {
                 let f: &[u8; FRAME_LEN] = c.rx[used..used + FRAME_LEN].try_into().unwrap_or(&[0; FRAME_LEN]);
                 used += FRAME_LEN;
                 let (wall, mono) = (cfg.clock)();
-                match cfg.door.accept(f, wall, mono) {
-                    Ok((t, kind)) if kind.is_reducing() => {
-                        if !reduce.try_push_ref(&t) {
-                            pending = Some(t);
+                let accepted = cfg.door.accept(f, wall, mono);
+                // A TERM slot the boot did not enable has no lane: refused.
+                let accepted = match accepted {
+                    Ok((t, k)) => match lanes.iter().position(|l| l.slot == t.cmd.slot) {
+                        Some(lane) => Ok((t, k, lane)),
+                        None => Err((crate::Refusal::Shape(crate::ShapeError::Slot), t.cmd)),
+                    },
+                    Err(e) => Err(e),
+                };
+                match accepted {
+                    Ok((t, kind, lane)) if kind.is_reducing() => {
+                        if !lanes[lane].reduce.try_push_ref(&t) {
+                            pending.push((lane, t));
                         }
                     }
-                    Ok((t, _)) => {
-                        if !grow.try_push_ref(&t) {
+                    Ok((t, _, lane)) => {
+                        if !lanes[lane].grow.try_push_ref(&t) {
                             TermEvt::refused(&t.cmd, Reason::RingFull, mono).write_le(&mut rec);
                             seal_frame(cfg.door.key(), &rec, &mut out);
                             // COPY: one 82 B sealed frame → the send buffer — the socket may take
@@ -138,13 +151,15 @@ fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut reduce: Red
             }
             c.rx.drain(..used);
             // Member events → the terminal.
-            while c.tx.len() + FRAME_LEN <= EVT_TX {
-                let Some(e) = evt.try_pop_ref() else { break };
-                e.write_le(&mut rec);
-                drop(e);
+            for lane in lanes.iter_mut() {
+                while c.tx.len() + FRAME_LEN <= EVT_TX {
+                    let Some(e) = lane.evt.try_pop_ref() else { break };
+                    e.write_le(&mut rec);
+                    drop(e);
                 seal_frame(cfg.door.key(), &rec, &mut out);
-                // COPY: one 82 B sealed member event → the send buffer (as above).
-                c.tx.extend_from_slice(&out);
+                    // COPY: one 82 B sealed member event → the send buffer (as above).
+                    c.tx.extend_from_slice(&out);
+                }
             }
             while !c.tx.is_empty() {
                 match c.s.write(&c.tx) {
@@ -164,7 +179,9 @@ fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut reduce: Red
             }
         } else {
             // No client: member events have nowhere to go; drop them.
-            while evt.try_pop_ref().is_some() {}
+            for lane in lanes.iter_mut() {
+                while lane.evt.try_pop_ref().is_some() {}
+            }
         }
         if closed {
             if let Some(mut c) = client.take() {
@@ -173,8 +190,10 @@ fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut reduce: Red
             // R-T15: a lost terminal cancels. Never dropped: if the ring is
             // full it waits as the pending reducing command.
             let d = disconnect(mono);
-            if pending.is_none() && !reduce.try_push_ref(&d) {
-                pending = Some(d);
+            for (k, lane) in lanes.iter_mut().enumerate() {
+                if !lane.reduce.try_push_ref(&d) {
+                    pending.push((k, d));
+                }
             }
         }
     }

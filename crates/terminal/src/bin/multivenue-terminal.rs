@@ -12,7 +12,7 @@ use terminal::bundle::Bundle;
 use terminal::server::{Config, Server};
 
 fn usage() -> ! {
-    eprintln!("usage: multivenue-terminal [--port 9393] [--bundle terminal-ui/dist] (--synthetic SEED | --replay SPOOL | --live [--hl BTC] [--bn BTCUSDT]) [--record SPOOL] [--no-door] [--probe SECS] [--extra-ca PEM]");
+    eprintln!("usage: multivenue-terminal [--port 9393] [--bundle terminal-ui/dist] (--synthetic SEED | --replay SPOOL | --live [--hl BTC] [--bn BTCUSDT]) [--record SPOOL] [--no-door] [--probe SECS] [--extra-ca PEM] [--door SOCK --door-key ENV --door-epoch FILE --route I:SLOT:SYM…]");
     std::process::exit(2)
 }
 
@@ -28,6 +28,10 @@ fn main() -> std::io::Result<()> {
     let mut bn: Vec<String> = Vec::new();
     let mut probe: Option<u64> = None;
     let mut extra_ca: Vec<PathBuf> = Vec::new();
+    let mut door_sock: Option<PathBuf> = None;
+    let mut door_key: Option<PathBuf> = None;
+    let mut door_epoch: Option<PathBuf> = None;
+    let mut routes: Vec<terminal::door::Route> = Vec::new();
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
         match k.as_str() {
@@ -40,6 +44,10 @@ fn main() -> std::io::Result<()> {
             "--live" => live = true,
             "--hl" => hl.push(a.next().unwrap_or_else(|| usage())),
             "--bn" => bn.push(a.next().unwrap_or_else(|| usage())),
+            "--door" => door_sock = Some(a.next().unwrap_or_else(|| usage()).into()),
+            "--door-key" => door_key = Some(a.next().unwrap_or_else(|| usage()).into()),
+            "--door-epoch" => door_epoch = Some(a.next().unwrap_or_else(|| usage()).into()),
+            "--route" => routes.push(a.next().and_then(|v| terminal::door::Route::parse(&v)).unwrap_or_else(|| usage())),
             "--extra-ca" => extra_ca.push(a.next().unwrap_or_else(|| usage()).into()),
             "--probe" => probe = Some(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             _ => usage(),
@@ -73,7 +81,24 @@ fn main() -> std::io::Result<()> {
     let token = terminal::auth::random_secret()?;
     // Replay never takes orders; until the door lands (M5) nothing does.
     let order_entry = !no_door && replay.is_none();
-    let cfg = Config { port, token, bundle, record, tick: Duration::from_millis(100), order_entry };
+    // The door: --door SOCK --door-key term.env --door-epoch term.epoch
+    // --route instr:slot:sym (repeatable). T-L1: the terminal still holds
+    // no venue key; the door key only authenticates it to the engine.
+    let door = match (door_sock, order_entry) {
+        (Some(sock), true) => {
+            let key = terminal::door::read_key(&door_key.unwrap_or_else(|| usage())).unwrap_or_else(|e| {
+                eprintln!("door refused: {e}");
+                std::process::exit(1)
+            });
+            let epoch: u64 = std::fs::read_to_string(door_epoch.unwrap_or_else(|| usage())).ok().and_then(|s| s.trim().parse().ok()).unwrap_or_else(|| {
+                eprintln!("door refused: unreadable epoch file");
+                std::process::exit(1)
+            });
+            Some(terminal::door::DoorClient::connect(&sock, key, epoch, routes)?)
+        }
+        _ => None,
+    };
+    let cfg = Config { port, token, bundle, record, tick: Duration::from_millis(100), order_entry, door };
     let mut srv = Server::bind(cfg)?;
     // The one-time login token goes to the operator's terminal only.
     println!("TERM http://127.0.0.1:{}/  login token: {}", srv.port(), String::from_utf8_lossy(&token));

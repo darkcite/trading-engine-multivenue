@@ -384,6 +384,7 @@ dependencies = [
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
+ "ingress-term",
  "libc",
  "mio 0.8.11",
  "opt-registry",
@@ -2513,6 +2514,7 @@ version = "0.1.0"
 dependencies = [
  "core-crypto",
  "core-net",
+ "ingress-term",
  "mio 0.8.11",
  "proptest",
  "rustls",

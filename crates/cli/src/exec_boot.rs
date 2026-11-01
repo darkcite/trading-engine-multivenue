@@ -194,11 +194,13 @@ pub const PINE_SLOT: usize = strategy_set::SLOT_PINE as usize;
 
 /// The slots no live arm may ever name in this binary (PVM ruling
 /// 2026-10-16): the Pine member's bit.
-pub const PAPER_ONLY_MASK: SlotMask = strategy_set::BIT_PINE;
+pub const PAPER_ONLY_MASK: SlotMask = strategy_set::BIT_PINE | strategy_set::TERM_MASK;
 
 // The parser's paper-only slot is the member table's pine slot.
 const _: () = assert!(PINE_SLOT == core_config::pine::PINE_SLOT);
-const _: () = assert!(PAPER_ONLY_MASK == (1 as SlotMask) << PINE_SLOT);
+// Pine (8, ruling 2026-10-16) and TERM (12–15, ruling O-T18: paper on the
+// term-t0-spike branch; live arming is its own ruling, R-T5).
+const _: () = assert!(PAPER_ONLY_MASK == ((1 as SlotMask) << PINE_SLOT) | 0xF000);
 
 /// PMJ J3 (R-PMJ-1, R-PMJ-S2) and J16: slot 11 (`pmj`). A live slot 11
 /// refuses the boot — whatever venues it names — unless this binary was
@@ -820,8 +822,9 @@ pub(crate) fn resolve_gated(
     let paper_only = (artifact_mask | flag_mask) & PAPER_ONLY_MASK;
     if paper_only != 0 {
         return Err(format!(
-            "exec: slot {} is PAPER ONLY by ruling (2026-10-16): the Pine member \
-             (third-party scripts) is refused in every live arm. ({} marks {} live, \
+            "exec: slot {} is PAPER ONLY by ruling: the Pine member (8, third-party scripts, \
+             2026-10-16) and the TERM members (12–15, O-T18) are refused in every live arm. \
+             ({} marks {} live, \
              --arm-live names {}.) Arming it is its own live-arming ruling.",
             render_slot_mask(paper_only),
             path.display(),
@@ -926,7 +929,7 @@ pub(crate) fn resolve_gated(
         // PVM ruling 2026-10-16: slot 8 is paper only ([`PINE_SLOT`]) —
         // unreachable behind the parser and the mask refusal above, kept so
         // the table build fails closed on its own.
-        if mode == ExecMode::Live && slot == PINE_SLOT {
+        if mode == ExecMode::Live && (slot == PINE_SLOT || (12..=15).contains(&slot)) {
             return Err(format!(
                 "exec: slot {slot} ({slot_name}) is marked live, but slot {slot} is PAPER ONLY \
                  by ruling (2026-10-16). Refusing the boot."
@@ -3731,8 +3734,9 @@ mod tests {
         assert_eq!(render_slot_mask((1 << 3) | (1 << 11)), "[3,11]");
         assert_eq!(render_slot_mask(SlotMask::MAX), "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]");
         assert_eq!(describe_slots((1 << 3) | (1 << 11)), "3 (bin15), 11 (pmj)");
-        assert_eq!(describe_slots((1 << 3) | (1 << 12)), "3 (bin15), 12 (reserved)");
-        assert_eq!(describe_slots(1 << 15), "15 (reserved)");
+        assert_eq!(describe_slots((1 << 3) | (1 << 12)), "3 (bin15), 12 (term-hl)");
+        assert_eq!(describe_slots(1 << 15), "15 (term-hc)");
+        assert_eq!(describe_slots(1 << 10), "10 (reserved)");
         assert!(slot_in(1 << 11, 11) && !slot_in(1 << 11, 3));
         assert!(!slot_in(SlotMask::MAX, 16) && !slot_in(SlotMask::MAX, 255));
     }
@@ -3778,27 +3782,38 @@ mod tests {
     /// **S16-R5** — a slot with no built member is never armed, from the
     /// artifact or the flag; a paper section for it still resolves.
     #[test]
+    fn term_slots_are_paper_only() {
+        // O-T18: TERM is paper on this branch; `--arm-live 12` and a live
+        // `[exec.slot.12]` are both refused, like pine's slot 8.
+        assert_eq!(PAPER_ONLY_MASK & 0xF000, 0xF000);
+        assert!(parse_arm_live("12").is_ok(), "the flag parses; the interlock refuses it");
+    }
+
+    #[test]
     fn an_unbuilt_slot_is_never_armed() {
         let d = tmp();
-        let live12 = MINIMAL_LIVE
-            .replace("[exec.slot.3]", "[exec.slot.12]")
+        let live10 = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.10]")
             .replace("name = \"bin15\"", "name = \"reserved\"");
-        let p = write(&d, "exec.toml", &live12);
-        let e = resolve(Some(&p), Some("12")).unwrap_err();
-        assert!(e.contains("no member") && e.contains("[12]"), "{e}");
+        let p = write(&d, "exec.toml", &live10);
+        let e = resolve(Some(&p), Some("10")).unwrap_err();
+        assert!(e.contains("no member") && e.contains("[10]"), "{e}");
         // The message renders on single spaces (its `\` continuations).
         assert!(e.contains("are reserved) ") && e.contains("live, --arm-live"), "{e}");
         assert!(!e.contains("  "), "{e}");
         // The flag alone, beside an artifact arming slot 3: refused as
         // unbuilt, never read as slot 3.
         let p3 = write(&d, "exec3.toml", MINIMAL_LIVE);
+        let e = resolve(Some(&p3), Some("3,10")).unwrap_err();
+        assert!(e.contains("no member") && e.contains("[10]"), "{e}");
+        // TERM's 15 is built but paper only (O-T18): refused as such.
         let e = resolve(Some(&p3), Some("3,15")).unwrap_err();
-        assert!(e.contains("no member") && e.contains("[15]"), "{e}");
-        let e = resolve(Some(&p3), Some("12")).unwrap_err();
-        assert!(e.contains("[12]"), "{e}");
+        assert!(e.contains("PAPER ONLY") && e.contains("[15]"), "{e}");
+        let e = resolve(Some(&p3), Some("10")).unwrap_err();
+        assert!(e.contains("[10]"), "{e}");
         assert!(resolve(Some(&p3), Some("3")).unwrap().unwrap().slot_live(3));
         // A paper section for a reserved slot arms nothing and resolves.
-        let paper12 = write(&d, "exec12.toml", "[exec]\n[exec.slot.12]\nmode = \"paper\"\n");
+        let paper12 = write(&d, "exec12.toml", "[exec]\n[exec.slot.10]\nmode = \"paper\"\n");
         let b = resolve(Some(&paper12), None).unwrap().unwrap();
         assert_eq!(b.live_mask, 0);
         assert_eq!(b.route.mode_at(12), Some(ExecMode::Paper));

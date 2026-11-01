@@ -225,6 +225,20 @@ pub enum EvtKind {
     Watchdog = 6,
 }
 
+impl EvtKind {
+    pub const fn from_u8(v: u8) -> Option<EvtKind> {
+        Some(match v {
+            1 => EvtKind::Refused,
+            2 => EvtKind::Sent,
+            3 => EvtKind::Fill,
+            4 => EvtKind::Cancelled,
+            5 => EvtKind::Halted,
+            6 => EvtKind::Watchdog,
+            _ => return None,
+        })
+    }
+}
+
 /// Why a command was refused (door and pre-gate, one byte).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]

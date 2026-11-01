@@ -84,8 +84,9 @@ pub const RUN_DIR_MAX: usize = 160;
 /// same way — **slot 8 is `"pine"` since PVM impl-08 T4** (2026-10-16; the
 /// Pine member, paper only), **slot 9 is `strategy-pm15` since PM15-5
 /// (2026-10-17)** and **slot 11 is `strategy-pmj` since PMJ J4 (2026-10-18)** —
-/// each additive (`"reserved"` → a name); 10 and 12–15 stay
-/// reserved. This is a copy of the `strategy-set` member table's names
+/// each additive (`"reserved"` → a name), and **slots 12–15 are TERM's since
+/// ruling O-T17 (2026-11-01): `term-hl`, `term-bn`, `term-pm`, `term-hc`**;
+/// 10 stays reserved. This is a copy of the `strategy-set` member table's names
 /// (the snapshot crate does not link the members): the cli's
 /// `exec_boot` snapshot-parity test is the guard against drift.
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
@@ -101,10 +102,10 @@ pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
     "pm15",
     RESERVED_SLOT_NAME,
     "pmj",
-    RESERVED_SLOT_NAME,
-    RESERVED_SLOT_NAME,
-    RESERVED_SLOT_NAME,
-    RESERVED_SLOT_NAME,
+    "term-hl",
+    "term-bn",
+    "term-pm",
+    "term-hc",
 ];
 
 /// Ingress index → venue name (see [`SNAPSHOT_VENUES`]).
