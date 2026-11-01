@@ -10,8 +10,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 
-use ingress_term::{open_frame, seal_frame, CmdKind, EvtKind, TermCmd, TermEvt, FRAME_LEN, OKIND_IOC, OKIND_LIMIT, REC_LEN};
-use term_proto::exec::{AckSource, FillView, Intent, IntentAck, Op, OrderKind, OrderStatus, OrderView, PositionView};
+use ingress_term::{open_frame, seal_frame, AlgoParams, CmdKind, EvtKind, TermCmd, TermEvt, ALGO_CHASE, ALGO_ICEBERG, ALGO_TWAP, FRAME_LEN, OKIND_IOC, OKIND_LIMIT, REC_LEN};
+use term_proto::exec::{Algo, AckSource, FillView, Intent, IntentAck, Op, OrderKind, OrderStatus, OrderView, PositionView};
 use term_proto::Side;
 
 /// Where an allow-listed instrument trades (R-T9): its TERM slot and the
@@ -93,7 +93,29 @@ pub fn to_cmd(i: &Intent, routes: &[Route], epoch: u64, seq: u32, wall_ns: u64) 
             c.sym = route?.sym;
         }
         Op::Halt => c.kind = CmdKind::Halt as u8,
-        Op::AlgoStart | Op::AlgoCancel => return None,
+        Op::AlgoStart => {
+            let r = route?;
+            c.kind = CmdKind::AlgoStart as u8;
+            c.sym = r.sym;
+            c.side = if i.side()? == Side::Buy { 0 } else { 1 };
+            c.flags = i.flags & ingress_term::FLAG_REDUCE_ONLY;
+            c.px = i.px; // the price cap
+            c.qty = i.qty; // the total
+            let slip_bps = u16::try_from(i.slip_1e6 / 100).ok()?;
+            let (okind, ap) = match i.algo {
+                Algo::Twap => (ALGO_TWAP, AlgoParams { dur_s: i.dur_s, slices: i.slices, slip_bps }),
+                Algo::Iceberg => (ALGO_ICEBERG, AlgoParams { dur_s: 0, slices: i.slices, slip_bps: 0 }),
+                Algo::Chase => (ALGO_CHASE, AlgoParams { dur_s: i.dur_s, slices: 0, slip_bps }),
+                Algo::None => return None,
+            };
+            c.okind = okind;
+            c.target_oid = ap.pack();
+        }
+        Op::AlgoCancel => {
+            c.kind = CmdKind::AlgoCancel as u8;
+            c.sym = route.map_or(0, |r| r.sym);
+            c.target_oid = oid_of(&i.target);
+        }
     }
     c.validate_shape().ok().map(|_| c)
 }
@@ -248,6 +270,28 @@ mod tests {
     fn clock() -> (u64, u64) {
         let w = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
         (w, w)
+    }
+
+    #[test]
+    fn algo_intents_map_onto_the_door() {
+        let routes = [Route { instr: 0, slot: 12, sym: 3 }];
+        let mut i = Intent::blank(5, 12, 0, Op::AlgoStart);
+        i.side = Side::Buy as u8;
+        i.kind = OrderKind::Limit as u8;
+        i.px = 78_000_000_000;
+        i.qty = 600;
+        i.algo = Algo::Twap;
+        i.dur_s = 60;
+        i.slices = 6;
+        let c = to_cmd(&i, &routes, 1, 1, 1).unwrap();
+        assert_eq!((c.kind, c.okind, c.sym, c.qty), (CmdKind::AlgoStart as u8, ALGO_TWAP, 3, 600));
+        assert_eq!(AlgoParams::unpack(c.target_oid), AlgoParams { dur_s: 60, slices: 6, slip_bps: 0 });
+        i.algo = Algo::Chase;
+        i.dur_s = 0;
+        i.slices = 0;
+        i.slip_1e6 = 2_000; // 20 bps
+        let c = to_cmd(&i, &routes, 1, 1, 1).unwrap();
+        assert_eq!((c.okind, AlgoParams::unpack(c.target_oid).slip_bps), (ALGO_CHASE, 20));
     }
 
     #[test]

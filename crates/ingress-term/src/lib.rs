@@ -61,6 +61,44 @@ pub enum CmdKind {
     /// Door-only: the terminal's socket closed (R-T15: cancel). Refused
     /// from the wire.
     Disconnect = 8,
+    /// Start an algo (growing): `okind` is the algo, `px` its price cap,
+    /// `qty` its total, `target_oid` its packed parameters ([`AlgoParams`]).
+    AlgoStart = 9,
+    /// Stop an algo (reducing): `target_oid` is the algo's id (its start
+    /// command's nonce).
+    AlgoCancel = 10,
+}
+
+pub const ALGO_TWAP: u8 = 1;
+pub const ALGO_CHASE: u8 = 2;
+pub const ALGO_ICEBERG: u8 = 3;
+pub const ALGO_MAX_SLICES: u16 = 100;
+
+/// An algo's parameters, packed into `target_oid`: `dur_s` in bits 0..32,
+/// `slices` in 32..48, `slip_bps` in 48..64.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct AlgoParams {
+    pub dur_s: u32,
+    pub slices: u16,
+    pub slip_bps: u16,
+}
+
+impl AlgoParams {
+    pub const fn pack(self) -> u64 {
+        self.dur_s as u64 | (self.slices as u64) << 32 | (self.slip_bps as u64) << 48
+    }
+    pub const fn unpack(v: u64) -> AlgoParams {
+        AlgoParams { dur_s: v as u32, slices: (v >> 32) as u16, slip_bps: (v >> 48) as u16 }
+    }
+    /// The per-algo shape.
+    pub const fn valid_for(self, algo: u8) -> bool {
+        match algo {
+            ALGO_TWAP => self.dur_s >= 1 && self.dur_s <= 86_400 && self.slices >= 1 && self.slices <= ALGO_MAX_SLICES && self.slip_bps <= 500,
+            ALGO_ICEBERG => self.slices >= 2 && self.slices <= ALGO_MAX_SLICES && self.dur_s == 0 && self.slip_bps == 0,
+            ALGO_CHASE => self.slip_bps >= 1 && self.slip_bps <= 500 && self.dur_s <= 86_400 && self.slices == 0,
+            _ => false,
+        }
+    }
 }
 
 impl CmdKind {
@@ -74,12 +112,14 @@ impl CmdKind {
             6 => CmdKind::Flatten,
             7 => CmdKind::Halt,
             8 => CmdKind::Disconnect,
+            9 => CmdKind::AlgoStart,
+            10 => CmdKind::AlgoCancel,
             _ => return None,
         })
     }
     /// Reducing commands skip the pre-gate and are never dropped.
     pub const fn is_reducing(self) -> bool {
-        !matches!(self, CmdKind::Place | CmdKind::Modify)
+        !matches!(self, CmdKind::Place | CmdKind::Modify | CmdKind::AlgoStart)
     }
 }
 
@@ -199,6 +239,14 @@ impl TermCmd {
             CmdKind::Cancel => self.target_oid != 0 && no_order,
             CmdKind::CancelAll | CmdKind::Flatten => self.target_oid == 0 && no_order,
             CmdKind::Halt | CmdKind::Beat => self.target_oid == 0 && no_order && self.sym == 0,
+            CmdKind::AlgoStart => {
+                self.side <= 1
+                    && self.flags & !FLAG_REDUCE_ONLY == 0
+                    && self.px > 0
+                    && self.qty > 0
+                    && AlgoParams::unpack(self.target_oid).valid_for(self.okind)
+            }
+            CmdKind::AlgoCancel => self.target_oid != 0 && no_order,
             CmdKind::Disconnect => false,
         };
         if ok {
@@ -516,6 +564,23 @@ mod tests {
         assert_eq!(c.validate_shape(), Ok(CmdKind::Halt));
         c.sym = 4;
         assert_eq!(c.validate_shape(), Err(ShapeError::Fields), "halt is slot-scoped, never per symbol");
+    }
+
+    #[test]
+    fn algo_shapes() {
+        let mut c = TermCmd { kind: CmdKind::AlgoStart as u8, slot: 12, side: 1, okind: ALGO_TWAP, px: 5, qty: 60, nonce: 3, sym: 1, ..TermCmd::default() };
+        c.target_oid = AlgoParams { dur_s: 60, slices: 6, slip_bps: 0 }.pack();
+        assert_eq!(c.validate_shape(), Ok(CmdKind::AlgoStart));
+        assert!(!CmdKind::AlgoStart.is_reducing() && CmdKind::AlgoCancel.is_reducing());
+        c.target_oid = AlgoParams { dur_s: 60, slices: 0, slip_bps: 0 }.pack();
+        assert!(c.validate_shape().is_err(), "a TWAP needs slices");
+        c.okind = ALGO_ICEBERG;
+        c.target_oid = AlgoParams { dur_s: 0, slices: 5, slip_bps: 0 }.pack();
+        assert!(c.validate_shape().is_ok());
+        c.okind = ALGO_CHASE;
+        c.target_oid = AlgoParams { dur_s: 0, slices: 0, slip_bps: 600 }.pack();
+        assert!(c.validate_shape().is_err(), "chase slip ≤ 500 bps");
+        assert_eq!(AlgoParams::unpack(AlgoParams { dur_s: 7, slices: 8, slip_bps: 9 }.pack()), AlgoParams { dur_s: 7, slices: 8, slip_bps: 9 });
     }
 
     #[test]

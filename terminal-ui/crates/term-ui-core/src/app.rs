@@ -14,7 +14,7 @@ use egui_wgpu::RenderState;
 use term_proto::ctl::{Beat, Control, CtlOp, InstrDef, CH_ALL};
 use term_proto::dec::format_1e6;
 use term_proto::ctl::Venue;
-use term_proto::exec::{EngineStatus, FillView, Intent, IntentAck, Op, OrderKind, OrderStatus, OrderView, PositionView, AckSource, FLAG_REDUCE_ONLY};
+use term_proto::exec::{Algo, EngineStatus, FillView, Intent, IntentAck, Op, OrderKind, OrderStatus, OrderView, PositionView, AckSource, FLAG_REDUCE_ONLY};
 use term_proto::md::*;
 use term_proto::{Kind, Side};
 use term_render::{CircleInst, HeatU, PaneDraw, RectInst, TermGpu, ViewU, HEAT_COLS, HEAT_ROWS};
@@ -73,6 +73,7 @@ pub struct App<P: Platform, L: Link> {
     px_text: String,
     qty_text: String,
     reduce_only: bool,
+    algo_sell: bool,
     entry_err: Option<&'static str>,
     orders: BTreeMap<u64, OrderView>,
     positions: BTreeMap<(u8, u16), PositionView>,
@@ -148,6 +149,7 @@ impl<P: Platform, L: Link> App<P, L> {
             px_text: String::new(),
             qty_text: String::new(),
             reduce_only: false,
+            algo_sell: false,
             entry_err: None,
             orders: BTreeMap::new(),
             positions: BTreeMap::new(),
@@ -361,7 +363,7 @@ impl<P: Platform, L: Link> App<P, L> {
             let chart = Rect::from_min_max(left.min, Pos2::new(left.max.x, s1 - 3.0));
             let heat = Rect::from_min_max(Pos2::new(left.min.x, s1 + 3.0), Pos2::new(left.max.x, s2 - 3.0));
             let blotter = Rect::from_min_max(Pos2::new(left.min.x, s2 + 3.0), left.max);
-            let ticket = Rect::from_min_max(right.min, Pos2::new(right.max.x, right.min.y + 196.0));
+            let ticket = Rect::from_min_max(right.min, Pos2::new(right.max.x, right.min.y + 220.0));
             let lsplit = ticket.max.y + 6.0 + (right.max.y - ticket.max.y) * 0.62;
             let ladder = Rect::from_min_max(Pos2::new(right.min.x, ticket.max.y + 6.0), Pos2::new(right.max.x, lsplit - 3.0));
             let tape = Rect::from_min_max(Pos2::new(right.min.x, lsplit + 3.0), right.max);
@@ -636,6 +638,26 @@ impl<P: Platform, L: Link> App<P, L> {
         self.send_intent(i);
     }
 
+    /// An algo on the ticket's price (the cap) and size (the total).
+    fn algo(&mut self, algo: Algo, dur_s: u32, slices: u16, slip_bps: i64) {
+        let Some(def) = self.ins.get(self.sel).and_then(|i| i.def) else { return };
+        let (Ok(px), Ok(qty)) = (term_proto::dec::parse_1e6(self.px_text.trim().as_bytes()), term_proto::dec::parse_1e6(self.qty_text.trim().as_bytes())) else {
+            self.entry_err = Some("price (the cap) and size (the total): plain decimals, at most 6 places");
+            return;
+        };
+        let mut i = Intent::blank(1, term_slot(def.venue), def.instr, Op::AlgoStart);
+        i.side = if self.algo_sell { Side::Sell as u8 } else { Side::Buy as u8 };
+        i.kind = OrderKind::Limit as u8;
+        i.flags = if self.reduce_only { FLAG_REDUCE_ONLY } else { 0 };
+        i.px = px;
+        i.qty = qty;
+        i.algo = algo;
+        i.dur_s = dur_s;
+        i.slices = slices;
+        i.slip_1e6 = slip_bps * 100;
+        self.send_intent(i);
+    }
+
     fn simple(&mut self, op: Op) {
         let Some(def) = self.ins.get(self.sel).and_then(|i| i.def) else { return };
         self.send_intent(Intent::blank(1, term_slot(def.venue), def.instr, op));
@@ -678,6 +700,21 @@ impl<P: Platform, L: Link> App<P, L> {
                     }
                     if ui.button("Sell IoC").clicked() {
                         self.place(Side::Sell, true);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let side = if self.algo_sell { "Sell" } else { "Buy" };
+                    if ui.button(side).on_hover_text("algo side").clicked() {
+                        self.algo_sell = !self.algo_sell;
+                    }
+                    if ui.button("TWAP 60s×6").clicked() {
+                        self.algo(Algo::Twap, 60, 6, 0);
+                    }
+                    if ui.button("Iceberg ×5").clicked() {
+                        self.algo(Algo::Iceberg, 0, 5, 0);
+                    }
+                    if ui.button("Chase 20bp").clicked() {
+                        self.algo(Algo::Chase, 0, 0, 20);
                     }
                 });
                 ui.horizontal(|ui| {

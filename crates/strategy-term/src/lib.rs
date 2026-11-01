@@ -31,7 +31,7 @@ use core_types::{
     ORDER_EVENT_CANCELED, ORDER_EVENT_FILLED, ORDER_EVENT_REJECTED, ORDER_FLAG_POST_ONLY, ORDER_FLAG_REDUCE_ONLY,
 };
 use ingress_term::{
-    is_term_slot, CmdKind, EvtKind, EvtTx, GrowRx, ReduceRx, Reason, TermCmd, TermEvt, TermIn, OKIND_IOC,
+    is_term_slot, AlgoParams, CmdKind, EvtKind, EvtTx, ALGO_CHASE, ALGO_ICEBERG, ALGO_TWAP, GrowRx, ReduceRx, Reason, TermCmd, TermEvt, TermIn, OKIND_IOC,
     FLAG_POST_ONLY, FLAG_REDUCE_ONLY,
 };
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError};
@@ -40,6 +40,8 @@ pub const MAX_SYMS: usize = 32;
 pub const MAX_OPEN: usize = 128;
 pub const GROW_PER_TIMER: usize = 32;
 pub const TIMER_NS: u64 = 50_000_000;
+/// Concurrent algos per slot.
+pub const MAX_ALGOS: usize = 4;
 
 /// The pre-gate's numbers for one slot (paper: equal to the proposals in
 /// TERM plan §4.3; live caps are the operator's call, R-T5).
@@ -111,6 +113,26 @@ struct Open {
     nonce: u64,
 }
 
+/// One running algo. Children are ordinary orders through the pre-gate.
+#[derive(Copy, Clone, Debug)]
+struct AlgoRun {
+    id: u64,
+    kind: u8,
+    sym: SymbolId,
+    side: Side,
+    cap: i64,
+    total: i64,
+    sent: i64,
+    slices: u16,
+    step_ns: u64,
+    next_ns: NsTs,
+    slip_bps: i64,
+    ref_mid: i64,
+    child: u64,
+    child_px: i64,
+    reduce_only: bool,
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct TermCounters {
     pub reduce: u64,
@@ -120,6 +142,8 @@ pub struct TermCounters {
     pub evt_dropped: u64,
     pub watchdog_fired: u64,
     pub fills: u64,
+    pub algos_started: u64,
+    pub algos_stopped: u64,
 }
 
 pub struct TermStrategy {
@@ -137,6 +161,7 @@ pub struct TermStrategy {
     touch: Box<[Touch; MAX_SYMS]>,
     pos: Box<[Pos; MAX_SYMS]>,
     open: Box<[Option<Open>; MAX_OPEN]>,
+    algos: Box<[Option<AlgoRun>; MAX_ALGOS]>,
     seq: u64,
     beat_ns: NsTs,
     beat_seen: bool,
@@ -162,6 +187,7 @@ impl TermStrategy {
             touch: Box::new([Touch::default(); MAX_SYMS]),
             pos: Box::new([Pos::default(); MAX_SYMS]),
             open: Box::new([None; MAX_OPEN]),
+            algos: Box::new([None; MAX_ALGOS]),
             seq: 0,
             beat_ns: 0,
             beat_seen: false,
@@ -247,6 +273,13 @@ impl TermStrategy {
     // ---- reducing path ------------------------------------------------------------------
 
     fn cancel_where<C: Ctx>(&mut self, ctx: &mut C, now: NsTs, sym: Option<SymbolId>) -> u32 {
+        // Every cancel-all stops the algos on the same symbols (R-T15).
+        for a in self.algos.iter_mut() {
+            if a.is_some_and(|r| sym.is_none_or(|s| s == r.sym)) {
+                *a = None;
+                self.counters.algos_stopped += 1;
+            }
+        }
         let mut n = 0;
         for k in 0..MAX_OPEN {
             let Some(o) = self.open[k] else { continue };
@@ -310,6 +343,17 @@ impl TermStrategy {
                 let n = self.cancel_where(ctx, now, None);
                 self.evt(TermEvt { kind: EvtKind::Halted as u8, slot: self.slot, nonce: c.nonce, ts_ns: now, extra: n as i64, ..TermEvt::default() });
             }
+            Some(CmdKind::AlgoCancel) => match self.algos.iter().position(|a| a.is_some_and(|r| r.id == c.target_oid)) {
+                Some(k) => {
+                    let r = self.algos[k].take();
+                    self.counters.algos_stopped += 1;
+                    if let Some(r) = r.filter(|r| r.child != 0) {
+                        let _ = ctx.cancel(CancelReq::new(now, self.p.venue, r.sym, r.child));
+                    }
+                    self.evt(TermEvt { kind: EvtKind::Sent as u8, slot: self.slot, reason: 0, sym: c.sym, nonce: c.nonce, ts_ns: now, ..TermEvt::default() });
+                }
+                None => self.refuse(&c, Reason::UnknownOrder, now),
+            },
             Some(CmdKind::Disconnect) => {
                 // R-T15: a lost terminal cancels; growing commands still on
                 // the grow ring are discarded at the next drain (their
@@ -418,6 +462,41 @@ impl TermStrategy {
                 }
                 self.send(ctx, o, &c, now);
             }
+            Some(CmdKind::AlgoStart) => {
+                if self.halted {
+                    return self.refuse(&c, Reason::Halted, now);
+                }
+                if now.saturating_sub(t.recv_ns) > self.p.max_age_ns || t.recv_ns < self.disconnected_at {
+                    return self.refuse(&c, Reason::Stale, now);
+                }
+                let Some((bid, ask)) = self.touch_of(c.sym, now) else {
+                    return self.refuse(&c, Reason::NoTouch, now);
+                };
+                let Some(k) = self.algos.iter().position(|a| a.is_none()) else {
+                    return self.refuse(&c, Reason::Submit, now);
+                };
+                let ap = AlgoParams::unpack(c.target_oid);
+                let slices = ap.slices.max(1);
+                self.algos[k] = Some(AlgoRun {
+                    id: c.nonce,
+                    kind: c.okind,
+                    sym: c.sym,
+                    side: if c.side == 0 { Side::Bid } else { Side::Ask },
+                    cap: c.px,
+                    total: c.qty,
+                    sent: 0,
+                    slices,
+                    step_ns: u64::from(ap.dur_s) * 1_000_000_000 / u64::from(slices),
+                    next_ns: now,
+                    slip_bps: i64::from(ap.slip_bps),
+                    ref_mid: (bid + ask) / 2,
+                    child: 0,
+                    child_px: 0,
+                    reduce_only: c.flags & FLAG_REDUCE_ONLY != 0,
+                });
+                self.counters.algos_started += 1;
+                self.evt(TermEvt { kind: EvtKind::Sent as u8, slot: self.slot, reason: 0, side: c.side, sym: c.sym, nonce: c.nonce, ts_ns: now, ..TermEvt::default() });
+            }
             Some(CmdKind::Modify) => {
                 let Some(k) = self.open.iter().position(|o| o.is_some_and(|o| o.oid == c.target_oid)) else {
                     return self.refuse(&c, Reason::UnknownOrder, now);
@@ -446,6 +525,121 @@ impl TermStrategy {
         }
     }
 
+    /// Stop algo `k`, telling the terminal why (the algo's id is its nonce).
+    fn stop_algo(&mut self, k: usize, r: Reason, now: NsTs) {
+        if let Some(run) = self.algos[k].take() {
+            self.counters.algos_stopped += 1;
+            if r != Reason::None {
+                self.counters.refused += 1;
+                self.evt(TermEvt { kind: EvtKind::Refused as u8, slot: self.slot, reason: r as u8, sym: run.sym, nonce: run.id, ts_ns: now, ..TermEvt::default() });
+            }
+        }
+    }
+
+    /// One child through the pre-gate, then out. `Err` stops the algo.
+    fn child<C: Ctx>(&mut self, ctx: &mut C, now: NsTs, run: &AlgoRun, kind: u8, px: i64, qty: i64) -> Result<u64, Reason> {
+        let d = if run.side == Side::Bid { qty } else { -qty };
+        // A child is judged as fresh: its age is the algo's business.
+        let probe = TermCmd { slot: self.slot, sym: run.sym, ..TermCmd::default() };
+        self.pregate(&probe, &TermIn { cmd: probe, recv_ns: now }, now, run.sym, px, qty, d, run.reduce_only)?;
+        let oid = self.next_oid();
+        let mut o = Order::new(now, self.p.venue, run.sym, run.side, kind, Price::from_raw(px), Qty::from_raw(qty), oid);
+        o.flags = if run.reduce_only { ORDER_FLAG_REDUCE_ONLY } else { 0 };
+        if kind == ORDER_KIND_MAKER {
+            o = o.with_ttl_ns(self.p.max_rest_ns);
+        }
+        // Children carry no nonce: the terminal acked the algo once.
+        let before = self.counters.sent;
+        self.send(ctx, o, &probe, now);
+        if self.counters.sent == before {
+            return Err(Reason::Submit);
+        }
+        Ok(oid)
+    }
+
+    fn step_algos<C: Ctx>(&mut self, ctx: &mut C, now: NsTs) {
+        for k in 0..MAX_ALGOS {
+            let Some(mut run) = self.algos[k] else { continue };
+            let Some((bid, ask)) = self.touch_of(run.sym, now) else {
+                continue; // wait for a fresh touch; never trade blind
+            };
+            let buy = run.side == Side::Bid;
+            let res: Result<(), Reason> = match run.kind {
+                ALGO_TWAP => {
+                    if now < run.next_ns {
+                        continue;
+                    }
+                    let left = run.total - run.sent;
+                    let slice = if run.sent + 2 * (run.total / i64::from(run.slices)) > run.total { left } else { (run.total / i64::from(run.slices)).max(1) };
+                    let marketable = if buy { ask + ask * run.slip_bps / 10_000 } else { bid - bid * run.slip_bps / 10_000 };
+                    let px = if buy { marketable.min(run.cap) } else { marketable.max(run.cap) };
+                    self.child(ctx, now, &run, ORDER_KIND_IOC, px, slice).map(|_| {
+                        run.sent += slice;
+                        run.next_ns = now + run.step_ns;
+                    })
+                }
+                ALGO_ICEBERG => {
+                    if run.child != 0 || run.sent >= run.total {
+                        Ok(())
+                    } else {
+                        let slice = (run.total / i64::from(run.slices)).max(1).min(run.total - run.sent);
+                        self.child(ctx, now, &run, ORDER_KIND_MAKER, run.cap, slice).map(|oid| {
+                            run.child = oid;
+                            run.sent += slice;
+                        })
+                    }
+                }
+                ALGO_CHASE => {
+                    let touch = if buy { bid.min(run.cap) } else { ask.max(run.cap) };
+                    let away = (touch - run.ref_mid).abs() as i128 * 10_000 > run.slip_bps as i128 * run.ref_mid as i128;
+                    if away {
+                        if run.child != 0 {
+                            let _ = ctx.cancel(CancelReq::new(now, self.p.venue, run.sym, run.child));
+                        }
+                        self.stop_algo(k, Reason::Band, now);
+                        continue;
+                    }
+                    if run.child == 0 && run.sent == 0 {
+                        self.child(ctx, now, &run, ORDER_KIND_MAKER, touch, run.total).map(|oid| {
+                            run.child = oid;
+                            run.child_px = touch;
+                            run.sent = run.total;
+                        })
+                    } else if run.child != 0 && touch != run.child_px && self.rate_take(now) {
+                        let oid = self.next_oid();
+                        let o = Order::new(now, self.p.venue, run.sym, run.side, ORDER_KIND_MAKER, Price::from_raw(touch), Qty::from_raw(run.total), oid).with_ttl_ns(self.p.max_rest_ns);
+                        if ctx.modify(run.child, o).is_ok() {
+                            if let Some(slot) = self.open.iter_mut().find(|x| x.is_some_and(|x| x.oid == run.child)) {
+                                *slot = Some(Open { oid, sym: run.sym, side: run.side, qty: run.total, nonce: 0 });
+                            }
+                            run.child = oid;
+                            run.child_px = touch;
+                        }
+                        Ok(())
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Err(Reason::Shape),
+            };
+            match res {
+                Err(r) => self.stop_algo(k, r, now),
+                Ok(()) => {
+                    // TWAP is done once everything is sent.
+                    if run.kind == ALGO_TWAP && run.sent >= run.total {
+                        self.algos[k] = None;
+                    } else {
+                        self.algos[k] = Some(run);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn algos_running(&self) -> usize {
+        self.algos.iter().filter(|a| a.is_some()).count()
+    }
+
     /// Drain the rings, reducing first, then the watchdog. Public so a host
     /// without the set's timer (tests, a bench) can drive it.
     pub fn service<C: Ctx>(&mut self, ctx: &mut C, now: NsTs) {
@@ -468,6 +662,7 @@ impl TermStrategy {
             }
             self.grow = Some(gr);
         }
+        self.step_algos(ctx, now);
         if self.beat_seen && now.saturating_sub(self.beat_ns) > self.p.watchdog_ns {
             let k = self.cancel_where(ctx, now, None);
             self.beat_seen = false;
@@ -519,6 +714,20 @@ impl Strategy for TermStrategy {
             return;
         }
         if matches!(e.kind, ORDER_EVENT_FILLED | ORDER_EVENT_CANCELED | ORDER_EVENT_REJECTED) {
+            for k in 0..MAX_ALGOS {
+                let Some(mut run) = self.algos[k] else { continue };
+                if run.child != e.client_oid {
+                    continue;
+                }
+                run.child = 0;
+                let done = e.kind != ORDER_EVENT_FILLED || run.kind == ALGO_CHASE || run.sent >= run.total;
+                if done {
+                    self.algos[k] = None;
+                    self.counters.algos_stopped += 1;
+                } else {
+                    self.algos[k] = Some(run); // the iceberg shows its next slice
+                }
+            }
             if let Some(k) = self.open.iter().position(|o| o.is_some_and(|o| o.oid == e.client_oid)) {
                 let o = self.open[k].take();
                 if e.kind != ORDER_EVENT_FILLED {
@@ -842,6 +1051,101 @@ mod tests {
         assert_eq!(ev[0].kind, EvtKind::Watchdog as u8);
         assert!(y.ctx.submitted.is_empty());
         assert!(ev.iter().any(|e| e.reason == Reason::Stale as u8));
+    }
+
+    fn algo(x: &mut H, kind: u8, side: u8, cap: i64, qty: i64, ap: AlgoParams) -> u64 {
+        let mut c = x.cmd(CmdKind::AlgoStart);
+        c.okind = kind;
+        c.side = side;
+        c.px = cap;
+        c.qty = qty;
+        c.target_oid = ap.pack();
+        let id = c.nonce;
+        x.grow(c);
+        id
+    }
+
+    fn filled(x: &mut H, oid: u64) {
+        let e = OrderEvent::new(x.ctx.now, VenueId::Hyperliquid, SYM, oid, SLOT_TERM_HL, ORDER_EVENT_FILLED, 0, 0);
+        x.m.on_order_event(&e, &mut x.ctx);
+    }
+
+    #[test]
+    fn twap_slices_on_time_and_the_last_takes_the_rest() {
+        let mut x = h();
+        algo(&mut x, ALGO_TWAP, 0, 78_010_000_000, 450, AlgoParams { dur_s: 60, slices: 3, slip_bps: 5 });
+        let ev = x.tick();
+        assert_eq!(ev[0].kind, EvtKind::Sent as u8, "the algo is acked");
+        assert_eq!(x.ctx.submitted.len(), 1);
+        assert_eq!((x.ctx.submitted[0].kind, x.ctx.submitted[0].qty.raw()), (ORDER_KIND_IOC, 150));
+        assert!(x.ctx.submitted[0].px.raw() <= 78_010_000_000, "never above the cap");
+        for _ in 0..2 {
+            x.ctx.now += 20 * S;
+            x.depth(78_000_000_000, 78_001_000_000);
+            x.tick();
+        }
+        let q: Vec<i64> = x.ctx.submitted.iter().map(|o| o.qty.raw()).collect();
+        assert_eq!(q, [150, 150, 150]);
+        assert_eq!(x.m.algos_running(), 0, "done");
+    }
+
+    #[test]
+    fn iceberg_shows_one_slice_at_a_time() {
+        let mut x = h();
+        algo(&mut x, ALGO_ICEBERG, 1, 78_001_000_000, 450, AlgoParams { dur_s: 0, slices: 3, slip_bps: 0 });
+        x.tick();
+        assert_eq!(x.ctx.submitted.len(), 1);
+        let first = x.ctx.submitted[0];
+        assert_eq!((first.kind, first.qty.raw(), first.px.raw()), (ORDER_KIND_MAKER, 150, 78_001_000_000));
+        x.tick();
+        assert_eq!(x.ctx.submitted.len(), 1, "nothing new until the slice fills");
+        filled(&mut x, first.client_oid);
+        x.tick();
+        assert_eq!(x.ctx.submitted.len(), 2);
+    }
+
+    #[test]
+    fn chase_repegs_then_gives_up_beyond_its_slip() {
+        let mut x = h();
+        algo(&mut x, ALGO_CHASE, 0, 78_100_000_000, 150, AlgoParams { dur_s: 0, slices: 0, slip_bps: 10 });
+        x.tick();
+        assert_eq!(x.ctx.submitted[0].px.raw(), 78_000_000_000, "rests at the bid");
+        x.ctx.now += S / 2;
+        x.depth(78_002_000_000, 78_003_000_000);
+        x.tick();
+        assert_eq!(x.ctx.modified.len(), 1);
+        assert_eq!(x.ctx.modified[0].1.px.raw(), 78_002_000_000, "re-pegged to the new bid");
+        x.ctx.now += S / 2;
+        x.depth(78_200_000_000, 78_201_000_000); // ~25 bps away
+        let ev = x.tick();
+        assert_eq!(x.m.algos_running(), 0);
+        assert!(ev.iter().any(|e| e.reason == Reason::Band as u8));
+        assert!(!x.ctx.cancelled.is_empty(), "the resting child is cancelled");
+    }
+
+    #[test]
+    fn a_refused_child_stops_its_algo_and_halt_stops_all() {
+        let mut x = h();
+        // 2 BTC at $78k is over the per-order notional cap: refused.
+        algo(&mut x, ALGO_TWAP, 0, 78_010_000_000, 2_000_000, AlgoParams { dur_s: 10, slices: 1, slip_bps: 0 });
+        let ev = x.tick();
+        assert!(ev.iter().any(|e| e.reason == Reason::Notional as u8));
+        assert_eq!(x.m.algos_running(), 0);
+        let id = algo(&mut x, ALGO_ICEBERG, 1, 78_001_000_000, 450, AlgoParams { dur_s: 0, slices: 3, slip_bps: 0 });
+        x.tick();
+        assert_eq!(x.m.algos_running(), 1);
+        let mut c = x.cmd(CmdKind::AlgoCancel);
+        c.sym = 0;
+        c.target_oid = id;
+        x.reduce(c);
+        x.tick();
+        assert_eq!(x.m.algos_running(), 0, "AlgoCancel stops it");
+        algo(&mut x, ALGO_ICEBERG, 1, 78_001_000_000, 450, AlgoParams { dur_s: 0, slices: 3, slip_bps: 0 });
+        x.tick();
+        let hc = x.cmd(CmdKind::Halt);
+        x.reduce(TermCmd { sym: 0, ..hc });
+        x.tick();
+        assert_eq!(x.m.algos_running(), 0, "halt stops every algo");
     }
 
     #[test]
