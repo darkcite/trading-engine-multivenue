@@ -5,7 +5,7 @@
 //! network or capture. Code, not data. Fixed-capacity outputs, no allocation
 //! after `new`.
 
-use term_proto::Bar;
+use term_proto::md::Bar;
 
 /// xorshift64*: deterministic, tiny, good enough for a picture.
 #[derive(Copy, Clone, Debug)]
@@ -78,6 +78,7 @@ impl Market {
         let vol = ((0.2 + self.rng.unit() * 3.0) * 1e6) as i64 * (hi - lo + 1);
         let delta = (p - o).signum() * vol / 3 + ((self.rng.gauss() * 0.1) * vol as f32) as i64;
         let b = Bar {
+            instr: 0,
             bar: self.bar,
             tf_s: 60,
             o: o * TICK_1E6,

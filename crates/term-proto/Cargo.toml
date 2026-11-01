@@ -1,9 +1,18 @@
 [package]
-name = "term-proto"
-version = "0.0.1"
-edition = "2021"
-rust-version = "1.88"
-license = "Apache-2.0"
-publish = false
+name         = "term-proto"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "TERM wire: no_std, zero-dependency, fixed-layout little-endian frames shared by multivenue-terminal and term-ui (WASM). Zero-copy borrowed decode; every field validated."
+
+[lib]
+path = "src/lib.rs"
 
 [dependencies]
+# None, by law (TERM plan §4.11.2): it must build on both toolchains.
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -567,6 +567,7 @@ dependencies = [
  "pine-lang",
  "signer-eip712",
  "signer-evm",
+ "term-proto",
 ]
 
 [[package]]
@@ -710,6 +711,10 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "term-proto"
+version = "0.1.0"
 
 [[package]]
 name = "tiny-keccak"

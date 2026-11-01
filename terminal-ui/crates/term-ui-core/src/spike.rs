@@ -16,7 +16,7 @@ use std::sync::Arc;
 use egui::{Align2, Color32, FontId, Galley, Pos2, Rect, Sense, Vec2};
 use egui_wgpu::RenderState;
 use term_proto::dec::format_1e6;
-use term_proto::Bar;
+use term_proto::md::Bar;
 use term_render::{
     CircleInst, HeatU, LineStyle, PaneDraw, RectInst, TermGpu, ViewU, HEAT_COLS, HEAT_ROWS, MAX_CIRCLES, MAX_RECTS,
 };

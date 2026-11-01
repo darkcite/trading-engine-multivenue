@@ -119,11 +119,14 @@ members = [
 
     # --- bench/alloc harness ---
     "crates/bench",
+
+    # --- TERM (cold): the terminal's shared wire ---
+    "crates/term-proto",
 ]
 
 # Fuzz targets live in fuzz/Cargo.toml (cargo-fuzz convention) and are NOT
 # part of the main workspace.
-exclude = ["fuzz", "claude-worker"]
+exclude = ["fuzz", "claude-worker", "terminal-ui"]
 
 # ---------------------------------------------------------------
 # Shared dependency versions pinned at the workspace level.
@@ -286,6 +289,7 @@ exec-jupiter = { path = "crates/exec-jupiter" }
 engine          = { path = "crates/engine" }
 engine-snapshot = { path = "crates/engine-snapshot" }
 tui             = { path = "crates/tui" }
+term-proto      = { path = "crates/term-proto" }
 
 # ---------------------------------------------------------------
 # Profiles

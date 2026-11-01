@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
-use term_proto::Control;
+use term_proto::ctl::{Control, CtlOp};
 use term_ui_core::spike::Spike;
 use term_ui_core::Platform;
 use wasm_bindgen::prelude::*;
@@ -42,11 +42,11 @@ impl eframe::App for App {
 
 /// Encode a `Control` frame (what the client will send on the socket in
 /// T1a) and log it; the spike has no server.
-fn report(kind: Control) {
+fn report(kind: CtlOp) {
     let mut buf = [0u8; 32];
     let seq = 0;
     let ts = 0;
-    if let Ok(n) = kind.encode(seq, ts, &mut buf) {
+    if let Ok(n) = Control::op(kind).encode(seq, ts, &mut buf) {
         let ok = term_proto::decode(&buf[..n]).is_ok();
         web_sys::console::log_1(&JsValue::from_str(&format!(
             "TERMSPIKE {{\"event\":\"control\",\"kind\":\"{kind:?}\",\"bytes\":{n},\"decodes\":{ok}}}"
@@ -94,12 +94,12 @@ pub async fn start(canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
     let d2 = document.clone();
     listen(&doc_t, "visibilitychange", move || {
         report(match d2.visibility_state() {
-            web_sys::VisibilityState::Hidden => Control::Hidden,
-            _ => Control::Visible,
+            web_sys::VisibilityState::Hidden => CtlOp::Hidden,
+            _ => CtlOp::Visible,
         })
     })?;
-    listen(&doc_t, "freeze", || report(Control::Frozen))?;
-    listen(&doc_t, "resume", || report(Control::Resumed))?;
+    listen(&doc_t, "freeze", || report(CtlOp::Frozen))?;
+    listen(&doc_t, "resume", || report(CtlOp::Resumed))?;
 
     let plat = WebPlatform { perf };
     eframe::WebRunner::new()
