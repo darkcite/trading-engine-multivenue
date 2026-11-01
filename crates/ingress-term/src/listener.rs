@@ -36,6 +36,8 @@ pub struct DoorCfg {
     pub path: PathBuf,
     pub door: Door,
     pub clock: Clock,
+    /// `<run_dir>/term-cmds.pmlr`: every accepted command, as it arrived.
+    pub capture: Option<PathBuf>,
 }
 
 struct Client {
@@ -67,6 +69,15 @@ fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut lanes: Vec<
     let mut pending: Vec<(usize, TermIn)> = Vec::with_capacity(lanes.len() * 2);
     let mut rec = [0u8; REC_LEN];
     let mut out = [0u8; FRAME_LEN];
+    // The capture writer lives on this cold thread; a capture that fails to
+    // open or write is reported and dropped, never a reason to stop the door.
+    let mut cap = cfg.capture.as_ref().and_then(|p| match core_io::PmlrWriter::open(p, core_io::SlotKind::TermCmd, cfg.door.boot_epoch()) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("term-door: capture {} refused: {e}", p.display());
+            None
+        }
+    });
     while !stop.load(Ordering::Relaxed) {
         if poll.poll(&mut events, Some(Duration::from_millis(5))).is_err() {
             continue;
@@ -118,6 +129,17 @@ fn run(mut cfg: DoorCfg, mut poll: Poll, listener: UnixListener, mut lanes: Vec<
                 used += FRAME_LEN;
                 let (wall, mono) = (cfg.clock)();
                 let accepted = cfg.door.accept(f, wall, mono);
+                if let (Ok(_), Some(w)) = (&accepted, cap.as_mut()) {
+                    let mut raw = [0u8; REC_LEN];
+                    // COPY: the 64 B accepted record into the capture slot — the
+                    // capture is the record as it arrived — a borrowed record rejected
+                    // (the writer takes an owned POD).
+                    raw.copy_from_slice(&f[2..2 + REC_LEN]);
+                    if w.append(&core_types::TermCmdRecord::new(mono, wall, raw)).and_then(|_| w.flush()).is_err() {
+                        eprintln!("term-door: capture write failed; capture off");
+                        cap = None;
+                    }
+                }
                 // A TERM slot the boot did not enable has no lane: refused.
                 let accepted = match accepted {
                     Ok((t, k)) => match lanes.iter().position(|l| l.slot == t.cmd.slot) {

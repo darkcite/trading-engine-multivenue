@@ -28,10 +28,11 @@ fn per_run_key() -> [u8; 32] {
 fn door_loopback() {
     let key = per_run_key();
     let path = std::env::temp_dir().join(format!("term-door-{}.sock", std::process::id()));
+    let cap = std::env::temp_dir().join(format!("term-cmds-{}.pmlr", std::process::id()));
     let ((rtx, gtx, erx), (mut rrx, mut grx, mut etx)) = rings();
     let ((rtx2, gtx2, erx2), (mut rrx2, _grx2, _etx2)) = rings();
     let stop = Arc::new(AtomicBool::new(false));
-    let h = spawn(DoorCfg { path: path.clone(), door: Door::new(key, 5, 2_000_000_000), clock },
+    let h = spawn(DoorCfg { path: path.clone(), door: Door::new(key, 5, 2_000_000_000), clock, capture: Some(cap.clone()) },
         vec![Lane { slot: SLOT_TERM_HL, reduce: rtx, grow: gtx, evt: erx }, Lane { slot: SLOT_TERM_BN, reduce: rtx2, grow: gtx2, evt: erx2 }],
         stop.clone()).unwrap();
     let mode = std::fs::metadata(&path).unwrap();
@@ -96,4 +97,12 @@ fn door_loopback() {
     stop.store(true, Ordering::Relaxed);
     h.join().unwrap();
     assert!(!path.exists());
+    // Two commands were accepted (the place and the halt); the refused one
+    // is not captured. 64 B header + 2 x 128 B records.
+    let len = std::fs::metadata(&cap).unwrap().len();
+    assert_eq!(len, 64 + 2 * 128, "capture size");
+    let bytes = std::fs::read(&cap).unwrap();
+    assert_eq!(bytes[6], 11, "SlotKind::TermCmd");
+    assert_eq!(bytes[64 + 16], CmdKind::Place as u8, "the first record's wire bytes");
+    let _ = std::fs::remove_file(&cap);
 }

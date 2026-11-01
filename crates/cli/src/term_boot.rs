@@ -81,7 +81,7 @@ pub fn read_key(path: &std::path::Path) -> Result<[u8; 32], String> {
 }
 
 /// Wire TERM if the boot enabled any TERM slot. `dir` is `~/multivenue`.
-pub fn wire_in(set: &mut StrategySet, dir: &std::path::Path, epoch: u64) -> Result<Option<TermDoorGuard>, String> {
+pub fn wire_in(set: &mut StrategySet, dir: &std::path::Path, epoch: u64, run_dir: Option<&std::path::Path>) -> Result<Option<TermDoorGuard>, String> {
     let mask = set.enabled_mask() & TERM_MASK;
     if mask == 0 {
         return Ok(None);
@@ -119,9 +119,10 @@ pub fn wire_in(set: &mut StrategySet, dir: &std::path::Path, epoch: u64) -> Resu
         .map_err(|e| format!("term.epoch: {e}"))?;
     writeln!(f, "{epoch}").map_err(|e| format!("term.epoch: {e}"))?;
     let stop = Arc::new(AtomicBool::new(false));
-    let handle = spawn(DoorCfg { path: sock.clone(), door: Door::new(key, epoch, DOOR_MAX_AGE_NS), clock }, lanes, stop.clone())
+    let handle = spawn(DoorCfg { path: sock.clone(), door: Door::new(key, epoch, DOOR_MAX_AGE_NS), clock, capture: run_dir.map(|d| d.join("term-cmds.pmlr")) }, lanes, stop.clone())
         .map_err(|e| format!("term door {}: {e}", sock.display()))?;
-    let tell = format!("term: door {} · slots {slots:?} · PAPER · caps {caps_src} · epoch {epoch}", sock.display());
+    let capture = run_dir.map_or("no capture run".to_owned(), |d| d.join("term-cmds.pmlr").display().to_string());
+    let tell = format!("term: door {} · slots {slots:?} · PAPER · caps {caps_src} · capture {capture} · epoch {epoch}", sock.display());
     Ok(Some(TermDoorGuard { stop, handle: Some(handle), tell }))
 }
 
@@ -143,12 +144,12 @@ pub fn params_of(c: &core_config::term::TermCaps) -> strategy_term::TermParams {
 }
 
 /// `wire_in` at `$HOME/multivenue`; `epoch` is `/state`'s `boot.boot_wall_ns`.
-pub fn wire(set: &mut StrategySet, epoch: u64) -> Result<Option<TermDoorGuard>, String> {
+pub fn wire(set: &mut StrategySet, epoch: u64, run_dir: Option<&std::path::Path>) -> Result<Option<TermDoorGuard>, String> {
     if set.enabled_mask() & TERM_MASK == 0 {
         return Ok(None);
     }
     let home = std::env::var_os("HOME").ok_or("HOME is unset")?;
-    wire_in(set, &PathBuf::from(home).join("multivenue"), epoch)
+    wire_in(set, &PathBuf::from(home).join("multivenue"), epoch, run_dir)
 }
 
 #[cfg(test)]
@@ -171,11 +172,11 @@ mod tests {
         assert_eq!(read_key(&p).unwrap(), [0xab; 32]);
         // No TERM slot enabled: nothing is read or spawned.
         let mut set = StrategySet::new(strategy_set::ALL_MASK);
-        assert!(wire_in(&mut set, &dir, 7).unwrap().is_none());
+        assert!(wire_in(&mut set, &dir, 7, None).unwrap().is_none());
         // TERM enabled: the door comes up on the socket, the epoch is written
         // 0600, and the guard tears the door down.
         let mut set = StrategySet::new(TERM_MASK);
-        let g = wire_in(&mut set, &dir, 1_761_980_000_000_000_000).unwrap().unwrap();
+        let g = wire_in(&mut set, &dir, 1_761_980_000_000_000_000, None).unwrap().unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("term.epoch")).unwrap().trim(), "1761980000000000000");
         assert!(dir.join("term.sock").exists());
         let em = std::fs::metadata(dir.join("term.epoch")).unwrap().permissions().mode();
@@ -186,7 +187,7 @@ mod tests {
         // term.toml's caps reach the members; a bad file refuses the boot.
         std::fs::write(dir.join("term.toml"), "[term]\nband_bps = 150\nmin_notional_usd_1e6_13 = 5000000\n").unwrap();
         let mut set = StrategySet::new(TERM_MASK);
-        let g = wire_in(&mut set, &dir, 9).unwrap().unwrap();
+        let g = wire_in(&mut set, &dir, 9, None).unwrap().unwrap();
         assert!(g.tell.contains("caps term.toml"));
         assert_eq!(set.term_mut(12).unwrap().params().band_bps, 150);
         assert_eq!(set.term_mut(13).unwrap().params().min_notional_1e6, 5_000_000);
@@ -194,10 +195,10 @@ mod tests {
         drop(g);
         std::fs::write(dir.join("term.toml"), "[term]\nband_bps = 0\n").unwrap();
         let mut set = StrategySet::new(TERM_MASK);
-        assert!(wire_in(&mut set, &dir, 9).is_err());
+        assert!(wire_in(&mut set, &dir, 9, None).is_err());
         std::fs::remove_file(dir.join("term.toml")).unwrap();
         let mut set = StrategySet::new(TERM_MASK);
-        let g = wire_in(&mut set, &dir, 1_761_980_000_000_000_000).unwrap().unwrap();
+        let g = wire_in(&mut set, &dir, 1_761_980_000_000_000_000, None).unwrap().unwrap();
         drop(g);
         assert!(!dir.join("term.sock").exists());
         let _ = std::fs::remove_dir_all(&dir);

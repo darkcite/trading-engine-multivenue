@@ -1634,6 +1634,38 @@ const _: () = assert!(core::mem::offset_of!(T2tRecord, strategy_id) == 61);
 // asserts above pin the layout), so every byte is initialized.
 unsafe impl AsBytes for T2tRecord {}
 
+/// One command the TERM door accepted (`term-cmds.pmlr`,
+/// `SlotKind::TermCmd`; TERM plan §4.2 step 7): the engine's receive time
+/// and the door's 64-byte little-endian `TermCmd` record exactly as it
+/// arrived, so a session can be replayed and audited command by command.
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TermCmdRecord {
+    /// Engine monotonic ns at acceptance.
+    pub recv_ns: NsTs,
+    /// Wall ns at acceptance.
+    pub wall_ns: u64,
+    /// The `ingress_term::TermCmd` wire record.
+    pub rec: [u8; 64],
+    /// Zero.
+    pub _pad: [u8; 48],
+}
+
+impl TermCmdRecord {
+    /// A record for one accepted command.
+    pub const fn new(recv_ns: NsTs, wall_ns: u64, rec: [u8; 64]) -> Self {
+        Self { recv_ns, wall_ns, rec, _pad: [0; 48] }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<TermCmdRecord>() == 128);
+const _: () = assert!(core::mem::align_of::<TermCmdRecord>() == 64);
+
+// SAFETY: `#[repr(C, align(64))]`, `Copy`, two u64 and two byte arrays
+// filling exactly 128 bytes (asserted above): no padding, every byte
+// initialized.
+unsafe impl AsBytes for TermCmdRecord {}
+
 // ---------------------------------------------------------------
 // ChannelEvent — non-tick channel capture slot (Phase 8e, §6.5)
 // ---------------------------------------------------------------

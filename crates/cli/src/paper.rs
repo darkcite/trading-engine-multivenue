@@ -4338,7 +4338,8 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     }
     // TERM (O-T17/O-T18): only when the mask names a TERM slot. The guard
     // keeps the door up for this loop and stops it when the loop returns.
-    let _term_door = match crate::term_boot::wire(&mut set, obs.boot.boot_wall_ns) {
+    let term_run_dir = std::str::from_utf8(obs.boot.run_dir()).ok().filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
+    let _term_door = match crate::term_boot::wire(&mut set, obs.boot.boot_wall_ns, term_run_dir.as_deref()) {
         Ok(g) => {
             if let Some(g) = &g {
                 tracing::info!("{}", g.tell);

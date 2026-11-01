@@ -9,9 +9,8 @@
 //!
 //! **Accept order** ([`Door::accept`]): length → HMAC → shape (the slot is a
 //! TERM slot, 12–15) → seq → boot epoch → `sent_wall_ns` age → receive-time
-//! stamp → hand-off. The PMLR capture of accepted commands (`term-cmds.pmlr`)
-//! is owed: a new PMLR kind must be registered in every reader and the
-//! worker's 202-test pin on the Mac first.
+//! stamp → capture (`term-cmds.pmlr`, `SlotKind::TermCmd`, by the door's own
+//! thread) → hand-off.
 //!
 //! **Hand-off**: reducing commands (cancel, cancel-all, flatten, halt, the
 //! heartbeat and the door's own `Disconnect`) ride their own ring and are
@@ -450,6 +449,10 @@ impl Door {
 
     pub fn key(&self) -> &[u8; 32] {
         &self.key
+    }
+
+    pub fn boot_epoch(&self) -> u64 {
+        self.boot_epoch
     }
 
     /// A new connection starts a new sequence.

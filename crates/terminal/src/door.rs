@@ -308,7 +308,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("term-door-client-{}.sock", std::process::id()));
         let ((rt, gt, er), (mut rr, mut gr, mut et)) = rings();
         let stop = Arc::new(AtomicBool::new(false));
-        let h = spawn(DoorCfg { path: path.clone(), door: Door::new(key, 99, 2_000_000_000), clock }, vec![Lane { slot: SLOT_TERM_HL, reduce: rt, grow: gt, evt: er }], stop.clone()).unwrap();
+        let h = spawn(DoorCfg { path: path.clone(), door: Door::new(key, 99, 2_000_000_000), clock, capture: None }, vec![Lane { slot: SLOT_TERM_HL, reduce: rt, grow: gt, evt: er }], stop.clone()).unwrap();
         let mut dc = DoorClient::connect(&path, key, 99, vec![Route { instr: 0, slot: SLOT_TERM_HL, sym: 3 }]).unwrap();
         let mut i = Intent::blank(41, SLOT_TERM_HL, 0, Op::Place);
         i.side = Side::Sell as u8;

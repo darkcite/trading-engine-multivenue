@@ -1283,7 +1283,9 @@ name = "ingress-term"
 version = "0.1.0"
 dependencies = [
  "core-crypto",
+ "core-io",
  "core-ring",
+ "core-types",
  "mio 0.8.11",
  "proptest",
 ]

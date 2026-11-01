@@ -103,6 +103,9 @@ pub enum SlotKind {
     /// [`core_types::T2tRecord`] — one order's in-process stamps, engine
     /// side (T2T T0, `engine-latency.pmlr`).
     Latency = 10,
+    /// [`core_types::TermCmdRecord`] — the TERM door's accepted commands
+    /// (`term-cmds.pmlr`, TERM plan §4.2; 128 B).
+    TermCmd = 11,
 }
 
 impl SlotKind {
@@ -121,6 +124,7 @@ impl SlotKind {
     pub const fn slot_size(self) -> usize {
         match self {
             Self::Depth => 192,
+            Self::TermCmd => 128,
             _ => SLOT_SIZE,
         }
     }
@@ -141,6 +145,7 @@ impl SlotKind {
             8 => Some(Self::Exec),
             9 => Some(Self::OrderEvent),
             10 => Some(Self::Latency),
+            11 => Some(Self::TermCmd),
             _ => None,
         }
     }
@@ -305,6 +310,9 @@ mod tests {
         assert_eq!(SlotKind::OrderEvent.slot_size(), 64);
         assert_eq!(SlotKind::from_u8(10), Some(SlotKind::Latency));
         assert_eq!(SlotKind::Latency.slot_size(), 64);
+        assert_eq!(SlotKind::from_u8(11), Some(SlotKind::TermCmd));
+        assert_eq!(SlotKind::TermCmd.slot_size(), core::mem::size_of::<core_types::TermCmdRecord>());
+        assert_eq!(SlotKind::from_u8(12), None);
         assert_eq!(SlotKind::from_u8(42), None);
     }
 
