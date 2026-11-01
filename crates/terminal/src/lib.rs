@@ -18,5 +18,6 @@ pub mod replay;
 pub mod server;
 pub mod source;
 pub mod spool;
+pub mod state;
 pub mod synth;
 pub mod ws;

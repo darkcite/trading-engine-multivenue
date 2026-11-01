@@ -49,6 +49,8 @@ pub struct Config {
     pub order_entry: bool,
     /// The engine's TERM door; intents go nowhere without it.
     pub door: Option<crate::door::DoorClient>,
+    /// The engine's `/state` (EngineStatus and the door's epoch).
+    pub state: Option<crate::state::StatePoller>,
 }
 
 #[derive(Default)]
@@ -182,6 +184,7 @@ impl Server {
                 }
             }
             self.door_events();
+            self.engine_state();
             for i in 0..MAX_CLIENTS {
                 self.flush(i);
                 if self.clients[i].as_ref().is_some_and(|c| c.dead) {
@@ -404,6 +407,13 @@ impl Server {
                 self.note(Event::Upgraded);
                 self.one.clear();
                 src.hello(&mut self.one);
+                // `/state`'s status overrides a source's stub (later wins).
+                if let Some(st) = self.cfg.state.as_ref() {
+                    let mut b = [0u8; 256];
+                    if let Ok(n) = crate::state::engine_status(st.last.as_ref()).encode(0, 0, &mut b) {
+                        self.one.extend_from_slice(&b[..n]);
+                    }
+                }
                 self.send_frames(i);
             }
             (b"GET", path) => {
@@ -499,6 +509,31 @@ impl Server {
                 self.note(Event::Intent { nonce: intent.nonce, accepted, why });
             }
             _ => {} // Layout / Drawing / KeyMap / LiveConfirm: stored in later milestones.
+        }
+    }
+
+    /// `/state` changed → a fresh EngineStatus to every UI; a new engine
+    /// boot → the door re-keyed to its epoch.
+    fn engine_state(&mut self) {
+        let Some(st) = self.cfg.state.as_mut() else { return };
+        if !st.poll() {
+            return;
+        }
+        let status = crate::state::engine_status(st.last.as_ref());
+        if let (Some(d), true) = (self.cfg.door.as_mut(), status.engine_up) {
+            if status.boot_epoch != 0 && status.boot_epoch != d.epoch() && d.rekey(status.boot_epoch).is_err() {
+                self.cfg.door = None;
+                self.note(Event::Refused("door lost on engine restart"));
+            }
+        }
+        let mut b = [0u8; 256];
+        let Ok(n) = status.encode(0, 0, &mut b) else { return };
+        self.one.clear();
+        self.one.extend_from_slice(&b[..n]);
+        for i in 0..MAX_CLIENTS {
+            if self.clients[i].as_ref().is_some_and(|c| matches!(c.state, State::Ws(_))) {
+                self.send_frames(i);
+            }
         }
     }
 

@@ -296,6 +296,7 @@ term-proto      = { path = "crates/term-proto" }
 terminal        = { path = "crates/terminal" }
 ingress-term    = { path = "crates/ingress-term" }
 strategy-term   = { path = "crates/strategy-term" }
+notify          = { path = "crates/notify" }
 
 # ---------------------------------------------------------------
 # Profiles

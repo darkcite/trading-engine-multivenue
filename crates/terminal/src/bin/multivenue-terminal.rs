@@ -12,7 +12,7 @@ use terminal::bundle::Bundle;
 use terminal::server::{Config, Server};
 
 fn usage() -> ! {
-    eprintln!("usage: multivenue-terminal [--port 9393] [--bundle terminal-ui/dist] (--synthetic SEED | --replay SPOOL | --live [--hl BTC] [--bn BTCUSDT]) [--record SPOOL] [--no-door] [--probe SECS] [--extra-ca PEM] [--door SOCK --door-key ENV --door-epoch FILE --route I:SLOT:SYM…]");
+    eprintln!("usage: multivenue-terminal [--port 9393] [--bundle terminal-ui/dist] (--synthetic SEED | --replay SPOOL | --live [--hl BTC] [--bn BTCUSDT]) [--record SPOOL] [--no-door] [--probe SECS] [--extra-ca PEM] [--state URL] [--door SOCK --door-key ENV (--door-epoch FILE | --state URL) --route I:SLOT:SYM…]");
     std::process::exit(2)
 }
 
@@ -32,6 +32,7 @@ fn main() -> std::io::Result<()> {
     let mut door_key: Option<PathBuf> = None;
     let mut door_epoch: Option<PathBuf> = None;
     let mut routes: Vec<terminal::door::Route> = Vec::new();
+    let mut state_url: Option<String> = None;
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
         match k.as_str() {
@@ -44,6 +45,7 @@ fn main() -> std::io::Result<()> {
             "--live" => live = true,
             "--hl" => hl.push(a.next().unwrap_or_else(|| usage())),
             "--bn" => bn.push(a.next().unwrap_or_else(|| usage())),
+            "--state" => state_url = Some(a.next().unwrap_or_else(|| usage())),
             "--door" => door_sock = Some(a.next().unwrap_or_else(|| usage()).into()),
             "--door-key" => door_key = Some(a.next().unwrap_or_else(|| usage()).into()),
             "--door-epoch" => door_epoch = Some(a.next().unwrap_or_else(|| usage()).into()),
@@ -90,15 +92,27 @@ fn main() -> std::io::Result<()> {
                 eprintln!("door refused: {e}");
                 std::process::exit(1)
             });
-            let epoch: u64 = std::fs::read_to_string(door_epoch.unwrap_or_else(|| usage())).ok().and_then(|s| s.trim().parse().ok()).unwrap_or_else(|| {
-                eprintln!("door refused: unreadable epoch file");
+            // The epoch: /state's boot.boot_wall_ns when --state is given
+            // (T-L11), else the file the engine wrote beside the socket.
+            let from_state = state_url.as_deref().and_then(|u| notify::config::parse_state_url(u).ok()).and_then(|u| notify::state::fetch(&u, Duration::from_secs(2)).ok()).map(|v| v.boot_wall_ns);
+            let from_file = door_epoch.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| s.trim().parse().ok());
+            let epoch: u64 = from_state.or(from_file).unwrap_or_else(|| {
+                eprintln!("door refused: no epoch (pass --state URL or --door-epoch FILE)");
                 std::process::exit(1)
             });
             Some(terminal::door::DoorClient::connect(&sock, key, epoch, routes)?)
         }
         _ => None,
     };
-    let cfg = Config { port, token, bundle, record, tick: Duration::from_millis(100), order_entry, door };
+    let state = match state_url.as_deref().map(notify::config::parse_state_url) {
+        Some(Ok(u)) => Some(terminal::state::StatePoller::spawn(u)),
+        Some(Err(e)) => {
+            eprintln!("--state refused: {e:?}");
+            std::process::exit(2)
+        }
+        None => None,
+    };
+    let cfg = Config { port, token, bundle, record, tick: Duration::from_millis(100), order_entry, door, state };
     let mut srv = Server::bind(cfg)?;
     // The one-time login token goes to the operator's terminal only.
     println!("TERM http://127.0.0.1:{}/  login token: {}", srv.port(), String::from_utf8_lossy(&token));

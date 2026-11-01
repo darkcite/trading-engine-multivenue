@@ -24,7 +24,7 @@ struct Harness {
 
 fn boot(order_entry: bool) -> Harness {
     let token = terminal::auth::random_secret().unwrap();
-    let cfg = Config { port: 0, token, bundle: Bundle::none(), record: None, tick: Duration::from_millis(20), order_entry, door: None };
+    let cfg = Config { port: 0, token, bundle: Bundle::none(), record: None, tick: Duration::from_millis(20), order_entry, door: None, state: None };
     let mut srv = Server::bind(cfg).unwrap();
     let port = srv.port();
     let log = Arc::new(Mutex::new(Vec::new()));

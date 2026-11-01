@@ -21,6 +21,7 @@ core-crypto = { workspace = true }
 core-net    = { workspace = true }
 mio         = { workspace = true }
 ingress-term = { workspace = true }
+notify       = { workspace = true }
 rustls      = { workspace = true }
 webpki-roots     = { workspace = true }
 rustls-pki-types = { workspace = true }

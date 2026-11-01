@@ -99,6 +99,7 @@ pub fn to_cmd(i: &Intent, routes: &[Route], epoch: u64, seq: u32, wall_ns: u64) 
 }
 
 pub struct DoorClient {
+    sock: std::path::PathBuf,
     s: UnixStream,
     key: [u8; 32],
     epoch: u64,
@@ -113,7 +114,24 @@ impl DoorClient {
     pub fn connect(sock: &std::path::Path, key: [u8; 32], epoch: u64, routes: Vec<Route>) -> std::io::Result<DoorClient> {
         let s = UnixStream::connect(sock)?;
         s.set_nonblocking(true)?;
-        Ok(DoorClient { s, key, epoch, seq: 0, rx: Vec::with_capacity(64 * FRAME_LEN), routes, open: Vec::new() })
+        Ok(DoorClient { sock: sock.to_path_buf(), s, key, epoch, seq: 0, rx: Vec::with_capacity(64 * FRAME_LEN), routes, open: Vec::new() })
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The engine restarted (a new `boot.boot_wall_ns` on `/state`): connect
+    /// again and quote the new epoch, or every command would be refused.
+    pub fn rekey(&mut self, epoch: u64) -> std::io::Result<()> {
+        let s = UnixStream::connect(&self.sock)?;
+        s.set_nonblocking(true)?;
+        self.s = s;
+        self.epoch = epoch;
+        self.seq = 0;
+        self.rx.clear();
+        self.open.clear();
+        Ok(())
     }
 
     fn send(&mut self, c: &TermCmd) -> std::io::Result<()> {

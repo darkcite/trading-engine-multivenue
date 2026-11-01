@@ -2516,6 +2516,7 @@ dependencies = [
  "core-net",
  "ingress-term",
  "mio 0.8.11",
+ "notify",
  "proptest",
  "rustls",
  "rustls-pki-types",

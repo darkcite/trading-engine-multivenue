@@ -5,9 +5,10 @@
 //! Only when the boot's strategy mask names a TERM slot: read the door key
 //! from `~/multivenue/term.env` (R-T13: it must be `0600`; the boot refuses
 //! otherwise), attach one ring lane per enabled TERM slot to its member,
-//! spawn the `term-door` thread on `~/multivenue/term.sock`, and write the
-//! boot epoch to `~/multivenue/term.epoch` (`0600`) for the terminal to quote
-//! (T-L11; publishing it in `/state` is owed). The returned guard stops the
+//! spawn the `term-door` thread on `~/multivenue/term.sock`. The door's boot
+//! epoch IS the engine's `boot.boot_wall_ns`, which `/state` already
+//! publishes (T-L11); `~/multivenue/term.epoch` (`0600`) carries the same
+//! value for a terminal without a `/state` reader. The returned guard stops the
 //! door when the engine loop ends. Cold: boot only, never the hot loop.
 
 use std::io::Write;
@@ -80,13 +81,12 @@ pub fn read_key(path: &std::path::Path) -> Result<[u8; 32], String> {
 }
 
 /// Wire TERM if the boot enabled any TERM slot. `dir` is `~/multivenue`.
-pub fn wire_in(set: &mut StrategySet, dir: &std::path::Path) -> Result<Option<TermDoorGuard>, String> {
+pub fn wire_in(set: &mut StrategySet, dir: &std::path::Path, epoch: u64) -> Result<Option<TermDoorGuard>, String> {
     let mask = set.enabled_mask() & TERM_MASK;
     if mask == 0 {
         return Ok(None);
     }
     let key = read_key(&dir.join("term.env"))?;
-    let epoch = wall_ns();
     let mut lanes = Vec::with_capacity(4);
     let mut slots = Vec::with_capacity(4);
     for slot in 12u8..=15 {
@@ -115,13 +115,13 @@ pub fn wire_in(set: &mut StrategySet, dir: &std::path::Path) -> Result<Option<Te
     Ok(Some(TermDoorGuard { stop, handle: Some(handle), tell }))
 }
 
-/// `wire_in` at `$HOME/multivenue`.
-pub fn wire(set: &mut StrategySet) -> Result<Option<TermDoorGuard>, String> {
+/// `wire_in` at `$HOME/multivenue`; `epoch` is `/state`'s `boot.boot_wall_ns`.
+pub fn wire(set: &mut StrategySet, epoch: u64) -> Result<Option<TermDoorGuard>, String> {
     if set.enabled_mask() & TERM_MASK == 0 {
         return Ok(None);
     }
     let home = std::env::var_os("HOME").ok_or("HOME is unset")?;
-    wire_in(set, &PathBuf::from(home).join("multivenue"))
+    wire_in(set, &PathBuf::from(home).join("multivenue"), epoch)
 }
 
 #[cfg(test)]
@@ -144,11 +144,12 @@ mod tests {
         assert_eq!(read_key(&p).unwrap(), [0xab; 32]);
         // No TERM slot enabled: nothing is read or spawned.
         let mut set = StrategySet::new(strategy_set::ALL_MASK);
-        assert!(wire_in(&mut set, &dir).unwrap().is_none());
+        assert!(wire_in(&mut set, &dir, 7).unwrap().is_none());
         // TERM enabled: the door comes up on the socket, the epoch is written
         // 0600, and the guard tears the door down.
         let mut set = StrategySet::new(TERM_MASK);
-        let g = wire_in(&mut set, &dir).unwrap().unwrap();
+        let g = wire_in(&mut set, &dir, 1_761_980_000_000_000_000).unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("term.epoch")).unwrap().trim(), "1761980000000000000");
         assert!(dir.join("term.sock").exists());
         let em = std::fs::metadata(dir.join("term.epoch")).unwrap().permissions().mode();
         assert_eq!(em & 0o777, 0o600);
