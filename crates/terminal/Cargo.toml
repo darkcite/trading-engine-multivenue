@@ -8,8 +8,16 @@ publish.workspace      = true
 authors.workspace      = true
 description  = "TERM: `multivenue-terminal`, the operator's terminal server — a COLD process (T-L1: no venue key, no order socket, never sources .env). Serves the WASM bundle under the CSP, speaks term-proto over one loopback WebSocket, and feeds it from --synthetic, --replay or public market data."
 
+build = "build.rs"
+
 [lib]
 path = "src/lib.rs"
+
+[features]
+# Embed terminal-ui/dist (or $TERM_WEB_DIST) into the binary at build time;
+# every file is checked against dist/MANIFEST by build.rs. Without it the
+# server loads --bundle DIR at boot (the same check, at run time).
+web-bundle = []
 
 [[bin]]
 name = "multivenue-terminal"
@@ -25,6 +33,9 @@ notify       = { workspace = true }
 rustls      = { workspace = true }
 webpki-roots     = { workspace = true }
 rustls-pki-types = { workspace = true }
+
+[build-dependencies]
+core-crypto = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -80,7 +80,7 @@ fn main() -> std::io::Result<()> {
             eprintln!("bundle refused: {e}");
             std::process::exit(1)
         }),
-        None => Bundle::none(),
+        None => Bundle::embedded().unwrap_or_else(Bundle::none),
     };
     let token = terminal::auth::random_secret()?;
     // Replay never takes orders; until the door lands (M5) nothing does.

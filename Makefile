@@ -228,3 +228,13 @@ license-deps:
 
 clean:
 	cargo clean
+
+# TERM (plan §4.11.1): the terminal UI's own gates — host tests, wasm32
+# clippy, the bundle build, and the glue hash (scripts/terminal-ui-glue-check.sh).
+.PHONY: terminal-ui-gates
+terminal-ui-gates:
+	cd terminal-ui && cargo test --workspace
+	cd terminal-ui && cargo clippy --workspace --all-targets -- -D warnings
+	cd terminal-ui && cargo clippy --workspace --lib --target wasm32-unknown-unknown -- -D warnings
+	terminal-ui/scripts/terminal-ui-build.sh
+	terminal-ui/scripts/terminal-ui-glue-check.sh

@@ -2,8 +2,8 @@
 // Copyright 2026 Anton (darkcite)
 //! The WASM bundle the server serves (TERM plan §4.11.1): loaded once at
 //! boot from `terminal-ui/dist/` and refused unless every file matches its
-//! SHA-256 in `dist/MANIFEST`. (Embedding with `build.rs` under a
-//! `web-bundle` feature replaces the load for release builds.)
+//! SHA-256 in `dist/MANIFEST`; or, built with `--features web-bundle`,
+//! embedded at build time by `build.rs` with the same check.
 
 pub struct File {
     pub path: &'static str,
@@ -27,7 +27,26 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+mod embed {
+    include!(concat!(env!("OUT_DIR"), "/bundle_embed.rs"));
+}
+
 impl Bundle {
+    /// The bundle compiled in with `--features web-bundle` (already checked
+    /// against MANIFEST by build.rs); `None` in a build without it.
+    // The constant is empty in a build without the feature, by design.
+    #[allow(clippy::const_is_empty)]
+    pub fn embedded() -> Option<Bundle> {
+        if embed::EMBEDDED.is_empty() {
+            return None;
+        }
+        let files = FILES
+            .iter()
+            .filter_map(|(name, ctype)| embed::EMBEDDED.iter().find(|(n, _)| n == name).map(|(_, b)| File { path: name, ctype, body: b.to_vec() }))
+            .collect();
+        Some(Bundle { files })
+    }
+
     /// An empty bundle: every page answers 503 with a build hint.
     pub fn none() -> Bundle {
         Bundle { files: Vec::new() }
