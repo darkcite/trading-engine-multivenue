@@ -24,7 +24,7 @@ struct Harness {
 
 fn boot(order_entry: bool) -> Harness {
     let token = terminal::auth::random_secret().unwrap();
-    let cfg = Config { port: 0, token, bundle: Bundle::none(), record: None, tick: Duration::from_millis(20), order_entry, door: None, state: None };
+    let cfg = Config { port: 0, token, bundle: Bundle::none(), record: None, tick: Duration::from_millis(20), order_entry, door: None, state: None, data_dir: None };
     let mut srv = Server::bind(cfg).unwrap();
     let port = srv.port();
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -280,5 +280,33 @@ fn record_then_replay_round_trips() {
     bytes[9] = term_proto::VER.wrapping_add(1);
     std::fs::write(&path, &bytes).unwrap();
     assert!(matches!(terminal::replay::Replay::open(&path), Err(terminal::spool::SpoolErr::Version(_))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn drawings_persist_across_a_restart() {
+    use term_proto::ctl::{ChartPt, DrawKind, Drawing};
+    use terminal::server::Drawings;
+    let dir = std::env::temp_dir().join(format!("term-draw-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut d = Drawings::default();
+    let mut b = [0u8; 128];
+    let mk = |id, px| Drawing { instr: 1, id, kind: DrawKind::HLine, rgba: 1, pts: [ChartPt { bar: 5, px }, ChartPt { bar: 5, px }] };
+    let n = mk(1, 100).encode(0, 0, &mut b).unwrap();
+    assert!(d.put(&b[..n]));
+    let n = mk(2, 200).encode(0, 0, &mut b).unwrap();
+    assert!(d.put(&b[..n]));
+    let n = mk(1, 150).encode(0, 0, &mut b).unwrap();
+    assert!(d.put(&b[..n]), "same id replaces");
+    d.save(&dir).unwrap();
+    let back = Drawings::load(&dir);
+    let mut out = Vec::new();
+    back.append_for(1, &mut out);
+    let pxs: Vec<i64> = terminal::source::frames(&out).map(|f| {
+        let (g, _) = term_proto::decode(f.unwrap()).unwrap();
+        Drawing::parse(g.body).unwrap().pts[0].px
+    }).collect();
+    assert_eq!(pxs, [200, 150]);
+    assert!(!d.put(b"not a frame"));
     let _ = std::fs::remove_dir_all(&dir);
 }

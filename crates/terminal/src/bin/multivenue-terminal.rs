@@ -12,7 +12,7 @@ use terminal::bundle::Bundle;
 use terminal::server::{Config, Server};
 
 fn usage() -> ! {
-    eprintln!("usage: multivenue-terminal [--port 9393] [--bundle terminal-ui/dist] (--synthetic SEED | --replay SPOOL | --live [--hl BTC] [--bn BTCUSDT]) [--record SPOOL] [--no-door] [--probe SECS] [--extra-ca PEM] [--state URL] [--door SOCK --door-key ENV (--door-epoch FILE | --state URL) --route I:SLOT:SYM…]");
+    eprintln!("usage: multivenue-terminal [--port 9393] [--bundle terminal-ui/dist] (--synthetic SEED | --replay SPOOL | --live [--hl BTC] [--bn BTCUSDT]) [--record SPOOL] [--no-door] [--probe SECS] [--extra-ca PEM] [--data DIR] [--state URL] [--door SOCK --door-key ENV (--door-epoch FILE | --state URL) --route I:SLOT:SYM…]");
     std::process::exit(2)
 }
 
@@ -33,6 +33,7 @@ fn main() -> std::io::Result<()> {
     let mut door_epoch: Option<PathBuf> = None;
     let mut routes: Vec<terminal::door::Route> = Vec::new();
     let mut state_url: Option<String> = None;
+    let mut data_dir: Option<PathBuf> = None;
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
         match k.as_str() {
@@ -45,6 +46,7 @@ fn main() -> std::io::Result<()> {
             "--live" => live = true,
             "--hl" => hl.push(a.next().unwrap_or_else(|| usage())),
             "--bn" => bn.push(a.next().unwrap_or_else(|| usage())),
+            "--data" => data_dir = Some(a.next().unwrap_or_else(|| usage()).into()),
             "--state" => state_url = Some(a.next().unwrap_or_else(|| usage())),
             "--door" => door_sock = Some(a.next().unwrap_or_else(|| usage()).into()),
             "--door-key" => door_key = Some(a.next().unwrap_or_else(|| usage()).into()),
@@ -112,7 +114,7 @@ fn main() -> std::io::Result<()> {
         }
         None => None,
     };
-    let cfg = Config { port, token, bundle, record, tick: Duration::from_millis(100), order_entry, door, state };
+    let cfg = Config { port, token, bundle, record, tick: Duration::from_millis(100), order_entry, door, state, data_dir };
     let mut srv = Server::bind(cfg)?;
     // The one-time login token goes to the operator's terminal only.
     println!("TERM http://127.0.0.1:{}/  login token: {}", srv.port(), String::from_utf8_lossy(&token));

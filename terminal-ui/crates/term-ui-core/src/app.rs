@@ -51,6 +51,9 @@ struct Inst {
     drawings: Vec<Drawing>,
     /// A trend line's first point, until its release.
     trend_from: Option<ChartPt>,
+    /// Footprint cells per bar: (px, bid, ask); and one being assembled.
+    fp: BTreeMap<i64, Vec<(i64, i64, i64)>>,
+    fp_pending: Option<(i64, Vec<(i64, i64, i64)>)>,
 }
 
 pub struct App<P: Platform, L: Link> {
@@ -79,6 +82,8 @@ pub struct App<P: Platform, L: Link> {
     qty_text: String,
     reduce_only: bool,
     algo_sell: bool,
+    /// 0 full, 1 chart + blotter, 2 chart only.
+    layout: u8,
     entry_err: Option<&'static str>,
     orders: BTreeMap<u64, OrderView>,
     positions: BTreeMap<(u8, u16), PositionView>,
@@ -155,6 +160,7 @@ impl<P: Platform, L: Link> App<P, L> {
             qty_text: String::new(),
             reduce_only: false,
             algo_sell: false,
+            layout: 0,
             entry_err: None,
             orders: BTreeMap::new(),
             positions: BTreeMap::new(),
@@ -245,6 +251,41 @@ impl<P: Platform, L: Link> App<P, L> {
                     i.bars.insert(b.bar, b);
                     while i.bars.len() > MAX_BARS {
                         i.bars.pop_first();
+                    }
+                }
+            }
+            Kind::Drawing => {
+                // The server's stored drawings, with each snapshot.
+                if let Ok(d) = Drawing::parse(f.body) {
+                    let v = &mut self.inst(d.instr).drawings;
+                    v.retain(|x| x.id != d.id);
+                    v.push(d);
+                }
+            }
+            Kind::FootprintCells => {
+                if let Ok(v) = Footprint::parse(f.body) {
+                    let i = self.inst(v.instr);
+                    if v.chunk.offset == 0 {
+                        i.fp_pending = Some((v.bar, Vec::with_capacity(v.chunk.total as usize)));
+                    }
+                    let ok = i.fp_pending.as_ref().is_some_and(|(b, cells)| *b == v.bar && cells.len() == v.chunk.offset as usize);
+                    if ok {
+                        if let Some((_, cells)) = i.fp_pending.as_mut() {
+                            for k in 0..v.len() {
+                                let c = v.cell(k);
+                                cells.push((c.px, c.bid_vol, c.ask_vol));
+                            }
+                        }
+                        if v.chunk.last {
+                            if let Some((bar, cells)) = i.fp_pending.take() {
+                                i.fp.insert(bar, cells);
+                                while i.fp.len() > 300 {
+                                    i.fp.pop_first();
+                                }
+                            }
+                        }
+                    } else {
+                        i.fp_pending = None; // a gap: wait for the next whole bar
                     }
                 }
             }
@@ -371,8 +412,13 @@ impl<P: Platform, L: Link> App<P, L> {
             let side_w = 280.0f32.min(body.width() * 0.3);
             let left = Rect::from_min_max(body.min, Pos2::new(body.max.x - side_w - 6.0, body.max.y));
             let right = Rect::from_min_max(Pos2::new(body.max.x - side_w, body.min.y), body.max);
-            let s1 = left.min.y + left.height() * 0.52;
-            let s2 = left.min.y + left.height() * 0.76;
+            let (f1, f2) = match self.layout {
+                0 => (0.52, 0.76),
+                1 => (0.76, 0.76),
+                _ => (1.0, 1.0),
+            };
+            let s1 = left.min.y + left.height() * f1;
+            let s2 = left.min.y + left.height() * f2;
             let chart = Rect::from_min_max(left.min, Pos2::new(left.max.x, s1 - 3.0));
             let heat = Rect::from_min_max(Pos2::new(left.min.x, s1 + 3.0), Pos2::new(left.max.x, s2 - 3.0));
             let blotter = Rect::from_min_max(Pos2::new(left.min.x, s2 + 3.0), left.max);
@@ -381,10 +427,14 @@ impl<P: Platform, L: Link> App<P, L> {
             let ladder = Rect::from_min_max(Pos2::new(right.min.x, ticket.max.y + 6.0), Pos2::new(right.max.x, lsplit - 3.0));
             let tape = Rect::from_min_max(Pos2::new(right.min.x, lsplit + 3.0), right.max);
             self.ticket(ui, ticket);
-            self.blotter(ui, blotter);
+            if blotter.height() > 20.0 {
+                self.blotter(ui, blotter);
+            }
             if let Some(rs) = rs {
                 self.chart(ui, rs, chart);
-                self.heat(ui, rs, heat);
+                if heat.height() > 20.0 {
+                    self.heat(ui, rs, heat);
+                }
             }
             self.ladder(ui, ladder);
             self.tape(ui, tape);
@@ -430,6 +480,14 @@ impl<P: Platform, L: Link> App<P, L> {
                 self.ins[k].heat_base.fill(i32::MIN);
             }
             x = br.max.x + 6.0;
+        }
+        let names = ["layout: full", "layout: chart + blotter", "layout: chart"];
+        let g = p.layout_no_wrap(names[self.layout as usize % 3].to_owned(), FontId::proportional(12.0), MUTED);
+        let lr = Rect::from_min_size(Pos2::new(x + 12.0, r.min.y + 3.0), g.size() + Vec2::new(12.0, 6.0));
+        p.rect_stroke(lr, 3.0, egui::Stroke::new(1.0, Color32::from_rgb(0x2A, 0x36, 0x42)), egui::StrokeKind::Inside);
+        p.galley(lr.min + Vec2::new(6.0, 3.0), g, MUTED);
+        if ui.interact(lr, ui.id().with("layout"), Sense::click()).clicked() {
+            self.layout = (self.layout + 1) % 3;
         }
         let link = match self.link.state() {
             LinkState::Open => "live",
@@ -527,6 +585,37 @@ impl<P: Platform, L: Link> App<P, L> {
             let n = format_1e6(t * tick, decimals(tick), &mut self.fmt);
             let s = std::str::from_utf8(&self.fmt[..n]).unwrap_or("");
             painter.text(Pos2::new(rect.max.x - 6.0, rect.min.y + v.y_px(t) - 1.0), Align2::RIGHT_BOTTOM, s, FontId::monospace(10.5), MUTED);
+        }
+        // Footprint: bid × ask inside each candle once there is room.
+        if v.px_per_bar >= 70.0 {
+            let rows = (10.0 / v.px_per_tick).ceil().max(1.0) as i64;
+            let mut drawn = 0usize;
+            for (&bar, cells) in i.fp.range(b0..=b1) {
+                let mut agg: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+                for &(px, bv, av) in cells {
+                    let e = agg.entry((px / tick).div_euclid(rows)).or_insert((0, 0));
+                    e.0 += bv;
+                    e.1 += av;
+                }
+                let max = agg.values().map(|(b, a)| b + a).max().unwrap_or(0);
+                let xc = rect.min.x + v.x_px(bar);
+                for (row, (bv, av)) in agg {
+                    if drawn > 1500 {
+                        break;
+                    }
+                    let y = rect.min.y + v.y_px(row * rows + rows / 2);
+                    if !(rect.min.y..rect.max.y).contains(&y) {
+                        continue;
+                    }
+                    if bv + av == max && max > 0 {
+                        let r = Rect::from_center_size(Pos2::new(xc, y), Vec2::new(v.px_per_bar * 0.86, (v.px_per_tick * rows as f32).max(10.0)));
+                        painter.rect_stroke(r, 1.0, egui::Stroke::new(1.0, Color32::from_rgb(0xF2, 0xC2, 0x5C)), egui::StrokeKind::Inside);
+                    }
+                    let t = format!("{} × {}", compact(bv), compact(av));
+                    painter.text(Pos2::new(xc, y), Align2::CENTER_CENTER, t, FontId::monospace(9.0), TEXT);
+                    drawn += 1;
+                }
+            }
         }
         // Volume profile on the right edge, under the axis labels.
         if let Some((base, step, cells)) = &i.vap {
@@ -629,7 +718,7 @@ impl<P: Platform, L: Link> App<P, L> {
             painter.text(tag.center(), Align2::CENTER_CENTER, s, FontId::monospace(10.5), BG);
         }
         if let Some(mut d) = new_drawing {
-            d.id = self.ins[sel].drawings.len() as u32 + 1;
+            d.id = self.ins[sel].drawings.iter().map(|x| x.id).max().unwrap_or(0) + 1;
             // The server keeps the operator's drawings (typed records only).
             if let Ok(n) = d.encode(0, 0, &mut self.out) {
                 self.link.send(&self.out[..n]);
@@ -889,6 +978,20 @@ impl<P: Platform, L: Link> App<P, L> {
     }
 }
 
+/// A ×1e6 size in at most four characters (`0.12`, `3.4`, `56`, `1.2k`).
+pub fn compact(q: i64) -> String {
+    let v = q as f64 / 1e6;
+    if v >= 1000.0 {
+        format!("{:.1}k", v / 1000.0)
+    } else if v >= 10.0 {
+        format!("{v:.0}")
+    } else if v >= 1.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
 /// Decimals to show for a tick (×1e6): 1.0 → 0, 0.1 → 1, 0.01 → 2 …
 pub fn decimals(tick_1e6: i64) -> u32 {
     let mut d = 6;
@@ -903,6 +1006,14 @@ pub fn decimals(tick_1e6: i64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_sizes() {
+        assert_eq!(compact(120_000), "0.12");
+        assert_eq!(compact(3_400_000), "3.4");
+        assert_eq!(compact(56_000_000), "56");
+        assert_eq!(compact(1_234_000_000), "1.2k");
+    }
 
     #[test]
     fn slots_and_reasons() {

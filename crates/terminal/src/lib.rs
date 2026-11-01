@@ -11,6 +11,7 @@
 pub mod auth;
 pub mod bundle;
 pub mod door;
+pub mod footprint;
 pub mod http;
 pub mod live;
 pub mod probe;

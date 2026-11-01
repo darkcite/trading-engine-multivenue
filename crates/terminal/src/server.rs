@@ -51,6 +51,66 @@ pub struct Config {
     pub door: Option<crate::door::DoorClient>,
     /// The engine's `/state` (EngineStatus and the door's epoch).
     pub state: Option<crate::state::StatePoller>,
+    /// Where the operator's drawings persist (`DIR/drawings.spool`).
+    pub data_dir: Option<std::path::PathBuf>,
+}
+
+/// The operator's drawings, per instrument, as their encoded frames.
+#[derive(Default)]
+pub struct Drawings {
+    pub by_instr: Vec<Vec<Vec<u8>>>,
+}
+
+impl Drawings {
+    const MAX_PER_INSTR: usize = 256;
+
+    pub fn load(dir: &std::path::Path) -> Drawings {
+        let mut d = Drawings::default();
+        if let Ok(mut r) = crate::spool::Reader::open(&dir.join("drawings.spool")) {
+            while let Ok(Some((_, f))) = r.next_record() {
+                d.put(f);
+            }
+        }
+        d
+    }
+
+    /// Store (or replace, by id) one validated Drawing frame.
+    pub fn put(&mut self, frame: &[u8]) -> bool {
+        let Ok((f, _)) = term_proto::decode(frame) else { return false };
+        let Ok(dr) = term_proto::ctl::Drawing::parse(f.body) else { return false };
+        let k = dr.instr as usize;
+        if k >= MAX_INSTR {
+            return false;
+        }
+        while self.by_instr.len() <= k {
+            self.by_instr.push(Vec::new());
+        }
+        let v = &mut self.by_instr[k];
+        v.retain(|x| term_proto::decode(x).ok().and_then(|(g, _)| term_proto::ctl::Drawing::parse(g.body).ok()).is_none_or(|o| o.id != dr.id));
+        if v.len() >= Self::MAX_PER_INSTR {
+            v.remove(0);
+        }
+        v.push(frame.to_vec());
+        true
+    }
+
+    pub fn save(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        let tmp = dir.join("drawings.spool.tmp");
+        let mut r = crate::spool::Recorder::create(&tmp)?;
+        for f in self.by_instr.iter().flatten() {
+            r.record(0, f)?;
+        }
+        r.flush()?;
+        std::fs::rename(&tmp, dir.join("drawings.spool"))
+    }
+
+    pub fn append_for(&self, instr: u16, out: &mut Vec<u8>) {
+        if let Some(v) = self.by_instr.get(instr as usize) {
+            for f in v {
+                out.extend_from_slice(f);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -107,6 +167,8 @@ pub struct Server {
     one: Vec<u8>,
     vap: Vec<Option<crate::vap::VapBook>>,
     vap_tick: u32,
+    drawings: Drawings,
+    fp: Vec<crate::footprint::FpBook>,
     pub log: Vec<Event>,
 }
 
@@ -125,8 +187,9 @@ impl Server {
             None => None,
         };
         let auth = Auth::new(cfg.token, port);
+        let drawings = cfg.data_dir.as_deref().map(Drawings::load).unwrap_or_default();
         let clients = (0..MAX_CLIENTS).map(|_| None).collect();
-        Ok(Server { poll, listener, clients, auth, cfg, port, csp, rec, start: Instant::now(), md: Vec::with_capacity(1 << 20), one: Vec::with_capacity(1 << 20), vap: (0..MAX_INSTR).map(|_| None).collect(), vap_tick: 0, log: vec![Event::Listening(port)] })
+        Ok(Server { poll, listener, clients, auth, cfg, port, csp, rec, start: Instant::now(), md: Vec::with_capacity(1 << 20), one: Vec::with_capacity(1 << 20), vap: (0..MAX_INSTR).map(|_| None).collect(), vap_tick: 0, drawings, fp: (0..MAX_INSTR).map(|_| crate::footprint::FpBook::default()).collect(), log: vec![Event::Listening(port)] })
     }
 
     pub fn port(&self) -> u16 {
@@ -175,6 +238,7 @@ impl Server {
                     if f[0] == term_proto::Kind::TradeBatch as u8 {
                         crate::vap::feed(&mut self.vap, &f[term_proto::HDR_LEN..]);
                     }
+                    crate::footprint::feed(&mut self.fp, f);
                 }
                 self.vap_tick += 1;
                 let vap_due = self.vap_tick % 10 == 0;
@@ -185,6 +249,9 @@ impl Server {
                         if let Some(v) = v {
                             v.frame(k as u16, t_ns, &mut self.md);
                         }
+                    }
+                    for (k, fp) in self.fp.iter_mut().enumerate() {
+                        fp.frames(k as u16, t_ns, &mut self.md);
                     }
                     if !self.md.is_empty() {
                         let rec = self.rec.take();
@@ -474,6 +541,14 @@ impl Server {
         if used != msg.len() {
             return self.drop_client(i, "trailing bytes");
         }
+        if f.hdr.kind == Kind::Drawing && self.drawings.put(msg) {
+            if let Some(dir) = self.cfg.data_dir.as_deref() {
+                if let Err(e) = self.drawings.save(dir) {
+                    eprintln!("terminal: drawings not saved: {e}");
+                }
+            }
+            return;
+        }
         self.handle(i, f, src);
     }
 
@@ -504,6 +579,7 @@ impl Server {
                         if fresh {
                             self.one.clear();
                             src.snapshot(c.a, &mut self.one);
+                            self.drawings.append_for(c.a, &mut self.one);
                             self.send_frames(i);
                         }
                     }
@@ -543,7 +619,7 @@ impl Server {
                 }
                 self.note(Event::Intent { nonce: intent.nonce, accepted, why });
             }
-            _ => {} // Layout / Drawing / KeyMap / LiveConfirm: stored in later milestones.
+            _ => {} // Drawing is stored in ui_message; Layout / KeyMap / LiveConfirm not yet.
         }
     }
 
@@ -643,6 +719,7 @@ impl Server {
                     w.needs_snapshot[k] = false;
                     self.one.clear();
                     src.snapshot(k as u16, &mut self.one);
+                    self.drawings.append_for(k as u16, &mut self.one);
                     self.send_frames(i);
                     break; // one per tick
                 }
