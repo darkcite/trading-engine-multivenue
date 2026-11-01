@@ -172,6 +172,18 @@ impl TermStrategy {
         }
     }
 
+    /// Replace the pre-gate's numbers (from `term.toml`, at boot). The
+    /// slot's venue is kept; the rate bucket starts full.
+    pub fn set_params(&mut self, mut p: TermParams) {
+        p.venue = self.p.venue;
+        self.p = p;
+        self.tokens_milli = p.rate_burst as u64 * 1000;
+    }
+
+    pub fn params(&self) -> TermParams {
+        self.p
+    }
+
     /// Hand the member its ends of the door's rings (boot wiring).
     pub fn attach(&mut self, reduce: ReduceRx, grow: GrowRx, evt: EvtTx) {
         self.reduce = Some(reduce);

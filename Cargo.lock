@@ -412,6 +412,7 @@ dependencies = [
  "strategy-pmj",
  "strategy-rule-tree",
  "strategy-set",
+ "strategy-term",
  "strategy-vm",
  "strategy-vrp",
  "strategy-xmm",

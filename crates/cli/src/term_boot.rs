@@ -87,6 +87,13 @@ pub fn wire_in(set: &mut StrategySet, dir: &std::path::Path, epoch: u64) -> Resu
         return Ok(None);
     }
     let key = read_key(&dir.join("term.env"))?;
+    // The pre-gate's caps: term.toml, else the paper defaults (TERM §4.3).
+    let toml = dir.join("term.toml");
+    let (caps, caps_src) = match std::fs::read_to_string(&toml) {
+        Ok(src) => (core_config::term::parse(&src).map_err(|e| e.to_string())?, "term.toml"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (core_config::term::TermFile::PAPER, "paper defaults"),
+        Err(e) => return Err(format!("{}: {e}", toml.display())),
+    };
     let mut lanes = Vec::with_capacity(4);
     let mut slots = Vec::with_capacity(4);
     for slot in 12u8..=15 {
@@ -95,6 +102,9 @@ pub fn wire_in(set: &mut StrategySet, dir: &std::path::Path, epoch: u64) -> Resu
         }
         let ((reduce, grow, evt), (rr, gr, et)) = rings();
         let m = set.term_mut(slot).ok_or("a TERM slot without a member")?;
+        if let Some(c) = caps.caps(slot) {
+            m.set_params(params_of(&c));
+        }
         m.attach(rr, gr, et);
         lanes.push(Lane { slot, reduce, grow, evt });
         slots.push(slot);
@@ -111,8 +121,25 @@ pub fn wire_in(set: &mut StrategySet, dir: &std::path::Path, epoch: u64) -> Resu
     let stop = Arc::new(AtomicBool::new(false));
     let handle = spawn(DoorCfg { path: sock.clone(), door: Door::new(key, epoch, DOOR_MAX_AGE_NS), clock }, lanes, stop.clone())
         .map_err(|e| format!("term door {}: {e}", sock.display()))?;
-    let tell = format!("term: door {} · slots {slots:?} · PAPER · epoch {epoch}", sock.display());
+    let tell = format!("term: door {} · slots {slots:?} · PAPER · caps {caps_src} · epoch {epoch}", sock.display());
     Ok(Some(TermDoorGuard { stop, handle: Some(handle), tell }))
+}
+
+/// `term.toml` caps → the member's parameters (the venue is the slot's).
+pub fn params_of(c: &core_config::term::TermCaps) -> strategy_term::TermParams {
+    let mut p = strategy_term::TermParams::paper_hl();
+    p.band_bps = c.band_bps;
+    p.min_notional_1e6 = c.min_notional_usd_1e6;
+    p.max_order_notional_1e6 = c.max_order_notional_usd_1e6;
+    p.max_pos_1e6 = c.max_pos_1e6;
+    p.rate_burst = c.rate_burst;
+    p.rate_per_s = c.rate_per_s;
+    p.max_age_ns = u64::from(c.max_age_ms) * 1_000_000;
+    p.touch_stale_ns = u64::from(c.touch_stale_ms) * 1_000_000;
+    p.watchdog_ns = u64::from(c.watchdog_ms) * 1_000_000;
+    p.flatten_slip_bps = c.flatten_slip_bps;
+    p.max_rest_ns = u64::from(c.max_rest_s) * 1_000_000_000;
+    p
 }
 
 /// `wire_in` at `$HOME/multivenue`; `epoch` is `/state`'s `boot.boot_wall_ns`.
@@ -154,6 +181,23 @@ mod tests {
         let em = std::fs::metadata(dir.join("term.epoch")).unwrap().permissions().mode();
         assert_eq!(em & 0o777, 0o600);
         assert!(g.tell.contains("[12, 13, 14, 15]"));
+        assert!(g.tell.contains("caps paper defaults"));
+        drop(g);
+        // term.toml's caps reach the members; a bad file refuses the boot.
+        std::fs::write(dir.join("term.toml"), "[term]\nband_bps = 150\nmin_notional_usd_1e6_13 = 5000000\n").unwrap();
+        let mut set = StrategySet::new(TERM_MASK);
+        let g = wire_in(&mut set, &dir, 9).unwrap().unwrap();
+        assert!(g.tell.contains("caps term.toml"));
+        assert_eq!(set.term_mut(12).unwrap().params().band_bps, 150);
+        assert_eq!(set.term_mut(13).unwrap().params().min_notional_1e6, 5_000_000);
+        assert_eq!(set.term_mut(12).unwrap().params().min_notional_1e6, 10_000_000);
+        drop(g);
+        std::fs::write(dir.join("term.toml"), "[term]\nband_bps = 0\n").unwrap();
+        let mut set = StrategySet::new(TERM_MASK);
+        assert!(wire_in(&mut set, &dir, 9).is_err());
+        std::fs::remove_file(dir.join("term.toml")).unwrap();
+        let mut set = StrategySet::new(TERM_MASK);
+        let g = wire_in(&mut set, &dir, 1_761_980_000_000_000_000).unwrap().unwrap();
         drop(g);
         assert!(!dir.join("term.sock").exists());
         let _ = std::fs::remove_dir_all(&dir);

@@ -20,6 +20,7 @@ path = "src/bin/multivenue-engine.rs"
 
 [dependencies]
 ingress-term = { workspace = true }
+strategy-term = { workspace = true }
 core-config          = { workspace = true }
 core-regime          = { workspace = true }
 core-io              = { workspace = true }

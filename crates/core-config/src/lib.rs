@@ -51,6 +51,7 @@ pub mod pmj;
 /// RG2: the regime detector's parameter artifact (`regime.toml`) + seed file.
 pub mod regime;
 pub mod strike_law;
+pub mod term;
 pub mod universe;
 /// VRP V4: the VRP member's parameter artifact (`vrp.toml`) + seed rows.
 pub mod vrp;
