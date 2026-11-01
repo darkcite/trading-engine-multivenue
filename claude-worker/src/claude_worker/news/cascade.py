@@ -952,7 +952,7 @@ ANALYST_SYSTEM: str = (
     ' {"kind": "declare_vol_high", "profile": "fast"|"slow"|"both", "ttl_s": <int>}\n'
     ' {"kind": "order_intent", "market": "<market name>", "side": "bid"|"ask",'
     ' "px_offset_bps": <int -50..50>, "qty_usd": <number>, "ttl_s": <int>}\n'
-    ' {"kind": "disable_paper_slot", "slot": <int 0..7: the members; 8..15 are reserved>,'
+    ' {"kind": "disable_paper_slot", "slot": <int 0..7: the production members; 8..15 are never for the analyst>,'
     ' "venue": "<venue>", "until_ts": <unix seconds>}\n'
     ' {"kind": "propose_universe_append", "descriptor": "<descriptor>"}\n'
     ' {"kind": "propose_xsd_drop", "descriptor": "<descriptor>", "before_ts": <unix seconds>}\n'

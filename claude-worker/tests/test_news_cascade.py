@@ -513,8 +513,9 @@ def test_assessment_halt_is_not_a_kind() -> None:
 
 
 def test_disable_slot_range_is_the_built_members() -> None:
-    """S16-5: the engine has 16 slots, but 8-15 are reserved (no member) —
-    the analyst may name only a built slot, 0-7, and its prompt says so."""
+    """S16-5: the engine has 16 slots; the analyst may name only the eight
+    production members, 0-7, and its prompt says so. 8-15 (pine, pm15, pmj,
+    reserved 10, TERM 12-15) are never the analyst's."""
     cascade = claude_worker.news.cascade
     assert cascade.SLOT_BUILT_MAX == 7
 
@@ -527,10 +528,10 @@ def test_disable_slot_range_is_the_built_members() -> None:
     for slot in (0, 7):
         got = _parse(disable(slot))
         assert got is not None and got.actions[0].slot == slot
-    for slot in (-1, 8, 11, 15, 16):
+    for slot in (-1, 8, 10, 11, 12, 15, 16):
         assert _parse(disable(slot)) is None, slot
     shape = cascade.ANALYST_SYSTEM.split("disable_paper_slot")[1].split("\n")[0]
-    assert "0..7" in shape and "8..15 are reserved" in shape
+    assert "0..7" in shape and "8..15 are never for the analyst" in shape
 
 
 def test_assessment_evidence_subset() -> None:
