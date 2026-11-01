@@ -105,6 +105,8 @@ pub struct Server {
     start: Instant,
     md: Vec<u8>,
     one: Vec<u8>,
+    vap: Vec<Option<crate::vap::VapBook>>,
+    vap_tick: u32,
     pub log: Vec<Event>,
 }
 
@@ -124,7 +126,7 @@ impl Server {
         };
         let auth = Auth::new(cfg.token, port);
         let clients = (0..MAX_CLIENTS).map(|_| None).collect();
-        Ok(Server { poll, listener, clients, auth, cfg, port, csp, rec, start: Instant::now(), md: Vec::with_capacity(1 << 20), one: Vec::with_capacity(1 << 20), log: vec![Event::Listening(port)] })
+        Ok(Server { poll, listener, clients, auth, cfg, port, csp, rec, start: Instant::now(), md: Vec::with_capacity(1 << 20), one: Vec::with_capacity(1 << 20), vap: (0..MAX_INSTR).map(|_| None).collect(), vap_tick: 0, log: vec![Event::Listening(port)] })
     }
 
     pub fn port(&self) -> u16 {
@@ -167,7 +169,29 @@ impl Server {
                 self.md.clear();
                 let t_ns = self.start.elapsed().as_nanos() as u64;
                 src.tick(t_ns, &mut self.md);
+                // Volume at price from the prints in this batch; the profile
+                // goes out about once a second (derived: not recorded).
+                for f in frames(&self.md).flatten() {
+                    if f[0] == term_proto::Kind::TradeBatch as u8 {
+                        crate::vap::feed(&mut self.vap, &f[term_proto::HDR_LEN..]);
+                    }
+                }
+                self.vap_tick += 1;
+                let vap_due = self.vap_tick % 10 == 0;
                 self.fan_out(t_ns);
+                if vap_due {
+                    self.md.clear();
+                    for (k, v) in self.vap.iter_mut().enumerate() {
+                        if let Some(v) = v {
+                            v.frame(k as u16, t_ns, &mut self.md);
+                        }
+                    }
+                    if !self.md.is_empty() {
+                        let rec = self.rec.take();
+                        self.fan_out(t_ns);
+                        self.rec = rec;
+                    }
+                }
                 self.serve_snapshots(src);
             }
             if now >= next_beat {

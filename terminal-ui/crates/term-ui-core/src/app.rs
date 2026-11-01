@@ -13,7 +13,7 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use egui_wgpu::RenderState;
 use term_proto::ctl::{Beat, Control, CtlOp, InstrDef, CH_ALL};
 use term_proto::dec::format_1e6;
-use term_proto::ctl::Venue;
+use term_proto::ctl::{ChartPt, DrawKind, Drawing, Venue};
 use term_proto::exec::{Algo, EngineStatus, FillView, Intent, IntentAck, Op, OrderKind, OrderStatus, OrderView, PositionView, AckSource, FLAG_REDUCE_ONLY};
 use term_proto::md::*;
 use term_proto::{Kind, Side};
@@ -46,6 +46,11 @@ struct Inst {
     heat_scale: u16,
     view: Option<Viewport>,
     follow: bool,
+    /// Volume at price from the server: base, step, (bid, ask) per bucket.
+    vap: Option<(i64, i64, Vec<(i64, i64)>)>,
+    drawings: Vec<Drawing>,
+    /// A trend line's first point, until its release.
+    trend_from: Option<ChartPt>,
 }
 
 pub struct App<P: Platform, L: Link> {
@@ -243,6 +248,14 @@ impl<P: Platform, L: Link> App<P, L> {
                     }
                 }
             }
+            Kind::VapArray => {
+                if let Ok(v) = Vap::parse(f.body) {
+                    if v.chunk.offset == 0 && v.chunk.last {
+                        let cells = (0..v.len()).map(|k| (v.cell(k).bid_vol, v.cell(k).ask_vol)).collect();
+                        self.inst(v.instr).vap = Some((v.base_px, v.step_px, cells));
+                    }
+                }
+            }
             Kind::FlowPoint => {
                 if let Ok(p) = FlowPoint::parse(f.body) {
                     self.inst(p.instr).flow = p;
@@ -435,6 +448,7 @@ impl<P: Platform, L: Link> App<P, L> {
 
     fn chart(&mut self, ui: &mut egui::Ui, rs: &RenderState, rect: Rect) {
         let sel = self.sel;
+        let mut new_drawing: Option<Drawing> = None;
         let (w, h) = (rect.width(), rect.height());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, PANE);
@@ -447,7 +461,7 @@ impl<P: Platform, L: Link> App<P, L> {
         let i = &mut self.ins[sel];
         let v = i.view.get_or_insert_with(|| Viewport::new(last - 120, 0, 8.0, 1.0));
         let d = resp.drag_delta();
-        if d != Vec2::ZERO {
+        if d != Vec2::ZERO && !ui.input(|x| x.modifiers.shift) {
             v.pan_px(d.x, 0.0);
             i.follow = false;
         }
@@ -514,6 +528,97 @@ impl<P: Platform, L: Link> App<P, L> {
             let s = std::str::from_utf8(&self.fmt[..n]).unwrap_or("");
             painter.text(Pos2::new(rect.max.x - 6.0, rect.min.y + v.y_px(t) - 1.0), Align2::RIGHT_BOTTOM, s, FontId::monospace(10.5), MUTED);
         }
+        // Volume profile on the right edge, under the axis labels.
+        if let Some((base, step, cells)) = &i.vap {
+            let (lo_px, hi_px) = (t_lo * tick, t_hi * tick);
+            let k0 = ((lo_px - base) / step).max(0) as usize;
+            let k1 = (((hi_px - base) / step) as usize + 1).min(cells.len());
+            let vmax = cells.get(k0..k1).map(|c| c.iter().map(|(b, a)| b + a).max().unwrap_or(0)).unwrap_or(0).max(1);
+            let wmax = w * 0.22;
+            for (k, (bv, av)) in cells.iter().enumerate().take(k1).skip(k0) {
+                if bv + av == 0 {
+                    continue;
+                }
+                let px = base + k as i64 * step;
+                let y0 = rect.min.y + v.y_px((px + step) / tick);
+                let y1 = rect.min.y + v.y_px(px / tick);
+                let h = (y1 - y0).abs().max(1.0);
+                let wb = wmax * (*bv as f32 / vmax as f32);
+                let wa = wmax * (*av as f32 / vmax as f32);
+                let x = rect.max.x - 76.0;
+                painter.rect_filled(Rect::from_min_size(Pos2::new(x - wa - wb, y0.min(y1)), Vec2::new(wb, h)), 0.0, Color32::from_rgba_unmultiplied(DOWN[0], DOWN[1], DOWN[2], 0x30));
+                painter.rect_filled(Rect::from_min_size(Pos2::new(x - wa, y0.min(y1)), Vec2::new(wa, h)), 0.0, Color32::from_rgba_unmultiplied(UP[0], UP[1], UP[2], 0x30));
+            }
+        }
+        // Drawings: chart space (bar, ×1e6 price), never screen space.
+        let to_screen = |p: &ChartPt| Pos2::new(rect.min.x + v.x_px(p.bar), rect.min.y + v.y_px(p.px / tick));
+        for d in i.drawings.iter() {
+            let col = Color32::from_rgb(0xF2, 0xC2, 0x5C);
+            match d.kind {
+                DrawKind::HLine => {
+                    let y = to_screen(&d.pts[0]).y;
+                    painter.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], egui::Stroke::new(1.0, col));
+                }
+                _ => {
+                    painter.line_segment([to_screen(&d.pts[0]), to_screen(&d.pts[1])], egui::Stroke::new(1.2, col));
+                }
+            }
+        }
+        // The crosshair, its price on the axis and its bar's time.
+        if let Some(hp) = resp.hover_pos() {
+            let stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xC6, 0xD0, 0xD8, 0x60));
+            painter.line_segment([Pos2::new(rect.min.x, hp.y), Pos2::new(rect.max.x, hp.y)], stroke);
+            painter.line_segment([Pos2::new(hp.x, rect.min.y), Pos2::new(hp.x, rect.max.y)], stroke);
+            let t_rel = v.top.rel(v.origin_tick) - (hp.y - rect.min.y) / v.px_per_tick;
+            let tick_at = v.origin_tick + t_rel.round() as i64;
+            let n = format_1e6(tick_at * tick, decimals(tick), &mut self.fmt);
+            let ps = std::str::from_utf8(&self.fmt[..n]).unwrap_or("").to_owned();
+            let tag = Rect::from_min_size(Pos2::new(rect.max.x - 72.0, hp.y - 8.0), Vec2::new(72.0, 16.0));
+            painter.rect_filled(tag, 2.0, Color32::from_rgb(0x2A, 0x36, 0x42));
+            painter.text(tag.center(), Align2::CENTER_CENTER, ps, FontId::monospace(10.5), TEXT);
+            let bar_at = v.left.whole + ((hp.x - rect.min.x) / v.px_per_bar + v.left.frac) as i64;
+            let tf = i.bars.values().next_back().map_or(60, |b| b.tf_s as i64);
+            let secs = (bar_at * tf).rem_euclid(86_400);
+            painter.text(Pos2::new(hp.x + 4.0, rect.max.y - 4.0), Align2::LEFT_BOTTOM, format!("{:02}:{:02} UTC", secs / 3600, secs / 60 % 60), FontId::monospace(10.0), MUTED);
+            // Alt-click: a horizontal line; Shift-drag: a trend line.
+            let mods = ui.input(|x| x.modifiers);
+            let here = ChartPt { bar: bar_at, px: tick_at * tick };
+            if resp.clicked() && mods.alt {
+                new_drawing = Some(Drawing { instr: sel as u16, id: 0, kind: DrawKind::HLine, rgba: 0xF2C25CFF, pts: [here, here] });
+            }
+        }
+        // Shift-drag: a trend line. The raw pointer events carry the press
+        // and release positions even when both land in one slow frame.
+        let (shift_press, shift_release) = ui.input(|x| {
+            let mut p = None;
+            let mut r = None;
+            for e in &x.events {
+                if let egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers } = e {
+                    if modifiers.shift && rect.contains(*pos) {
+                        if *pressed {
+                            p = Some(*pos);
+                        } else {
+                            r = Some(*pos);
+                        }
+                    }
+                }
+            }
+            (p, r)
+        });
+        let to_chart = |q: Pos2| {
+            let t = v.top.rel(v.origin_tick) - (q.y - rect.min.y) / v.px_per_tick;
+            ChartPt { bar: v.left.whole + ((q.x - rect.min.x) / v.px_per_bar + v.left.frac) as i64, px: (v.origin_tick + t.round() as i64) * tick }
+        };
+        if let Some(pp) = shift_press {
+            i.trend_from = Some(to_chart(pp));
+        }
+        if let (Some(rp), Some(from)) = (shift_release, i.trend_from) {
+            i.trend_from = None;
+            let to = to_chart(rp);
+            if from != to {
+                new_drawing = Some(Drawing { instr: sel as u16, id: 0, kind: DrawKind::Trend, rgba: 0xF2C25CFF, pts: [from, to] });
+            }
+        }
         if let Some(b) = i.bars.get(&last) {
             let n = format_1e6(b.c, decimals(tick), &mut self.fmt);
             let s = std::str::from_utf8(&self.fmt[..n]).unwrap_or("");
@@ -522,6 +627,14 @@ impl<P: Platform, L: Link> App<P, L> {
             let c = if b.c >= b.o { UP } else { DOWN };
             painter.rect_filled(tag, 2.0, Color32::from_rgb(c[0], c[1], c[2]));
             painter.text(tag.center(), Align2::CENTER_CENTER, s, FontId::monospace(10.5), BG);
+        }
+        if let Some(mut d) = new_drawing {
+            d.id = self.ins[sel].drawings.len() as u32 + 1;
+            // The server keeps the operator's drawings (typed records only).
+            if let Ok(n) = d.encode(0, 0, &mut self.out) {
+                self.link.send(&self.out[..n]);
+            }
+            self.ins[sel].drawings.push(d);
         }
     }
 

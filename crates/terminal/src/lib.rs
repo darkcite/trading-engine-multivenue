@@ -20,4 +20,5 @@ pub mod source;
 pub mod spool;
 pub mod state;
 pub mod synth;
+pub mod vap;
 pub mod ws;
