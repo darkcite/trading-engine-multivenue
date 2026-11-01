@@ -43,7 +43,7 @@ impl eframe::App for App {
 /// Encode a `Control` frame (what the client will send on the socket in
 /// T1a) and log it; the spike has no server.
 fn report(kind: CtlOp) {
-    let mut buf = [0u8; 32];
+    let mut buf = [0u8; term_proto::HDR_LEN + term_proto::ctl::Control::LEN];
     let seq = 0;
     let ts = 0;
     if let Ok(n) = Control::op(kind).encode(seq, ts, &mut buf) {

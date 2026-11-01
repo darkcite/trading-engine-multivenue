@@ -11,6 +11,8 @@
 pub mod auth;
 pub mod bundle;
 pub mod http;
+pub mod live;
+pub mod probe;
 pub mod replay;
 pub mod server;
 pub mod source;

@@ -28,6 +28,8 @@ exec-hyperliquid = { path = "../crates/exec-hyperliquid" }
 exec-binance     = { path = "../crates/exec-binance" }
 # TERM wire (TERM plan §4.11.2): term_proto_frame / _intent / _dec.
 term-proto       = { path = "../crates/term-proto" }
+# TERM live-feed scanners: term_live_scan.
+terminal         = { path = "../crates/terminal" }
 # cargo-fuzz runtime.
 libfuzzer-sys = "0.4"
 # pine_lex_parse: the PVM lane's Pine v5/v6 front end (impl-01 section 7.12).
@@ -583,6 +585,13 @@ bench  = false
 [[bin]]
 name   = "term_proto_dec"
 path   = "fuzz_targets/term_proto_dec.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "term_live_scan"
+path   = "fuzz_targets/term_live_scan.rs"
 test   = false
 doc    = false
 bench  = false

@@ -2492,7 +2492,10 @@ dependencies = [
  "core-net",
  "mio 0.8.11",
  "proptest",
+ "rustls",
+ "rustls-pki-types",
  "term-proto",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

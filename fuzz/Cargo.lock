@@ -568,6 +568,7 @@ dependencies = [
  "signer-eip712",
  "signer-evm",
  "term-proto",
+ "terminal",
 ]
 
 [[package]]
@@ -715,6 +716,19 @@ dependencies = [
 [[package]]
 name = "term-proto"
 version = "0.1.0"
+
+[[package]]
+name = "terminal"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "core-net",
+ "mio",
+ "rustls",
+ "rustls-pki-types",
+ "term-proto",
+ "webpki-roots 0.26.11",
+]
 
 [[package]]
 name = "tiny-keccak"
