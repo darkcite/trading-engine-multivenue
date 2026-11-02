@@ -68,17 +68,30 @@ box, so nothing built here can trade.
   each, clean: term_proto_frame, term_proto_intent, term_proto_dec,
   term_live_scan, term_door_frame. `license-deps` not triggered (no new
   third-party crate).
-- **Owed to the Mac**: alloc-assert, bench-check, the worker's pytest pin
-  (`claude-worker/tests/test_news_cascade.py` asserts "8..15 are reserved":
-  already stale before TERM, now 12–15 are TERM's), the `term-cmds.pmlr`
-  PMLR kind (every reader + the worker), publishing the boot epoch in
-  `/state`, Safari 26 + a real GPU for T0, and a first paper session through
-  the real door (`STRATEGY=…+term-hl`, `term.env` 0600, the terminal with
-  `--door … --route …`).
-- **Follow-ups**: HL coarse `nSigFigs` book for the heatmap; footprint and
-  VP frames; drawing tools, crosshair, panes; the blotter and refusal
-  display; algos over the door; `term.toml` caps; kittest; the glue
-  byte-compare gate; `build.rs` embedding under `web-bundle`.
+- **P1–P9 done on the cloud box** (2026-11-01, after M6):
+  P1 the worker's analyst prompt no longer calls 8..15 "reserved" (worker
+  suite runs here in its locked uv env: 1762 passed); P2 the door's epoch
+  is `/state`'s `boot.boot_wall_ns`, the terminal reads `/state`
+  (`--state URL`) for EngineStatus and re-keys the door on an engine
+  restart; P3 IntentAck (kind 24), an order ticket (trading off at login)
+  and a blotter; P4 `term.toml` per-slot caps; P5 TWAP / iceberg / chase
+  over the door, children through the pre-gate; P6 server-side volume
+  profile and footprint, crosshair, drawings (persisted with `--data DIR`),
+  a layout switch; P7 HL's nSigFigs-4 book widens the heatmap; P8 the glue
+  gate (`terminal-ui/glue.sha256`, `make terminal-ui-gates`) and the
+  `web-bundle` feature (build-time embedding, MANIFEST-checked); P9
+  `term-cmds.pmlr` (`SlotKind::TermCmd` = 11, `TermCmdRecord` 128 B) in
+  the run dir.
+- **Owed to the Mac**: alloc-assert and bench-check (the TERM member is on
+  the engine's timer path: its on_timer must stay allocation-free — it
+  is written so, unproven here); Safari 26 + a real GPU for T0; a first
+  paper session through the real door (`STRATEGY=…+term-hl`, `term.env`
+  0600, optional `term.toml`, then `multivenue-terminal --state
+  http://127.0.0.1:<port>/state --door ~/multivenue/term.sock --door-key
+  ~/multivenue/term.env --route 0:12:<sym>`); a footprint screenshot at a
+  readable zoom.
+- **Follow-ups**: Layout / KeyMap records stored by the server; Binance
+  live (geo-blocked here, sync unit-tested); kittest.
 - **Local notes for the cloud box**: build with `RUSTFLAGS=-C
   target-cpu=native` in a separate target dir; the sandbox caps disk at
   ~19 GB, so test with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`; detached jobs die between
