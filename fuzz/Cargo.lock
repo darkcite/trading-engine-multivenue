@@ -465,7 +465,9 @@ name = "ingress-term"
 version = "0.1.0"
 dependencies = [
  "core-crypto",
+ "core-io",
  "core-ring",
+ "core-types",
  "mio",
 ]
 
@@ -517,6 +519,16 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "notify"
+version = "0.1.0"
+dependencies = [
+ "core-io",
+ "core-net",
+ "core-types",
+ "rustls",
 ]
 
 [[package]]
@@ -735,6 +747,7 @@ dependencies = [
  "core-net",
  "ingress-term",
  "mio",
+ "notify",
  "rustls",
  "rustls-pki-types",
  "term-proto",
