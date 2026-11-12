@@ -515,7 +515,7 @@ The engine stays exactly as it is. The UI workspace gets its own gate targets (�
 
 The terminal's `build.rs` embeds `dist/` under `web-bundle` and refuses when a hash does not match `MANIFEST`. `dist/` is git-ignored.
 
-**Detecting a hand edit:** the manifest cannot, because the same script writes it. **The gate regenerates the glue from a clean build and compares `term_ui.js` byte for byte** against what is embedded.
+**Detecting a hand edit:** the manifest cannot, because the same script writes it. **The gate regenerates the glue from a clean build and compares `term_ui.js` byte for byte** against the pin in `terminal-ui/glue.sha256`, with one normalisation (2026-11-12): each rustc symbol hash wasm-bindgen copies into an export name (`__h` + 16 hex digits, with its `_N` dedupe suffix) is renumbered in order of first appearance before hashing. Cargo derives those hashes from `-C metadata`, which hashes the absolute path of `term-proto` (a path dependency outside the `terminal-ui` workspace) and the host triple of the proc-macro units, so the raw glue differs between checkouts and hosts while the code does not. Every other byte, and which call site names which function, stays pinned. `scripts/terminal-ui-glue-check.sh --dump FILE` writes the normalised glue for review.
 
 **Release profile:** `opt-level = "s"`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`. A minimal eframe + wgpu app measured **4.46 MB before `wasm-opt`**; it loads once from localhost.
 
@@ -788,7 +788,7 @@ All of these are wired into `make terminal-ui-gates`. The engine's own gates are
 - The UI's own validation exists for feedback only.
 
 **T-L14 — no JS except the generated glue and the loader (new).**
-- The browser runs only the `wasm-bindgen`-generated glue (regenerated each build, never edited, compared byte for byte by a gate) and `loader.js`, the one hand-written file (15 lines or fewer, SPDX header, hash-checked).
+- The browser runs only the `wasm-bindgen`-generated glue (regenerated each build, never edited, compared byte for byte by a gate, rustc symbol hashes normalised as in §4.11.1) and `loader.js`, the one hand-written file (15 lines or fewer, SPDX header, hash-checked).
 - No JS dependency, no npm, no CDN.
 
 ---

@@ -78,7 +78,11 @@ box, so nothing built here can trade.
   over the door, children through the pre-gate; P6 server-side volume
   profile and footprint, crosshair, drawings (persisted with `--data DIR`),
   a layout switch; P7 HL's nSigFigs-4 book widens the heatmap; P8 the glue
-  gate (`terminal-ui/glue.sha256`, `make terminal-ui-gates`) and the
+  gate (`terminal-ui/glue.sha256`, `make terminal-ui-gates`; since
+  2026-11-12 the pin covers the glue with rustc's `__h<16 hex>` symbol
+  hashes renumbered in order of first appearance, because cargo derives
+  them from term-proto's absolute path and the build host; every other
+  byte stays pinned, `--dump FILE` writes the normalised glue) and the
   `web-bundle` feature (build-time embedding, MANIFEST-checked); P9
   `term-cmds.pmlr` (`SlotKind::TermCmd` = 11, `TermCmdRecord` 128 B) in
   the run dir.
