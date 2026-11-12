@@ -81,7 +81,8 @@ box, so nothing built here can trade.
   gate (`terminal-ui/glue.sha256`, `make terminal-ui-gates`; since
   2026-11-12 the pin covers the glue with rustc's `__h<16 hex>` symbol
   hashes renumbered in order of first appearance, because cargo derives
-  them from term-proto's absolute path and the build host; every other
+  them from term-proto's absolute path and the build host, and likewise the
+  host-dependent `shim_idx: N` of the glue's comment lines; every other
   byte stays pinned, `--dump FILE` writes the normalised glue) and the
   `web-bundle` feature (build-time embedding, MANIFEST-checked); P9
   `term-cmds.pmlr` (`SlotKind::TermCmd` = 11, `TermCmdRecord` 128 B) in

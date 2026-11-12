@@ -19,6 +19,13 @@
 # …): the hash values drop out, which call site refers to which function
 # stays pinned, and so does every other byte.
 #
+# One more host-dependent number lives in comments only: the `shim_idx: N`
+# in wasm-bindgen's `// Cast intrinsic for ...` lines is an index into the
+# wasm module's function space, which differs between a macOS and a Linux
+# build (1942 vs 1936 for the same commit, 2026-11-12). On comment lines
+# (first non-blank characters `//`) each distinct `shim_idx: N` is renumbered
+# the same way (`shim_idx: @0`, ...); no executable byte is touched.
+#
 # Re-pin with:            scripts/terminal-ui-glue-check.sh --pin
 # Dump the normalised glue for a diff:  scripts/terminal-ui-glue-check.sh --dump FILE
 set -euo pipefail
@@ -33,7 +40,7 @@ normalise() {
   awk '
     BEGIN { x = "[0-9a-f]"; re = "__h"
             for (i = 0; i < 16; i++) re = re x
-            re = re "(_[0-9]+)?"; n = 0 }
+            re = re "(_[0-9]+)?"; n = 0; m = 0 }
     { s = $0; out = ""
       while (match(s, re)) {
         tok = substr(s, RSTART, RLENGTH)
@@ -41,7 +48,18 @@ normalise() {
         out = out substr(s, 1, RSTART - 1) "__h@" id[tok]
         s = substr(s, RSTART + RLENGTH)
       }
-      print out s }
+      s = out s
+      if (s ~ /^[ \t]*\/\//) {
+        out = ""
+        while (match(s, /shim_idx: [0-9]+/)) {
+          tok = substr(s, RSTART, RLENGTH)
+          if (!(tok in sid)) sid[tok] = m++
+          out = out substr(s, 1, RSTART - 1) "shim_idx: @" sid[tok]
+          s = substr(s, RSTART + RLENGTH)
+        }
+        s = out s
+      }
+      print s }
   ' "$glue"
 }
 if [[ "${1:-}" == "--dump" ]]; then
